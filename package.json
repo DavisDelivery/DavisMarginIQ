@@ -1,0 +1,9 @@
+{
+  "name": "davis-marginiq",
+  "version": "1.1.0",
+  "description": "Davis MarginIQ - Cost Intelligence Platform",
+  "private": true,
+  "dependencies": {
+    "@netlify/functions": "^2.0.0"
+  }
+}

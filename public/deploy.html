@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html><head><title>Deploy MarginIQ</title>
+<style>body{font-family:system-ui;background:#0c1220;color:#f1f5f9;padding:40px 20px;max-width:600px;margin:0 auto}
+h1{color:#2a7bc8;font-size:20px}button{background:#1e5b92;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:14px;cursor:pointer;margin:8px 4px 8px 0}
+button:disabled{opacity:0.5}#log{background:#111827;border:1px solid #1e293b;border-radius:8px;padding:16px;margin:16px 0;font-family:monospace;font-size:12px;white-space:pre-wrap;max-height:400px;overflow:auto}
+input{background:#1f2937;border:1px solid #334155;color:#f1f5f9;padding:8px 12px;border-radius:6px;width:100%;margin:8px 0;font-size:14px}
+</style></head><body>
+<h1>📊 Deploy Davis MarginIQ</h1>
+<div>
+<label>GitHub Token</label><input id="token" type="password" placeholder="ghp_..." />
+<label>Branch</label><input id="branch" value="main" />
+</div>
+<button onclick="deploy()">🚀 Deploy to GitHub</button>
+<button onclick="checkStatus()">📋 Check Status</button>
+<div id="log">Ready to deploy...</div>
+<script>
+const REPO='DavisDelivery/DavisMarginIQ';
+const log=document.getElementById('log');
+function addLog(m){log.textContent+='\n'+new Date().toLocaleTimeString()+' '+m;log.scrollTop=log.scrollHeight}
+
+async function deploy(){
+  const token=document.getElementById('token').value;
+  const branch=document.getElementById('branch').value;
+  if(!token){addLog('❌ Enter GitHub token');return}
+  const headers={'Authorization':'token '+token,'Content-Type':'application/json'};
+  
+  addLog('📦 Gathering files...');
+  const files=['public/index.html','public/MarginIQ.jsx','netlify.toml',
+    'netlify/functions/marginiq-qbo-auth.mts','netlify/functions/marginiq-qbo-callback.mts',
+    'netlify/functions/marginiq-qbo-data.mts','netlify/functions/marginiq-motive.mts'];
+  
+  try{
+    // Get current ref
+    const refR=await fetch(`https://api.github.com/repos/${REPO}/git/ref/heads/${branch}`,{headers});
+    if(!refR.ok){addLog('❌ Repo/branch not found. Create repo first.');return}
+    const ref=await refR.json();
+    const baseSha=ref.object.sha;
+    addLog('✅ Current SHA: '+baseSha.slice(0,7));
+
+    // Get base tree
+    const commitR=await fetch(`https://api.github.com/repos/${REPO}/git/commits/${baseSha}`,{headers});
+    const commit=await commitR.json();
+    const baseTree=commit.tree.sha;
+
+    // Create blobs
+    const tree=[];
+    for(const f of files){
+      addLog('📄 '+f);
+      const resp=await fetch(f);
+      const content=await resp.text();
+      const blobR=await fetch(`https://api.github.com/repos/${REPO}/git/blobs`,{method:'POST',headers,body:JSON.stringify({content,encoding:'utf-8'})});
+      const blob=await blobR.json();
+      tree.push({path:f,mode:'100644',type:'blob',sha:blob.sha});
+    }
+
+    // Create tree
+    const treeR=await fetch(`https://api.github.com/repos/${REPO}/git/trees`,{method:'POST',headers,body:JSON.stringify({base_tree:baseTree,tree})});
+    const newTree=await treeR.json();
+    addLog('🌳 Tree: '+newTree.sha.slice(0,7));
+
+    // Create commit
+    const commitNewR=await fetch(`https://api.github.com/repos/${REPO}/git/commits`,{method:'POST',headers,body:JSON.stringify({message:'Deploy MarginIQ v'+document.title,tree:newTree.sha,parents:[baseSha]})});
+    const newCommit=await commitNewR.json();
+    addLog('📝 Commit: '+newCommit.sha.slice(0,7));
+
+    // Update ref
+    await fetch(`https://api.github.com/repos/${REPO}/git/refs/heads/${branch}`,{method:'PATCH',headers,body:JSON.stringify({sha:newCommit.sha})});
+    addLog('🚀 Deployed! Netlify will auto-build.');
+  }catch(e){addLog('❌ '+e.message)}
+}
+
+async function checkStatus(){
+  try{
+    const r=await fetch('/.netlify/functions/marginiq-motive?action=vehicles');
+    if(r.ok){const d=await r.json();addLog('✅ Motive: '+d.count+' vehicles')}
+    else addLog('⚠️ Motive: '+r.status);
+  }catch(e){addLog('❌ Motive: '+e.message)}
+  try{
+    const r=await fetch('/.netlify/functions/marginiq-qbo-data?action=status');
+    if(r.ok){const d=await r.json();addLog(d.connected?'✅ QBO: Connected':'⚠️ QBO: Not connected')}
+    else addLog('⚠️ QBO: '+r.status);
+  }catch(e){addLog('❌ QBO: '+e.message)}
+}
+</script></body></html>
