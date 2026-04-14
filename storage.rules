@@ -1,0 +1,22 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Payroll PDFs — read from web, write by service account only
+    match /payroll/{allPaths=**} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Uline raw xlsx uploads — read/write from web (internal tool)
+    match /uline/{allPaths=**} {
+      allow read, write: if true;
+    }
+
+    // NuVizz raw CSV uploads — read/write from web
+    match /nuvizz/{allPaths=**} {
+      allow read, write: if true;
+    }
+
+  }
+}
