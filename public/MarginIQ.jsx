@@ -1,6 +1,91 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { initializeApp } from "firebase/app";
+import {
+  getFirestore, collection, doc, getDoc, getDocs,
+  setDoc, addDoc, updateDoc, query, orderBy, limit, onSnapshot, serverTimestamp
+} from "firebase/firestore";
+import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 
-const APP_VERSION = "1.1.0";
+// ─── Firebase Config ──────────────────────────────────────────
+const firebaseConfig = {
+  apiKey: "AIzaSyDyRyjuiP_UD8T_2xmW2xLjvqx9RLCYCmo",
+  authDomain: "davismarginiq.firebaseapp.com",
+  projectId: "davismarginiq",
+  storageBucket: "davismarginiq.firebasestorage.app",
+  messagingSenderId: "131773007635",
+  appId: "1:131773007635:web:be408aab03d843333afce6",
+  measurementId: "G-SRN8BVXXDB",
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
+const storage = getStorage(firebaseApp);
+
+// ─── Firestore Helpers ────────────────────────────────────────
+// Collections:
+//   payroll_runs/{runId}         — CyberPay weekly payroll metadata
+//   reports_1099/{dateRange}     — 1099 report metadata
+//   uline_audits/{YYYY-MM-DD}    — Uline weekly audit rows
+//   nuvizz_manifests/{YYYY-MM-DD}/stops/{stopId} — NuVizz stop data
+//   drivers/{driverId}           — Driver roster (W2/1099)
+//   costs/{YYYY-MM-DD}           — Daily cost roll-ups
+//   margin_summary/{weekOf}      — Weekly margin snapshots
+
+async function fsGetLatestPayrolls(limitN = 10) {
+  try {
+    const q = query(collection(db, "payroll_runs"), orderBy("check_date", "desc"), limit(limitN));
+    const snap = await getDocs(q);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch (e) { console.error("fsGetLatestPayrolls:", e); return []; }
+}
+
+async function fsGetDrivers() {
+  try {
+    const snap = await getDocs(collection(db, "drivers"));
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch (e) { console.error("fsGetDrivers:", e); return []; }
+}
+
+async function fsSetDriver(driverId, data) {
+  try {
+    await setDoc(doc(db, "drivers", driverId), { ...data, updated_at: serverTimestamp() }, { merge: true });
+    return true;
+  } catch (e) { console.error("fsSetDriver:", e); return false; }
+}
+
+async function fsGetUlineAudit(dateStr) {
+  try {
+    const d = await getDoc(doc(db, "uline_audits", dateStr));
+    return d.exists() ? { id: d.id, ...d.data() } : null;
+  } catch (e) { console.error("fsGetUlineAudit:", e); return null; }
+}
+
+async function fsGetMarginSummaries(limitN = 12) {
+  try {
+    const q = query(collection(db, "margin_summary"), orderBy("week_of", "desc"), limit(limitN));
+    const snap = await getDocs(q);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch (e) { console.error("fsGetMarginSummaries:", e); return []; }
+}
+
+async function fsGetCosts(dateStr) {
+  try {
+    const d = await getDoc(doc(db, "costs", dateStr));
+    return d.exists() ? { id: d.id, ...d.data() } : null;
+  } catch (e) { console.error("fsGetCosts:", e); return null; }
+}
+
+// Storage: upload a file and return its download URL
+// path examples: "payroll/pdfs/2026/file.pdf", "uline/raw/2026-04-14/file.xlsx"
+async function fsUploadFile(path, file) {
+  try {
+    const fileRef = storageRef(storage, path);
+    const snap = await uploadBytes(fileRef, file);
+    return await getDownloadURL(snap.ref);
+  } catch (e) { console.error("fsUploadFile:", e); return null; }
+}
+
+const APP_VERSION = "1.1.1";
 
 // ─── Design Tokens ───────────────────────────────────────────
 const T = {
