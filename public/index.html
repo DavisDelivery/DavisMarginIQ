@@ -3,46 +3,46 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>Davis MarginIQ</title>
-  <link rel="icon" type="image/x-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>" />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #0c1220; overflow-x: hidden; }
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0c1220; overflow-x: hidden; font-family: 'DM Sans', sans-serif; }
     #root { min-height: 100vh; }
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     input[type="number"]::-webkit-inner-spin-button { opacity: 1; }
+    input[type="date"] { color-scheme: dark; }
   </style>
+
+  <!-- Firebase via CDN (must load before React) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
+  <script>
+    firebase.initializeApp({
+      apiKey: "AIzaSyDyRyjuiP_UD8T_2xmW2xLjvqx9RLCYCmo",
+      authDomain: "davismarginiq.firebaseapp.com",
+      projectId: "davismarginiq",
+      storageBucket: "davismarginiq.firebasestorage.app",
+      messagingSenderId: "131773007635",
+      appId: "1:131773007635:web:be408aab03d843333afce6",
+    });
+    window.db = firebase.firestore();
+    window.fbStorage = firebase.storage();
+  </script>
 </head>
 <body>
   <div id="root"></div>
-  <script type="importmap">
-  {
-    "imports": {
-      "react": "https://esm.sh/react@18.2.0",
-      "react-dom": "https://esm.sh/react-dom@18.2.0",
-      "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
-      "react/jsx-runtime": "https://esm.sh/react@18.2.0/jsx-runtime",
-      "firebase/app": "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js",
-      "firebase/firestore": "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js",
-      "firebase/storage": "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js"
-    }
-  }
-  </script>
-  <script type="module">
-    import React from 'react';
-    import { createRoot } from 'react-dom/client';
 
-    // Dynamic import of the app
-    const appModule = await import('./MarginIQ.jsx');
-    const App = appModule.default;
+  <!-- React via CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel for JSX transform -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-    const root = createRoot(document.getElementById('root'));
-    root.render(React.createElement(App));
-  </script>
+  <script type="text/babel" data-type="module" src="./MarginIQ.jsx"></script>
 </body>
 </html>
