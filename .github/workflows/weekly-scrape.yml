@@ -1,0 +1,61 @@
+name: Weekly CyberPay Scrape → Firebase
+
+on:
+  schedule:
+    # Every Monday 13:00 UTC (≈9 AM ET)
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Scrape command (weekly-all | weekly-payroll | 1099 | backfill)"
+        required: false
+        default: "weekly-all"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e "scraper/[dev]"
+
+      - name: Run scraper
+        env:
+          CYBERPAY_USER: ${{ secrets.CYBERPAY_USER }}
+          CYBERPAY_PASS: ${{ secrets.CYBERPAY_PASS }}
+          CYBERPAY_COMPANY_CODE: ${{ secrets.CYBERPAY_COMPANY_CODE }}
+          FIREBASE_PROJECT_ID: davismarginiq
+          FIREBASE_STORAGE_BUCKET: davismarginiq.firebasestorage.app
+          FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
+        run: |
+          CMD="${{ github.event.inputs.command || 'weekly-all' }}"
+          echo "Running: marginiq scrape $CMD"
+          cd scraper && marginiq scrape $CMD --out ../data
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: payroll-${{ github.run_id }}
+          path: data/
+          retention-days: 90
+
+      - name: Commit to data branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin data 2>/dev/null || git checkout --orphan data
+          git checkout data 2>/dev/null || true
+          mkdir -p data
+          cp -r data/* . 2>/dev/null || true
+          git add data/
+          git diff --cached --quiet || git commit -m "Weekly payroll scrape $(date -u +%Y-%m-%d)"
+          git push origin data
