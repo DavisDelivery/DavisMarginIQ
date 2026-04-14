@@ -5,7 +5,7 @@ const PROJECT_ID = "davismarginiq";
 
 // ── Firestore helpers ─────────────────────────────────────────────────────────
 async function getTokens() {
-  const FIREBASE_API_KEY = Netlify.env.get("FIREBASE_API_KEY");
+  const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
   const resp = await fetch(
     `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/qbo_tokens?key=${FIREBASE_API_KEY}`
   );
@@ -21,7 +21,7 @@ async function getTokens() {
 }
 
 async function saveTokens(tokens: any, realmId: string) {
-  const FIREBASE_API_KEY = Netlify.env.get("FIREBASE_API_KEY");
+  const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
   await fetch(
     `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/qbo_tokens?key=${FIREBASE_API_KEY}`,
     {
@@ -41,8 +41,8 @@ async function saveTokens(tokens: any, realmId: string) {
 }
 
 async function refreshAccessToken(refreshToken: string, realmId: string): Promise<string> {
-  const QBO_CLIENT_ID = Netlify.env.get("QBO_CLIENT_ID");
-  const QBO_CLIENT_SECRET = Netlify.env.get("QBO_CLIENT_SECRET");
+  const QBO_CLIENT_ID = process.env["QBO_CLIENT_ID"];
+  const QBO_CLIENT_SECRET = process.env["QBO_CLIENT_SECRET"];
 
   const resp = await fetch("https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer", {
     method: "POST",

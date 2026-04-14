@@ -9,7 +9,7 @@ function guessType(v: any): string {
 }
 
 export default async (req: Request, context: Context) => {
-  const MOTIVE_API_KEY = Netlify.env.get("MOTIVE_API_KEY");
+  const MOTIVE_API_KEY = process.env["MOTIVE_API_KEY"];
   if (!MOTIVE_API_KEY) {
     return new Response(JSON.stringify({ error: "MOTIVE_API_KEY not set" }), { status: 500 });
   }
