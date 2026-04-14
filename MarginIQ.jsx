@@ -1199,6 +1199,12 @@ function MarginIQ() {
       // Check URL for QBO callback
       const params = new URLSearchParams(window.location.search);
       if (params.get("qbo")==="connected") { setQboConnected(true); window.history.replaceState({},"","/"); }
+      if (params.get("qbo")==="error") {
+        const reason = params.get("reason") || "unknown";
+        const detail = params.get("detail") || "";
+        alert("QBO Connect Failed: " + reason + (detail ? "\n" + decodeURIComponent(detail) : ""));
+        window.history.replaceState({},"","/");
+      }
 
       // Check Motive
       try {
