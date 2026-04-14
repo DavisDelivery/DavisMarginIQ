@@ -5,6 +5,13 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
+# API routes handled by functions (explicit paths take precedence)
+[[redirects]]
+  from = "/api/nuvizz/*"
+  to = "/.netlify/functions/nuvizz/:splat"
+  status = 200
+
+# SPA catch-all (must be LAST)
 [[redirects]]
   from = "/*"
   to = "/index.html"
