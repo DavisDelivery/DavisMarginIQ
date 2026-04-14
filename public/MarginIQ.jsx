@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.0.3";
+const APP_VERSION = "2.0.8";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -214,7 +214,7 @@ function calculateMargins(costs, ulineData, nuvizzStops, qboData) {
   const monthlyCost = totalAnnualCost / 12;
 
   // ── Per-stop costs (using Uline volume as baseline) ──
-  const dailyStops = ulineData ? (ulineData.totalStops / (ulineData.weekCount||1) / 5) : 600;
+  const dailyStops = ulineData ? (ulineData.totalStops / (ulineData.weekCount||1) / 5) : 0;
   const annualStops = dailyStops * wd;
   const costPerStop = dailyCost / dailyStops;
 
@@ -1127,7 +1127,37 @@ function CostStructure({ costs, onSave, margins }) {
 // ═══════════════════════════════════════════════════════════════
 // TAB: SETTINGS
 // ═══════════════════════════════════════════════════════════════
-function Settings({ qboConnected, motiveConnected }) {
+function Settings({ qboConnected, motiveConnected, ulineWeeks, costs }) {
+  const [dataHistory, setDataHistory] = useState(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  const loadHistory = async () => {
+    if (!hasFirebase) return;
+    setLoadingHistory(true);
+    try {
+      const collections = [
+        { name: "uline_audits", label: "Uline Uploads", icon: "📦" },
+        { name: "payroll_runs", label: "Payroll Runs (CyberPay)", icon: "💵" },
+        { name: "drivers", label: "Driver Roster", icon: "👤" },
+        { name: "marginiq_config", label: "App Config", icon: "⚙️" },
+        { name: "costs", label: "Cost Records", icon: "📉" },
+        { name: "margin_summary", label: "Margin Summaries", icon: "📊" },
+      ];
+      const results = [];
+      for (const col of collections) {
+        try {
+          const snap = await window.db.collection(col.name).get();
+          const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          results.push({ ...col, count: docs.length, docs: docs.slice(0, 20) });
+        } catch(e) { results.push({ ...col, count: 0, docs: [], error: e.message }); }
+      }
+      setDataHistory(results);
+    } catch(e) { console.warn(e); }
+    setLoadingHistory(false);
+  };
+
+  useEffect(() => { loadHistory(); }, []);
+
   return (
     <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
       <SectionTitle icon="⚙️" text="Settings & Connections" />
@@ -1149,6 +1179,44 @@ function Settings({ qboConnected, motiveConnected }) {
           </div>
         ))}
       </div>
+
+      {/* Data History */}
+      <div style={cardStyle}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div style={{fontSize:13,fontWeight:700}}>📂 Data History (Firebase)</div>
+          <PrimaryBtn text={loadingHistory?"Loading...":"Refresh"} onClick={loadHistory} loading={loadingHistory} style={{padding:"6px 14px",fontSize:11}} />
+        </div>
+        {!dataHistory && <div style={{fontSize:12,color:T.textMuted,padding:"16px 0",textAlign:"center"}}>Loading data inventory...</div>}
+        {dataHistory && dataHistory.map((col,i) => (
+          <div key={i} style={{marginBottom:12,padding:"10px 12px",borderRadius:8,background:T.bgSurface,border:`1px solid ${T.borderLight}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:col.count>0?8:0}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span>{col.icon}</span>
+                <span style={{fontSize:13,fontWeight:600}}>{col.label}</span>
+              </div>
+              <Badge text={`${col.count} record${col.count!==1?"s":""}`} color={col.count>0?T.greenText:T.textDim} bg={col.count>0?T.greenBg:T.borderLight} />
+            </div>
+            {col.error && <div style={{fontSize:11,color:T.red,marginTop:4}}>⚠️ {col.error}</div>}
+            {col.count > 0 && (
+              <div style={{maxHeight:160,overflowY:"auto",marginTop:4}}>
+                {col.docs.map((doc,j) => {
+                  const summary = doc.filename || doc.name || doc.check_date || doc.week_of || doc.id;
+                  const date = doc.upload_date || doc.scraped_at || doc.updated_at || doc.check_date || "";
+                  const dateStr = date ? new Date(date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "";
+                  return (
+                    <div key={j} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:j<col.docs.length-1?`1px solid ${T.borderLight}`:"none",fontSize:11}}>
+                      <span style={{color:T.text,fontWeight:500}}>{summary}</span>
+                      <span style={{color:T.textDim}}>{dateStr}</span>
+                    </div>
+                  );
+                })}
+                {col.count > 20 && <div style={{fontSize:10,color:T.textDim,marginTop:4}}>...and {col.count-20} more</div>}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
       <div style={cardStyle}>
         <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>System Info</div>
         {[["Firebase","davismarginiq"],["Netlify","davis-marginiq.netlify.app"],["Version",APP_VERSION],["Firestore","nam5 (US multi-region)"]].map(([l,v])=>(
@@ -1285,7 +1353,7 @@ function MarginIQ() {
       {!loading && tab==="fleet" && <Fleet margins={margins} />}
       {!loading && tab==="quickbooks" && <QuickBooksTab connected={qboConnected} />}
       {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
-      {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} />}
+      {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} ulineWeeks={ulineWeeks} costs={costs} />}
     </div>
   );
 }
