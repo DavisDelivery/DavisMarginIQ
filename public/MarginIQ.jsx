@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "2.0.1";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -23,32 +23,32 @@ const T = {
   shadowLg:"0 10px 30px rgba(0,0,0,0.1)",
 };
 
-// ─── Default Cost Structure ──────────────────────────────────
+// ─── Default Cost Structure (all zeros — populate from real data) ─
 const DEFAULT_COSTS = {
   // Annual fixed costs
-  warehouse: 450000,
-  forklifts: 84000,       // 14 × $500/mo
-  forklift_operators: 416000, // 10 × $20/hr × 40hr × 52wk
-  truck_insurance_monthly: 1000,
-  truck_count_box: 30,
-  truck_count_tractor: 20,
+  warehouse: 0,
+  forklifts: 0,
+  forklift_operators: 0,
+  truck_insurance_monthly: 0,
+  truck_count_box: 0,
+  truck_count_tractor: 0,
   // Hourly rates
-  rate_box_driver: 23,
-  rate_tractor_driver: 27.50,
-  rate_dispatcher: 20,
-  rate_admin: 18,
-  rate_mechanic: 28,
+  rate_box_driver: 0,
+  rate_tractor_driver: 0,
+  rate_dispatcher: 0,
+  rate_admin: 0,
+  rate_mechanic: 0,
   // Headcounts
-  count_box_drivers: 16,
-  count_tractor_drivers: 19,
-  count_dispatchers: 2,
-  count_admin: 3,
-  count_mechanics: 2,
-  count_forklift_ops: 10,
+  count_box_drivers: 0,
+  count_tractor_drivers: 0,
+  count_dispatchers: 0,
+  count_admin: 0,
+  count_mechanics: 0,
+  count_forklift_ops: 0,
   // Vehicle
-  mpg_box: 8,
-  mpg_tractor: 6,
-  fuel_price: 3.50,
+  mpg_box: 0,
+  mpg_tractor: 0,
+  fuel_price: 0,
   // Working days
   working_days_year: 260,
   avg_hours_per_shift: 10,
