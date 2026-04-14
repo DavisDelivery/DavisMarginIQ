@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.0.1";
+const APP_VERSION = "2.0.2";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
