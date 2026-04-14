@@ -1,10 +1,11 @@
 import type { Context, Config } from "@netlify/functions";
 
-const FIREBASE_API_KEY = "AIzaSyDY2OceDzBWMHPR3C3O1oxktrCIy3mKMqU";
-const PROJECT_ID = "glorybounddispatch";
 const QBO_BASE = "https://quickbooks.api.intuit.com/v3/company";
+const PROJECT_ID = "davismarginiq";
 
+// ── Firestore helpers ─────────────────────────────────────────────────────────
 async function getTokens() {
+  const FIREBASE_API_KEY = Netlify.env.get("FIREBASE_API_KEY");
   const resp = await fetch(
     `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/qbo_tokens?key=${FIREBASE_API_KEY}`
   );
@@ -19,7 +20,27 @@ async function getTokens() {
   };
 }
 
-async function refreshTokens(refreshToken: string) {
+async function saveTokens(tokens: any, realmId: string) {
+  const FIREBASE_API_KEY = Netlify.env.get("FIREBASE_API_KEY");
+  await fetch(
+    `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/qbo_tokens?key=${FIREBASE_API_KEY}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fields: {
+          access_token: { stringValue: tokens.access_token },
+          refresh_token: { stringValue: tokens.refresh_token },
+          realm_id: { stringValue: realmId },
+          expires_at: { integerValue: String(Date.now() + tokens.expires_in * 1000) },
+          updated_at: { stringValue: new Date().toISOString() },
+        },
+      }),
+    }
+  );
+}
+
+async function refreshAccessToken(refreshToken: string, realmId: string): Promise<string> {
   const QBO_CLIENT_ID = Netlify.env.get("QBO_CLIENT_ID");
   const QBO_CLIENT_SECRET = Netlify.env.get("QBO_CLIENT_SECRET");
 
@@ -33,116 +54,209 @@ async function refreshTokens(refreshToken: string) {
     body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }),
   });
 
-  if (!resp.ok) throw new Error("Token refresh failed");
+  if (!resp.ok) throw new Error(`Token refresh failed: ${await resp.text()}`);
   const tokens = await resp.json();
-
-  await fetch(
-    `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/qbo_tokens?key=${FIREBASE_API_KEY}`,
-    {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        fields: {
-          access_token: { stringValue: tokens.access_token },
-          refresh_token: { stringValue: tokens.refresh_token },
-          realm_id: { stringValue: tokens.realm_id || "" },
-          expires_at: { integerValue: String(Date.now() + tokens.expires_in * 1000) },
-          updated_at: { stringValue: new Date().toISOString() },
-        },
-      }),
-    }
-  );
+  await saveTokens(tokens, realmId);
   return tokens.access_token;
 }
 
-async function qboFetch(endpoint: string, token: string, realmId: string) {
-  const resp = await fetch(`${QBO_BASE}/${realmId}/${endpoint}`, {
+// ── QBO API fetch ─────────────────────────────────────────────────────────────
+async function qbo(path: string, token: string, realmId: string) {
+  const resp = await fetch(`${QBO_BASE}/${realmId}/${path}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
   });
-  if (!resp.ok) throw new Error(`QBO ${resp.status}: ${await resp.text()}`);
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`QBO ${resp.status}: ${body}`);
+  }
   return resp.json();
 }
 
+function qql(query: string) {
+  return `query?query=${encodeURIComponent(query)}&minorversion=65`;
+}
+
+// ── Main handler ──────────────────────────────────────────────────────────────
 export default async (req: Request, context: Context) => {
   const url = new URL(req.url);
   const action = url.searchParams.get("action");
+  const start = url.searchParams.get("start") || `${new Date().getFullYear()}-01-01`;
+  const end = url.searchParams.get("end") || new Date().toISOString().slice(0, 10);
 
   try {
-    const tokens = await getTokens();
-    if (!tokens?.access_token) {
-      return new Response(JSON.stringify({ error: "Not connected to QuickBooks" }), { status: 401 });
+    // Load and auto-refresh tokens
+    const stored = await getTokens();
+    if (!stored?.access_token) {
+      return new Response(JSON.stringify({ error: "Not connected to QuickBooks", connected: false }), {
+        status: 401, headers: { "Content-Type": "application/json" },
+      });
     }
 
-    let accessToken = tokens.access_token;
-    if (Date.now() > tokens.expires_at - 60000) {
-      accessToken = await refreshTokens(tokens.refresh_token!);
+    let token = stored.access_token;
+    const realmId = stored.realm_id!;
+
+    if (Date.now() > stored.expires_at - 120000) {
+      token = await refreshAccessToken(stored.refresh_token!, realmId);
     }
 
-    const rid = tokens.realm_id!;
-    let data;
+    let data: any;
 
     switch (action) {
+
+      // ── Connection status ──────────────────────────────────────────────────
       case "status":
-        return new Response(JSON.stringify({ connected: true, realm_id: rid }));
+        return new Response(JSON.stringify({ connected: true, realm_id: realmId }), {
+          headers: { "Content-Type": "application/json" },
+        });
 
+      // ── Company info ───────────────────────────────────────────────────────
       case "company":
-        data = await qboFetch(`companyinfo/${rid}`, accessToken, rid);
+        data = await qbo(`companyinfo/${realmId}`, token, realmId);
         break;
 
-      case "invoices": {
-        const start = url.searchParams.get("start") || "2026-01-01";
-        const end = url.searchParams.get("end") || new Date().toISOString().split("T")[0];
-        data = await qboFetch(`query?query=${encodeURIComponent(`SELECT * FROM Invoice WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' ORDERBY TxnDate DESC MAXRESULTS 500`)}`, accessToken, rid);
-        break;
-      }
-
-      case "bills": {
-        const start = url.searchParams.get("start") || "2026-01-01";
-        const end = url.searchParams.get("end") || new Date().toISOString().split("T")[0];
-        data = await qboFetch(`query?query=${encodeURIComponent(`SELECT * FROM Bill WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' ORDERBY TxnDate DESC MAXRESULTS 500`)}`, accessToken, rid);
-        break;
-      }
-
-      case "expenses": {
-        const start = url.searchParams.get("start") || "2026-01-01";
-        const end = url.searchParams.get("end") || new Date().toISOString().split("T")[0];
-        data = await qboFetch(`query?query=${encodeURIComponent(`SELECT * FROM Purchase WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' ORDERBY TxnDate DESC MAXRESULTS 500`)}`, accessToken, rid);
-        break;
-      }
-
-      case "vendors":
-        data = await qboFetch(`query?query=${encodeURIComponent("SELECT * FROM Vendor MAXRESULTS 200")}`, accessToken, rid);
+      // ── P&L Report ─────────────────────────────────────────────────────────
+      case "pnl":
+        data = await qbo(
+          `reports/ProfitAndLoss?start_date=${start}&end_date=${end}&accounting_method=Accrual&minorversion=65`,
+          token, realmId
+        );
         break;
 
+      // ── Balance Sheet ──────────────────────────────────────────────────────
+      case "balance_sheet":
+        data = await qbo(
+          `reports/BalanceSheet?date=${end}&accounting_method=Accrual&minorversion=65`,
+          token, realmId
+        );
+        break;
+
+      // ── Invoices (revenue) ─────────────────────────────────────────────────
+      case "invoices":
+        data = await qbo(
+          qql(`SELECT * FROM Invoice WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' ORDERBY TxnDate DESC MAXRESULTS 1000`),
+          token, realmId
+        );
+        break;
+
+      // ── Bills (AP/costs) ───────────────────────────────────────────────────
+      case "bills":
+        data = await qbo(
+          qql(`SELECT * FROM Bill WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' ORDERBY TxnDate DESC MAXRESULTS 1000`),
+          token, realmId
+        );
+        break;
+
+      // ── Expenses / Purchases ───────────────────────────────────────────────
+      case "expenses":
+        data = await qbo(
+          qql(`SELECT * FROM Purchase WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' ORDERBY TxnDate DESC MAXRESULTS 1000`),
+          token, realmId
+        );
+        break;
+
+      // ── Payroll expenses (checks written to employees) ─────────────────────
+      case "payroll":
+        data = await qbo(
+          qql(`SELECT * FROM VendorCredit WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' MAXRESULTS 500`),
+          token, realmId
+        );
+        // Also grab payroll checks
+        const checks = await qbo(
+          qql(`SELECT * FROM Check WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' ORDERBY TxnDate DESC MAXRESULTS 500`),
+          token, realmId
+        );
+        data = { payroll_checks: checks, vendor_credits: data };
+        break;
+
+      // ── Fuel & vehicle expenses ────────────────────────────────────────────
+      case "fuel":
+        data = await qbo(
+          qql(`SELECT * FROM Purchase WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' AND AccountRef IN (SELECT Id FROM Account WHERE Name LIKE '%Fuel%' OR Name LIKE '%Gas%' OR Name LIKE '%Vehicle%') MAXRESULTS 500`),
+          token, realmId
+        );
+        break;
+
+      // ── Customers ─────────────────────────────────────────────────────────
       case "customers":
-        data = await qboFetch(`query?query=${encodeURIComponent("SELECT * FROM Customer WHERE Active = true MAXRESULTS 200")}`, accessToken, rid);
+        data = await qbo(
+          qql(`SELECT * FROM Customer WHERE Active = true MAXRESULTS 500`),
+          token, realmId
+        );
         break;
 
+      // ── Vendors ───────────────────────────────────────────────────────────
+      case "vendors":
+        data = await qbo(
+          qql(`SELECT * FROM Vendor WHERE Active = true MAXRESULTS 500`),
+          token, realmId
+        );
+        break;
+
+      // ── Chart of accounts ──────────────────────────────────────────────────
       case "accounts":
-        data = await qboFetch(`query?query=${encodeURIComponent("SELECT * FROM Account WHERE Active = true MAXRESULTS 200")}`, accessToken, rid);
+        data = await qbo(
+          qql(`SELECT * FROM Account WHERE Active = true MAXRESULTS 500`),
+          token, realmId
+        );
         break;
 
-      case "pnl": {
-        const start = url.searchParams.get("start") || "2026-01-01";
-        const end = url.searchParams.get("end") || new Date().toISOString().split("T")[0];
-        data = await qboFetch(`reports/ProfitAndLoss?start_date=${start}&end_date=${end}&minorversion=65`, accessToken, rid);
+      // ── Employees ─────────────────────────────────────────────────────────
+      case "employees":
+        data = await qbo(
+          qql(`SELECT * FROM Employee WHERE Active = true MAXRESULTS 200`),
+          token, realmId
+        );
         break;
-      }
 
-      case "attachment": {
-        const id = url.searchParams.get("id");
-        if (!id) return new Response(JSON.stringify({ error: "Missing attachment ID" }), { status: 400 });
-        data = await qboFetch(`attachable/${id}`, accessToken, rid);
+      // ── Dashboard summary (all key numbers in one call) ────────────────────
+      case "dashboard": {
+        const [invoices, bills, expenses, accounts] = await Promise.all([
+          qbo(qql(`SELECT * FROM Invoice WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' MAXRESULTS 1000`), token, realmId),
+          qbo(qql(`SELECT * FROM Bill WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' MAXRESULTS 1000`), token, realmId),
+          qbo(qql(`SELECT * FROM Purchase WHERE TxnDate >= '${start}' AND TxnDate <= '${end}' MAXRESULTS 1000`), token, realmId),
+          qbo(qql(`SELECT * FROM Account WHERE Active = true MAXRESULTS 500`), token, realmId),
+        ]);
+
+        const invList = invoices?.QueryResponse?.Invoice || [];
+        const billList = bills?.QueryResponse?.Bill || [];
+        const expList = expenses?.QueryResponse?.Purchase || [];
+
+        const totalRevenue = invList.reduce((s: number, i: any) => s + parseFloat(i.TotalAmt || 0), 0);
+        const totalBills = billList.reduce((s: number, b: any) => s + parseFloat(b.TotalAmt || 0), 0);
+        const totalExpenses = expList.reduce((s: number, e: any) => s + parseFloat(e.TotalAmt || 0), 0);
+        const totalCosts = totalBills + totalExpenses;
+        const grossProfit = totalRevenue - totalCosts;
+        const margin = totalRevenue > 0 ? (grossProfit / totalRevenue) * 100 : 0;
+
+        data = {
+          period: { start, end },
+          revenue: totalRevenue,
+          costs: totalCosts,
+          bills: totalBills,
+          expenses: totalExpenses,
+          gross_profit: grossProfit,
+          margin_pct: margin,
+          invoice_count: invList.length,
+          bill_count: billList.length,
+          expense_count: expList.length,
+        };
         break;
       }
 
       default:
-        return new Response(JSON.stringify({ error: "Unknown action" }), { status: 400 });
+        return new Response(JSON.stringify({ error: `Unknown action: ${action}` }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
     }
 
-    return new Response(JSON.stringify(data));
+    return new Response(JSON.stringify(data), {
+      headers: { "Content-Type": "application/json" },
+    });
+
   } catch (e: any) {
     console.error("QBO proxy error:", e);
-    return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+    return new Response(JSON.stringify({ error: e.message }), {
+      status: 500, headers: { "Content-Type": "application/json" },
+    });
   }
 };
