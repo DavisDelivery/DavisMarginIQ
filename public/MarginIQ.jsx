@@ -558,6 +558,325 @@ function NuVizzUpload({ onData }) {
 }
 
 // ─── Main App ────────────────────────────────────────────────
+// ─── Analytics Page ───────────────────────────────────────────
+function AnalyticsPage() {
+  const today = new Date();
+  const fmt8 = (d) => d.toISOString().slice(0, 10);
+
+  // Period presets
+  const buildRange = (period) => {
+    const now = new Date();
+    let from, to;
+    if (period === "today") {
+      from = to = fmt8(now);
+    } else if (period === "yesterday") {
+      const y = new Date(now); y.setDate(y.getDate() - 1);
+      from = to = fmt8(y);
+    } else if (period === "week") {
+      const mon = new Date(now); mon.setDate(now.getDate() - now.getDay() + (now.getDay() === 0 ? -6 : 1));
+      from = fmt8(mon); to = fmt8(now);
+    } else if (period === "lastweek") {
+      const mon = new Date(now); mon.setDate(now.getDate() - now.getDay() - 6);
+      const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+      from = fmt8(mon); to = fmt8(sun);
+    } else if (period === "month") {
+      from = `${fmt8(now).slice(0,7)}-01`; to = fmt8(now);
+    } else if (period === "lastmonth") {
+      const lm = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const lme = new Date(now.getFullYear(), now.getMonth(), 0);
+      from = fmt8(lm); to = fmt8(lme);
+    } else if (period === "year") {
+      from = `${now.getFullYear()}-01-01`; to = fmt8(now);
+    } else if (period === "lastyear") {
+      from = `${now.getFullYear()-1}-01-01`; to = `${now.getFullYear()-1}-12-31`;
+    }
+    return { from, to };
+  };
+
+  const [period, setPeriod] = useState("week");
+  const [fromDate, setFromDate] = useState(() => buildRange("week").from);
+  const [toDate, setToDate] = useState(() => buildRange("week").to);
+  const [view, setView] = useState("stops"); // stops | drivers | loads | mileage
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+
+  const applyPeriod = (p) => {
+    setPeriod(p);
+    const r = buildRange(p);
+    setFromDate(r.from);
+    setToDate(r.to);
+  };
+
+  const fetchData = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const fromDTTM = `${fromDate}T00:00:00`;
+      const toDTTM = `${toDate}T23:59:59`;
+      const res = await fetch(`/api/nuvizz/stops?fromDTTM=${encodeURIComponent(fromDTTM)}&toDTTM=${encodeURIComponent(toDTTM)}`);
+      if (!res.ok) throw new Error(`NuVizz returned ${res.status}`);
+      const json = await res.json();
+      // NuVizz returns array or wrapped object
+      const stops = Array.isArray(json) ? json : (json.stopList || json.stops || json.data || []);
+      setData(stops);
+    } catch (e) {
+      setError(e.message);
+    }
+    setLoading(false);
+  };
+
+  // Derived stats from stops
+  const stats = data ? (() => {
+    const totalStops = data.length;
+    const delivered = data.filter(s => (s.stopStatus || s.status || "").toLowerCase().includes("deliver") || (s.stopStatus || "").toLowerCase().includes("complet")).length;
+    const failed = data.filter(s => (s.stopStatus || s.status || "").toLowerCase().includes("fail") || (s.stopStatus || "").toLowerCase().includes("cancel")).length;
+    const pending = totalStops - delivered - failed;
+
+    // Group by driver
+    const byDriver = {};
+    data.forEach(s => {
+      const driver = s.driverName || s.driver || s.assignedDriver || "Unassigned";
+      if (!byDriver[driver]) byDriver[driver] = { name: driver, stops: 0, delivered: 0, miles: 0 };
+      byDriver[driver].stops++;
+      if ((s.stopStatus || "").toLowerCase().includes("deliver") || (s.stopStatus || "").toLowerCase().includes("complet")) byDriver[driver].delivered++;
+      byDriver[driver].miles += parseFloat(s.distance || s.mileage || s.miles || 0);
+    });
+
+    // Group by day
+    const byDay = {};
+    data.forEach(s => {
+      const day = (s.schedDTTM || s.scheduledDate || s.stopDate || "").slice(0, 10);
+      if (!day) return;
+      if (!byDay[day]) byDay[day] = 0;
+      byDay[day]++;
+    });
+
+    const totalMiles = data.reduce((a, s) => a + parseFloat(s.distance || s.mileage || s.miles || 0), 0);
+    const avgMilesPerStop = totalStops > 0 ? totalMiles / totalStops : 0;
+
+    return {
+      totalStops, delivered, failed, pending,
+      deliveryRate: totalStops > 0 ? (delivered / totalStops * 100) : 0,
+      totalMiles: totalMiles.toFixed(1),
+      avgMilesPerStop: avgMilesPerStop.toFixed(1),
+      byDriver: Object.values(byDriver).sort((a, b) => b.stops - a.stops),
+      byDay: Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])),
+    };
+  })() : null;
+
+  const periodBtns = [
+    { id: "today", label: "Today" },
+    { id: "yesterday", label: "Yesterday" },
+    { id: "week", label: "This Week" },
+    { id: "lastweek", label: "Last Week" },
+    { id: "month", label: "This Month" },
+    { id: "lastmonth", label: "Last Month" },
+    { id: "year", label: "This Year" },
+    { id: "lastyear", label: "Last Year" },
+    { id: "custom", label: "Custom" },
+  ];
+
+  const viewBtns = [
+    { id: "stops", label: "🚚 Stops" },
+    { id: "drivers", label: "👤 Drivers" },
+    { id: "mileage", label: "📍 Mileage" },
+  ];
+
+  return (
+    <div style={S.page}>
+      <div style={S.secTitle}>📊 Operations Analytics</div>
+
+      {/* Period selector */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: T.textDim, marginBottom: 6, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>Date Range</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+          {periodBtns.map(b => (
+            <button key={b.id} onClick={() => applyPeriod(b.id)}
+              style={{ padding: "5px 11px", borderRadius: 7, border: `1px solid ${period === b.id ? T.brand : T.border}`, background: period === b.id ? T.brand : "transparent", color: period === b.id ? "#fff" : T.textMuted, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+              {b.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input type="date" value={fromDate} onChange={e => { setFromDate(e.target.value); setPeriod("custom"); }}
+            style={{ ...S.input, width: 140, fontSize: 12 }} />
+          <span style={{ color: T.textDim }}>→</span>
+          <input type="date" value={toDate} onChange={e => { setToDate(e.target.value); setPeriod("custom"); }}
+            style={{ ...S.input, width: 140, fontSize: 12 }} />
+          <button onClick={fetchData} style={{ ...S.primaryBtn, width: "auto", padding: "9px 20px", fontSize: 12 }}>
+            {loading ? "Loading..." : "Run Report"}
+          </button>
+        </div>
+      </div>
+
+      {error && <div style={{ background: T.redBg, color: T.red, padding: "10px 14px", borderRadius: 8, marginBottom: 12, fontSize: 12 }}>⚠️ {error}</div>}
+
+      {/* KPI row */}
+      {stats && (
+        <>
+          <div style={S.kpiRow}>
+            <KPI label="Total Stops" value={stats.totalStops.toLocaleString()} />
+            <KPI label="Delivered" value={stats.delivered.toLocaleString()} subColor={T.green} sub={`${stats.deliveryRate.toFixed(1)}% rate`} />
+            <KPI label="Failed / Cancelled" value={stats.failed.toLocaleString()} subColor={T.red} />
+            <KPI label="Pending" value={stats.pending.toLocaleString()} subColor={T.yellow} />
+            <KPI label="Total Miles" value={parseFloat(stats.totalMiles).toLocaleString()} sub="est." />
+            <KPI label="Avg Miles/Stop" value={stats.avgMilesPerStop} />
+          </div>
+
+          {/* View toggle */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+            {viewBtns.map(b => (
+              <button key={b.id} onClick={() => setView(b.id)}
+                style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${view === b.id ? T.brand : T.border}`, background: view === b.id ? T.brand : "transparent", color: view === b.id ? "#fff" : T.textMuted, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                {b.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Stops by day chart */}
+          {view === "stops" && (
+            <div style={S.card}>
+              <div style={S.cardTitle}>Stops by Day</div>
+              <div style={{ marginTop: 12 }}>
+                {stats.byDay.length === 0 && <div style={S.empty}>No date data available</div>}
+                {stats.byDay.map(([day, count]) => {
+                  const max = Math.max(...stats.byDay.map(([,c]) => c));
+                  const pct = max > 0 ? (count / max * 100) : 0;
+                  return (
+                    <div key={day} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 7 }}>
+                      <div style={{ width: 80, fontSize: 11, color: T.textMuted, flexShrink: 0 }}>{day.slice(5)}</div>
+                      <div style={{ flex: 1, height: 22, background: T.bgSurface, borderRadius: 5, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${T.brand}, ${T.brandLight})`, borderRadius: 5, transition: "width 0.5s", display: "flex", alignItems: "center", paddingLeft: 8 }}>
+                          <span style={{ fontSize: 10, color: "#fff", fontWeight: 700 }}>{pct > 20 ? count : ""}</span>
+                        </div>
+                      </div>
+                      <div style={{ width: 32, fontSize: 12, fontWeight: 700, color: T.text, textAlign: "right" }}>{count}</div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ marginTop: 14, maxHeight: 320, overflowY: "auto" }}>
+                <table style={S.table}>
+                  <thead><tr>
+                    <th style={S.th}>Stop #</th>
+                    <th style={S.th}>Customer</th>
+                    <th style={S.th}>City</th>
+                    <th style={S.th}>Driver</th>
+                    <th style={S.th}>Status</th>
+                    <th style={S.th}>Scheduled</th>
+                  </tr></thead>
+                  <tbody>
+                    {data.slice(0, 200).map((s, i) => (
+                      <tr key={i}>
+                        <td style={S.td}>{s.stopNbr || s.stopNumber || s.id || "—"}</td>
+                        <td style={S.td}>{s.custName || s.customerName || s.customer || "—"}</td>
+                        <td style={S.td}>{s.city || s.stopCity || "—"}</td>
+                        <td style={S.td}>{s.driverName || s.driver || "—"}</td>
+                        <td style={S.td}>
+                          <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
+                            background: (s.stopStatus||"").toLowerCase().includes("deliver") ? T.greenBg : (s.stopStatus||"").toLowerCase().includes("fail") ? T.redBg : T.yellowBg,
+                            color: (s.stopStatus||"").toLowerCase().includes("deliver") ? T.green : (s.stopStatus||"").toLowerCase().includes("fail") ? T.red : T.yellow }}>
+                            {s.stopStatus || s.status || "—"}
+                          </span>
+                        </td>
+                        <td style={S.td}>{(s.schedDTTM || s.scheduledDate || "—").slice(0,16)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {data.length > 200 && <div style={{ fontSize: 11, color: T.textDim, textAlign: "center", padding: 8 }}>Showing 200 of {data.length} stops</div>}
+              </div>
+            </div>
+          )}
+
+          {/* Driver breakdown */}
+          {view === "drivers" && (
+            <div style={S.card}>
+              <div style={S.cardTitle}>Driver Performance</div>
+              <div style={{ marginTop: 12, maxHeight: 500, overflowY: "auto" }}>
+                <table style={S.table}>
+                  <thead><tr>
+                    <th style={S.th}>Driver</th>
+                    <th style={S.th}>Stops</th>
+                    <th style={S.th}>Delivered</th>
+                    <th style={S.th}>Rate</th>
+                    <th style={S.th}>Miles</th>
+                    <th style={S.th}>Stops/Day</th>
+                  </tr></thead>
+                  <tbody>
+                    {stats.byDriver.map((d, i) => {
+                      const rate = d.stops > 0 ? (d.delivered / d.stops * 100) : 0;
+                      const days = stats.byDay.length || 1;
+                      return (
+                        <tr key={i}>
+                          <td style={{ ...S.td, fontWeight: 600 }}>{d.name}</td>
+                          <td style={S.td}>{d.stops}</td>
+                          <td style={{ ...S.td, color: T.green }}>{d.delivered}</td>
+                          <td style={S.td}>
+                            <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 7px", borderRadius: 4,
+                              background: rate >= 90 ? T.greenBg : rate >= 70 ? T.yellowBg : T.redBg,
+                              color: rate >= 90 ? T.green : rate >= 70 ? T.yellow : T.red }}>
+                              {rate.toFixed(0)}%
+                            </span>
+                          </td>
+                          <td style={S.td}>{d.miles > 0 ? d.miles.toFixed(0) : "—"}</td>
+                          <td style={S.td}>{(d.stops / days).toFixed(1)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Mileage breakdown */}
+          {view === "mileage" && (
+            <div style={S.card}>
+              <div style={S.cardTitle}>Mileage by Driver</div>
+              <div style={{ marginTop: 12 }}>
+                {stats.byDriver.filter(d => d.miles > 0).length === 0 && (
+                  <div style={S.empty}>No mileage data in this date range — NuVizz may not populate distance fields</div>
+                )}
+                {stats.byDriver.filter(d => d.miles > 0).map((d, i) => {
+                  const maxMiles = Math.max(...stats.byDriver.map(x => x.miles));
+                  const pct = maxMiles > 0 ? (d.miles / maxMiles * 100) : 0;
+                  return (
+                    <div key={i} style={{ marginBottom: 10 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600 }}>{d.name}</span>
+                        <span style={{ fontSize: 12, color: T.textMuted }}>{d.miles.toFixed(0)} mi • {d.stops} stops</span>
+                      </div>
+                      <div style={{ height: 10, background: T.bgSurface, borderRadius: 5, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${T.accent}, #34d399)`, borderRadius: 5 }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {!data && !loading && (
+        <div style={{ ...S.card, textAlign: "center", padding: "40px 20px" }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>📊</div>
+          <div style={{ fontSize: 14, color: T.textMuted, marginBottom: 8 }}>Select a date range and click Run Report</div>
+          <div style={{ fontSize: 11, color: T.textDim }}>Pulls live stop data from NuVizz for any period</div>
+        </div>
+      )}
+
+      {loading && (
+        <div style={{ ...S.card, textAlign: "center", padding: "40px 20px" }}>
+          <div style={{ fontSize: 14, color: T.textMuted }}>Pulling data from NuVizz...</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function MarginIQ() {
   const [tab, setTab] = useState("dashboard");
   const [connections, setConnections] = useState({ motive: false, motiveVehicles: 0, qbo: false, fleet: false, payroll: false, nuvizz: false });
@@ -641,6 +960,7 @@ export default function MarginIQ() {
 
   const tabs = [
     { id: "dashboard", label: "Dashboard" },
+    { id: "analytics", label: "📊 Analytics" },
     { id: "trucks", label: "Trucks" },
     { id: "drivers", label: "Drivers" },
     { id: "customers", label: "Customers" },
@@ -737,6 +1057,9 @@ export default function MarginIQ() {
 
       {/* Settings */}
       {tab === "settings" && <SettingsPage connections={connections} onConnectQBO={handleConnectQBO} costConfig={costConfig} setCostConfig={setCostConfig} />}
+
+      {/* Analytics */}
+      {tab === "analytics" && <AnalyticsPage />}
     </div>
   );
 }
