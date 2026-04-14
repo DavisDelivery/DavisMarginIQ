@@ -8,16 +8,20 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #0c1220; overflow-x: hidden; font-family: 'DM Sans', sans-serif; }
+    body { background: #f0f4f8; overflow-x: hidden; font-family: 'DM Sans', sans-serif; }
     #root { min-height: 100vh; }
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
     input[type="number"]::-webkit-inner-spin-button { opacity: 1; }
-    input[type="date"] { color-scheme: dark; }
+    input[type="date"] { color-scheme: light; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    .fade-in { animation: fadeIn 0.3s ease-out forwards; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+    .loading-pulse { animation: pulse 1.5s infinite; }
   </style>
 
-  <!-- Firebase via CDN (must load before React) -->
+  <!-- Firebase via CDN -->
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
@@ -33,6 +37,9 @@
     window.db = firebase.firestore();
     window.fbStorage = firebase.storage();
   </script>
+
+  <!-- SheetJS for xlsx parsing -->
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
