@@ -2,6 +2,11 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ── MarginIQ config (QBO tokens, cost structure) — read/write from web + functions ──
+    match /marginiq_config/{docId} {
+      allow read, write: if true;
+    }
+
     // ── Payroll runs — written by GitHub Actions (service account), read-only from web ──
     match /payroll_runs/{runId} {
       allow read: if true;
@@ -14,10 +19,9 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // ── Uline audits — read-only from web, written by scraper ──
+    // ── Uline audits — read/write from web (uploaded via app) ──
     match /uline_audits/{date} {
-      allow read: if true;
-      allow write: if false;
+      allow read, write: if true;
     }
 
     // ── NuVizz manifests ──
