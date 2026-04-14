@@ -2,7 +2,6 @@ name: Weekly CyberPay Scrape → Firebase
 
 on:
   schedule:
-    # Every Monday 13:00 UTC (≈9 AM ET)
     - cron: "0 13 * * 1"
   workflow_dispatch:
     inputs:
@@ -10,6 +9,10 @@ on:
         description: "Scrape command (weekly-all | weekly-payroll | 1099 | backfill)"
         required: false
         default: "weekly-all"
+
+permissions:
+  contents: write
+  id-token: write
 
 jobs:
   scrape:
@@ -19,6 +22,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: marginiq-github-actions@davismarginiq.iam.gserviceaccount.com
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -35,10 +44,8 @@ jobs:
           CYBERPAY_COMPANY_CODE: ${{ secrets.CYBERPAY_COMPANY_CODE }}
           FIREBASE_PROJECT_ID: davismarginiq
           FIREBASE_STORAGE_BUCKET: davismarginiq.firebasestorage.app
-          FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
         run: |
           CMD="${{ github.event.inputs.command || 'weekly-all' }}"
-          echo "Running: marginiq scrape $CMD"
           cd scraper && marginiq scrape $CMD --out ../data
 
       - name: Upload artifacts
@@ -52,10 +59,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin data 2>/dev/null || git checkout --orphan data
-          git checkout data 2>/dev/null || true
+          git fetch origin data 2>/dev/null || true
+          git checkout data 2>/dev/null || git checkout --orphan data
           mkdir -p data
-          cp -r data/* . 2>/dev/null || true
+          cp -r ../data/* . 2>/dev/null || true
           git add data/
           git diff --cached --quiet || git commit -m "Weekly payroll scrape $(date -u +%Y-%m-%d)"
           git push origin data
