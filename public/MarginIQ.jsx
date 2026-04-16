@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "5.2.0";
+const APP_VERSION = "6.0.0";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -2128,6 +2128,633 @@ function MileageTab({margins,costs}){
 // ═══════════════════════════════════════════════════════════════
 // TREND CHARTS (Week-over-week analysis)
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// PRICING ENGINE — Cost Analysis, Rate Card, LTL + TL Quote Generator
+// Uses QB financials + Uline data + Motive miles + cost structure
+// to build defensible quotes guaranteeing margin target.
+// ═══════════════════════════════════════════════════════════════
+
+// Haversine distance between two lat/lon points (miles)
+function haversineMiles(lat1, lon1, lat2, lon2){
+  const R = 3959; // earth radius in miles
+  const dLat = (lat2-lat1) * Math.PI/180;
+  const dLon = (lon2-lon1) * Math.PI/180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Given two ZIP codes, return {miles, fromState, toState, fromLL, toLL}
+function zipDistance(fromZip, toZip){
+  if(!fromZip||!toZip||!window.ZIP3_DATA) return null;
+  const fz = String(fromZip).padStart(5,"0").slice(0,3);
+  const tz = String(toZip).padStart(5,"0").slice(0,3);
+  const f = window.ZIP3_DATA[fz];
+  const t = window.ZIP3_DATA[tz];
+  if(!f||!t) return null;
+  const airMiles = haversineMiles(f[0],f[1],t[0],t[1]);
+  // Road miles = air miles * 1.18 (typical industry multiplier)
+  const roadMiles = airMiles * 1.18;
+  return {miles:Math.round(roadMiles), airMiles:Math.round(airMiles), fromState:f[2], toState:t[2], fromLL:[f[0],f[1]], toLL:[t[0],t[1]]};
+}
+
+// LTL Freight Class multipliers (relative to class 50 baseline)
+const FREIGHT_CLASSES = [
+  {cls:50, mult:1.00, desc:"Durable, high density (e.g., steel, fittings)"},
+  {cls:55, mult:1.08, desc:"Bricks, cement, hardwood flooring"},
+  {cls:60, mult:1.15, desc:"Car accessories, steel cables"},
+  {cls:65, mult:1.22, desc:"Car parts, bottled beverages, books"},
+  {cls:70, mult:1.30, desc:"Automotive parts, food items"},
+  {cls:77.5, mult:1.38, desc:"Tires, bathroom fixtures"},
+  {cls:85, mult:1.47, desc:"Crated machinery, cast iron stoves"},
+  {cls:92.5, mult:1.57, desc:"Computers, monitors, refrigerators"},
+  {cls:100, mult:1.68, desc:"Boat covers, canvas, wine cases"},
+  {cls:110, mult:1.80, desc:"Cabinets, framed art, tables"},
+  {cls:125, mult:1.95, desc:"Small appliances"},
+  {cls:150, mult:2.15, desc:"Auto sheet metal, bookcases"},
+  {cls:175, mult:2.35, desc:"Clothing, sofas, stuffed furniture"},
+  {cls:200, mult:2.58, desc:"Auto body parts, aircraft parts, mattresses"},
+  {cls:250, mult:2.88, desc:"Bamboo furniture, plasma TVs, mattresses"},
+  {cls:300, mult:3.20, desc:"Wood cabinets, tables, chairs setup"},
+  {cls:400, mult:3.75, desc:"Deer antlers"},
+  {cls:500, mult:4.50, desc:"Bags of gold dust, ping pong balls (low density)"},
+];
+
+// LTL Weight breaks (hundredweight CWT pricing, lower tiers = higher rate/CWT)
+const WEIGHT_BREAKS = [
+  {code:"MIN", min:0,     max:149,    factor:1.80, label:"Minimum (< 150 lb)"},
+  {code:"L5C", min:150,   max:499,    factor:1.55, label:"Less than 500 lb"},
+  {code:"M5C", min:500,   max:999,    factor:1.35, label:"500–999 lb"},
+  {code:"M1M", min:1000,  max:1999,   factor:1.20, label:"1,000–1,999 lb"},
+  {code:"M2M", min:2000,  max:4999,   factor:1.10, label:"2,000–4,999 lb"},
+  {code:"M5M", min:5000,  max:9999,   factor:1.00, label:"5,000–9,999 lb"},
+  {code:"M10M",min:10000, max:19999,  factor:0.92, label:"10,000–19,999 lb"},
+  {code:"M20M",min:20000, max:39999,  factor:0.85, label:"20,000+ lb"},
+];
+
+// Accessorial charges (standard industry rates — editable)
+const DEFAULT_ACCESSORIALS = {
+  liftgate: {label:"Liftgate Service", amount:95, type:"flat"},
+  residential: {label:"Residential Delivery", amount:85, type:"flat"},
+  limitedAccess: {label:"Limited Access (church, school, farm)", amount:75, type:"flat"},
+  insideDelivery: {label:"Inside Delivery", amount:110, type:"flat"},
+  appointment: {label:"Appointment Delivery", amount:55, type:"flat"},
+  notification: {label:"Arrival Notification", amount:35, type:"flat"},
+  sortSegregate: {label:"Sort & Segregate", amount:4.50, type:"cwt"},
+  gravel: {label:"Gravel / New Construction", amount:25, type:"flat"},
+  hazmat: {label:"Hazmat Handling", amount:125, type:"flat"},
+  reefer: {label:"Refrigerated / Reefer", amount:0.25, type:"permile"},
+};
+
+// ─── Pricing Engine ─────────────────────────────────────────────
+// Given real company data, compute cost-per-unit fundamentals
+function computeUnitEconomics({qbFinancials, costs, ulineWeeks, motiveVehicles}){
+  // Base: QB actual costs (annualized) + cost structure estimates
+  const ann = qbFinancials?.daysInRange > 0 ? 365/qbFinancials.daysInRange : 1;
+  const cat = qbFinancials?.categoryTotals || {};
+  const get = (name) => Math.round((cat[name]||0)*ann);
+
+  // Annual cost buckets from QB
+  const annualLabor = get("Salaries & Wages") + get("Subcontractors") + get("Temp Labor") + get("Officer Salaries") + get("Payroll Taxes") + get("Payroll Other");
+  const annualFleet = get("Fuel") + get("Truck Maintenance") + get("Truck Leases") + get("Truck Taxes/Licenses");
+  const annualInsurance = get("Insurance") + get("Health Insurance");
+  const annualFacility = get("Rent") + get("Warehouse") + get("Utilities");
+  const annualAdmin = get("IT") + get("Office/Admin") + get("Legal/Professional") + get("Bank/Interest") + get("Depreciation");
+  const annualOther = get("Travel/Meals") + get("Damages/Claims") + get("Uniforms") + get("Supplies") + get("Dues/Subs") + get("Marketing") + get("Repairs");
+
+  const totalAnnualCost = annualLabor + annualFleet + annualInsurance + annualFacility + annualAdmin + annualOther;
+  const annualRevenue = qbFinancials?.annualRevenue || 0;
+
+  // Total annual miles — estimate from fleet size + working days × typical miles/day
+  // Or use Motive if available
+  const totalTrucks = (costs.truck_count_box||0) + (costs.truck_count_tractor||0);
+  const workDays = costs.working_days_year||260;
+  const estimatedMilesPerDay = 175; // box truck local + tractor regional blended avg
+  const annualMiles = totalTrucks * workDays * estimatedMilesPerDay;
+
+  // Total annual stops — from Uline data extrapolated
+  const ulineStops = ulineWeeks.reduce((s,w)=>s+(w.totalStops||0), 0);
+  const ulineWeeks_count = ulineWeeks.length || 1;
+  const annualStops = Math.round((ulineStops / ulineWeeks_count) * 52);
+
+  // Unit costs
+  const costPerMile = annualMiles > 0 ? totalAnnualCost / annualMiles : 0;
+  const costPerStop = annualStops > 0 ? totalAnnualCost / annualStops : 0;
+  const costPerHour = annualLabor > 0 ? annualLabor / (totalTrucks * workDays * (costs.avg_hours_per_shift||10)) : 0;
+
+  // Fuel cost per mile (variable piece)
+  const boxFuelPerMile = (costs.fuel_price||3.50) / (costs.mpg_box||8);
+  const tractorFuelPerMile = (costs.fuel_price||3.50) / (costs.mpg_tractor||6);
+
+  // Direct cost per mile (fuel + variable maintenance only)
+  const variableFleetPerMile = annualMiles > 0 ? (get("Fuel") + get("Truck Maintenance")) / annualMiles : 0;
+  const fixedCostPerDay = workDays > 0 ? (totalAnnualCost - get("Fuel") - get("Truck Maintenance")) / workDays : 0;
+  const fixedCostPerStop = annualStops > 0 ? (totalAnnualCost - get("Fuel") - get("Truck Maintenance")) / annualStops : 0;
+
+  return {
+    // Annual totals
+    totalAnnualCost, annualRevenue, annualLabor, annualFleet, annualInsurance, annualFacility, annualAdmin, annualOther,
+    annualMiles, annualStops, totalTrucks,
+    // Unit economics
+    costPerMile, costPerStop, costPerHour,
+    variableFleetPerMile, fixedCostPerDay, fixedCostPerStop,
+    boxFuelPerMile, tractorFuelPerMile,
+    // Mix breakdown
+    laborPct: totalAnnualCost>0 ? annualLabor/totalAnnualCost : 0,
+    fleetPct: totalAnnualCost>0 ? annualFleet/totalAnnualCost : 0,
+    overheadPct: totalAnnualCost>0 ? (annualInsurance+annualFacility+annualAdmin+annualOther)/totalAnnualCost : 0,
+  };
+}
+
+// LTL Quote Calculator
+function calculateLTLQuote({fromZip, toZip, weight, freightClass, accessorials, unitEcon, targetMarginPct}){
+  if(!fromZip||!toZip||!weight||!freightClass) return null;
+  const dist = zipDistance(fromZip, toZip);
+  if(!dist) return {error:"Invalid ZIP codes"};
+
+  const miles = dist.miles;
+
+  // ─── COST BUILD (true cost to deliver) ───
+  // 1. Linehaul cost = miles × cost-per-mile (using tractor economics for LTL)
+  const linehaulCost = miles * (unitEcon.costPerMile || 2.50);
+  // 2. Stop cost (pickup + delivery = 2 stops)
+  const stopCost = 2 * (unitEcon.costPerStop || 50);
+  // 3. Weight-based handling surcharge (heavier = more labor/time)
+  const weightBreak = WEIGHT_BREAKS.find(w => weight >= w.min && weight <= w.max) || WEIGHT_BREAKS[WEIGHT_BREAKS.length-1];
+  const classMult = FREIGHT_CLASSES.find(c => c.cls === Number(freightClass))?.mult || 1.5;
+  const handlingFactor = weightBreak.factor * classMult;
+  const handlingSurcharge = (weight/100) * 2.50 * handlingFactor; // $2.50/CWT baseline × mix multiplier
+
+  const baseCost = linehaulCost + stopCost + handlingSurcharge;
+
+  // ─── ACCESSORIAL CHARGES (pass-through to customer) ───
+  let accessorialTotal = 0;
+  const accessorialBreakdown = [];
+  Object.entries(accessorials||{}).forEach(([key, enabled])=>{
+    if(!enabled) return;
+    const acc = DEFAULT_ACCESSORIALS[key];
+    if(!acc) return;
+    let amt = 0;
+    if(acc.type === "flat") amt = acc.amount;
+    else if(acc.type === "cwt") amt = (weight/100) * acc.amount;
+    else if(acc.type === "permile") amt = miles * acc.amount;
+    accessorialTotal += amt;
+    accessorialBreakdown.push({...acc, key, amount:amt});
+  });
+
+  // ─── FUEL SURCHARGE (market-standard, indexed) ───
+  // Rule of thumb: diesel $3.50/gal base, $0.02/mile per $0.05 over base
+  const fuelSurchargePct = 0.22; // 22% typical LTL fuel surcharge
+  const fuelSurcharge = baseCost * fuelSurchargePct;
+
+  // ─── PRICE WITH MARGIN ───
+  const targetMultiplier = 1 / (1 - (targetMarginPct/100)); // 30% margin = 1.4286
+  const basePrice = baseCost * targetMultiplier;
+  const totalPrice = basePrice + fuelSurcharge + accessorialTotal;
+  const totalCost = baseCost + (accessorialTotal * 0.20); // only 20% of accessorials are our cost (rest is markup)
+  const margin = totalPrice - totalCost;
+  const marginPct = totalPrice > 0 ? (margin/totalPrice * 100) : 0;
+
+  return {
+    // Inputs echoed
+    fromZip, toZip, weight, freightClass, miles,
+    fromState:dist.fromState, toState:dist.toState,
+    // Cost breakdown
+    linehaulCost, stopCost, handlingSurcharge, baseCost, accessorialTotal, accessorialBreakdown, fuelSurcharge,
+    weightBreak, classMult, handlingFactor,
+    // Price breakdown
+    basePrice, fuelSurchargeDollars:fuelSurcharge, totalPrice, totalCost, margin, marginPct,
+    // Quote metadata
+    pricePerCWT: weight > 0 ? (totalPrice / (weight/100)) : 0,
+    pricePerMile: miles > 0 ? (totalPrice / miles) : 0,
+  };
+}
+
+// Truckload Quote Calculator
+function calculateTLQuote({fromZip, toZip, equipmentType, roundTrip, unitEcon, targetMarginPct}){
+  if(!fromZip||!toZip) return null;
+  const dist = zipDistance(fromZip, toZip);
+  if(!dist) return {error:"Invalid ZIP codes"};
+  const miles = dist.miles * (roundTrip ? 2 : 1);
+  const deadheadMultiplier = roundTrip ? 1 : 1.15; // 15% deadhead for one-way
+
+  // Direct cost: fuel + driver time + maintenance per mile + fixed day cost
+  // Driver: avg 500 miles/day at 50 mph for 10hrs
+  const drivingDays = Math.max(1, Math.ceil(miles / 500));
+
+  const fuelCost = miles * (unitEcon.tractorFuelPerMile || 0.58);
+  const maintenanceCost = miles * 0.18; // $0.18/mile typical for tractor-trailer
+  const driverCost = drivingDays * (unitEcon.costPerHour || 27.50) * 10; // 10 hr day
+  const overheadPerDay = (unitEcon.totalAnnualCost - unitEcon.annualFleet - unitEcon.annualLabor) / 365;
+  const overheadCost = drivingDays * overheadPerDay;
+
+  // Equipment premium
+  const eqPremium = {dry:1.0, flatbed:1.15, reefer:1.30, stepdeck:1.20, lowboy:1.40}[equipmentType] || 1.0;
+
+  const baseCost = (fuelCost + maintenanceCost + driverCost + overheadCost) * deadheadMultiplier * eqPremium;
+
+  // Target price with margin
+  const targetMultiplier = 1 / (1 - (targetMarginPct/100));
+  const basePrice = baseCost * targetMultiplier;
+
+  // Fuel surcharge for TL (higher than LTL, typically 25-30%)
+  const fuelSurcharge = basePrice * 0.28;
+  const totalPrice = basePrice + fuelSurcharge;
+  const margin = totalPrice - baseCost;
+  const marginPct = totalPrice > 0 ? (margin/totalPrice * 100) : 0;
+
+  return {
+    fromZip, toZip, equipmentType, roundTrip, miles, drivingDays,
+    fromState:dist.fromState, toState:dist.toState,
+    fuelCost, maintenanceCost, driverCost, overheadCost, baseCost, eqPremium,
+    basePrice, fuelSurcharge, totalPrice, margin, marginPct,
+    pricePerMile: miles > 0 ? (totalPrice / miles) : 0,
+  };
+}
+
+// ─── UI Components ───
+
+function PricingTab({qbFinancials, costs, ulineWeeks}){
+  const [view, setView] = useState("overview");
+  const [targetMargin, setTargetMargin] = useState(30);
+
+  // Compute unit economics from all available data
+  const unitEcon = useMemo(()=> computeUnitEconomics({qbFinancials, costs, ulineWeeks}), [qbFinancials, costs, ulineWeeks]);
+
+  return (
+    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="🎯" text="Pricing Engine" right={
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <label style={{fontSize:11,color:T.textMuted}}>Target Margin:</label>
+          <input type="number" value={targetMargin} onChange={e=>setTargetMargin(parseFloat(e.target.value)||30)} min="10" max="60" step="1" style={{...IS,width:70,fontSize:12,padding:"4px 8px"}}/>
+          <span style={{fontSize:11,color:T.brand,fontWeight:700}}>%</span>
+        </div>
+      }/>
+
+      {!qbFinancials && <div style={{...CS,borderLeft:`4px solid ${T.yellow}`,background:T.yellowBg}}>
+        <div style={{fontSize:13,fontWeight:700,color:T.yellowText}}>⚠️ No QuickBooks data loaded</div>
+        <div style={{fontSize:11,color:T.textMuted,marginTop:4}}>Upload your General Ledger in the 📁 QB Import tab to get real cost-based pricing. The engine will use estimates without it.</div>
+      </div>}
+
+      {/* Unit Economics Summary */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+        <KPI label="Cost / Mile" value={unitEcon.costPerMile>0?"$"+unitEcon.costPerMile.toFixed(2):"—"} sub="linehaul unit" subColor={T.blue}/>
+        <KPI label="Cost / Stop" value={unitEcon.costPerStop>0?fmt(unitEcon.costPerStop):"—"} sub="fixed per delivery" subColor={T.blue}/>
+        <KPI label="Cost / Hour" value={unitEcon.costPerHour>0?"$"+unitEcon.costPerHour.toFixed(2):"—"} sub="labor blended" subColor={T.purple}/>
+        <KPI label="Fuel / Mile (tractor)" value={unitEcon.tractorFuelPerMile>0?"$"+unitEcon.tractorFuelPerMile.toFixed(2):"—"} sub={`@ ${fmtDec(costs.mpg_tractor||6,1)} MPG`}/>
+        <KPI label="Annual Miles (est)" value={fmtNum(unitEcon.annualMiles)} sub={`${unitEcon.totalTrucks} trucks`}/>
+        <KPI label="Annual Stops (est)" value={fmtNum(unitEcon.annualStops)} sub="from Uline data"/>
+      </div>
+
+      {/* View tabs */}
+      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+        <TabBtn active={view==="overview"} label="📊 Cost Breakdown" onClick={()=>setView("overview")}/>
+        <TabBtn active={view==="ltl"} label="📦 LTL Quote" onClick={()=>setView("ltl")}/>
+        <TabBtn active={view==="tl"} label="🚛 Truckload Quote" onClick={()=>setView("tl")}/>
+        <TabBtn active={view==="ratecard"} label="📋 Rate Card" onClick={()=>setView("ratecard")}/>
+      </div>
+
+      {view==="overview" && <CostBreakdownView unitEcon={unitEcon}/>}
+      {view==="ltl" && <LTLQuoteView unitEcon={unitEcon} targetMargin={targetMargin}/>}
+      {view==="tl" && <TLQuoteView unitEcon={unitEcon} targetMargin={targetMargin}/>}
+      {view==="ratecard" && <RateCardView unitEcon={unitEcon} targetMargin={targetMargin}/>}
+    </div>
+  );
+}
+
+function CostBreakdownView({unitEcon}){
+  const bucketData = [
+    {name:"Labor", value:unitEcon.annualLabor, color:"#3b82f6"},
+    {name:"Fleet (fuel, maint, leases)", value:unitEcon.annualFleet, color:"#ef4444"},
+    {name:"Insurance", value:unitEcon.annualInsurance, color:"#f59e0b"},
+    {name:"Facility", value:unitEcon.annualFacility, color:"#10b981"},
+    {name:"Admin & IT", value:unitEcon.annualAdmin, color:"#8b5cf6"},
+    {name:"Other", value:unitEcon.annualOther, color:"#94a3b8"},
+  ].filter(b=>b.value>0);
+
+  return (
+    <>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:12,marginBottom:12}}>
+        <div style={CS}>
+          <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>Annual Cost Structure</div>
+          <div style={{fontSize:10,color:T.textMuted,marginBottom:12}}>Derived from QuickBooks + cost structure inputs</div>
+          <DonutChart data={bucketData}/>
+        </div>
+        <div style={CS}>
+          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Key Ratios</div>
+          <DataRow label="Total Annual Cost" value={fmtK(unitEcon.totalAnnualCost)} valueColor={T.red} bold/>
+          <DataRow label="Total Annual Revenue" value={fmtK(unitEcon.annualRevenue)} valueColor={T.green} bold/>
+          <DataRow label="Current Net Margin" value={fmtPct(unitEcon.annualRevenue>0?(unitEcon.annualRevenue-unitEcon.totalAnnualCost)/unitEcon.annualRevenue*100:0)} bold valueColor={T.brand}/>
+          <div style={{height:8}}/>
+          <DataRow label="Labor % of cost" value={fmtPct(unitEcon.laborPct*100)}/>
+          <DataRow label="Fleet % of cost" value={fmtPct(unitEcon.fleetPct*100)}/>
+          <DataRow label="Overhead % of cost" value={fmtPct(unitEcon.overheadPct*100)}/>
+        </div>
+      </div>
+      <div style={CS}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Variable vs Fixed Cost Split</div>
+        <DataRow label="Variable per mile (fuel + maintenance)" value={"$"+unitEcon.variableFleetPerMile.toFixed(2)+"/mi"} valueColor={T.orange}/>
+        <DataRow label="Fixed per day (overhead spread)" value={fmt(unitEcon.fixedCostPerDay)+"/day"} valueColor={T.textMuted}/>
+        <DataRow label="Fixed per stop (overhead spread)" value={fmt(unitEcon.fixedCostPerStop)+"/stop"} valueColor={T.textMuted}/>
+        <div style={{fontSize:10,color:T.textMuted,marginTop:10,padding:"8px 10px",background:T.bgSurface,borderRadius:6}}>
+          💡 <strong>How quotes work:</strong> Variable costs scale with miles and weight. Fixed costs get allocated across every shipment as a per-stop overhead. We add target margin on top. Fuel surcharge and accessorials are additional.
+        </div>
+      </div>
+    </>
+  );
+}
+
+function LTLQuoteView({unitEcon, targetMargin}){
+  const [fromZip,setFromZip] = useState("30518"); // Buford, GA default
+  const [toZip,setToZip] = useState("");
+  const [weight,setWeight] = useState(1000);
+  const [freightClass,setFreightClass] = useState(70);
+  const [accessorials,setAccessorials] = useState({});
+  const [quote,setQuote] = useState(null);
+
+  const calc = () => {
+    const q = calculateLTLQuote({fromZip, toZip, weight:Number(weight), freightClass:Number(freightClass), accessorials, unitEcon, targetMarginPct:targetMargin});
+    setQuote(q);
+  };
+
+  const toggleAcc = (key) => setAccessorials(prev => ({...prev, [key]:!prev[key]}));
+
+  return (
+    <>
+      <div style={CS}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>LTL Shipment Details</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10}}>
+          <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>Pickup ZIP</label><input value={fromZip} onChange={e=>setFromZip(e.target.value)} placeholder="30518" maxLength="5" style={IS}/></div>
+          <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>Delivery ZIP</label><input value={toZip} onChange={e=>setToZip(e.target.value)} placeholder="90210" maxLength="5" style={IS}/></div>
+          <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>Weight (lbs)</label><input type="number" value={weight} onChange={e=>setWeight(e.target.value)} style={IS}/></div>
+          <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>Freight Class</label>
+            <select value={freightClass} onChange={e=>setFreightClass(e.target.value)} style={IS}>
+              {FREIGHT_CLASSES.map(fc => <option key={fc.cls} value={fc.cls}>Class {fc.cls} — {fc.desc.slice(0,30)}</option>)}
+            </select>
+          </div>
+        </div>
+        <div style={{marginTop:12}}>
+          <div style={{fontSize:11,color:T.textMuted,marginBottom:6,fontWeight:600}}>Accessorials (check all that apply):</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:6}}>
+            {Object.entries(DEFAULT_ACCESSORIALS).map(([key,acc])=>(
+              <label key={key} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 10px",borderRadius:6,background:accessorials[key]?T.brandPale:T.bgSurface,border:`1px solid ${accessorials[key]?T.brand:T.border}`,cursor:"pointer",fontSize:11}}>
+                <input type="checkbox" checked={!!accessorials[key]} onChange={()=>toggleAcc(key)}/>
+                <span style={{flex:1}}>{acc.label}</span>
+                <span style={{fontSize:10,color:T.textMuted,fontWeight:600}}>{acc.type==="flat"?fmt(acc.amount):acc.type==="cwt"?"$"+acc.amount+"/CWT":"$"+acc.amount+"/mi"}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+        <div style={{marginTop:14,display:"flex",gap:8}}>
+          <PrimaryBtn text="Generate Quote" onClick={calc}/>
+          {quote && !quote.error && <button onClick={()=>{setQuote(null);setToZip("");}} style={{padding:"10px 20px",borderRadius:10,border:`1px solid ${T.border}`,background:"transparent",color:T.textMuted,fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Reset</button>}
+        </div>
+      </div>
+
+      {quote?.error && <div style={{...CS,borderLeft:`4px solid ${T.red}`,background:T.redBg,color:T.redText,fontSize:13}}>❌ {quote.error}</div>}
+
+      {quote && !quote.error && (
+        <>
+          <div style={{...CS,borderLeft:`4px solid ${T.brand}`,background:"linear-gradient(135deg,#f0f9ff,#ffffff)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10,flexWrap:"wrap",gap:8}}>
+              <div>
+                <div style={{fontSize:11,color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>LTL Quote</div>
+                <div style={{fontSize:13,fontWeight:700,color:T.brand}}>{quote.fromZip} ({quote.fromState}) → {quote.toZip} ({quote.toState})</div>
+                <div style={{fontSize:11,color:T.textMuted}}>{fmtNum(quote.miles)} miles • {fmtNum(quote.weight)} lbs • Class {quote.freightClass}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:32,fontWeight:800,color:T.brand,letterSpacing:"-0.02em"}}>{fmt(quote.totalPrice)}</div>
+                <Badge text={fmtPct(quote.marginPct)+" margin"} color={quote.marginPct>=targetMargin?T.greenText:T.yellowText} bg={quote.marginPct>=targetMargin?T.greenBg:T.yellowBg}/>
+              </div>
+            </div>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:12}}>
+            <div style={CS}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>💰 Customer Price Breakdown</div>
+              <DataRow label="Base Rate (with margin)" value={fmt(quote.basePrice)}/>
+              <DataRow label="Fuel Surcharge (22%)" value={fmt(quote.fuelSurchargeDollars)} valueColor={T.orange}/>
+              <DataRow label="Accessorials" value={fmt(quote.accessorialTotal)}/>
+              <div style={{height:6}}/>
+              <DataRow label="TOTAL QUOTED" value={fmt(quote.totalPrice)} bold valueColor={T.brand}/>
+              <div style={{height:8}}/>
+              <DataRow label="Rate per CWT" value={fmt(quote.pricePerCWT)+"/CWT"}/>
+              <DataRow label="Rate per Mile" value={fmt(quote.pricePerMile)+"/mi"}/>
+            </div>
+            <div style={CS}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>📉 Our True Cost Basis</div>
+              <DataRow label="Linehaul cost" value={fmt(quote.linehaulCost)} valueColor={T.red}/>
+              <DataRow label="Stop cost (2 stops)" value={fmt(quote.stopCost)} valueColor={T.red}/>
+              <DataRow label="Handling (weight+class)" value={fmt(quote.handlingSurcharge)} valueColor={T.red}/>
+              <div style={{height:6}}/>
+              <DataRow label="Base cost" value={fmt(quote.baseCost)} valueColor={T.red} bold/>
+              <div style={{height:6}}/>
+              <DataRow label="Target margin" value={fmtPct(targetMargin)}/>
+              <DataRow label="Our margin ($)" value={fmt(quote.margin)} valueColor={T.green} bold/>
+              <DataRow label="Margin %" value={fmtPct(quote.marginPct)} valueColor={quote.marginPct>=targetMargin?T.green:T.yellow} bold/>
+            </div>
+          </div>
+
+          {quote.accessorialBreakdown.length>0 && <div style={CS}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Accessorials Detail</div>
+            {quote.accessorialBreakdown.map((a,i)=>(
+              <DataRow key={i} label={a.label} value={fmt(a.amount)}/>
+            ))}
+          </div>}
+        </>
+      )}
+    </>
+  );
+}
+
+function TLQuoteView({unitEcon, targetMargin}){
+  const [fromZip,setFromZip] = useState("30518");
+  const [toZip,setToZip] = useState("");
+  const [equipmentType,setEquipmentType] = useState("dry");
+  const [roundTrip,setRoundTrip] = useState(false);
+  const [quote,setQuote] = useState(null);
+
+  const calc = ()=>{
+    const q = calculateTLQuote({fromZip, toZip, equipmentType, roundTrip, unitEcon, targetMarginPct:targetMargin});
+    setQuote(q);
+  };
+
+  return (
+    <>
+      <div style={CS}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Truckload Shipment Details</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10}}>
+          <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>Origin ZIP</label><input value={fromZip} onChange={e=>setFromZip(e.target.value)} maxLength="5" style={IS}/></div>
+          <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>Destination ZIP</label><input value={toZip} onChange={e=>setToZip(e.target.value)} maxLength="5" style={IS}/></div>
+          <div><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>Equipment</label>
+            <select value={equipmentType} onChange={e=>setEquipmentType(e.target.value)} style={IS}>
+              <option value="dry">Dry Van</option>
+              <option value="flatbed">Flatbed (+15%)</option>
+              <option value="stepdeck">Stepdeck (+20%)</option>
+              <option value="reefer">Reefer (+30%)</option>
+              <option value="lowboy">Lowboy (+40%)</option>
+            </select>
+          </div>
+          <div style={{display:"flex",alignItems:"flex-end"}}>
+            <label style={{display:"flex",alignItems:"center",gap:6,padding:"8px 12px",borderRadius:6,background:roundTrip?T.brandPale:T.bgSurface,border:`1px solid ${roundTrip?T.brand:T.border}`,cursor:"pointer",fontSize:12,fontWeight:600,width:"100%"}}>
+              <input type="checkbox" checked={roundTrip} onChange={e=>setRoundTrip(e.target.checked)}/>Round Trip
+            </label>
+          </div>
+        </div>
+        <div style={{marginTop:14}}><PrimaryBtn text="Generate TL Quote" onClick={calc}/></div>
+      </div>
+
+      {quote?.error && <div style={{...CS,borderLeft:`4px solid ${T.red}`,background:T.redBg,color:T.redText,fontSize:13}}>❌ {quote.error}</div>}
+
+      {quote && !quote.error && (
+        <>
+          <div style={{...CS,borderLeft:`4px solid ${T.brand}`,background:"linear-gradient(135deg,#f0f9ff,#ffffff)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10,flexWrap:"wrap",gap:8}}>
+              <div>
+                <div style={{fontSize:11,color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>Truckload Quote</div>
+                <div style={{fontSize:13,fontWeight:700,color:T.brand}}>{quote.fromZip} ({quote.fromState}) → {quote.toZip} ({quote.toState})</div>
+                <div style={{fontSize:11,color:T.textMuted}}>{fmtNum(quote.miles)} miles • {quote.drivingDays} day{quote.drivingDays>1?"s":""} • {quote.equipmentType}{quote.roundTrip?" (RT)":""}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:32,fontWeight:800,color:T.brand,letterSpacing:"-0.02em"}}>{fmt(quote.totalPrice)}</div>
+                <Badge text={fmtPct(quote.marginPct)+" margin"} color={quote.marginPct>=targetMargin?T.greenText:T.yellowText} bg={quote.marginPct>=targetMargin?T.greenBg:T.yellowBg}/>
+              </div>
+            </div>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:12}}>
+            <div style={CS}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>💰 Customer Price</div>
+              <DataRow label="Linehaul (with margin)" value={fmt(quote.basePrice)}/>
+              <DataRow label="Fuel Surcharge (28%)" value={fmt(quote.fuelSurcharge)} valueColor={T.orange}/>
+              <div style={{height:6}}/>
+              <DataRow label="TOTAL QUOTED" value={fmt(quote.totalPrice)} bold valueColor={T.brand}/>
+              <div style={{height:8}}/>
+              <DataRow label="Rate per Mile" value={fmt(quote.pricePerMile)+"/mi"} valueColor={T.blue}/>
+            </div>
+            <div style={CS}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>📉 Our True Cost Basis</div>
+              <DataRow label="Fuel" value={fmt(quote.fuelCost)} valueColor={T.red}/>
+              <DataRow label="Maintenance/tires" value={fmt(quote.maintenanceCost)} valueColor={T.red}/>
+              <DataRow label="Driver pay + benefits" value={fmt(quote.driverCost)} valueColor={T.red}/>
+              <DataRow label="Overhead allocation" value={fmt(quote.overheadCost)} valueColor={T.red}/>
+              <div style={{height:6}}/>
+              <DataRow label="Total base cost" value={fmt(quote.baseCost)} valueColor={T.red} bold/>
+              <div style={{height:6}}/>
+              <DataRow label="Our margin ($)" value={fmt(quote.margin)} valueColor={T.green} bold/>
+              <DataRow label="Margin %" value={fmtPct(quote.marginPct)} valueColor={quote.marginPct>=targetMargin?T.green:T.yellow} bold/>
+            </div>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+function RateCardView({unitEcon, targetMargin}){
+  // Build a sample rate card grid: distance zones × weight breaks
+  const zones = [
+    {label:"0–50 mi", miles:30},
+    {label:"51–100 mi", miles:75},
+    {label:"101–250 mi", miles:175},
+    {label:"251–500 mi", miles:375},
+    {label:"501–1000 mi", miles:750},
+    {label:"1000+ mi", miles:1500},
+  ];
+  const weights = [250, 500, 1000, 2500, 5000, 10000, 20000];
+  const targetMult = 1 / (1 - (targetMargin/100));
+
+  const calcCell = (miles, weight, freightClass=70) => {
+    const linehaul = miles * (unitEcon.costPerMile || 2.50);
+    const stops = 2 * (unitEcon.costPerStop || 50);
+    const wb = WEIGHT_BREAKS.find(w => weight >= w.min && weight <= w.max) || WEIGHT_BREAKS[5];
+    const cm = FREIGHT_CLASSES.find(c => c.cls === freightClass)?.mult || 1.3;
+    const handling = (weight/100) * 2.50 * wb.factor * cm;
+    const baseCost = linehaul + stops + handling;
+    const basePrice = baseCost * targetMult;
+    const withFuel = basePrice * 1.22;
+    return Math.round(withFuel);
+  };
+
+  return (
+    <>
+      <div style={{...CS,borderLeft:`4px solid ${T.brand}`,background:T.brandPale,marginBottom:12}}>
+        <div style={{fontSize:13,fontWeight:700,color:T.brand,marginBottom:4}}>📋 Class 70 LTL Rate Card</div>
+        <div style={{fontSize:11,color:T.textMuted}}>All prices include {targetMargin}% target margin and 22% fuel surcharge. Accessorials extra. Other freight classes = base × class multiplier.</div>
+      </div>
+
+      <div style={CS}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Base LTL Rates (Class 70)</div>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:600}}>
+            <thead>
+              <tr style={{background:T.bgSurface}}>
+                <th style={{textAlign:"left",padding:"10px 8px",borderBottom:`2px solid ${T.border}`,fontSize:10,fontWeight:700,textTransform:"uppercase",color:T.textMuted}}>Distance</th>
+                {weights.map(w => <th key={w} style={{textAlign:"right",padding:"10px 8px",borderBottom:`2px solid ${T.border}`,fontSize:10,fontWeight:700,textTransform:"uppercase",color:T.textMuted}}>{w.toLocaleString()} lb</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {zones.map((zone,i) => (
+                <tr key={i} style={{background:i%2?T.bgSurface:"transparent"}}>
+                  <td style={{padding:"10px 8px",fontWeight:700,color:T.brand,borderBottom:`1px solid ${T.borderLight}`}}>{zone.label}</td>
+                  {weights.map(w => <td key={w} style={{textAlign:"right",padding:"10px 8px",fontWeight:600,borderBottom:`1px solid ${T.borderLight}`}}>{fmt(calcCell(zone.miles, w))}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={CS}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Class Multipliers (applied to base rate)</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(120px,1fr))",gap:6}}>
+          {FREIGHT_CLASSES.map(fc => (
+            <div key={fc.cls} style={{padding:"8px 10px",background:T.bgSurface,borderRadius:6,border:`1px solid ${T.border}`}}>
+              <div style={{fontSize:11,fontWeight:700}}>Class {fc.cls}</div>
+              <div style={{fontSize:14,fontWeight:800,color:T.brand}}>{fc.mult.toFixed(2)}×</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={CS}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Truckload Lane Rates (Dry Van)</div>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:500}}>
+            <thead><tr style={{background:T.bgSurface}}>
+              <th style={{textAlign:"left",padding:"10px 8px",borderBottom:`2px solid ${T.border}`,fontSize:10,fontWeight:700,textTransform:"uppercase",color:T.textMuted}}>Distance</th>
+              <th style={{textAlign:"right",padding:"10px 8px",borderBottom:`2px solid ${T.border}`,fontSize:10,fontWeight:700,textTransform:"uppercase",color:T.textMuted}}>One-Way Rate</th>
+              <th style={{textAlign:"right",padding:"10px 8px",borderBottom:`2px solid ${T.border}`,fontSize:10,fontWeight:700,textTransform:"uppercase",color:T.textMuted}}>Round Trip</th>
+              <th style={{textAlign:"right",padding:"10px 8px",borderBottom:`2px solid ${T.border}`,fontSize:10,fontWeight:700,textTransform:"uppercase",color:T.textMuted}}>$/Mile</th>
+            </tr></thead>
+            <tbody>
+              {zones.slice(1).map((zone,i) => {
+                const q1 = calculateTLQuote({fromZip:"30518",toZip:"",equipmentType:"dry",roundTrip:false,unitEcon,targetMarginPct:targetMargin});
+                // simulate
+                const base = zone.miles;
+                const fuel = base * (unitEcon.tractorFuelPerMile || 0.58) * 1.15;
+                const maint = base * 0.18 * 1.15;
+                const days = Math.max(1, Math.ceil(base/500));
+                const driver = days * (unitEcon.costPerHour || 27.50) * 10;
+                const oh = days * ((unitEcon.totalAnnualCost - unitEcon.annualFleet - unitEcon.annualLabor)/365);
+                const cost = fuel + maint + driver + oh;
+                const priceOW = Math.round(cost * targetMult * 1.28);
+                const priceRT = Math.round((cost*2/1.15) * targetMult * 1.28);
+                return (
+                  <tr key={i} style={{background:i%2?T.bgSurface:"transparent"}}>
+                    <td style={{padding:"10px 8px",fontWeight:700,color:T.brand,borderBottom:`1px solid ${T.borderLight}`}}>{zone.label}</td>
+                    <td style={{textAlign:"right",padding:"10px 8px",fontWeight:700,borderBottom:`1px solid ${T.borderLight}`}}>{fmt(priceOW)}</td>
+                    <td style={{textAlign:"right",padding:"10px 8px",fontWeight:700,borderBottom:`1px solid ${T.borderLight}`}}>{fmt(priceRT)}</td>
+                    <td style={{textAlign:"right",padding:"10px 8px",color:T.textMuted,borderBottom:`1px solid ${T.borderLight}`}}>{fmt(priceOW/zone.miles)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </>
+  );
+}
 function TrendsTab({ulineWeeks,margins,qbFinancials}){
   const [tab,setT]=useState(qbFinancials?"qb":"uline");
   const [qbPeriod,setQbPeriod]=useState("quarter");
@@ -2490,7 +3117,7 @@ function MarginIQApp({user,onLogout}){
     return m;
   },[costs,ulineWeeks,qboData,qbFinancials]);
   const onUline=w=>{setUlineWeeks(p=>[w,...p.filter(x=>x.week_id!==w.week_id)]);};
-  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"qbimport",i:"📁",l:"QB Import"},{id:"import",i:"📥",l:"Import"},{id:"settings",i:"🔧",l:"Settings"}];
+  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"pricing",i:"💎",l:"Pricing"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"qbimport",i:"📁",l:"QB Import"},{id:"import",i:"📥",l:"Import"},{id:"settings",i:"🔧",l:"Settings"}];
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
@@ -2514,6 +3141,7 @@ function MarginIQApp({user,onLogout}){
       {loading&&<div style={{textAlign:"center",padding:"60px 20px"}}><div className="loading-pulse" style={{fontSize:48,marginBottom:12}}>📊</div><div style={{fontSize:14,fontWeight:600}}>Loading...</div></div>}
       {!loading&&tab==="command"&&<CommandCenter margins={margins} ulineData={ulineWeeks.length>0?{weekCount:ulineWeeks.length,totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)}:null} qboConnected={qboConnected} qboData={qboData} qbFinancials={qbFinancials} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}}/>}
       {!loading&&tab==="ai"&&<AIInsights margins={margins} ulineWeeks={ulineWeeks} costs={costs} qbFinancials={qbFinancials}/>}
+      {!loading&&tab==="pricing"&&<PricingTab qbFinancials={qbFinancials} costs={costs} ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="import"&&<DataImport ulineWeeks={ulineWeeks} onUlineUpload={onUline}/>}
       {!loading&&tab==="reconcile"&&<ReconciliationTab ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="integrity"&&<DataIntegrity ulineWeeks={ulineWeeks}/>}
