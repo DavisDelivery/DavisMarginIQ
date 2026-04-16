@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "4.2.4";
+const APP_VERSION = "5.0.0";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -1171,120 +1171,499 @@ function ReconciliationTab({ulineWeeks}){
 }
 
 // ═══════════════════════════════════════════════════════════════
-// QBO FILE IMPORT (CSV/Excel from QuickBooks exports)
+// QB FILE IMPORT + FINANCIAL ANALYZER (v5 — quarterly/monthly/yearly)
 // ═══════════════════════════════════════════════════════════════
 function QBOImport(){
-  const [view,setView]=useState("overview");
+  const [view,setView]=useState("upload");
   const [importing,setImporting]=useState(false);
   const [result,setResult]=useState(null);
   const [qboFiles,setQboFiles]=useState([]);
-  const pnlRef=useRef(null);const custRef=useRef(null);const expRef=useRef(null);const payRef=useRef(null);
+  const [glData,setGlData]=useState(null);
+  const [period,setPeriod]=useState("quarter"); // month | quarter | year
+  const [selectedCat,setSelectedCat]=useState(null);
+  const glRef=useRef(null);const pnlRef=useRef(null);const bsRef=useRef(null);const custRef=useRef(null);const payRef=useRef(null);
 
-  useEffect(()=>{(async()=>{if(!hasFirebase)return;try{const s=await window.db.collection("qbo_imports").orderBy("imported_at","desc").limit(20).get();setQboFiles(s.docs.map(d=>({id:d.id,...d.data()})));}catch(e){}})();},[]);
+  // Load existing imports from Firebase
+  useEffect(()=>{(async()=>{
+    if(!hasFirebase) return;
+    try{const s=await window.db.collection("qbo_imports").orderBy("imported_at","desc").limit(50).get();
+      const files=s.docs.map(d=>({id:d.id,...d.data()}));
+      setQboFiles(files);
+      // If we have a GL import, load it
+      const glImport=files.find(f=>f.type==="gl");
+      if(glImport?.transactions) setGlData(glImport);
+    }catch(e){}
+  })();},[]);
 
-  const parseQBOFile=async(file,type)=>{
-    return new Promise((resolve,reject)=>{
-      if(typeof XLSX==="undefined") return reject(new Error("XLSX not loaded"));
-      const reader=new FileReader();
-      reader.onload=e=>{
-        try{
-          const wb=XLSX.read(e.target.result,{type:"array"});
-          const ws=wb.Sheets[wb.SheetNames[0]];
-          const raw=XLSX.utils.sheet_to_json(ws,{defval:"",header:1});
-          // Find header row (first row with multiple non-empty cells)
-          let headerIdx=0;
-          for(let i=0;i<Math.min(10,raw.length);i++){const nonEmpty=raw[i].filter(c=>c!=="").length;if(nonEmpty>=3){headerIdx=i;break;}}
-          const headers=raw[headerIdx].map(h=>String(h||"").toLowerCase().trim());
-          const rows=raw.slice(headerIdx+1).filter(r=>r.some(c=>c!==""));
-          const data=rows.map(r=>{const o={};headers.forEach((h,i)=>{if(h)o[h]=r[i]||"";});return o;});
-          resolve({type,headers,data,rowCount:data.length,filename:file.name});
-        }catch(e){reject(e);}
-      };
-      reader.onerror=reject;
-      reader.readAsArrayBuffer(file);
-    });
+  // ── Generic XLSX parser ──
+  const parseXLSX=(file)=>new Promise((resolve,reject)=>{
+    if(typeof XLSX==="undefined")return reject(new Error("XLSX not loaded"));
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{const wb=XLSX.read(e.target.result,{type:"array",cellDates:true});const ws=wb.Sheets[wb.SheetNames[0]];const raw=XLSX.utils.sheet_to_json(ws,{defval:"",header:1,raw:false});resolve(raw);}
+      catch(err){reject(err);}
+    };
+    reader.onerror=reject;reader.readAsArrayBuffer(file);
+  });
+
+  // ── General Ledger Parser (the big one) ──
+  const parseGL=async(file)=>{
+    const raw=await parseXLSX(file);
+    // Find header row (row with "Date", "Debit", "Credit" columns)
+    let headerIdx=-1;let cols={};
+    for(let i=0;i<Math.min(20,raw.length);i++){
+      const lc=raw[i].map(c=>String(c||"").toLowerCase().trim());
+      if(lc.includes("date")&&(lc.includes("debit")||lc.includes("credit"))){
+        headerIdx=i;
+        lc.forEach((h,j)=>{cols[h]=j;});
+        break;
+      }
+    }
+    if(headerIdx<0) throw new Error("Could not find GL header row. Expected 'Date', 'Debit', 'Credit' columns.");
+
+    const dateCol=cols["date"];const typeCol=cols["transaction type"]||cols["type"];const numCol=cols["num"];
+    const nameCol=cols["name"];const memoCol=cols["memo/description"]||cols["memo"];
+    const accountCol=cols["account"];const debitCol=cols["debit"];const creditCol=cols["credit"];
+
+    const txns=[];let currentAcct=null;
+    for(let i=headerIdx+1;i<raw.length;i++){
+      const row=raw[i];if(!row||row.length===0) continue;
+      const firstCell=String(row[0]||"").trim();
+      const dateCell=row[dateCol];
+      // Account header row: something in col 0, no date
+      if(firstCell&&!dateCell&&!String(firstCell).toLowerCase().startsWith("total")){
+        currentAcct=firstCell;continue;
+      }
+      if(String(firstCell).toLowerCase().startsWith("total")){currentAcct=null;continue;}
+      if(!dateCell) continue;
+      // Parse date (MM/DD/YYYY)
+      let date=null;
+      if(dateCell instanceof Date) date=dateCell;
+      else if(typeof dateCell==="string"&&dateCell.includes("/")){
+        const p=dateCell.split("/");
+        if(p.length===3){date=new Date(parseInt(p[2]),parseInt(p[0])-1,parseInt(p[1]));}
+      }
+      if(!date||isNaN(date.getTime())) continue;
+      const account=row[accountCol]||currentAcct||"";
+      if(!account) continue;
+      const debit=parseFloat(String(row[debitCol]||"0").replace(/[$,]/g,""))||0;
+      const credit=parseFloat(String(row[creditCol]||"0").replace(/[$,]/g,""))||0;
+      txns.push({
+        date:date.toISOString().slice(0,10),
+        year:date.getFullYear(),
+        month:date.getMonth()+1,
+        quarter:Math.floor(date.getMonth()/3)+1,
+        yearMonth:`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}`,
+        yearQuarter:`${date.getFullYear()}-Q${Math.floor(date.getMonth()/3)+1}`,
+        type:String(row[typeCol]||""),
+        num:String(row[numCol]||""),
+        name:String(row[nameCol]||""),
+        memo:String(row[memoCol]||""),
+        account:String(account).trim(),
+        debit,credit,
+        net:debit-credit, // positive = debit (expense/asset), negative = credit (income/liability)
+      });
+    }
+    return txns;
   };
 
-  const handleImport=async(e,type)=>{
+  // ── Handle GL upload (the big one) ──
+  const handleGL=async(e)=>{
     const file=e.target.files?.[0];if(!file)return;
     setImporting(true);setResult(null);
     try{
-      const parsed=await parseQBOFile(file,type);
-      let summary={};
+      const txns=await parseGL(file);
+      if(txns.length===0) throw new Error("No transactions found in file");
+      // Store metadata + transactions. Firebase doc limit is 1MB, so compress if needed
+      const totalDebit=txns.reduce((s,t)=>s+t.debit,0);
+      const totalCredit=txns.reduce((s,t)=>s+t.credit,0);
+      const dates=txns.map(t=>t.date).sort();
+      const summary={type:"gl",filename:file.name,txnCount:txns.length,totalDebit,totalCredit,dateStart:dates[0],dateEnd:dates[dates.length-1],imported_at:new Date().toISOString()};
+      // Store transactions in chunks if large (Firestore doc limit ~1MB)
+      if(hasFirebase){
+        const docId=`gl_${file.name}`.replace(/[\/\s\.]/g,"_").substring(0,200);
+        // Check dedup
+        const existing=await window.db.collection("qbo_imports").doc(docId).get();
+        if(existing.exists){setResult({type:"dup",filename:file.name,reportType:"gl"});setImporting(false);return;}
+        // Compact transaction storage — we save the full list for analysis
+        try{
+          await window.db.collection("qbo_imports").doc(docId).set({...summary,transactions:txns});
+        }catch(err){
+          // Too large — save summary only
+          await window.db.collection("qbo_imports").doc(docId).set({...summary,note:"Transactions too large for single doc, stored in memory only"});
+        }
+      }
+      setGlData({...summary,transactions:txns});
+      setResult({type:"success",reportType:"gl",filename:file.name,...summary});
+      setView("analyzer");
+    }catch(err){setResult({type:"error",message:err.message});}
+    setImporting(false);if(glRef.current)glRef.current.value="";
+  };
+
+  // ── Handle P&L, BS, Customers, Payroll uploads (summary-style) ──
+  const handleSimpleReport=async(e,type)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    setImporting(true);setResult(null);
+    try{
+      const raw=await parseXLSX(file);
+      const rows=raw.filter(r=>r.some(c=>c!==""));
+      let summary={type,filename:file.name,rowCount:rows.length,imported_at:new Date().toISOString()};
+
       if(type==="pnl"){
-        // Extract revenue and expense lines
-        const revenues=parsed.data.filter(r=>{const cat=String(Object.values(r)[0]||"").toLowerCase();return cat.match(/income|revenue|sales/);});
-        const expenses=parsed.data.filter(r=>{const cat=String(Object.values(r)[0]||"").toLowerCase();return cat.match(/expense|cost|cogs/);});
-        const totalRev=revenues.reduce((s,r)=>{const vals=Object.values(r).slice(1);return s+vals.reduce((ss,v)=>ss+(parseFloat(String(v).replace(/[$,]/g,""))||0),0);},0);
-        const totalExp=expenses.reduce((s,r)=>{const vals=Object.values(r).slice(1);return s+vals.reduce((ss,v)=>ss+(parseFloat(String(v).replace(/[$,]/g,""))||0),0);},0);
-        summary={totalRevenue:totalRev,totalExpenses:totalExp,grossProfit:totalRev-totalExp,margin:totalRev>0?((totalRev-totalExp)/totalRev*100):0,lineItems:parsed.data.length};
+        const items=[];let section=null;
+        for(const row of rows){
+          const label=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
+          if(!label) continue;
+          if(label==="Income") section="income";
+          else if(label==="Expenses") section="expense";
+          else if(label==="Other Income") section="other_income";
+          else if(label==="Other Expenses") section="other_expense";
+          else if(label==="Gross Profit"||label==="Net Income"||label==="Net Operating Income"||label==="Net Other Income") continue;
+          else if(!isNaN(val)&&val!==0&&section){
+            items.push({label,value:val,section,isTotal:label.toLowerCase().startsWith("total ")});
+          }
+        }
+        const totalIncome=items.filter(i=>i.section==="income"&&i.isTotal).reduce((s,i)=>s+i.value,0)||items.filter(i=>i.section==="income"&&!i.isTotal).reduce((s,i)=>s+i.value,0);
+        const totalExpense=items.filter(i=>i.section==="expense"&&i.isTotal).reduce((s,i)=>s+i.value,0)||items.filter(i=>i.section==="expense"&&!i.isTotal).reduce((s,i)=>s+i.value,0);
+        summary.items=items;summary.totalRevenue=totalIncome;summary.totalExpenses=totalExpense;summary.netIncome=totalIncome-totalExpense;summary.margin=totalIncome>0?((totalIncome-totalExpense)/totalIncome*100):0;
+      }
+      if(type==="bs"){
+        const items=[];let section=null;
+        for(const row of rows){
+          const label=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
+          if(!label) continue;
+          if(label==="Assets") section="asset";
+          else if(label==="Liabilities") section="liability";
+          else if(label==="Equity") section="equity";
+          else if(label.startsWith("Total for")) continue;
+          else if(!isNaN(val)&&val!==0&&section) items.push({label,value:val,section});
+        }
+        summary.items=items;summary.totalAssets=items.filter(i=>i.section==="asset").reduce((s,i)=>s+i.value,0);
+        summary.totalLiabilities=items.filter(i=>i.section==="liability").reduce((s,i)=>s+i.value,0);
+        summary.totalEquity=items.filter(i=>i.section==="equity").reduce((s,i)=>s+i.value,0);
       }
       if(type==="customers"){
-        const custs=parsed.data.map(r=>{const vals=Object.values(r);return{name:String(vals[0]||""),revenue:parseFloat(String(vals[vals.length-1]||"0").replace(/[$,]/g,""))||0};}).filter(c=>c.name&&c.revenue>0).sort((a,b)=>b.revenue-a.revenue);
-        summary={customers:custs,totalRevenue:custs.reduce((s,c)=>s+c.revenue,0)};
-      }
-      if(type==="expenses"){
-        const exps=parsed.data.map(r=>{const vals=Object.values(r);const amt=parseFloat(String(vals[vals.length-1]||vals[vals.length-2]||"0").replace(/[$,]/g,""))||0;return{vendor:String(vals[0]||""),date:String(vals[1]||""),amount:amt,category:String(vals[2]||"")};}).filter(e=>e.amount>0);
-        const byVendor={};exps.forEach(e=>{if(!byVendor[e.vendor])byVendor[e.vendor]={vendor:e.vendor,total:0,count:0};byVendor[e.vendor].total+=e.amount;byVendor[e.vendor].count++;});
-        summary={expenses:exps,byVendor:Object.values(byVendor).sort((a,b)=>b.total-a.total),totalExpenses:exps.reduce((s,e)=>s+e.amount,0)};
+        const customers=[];
+        for(const row of rows){
+          const name=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
+          if(name&&!isNaN(val)&&val!==0&&!name.startsWith("Total")&&name!=="Sales by Customer Summary"&&name!=="Davis Delivery Service"&&!name.match(/^\d{4}/)) customers.push({name,revenue:val});
+        }
+        customers.sort((a,b)=>b.revenue-a.revenue);
+        summary.customers=customers;summary.totalRevenue=customers.reduce((s,c)=>s+c.revenue,0);
       }
       if(type==="payroll"){
-        const rows=parsed.data.map(r=>{const vals=Object.values(r);return{employee:String(vals[0]||""),grossPay:parseFloat(String(vals[1]||vals[vals.length-2]||"0").replace(/[$,]/g,""))||0,netPay:parseFloat(String(vals[vals.length-1]||"0").replace(/[$,]/g,""))||0};}).filter(r=>r.employee&&r.grossPay>0);
-        summary={employees:rows,totalGross:rows.reduce((s,r)=>s+r.grossPay,0),totalNet:rows.reduce((s,r)=>s+r.netPay,0),headcount:rows.length};
+        const employees=[];
+        for(const row of rows){
+          const name=String(row[0]||"").trim();if(!name||name.startsWith("Total")||name==="TOTAL") continue;
+          const vals=row.slice(1).map(c=>parseFloat(String(c||"0").replace(/[$,]/g,""))||0);
+          if(vals.some(v=>v>0)) employees.push({employee:name,grossPay:vals[0]||0,totalPay:vals[vals.length-1]||vals[0]||0});
+        }
+        summary.employees=employees;summary.totalGross=employees.reduce((s,e)=>s+e.grossPay,0);summary.headcount=employees.length;
       }
-      // Save to Firebase with dedup
-      const docId=`${type}_${file.name}_${parsed.rowCount}`.replace(/[\/\s\.]/g,"_").substring(0,200);
+
+      // Dedup
+      const docId=`${type}_${file.name}`.replace(/[\/\s\.]/g,"_").substring(0,200);
       if(hasFirebase){
         const existing=await window.db.collection("qbo_imports").doc(docId).get();
         if(existing.exists){setResult({type:"dup",filename:file.name,reportType:type});setImporting(false);return;}
-        await window.db.collection("qbo_imports").doc(docId).set({...summary,type,filename:file.name,rowCount:parsed.rowCount,imported_at:new Date().toISOString()});
+        await window.db.collection("qbo_imports").doc(docId).set(summary);
       }
-      setResult({type:"success",reportType:type,filename:file.name,...summary});
-      setQboFiles(prev=>[{id:docId,type,filename:file.name,...summary,imported_at:new Date().toISOString()},...prev]);
+      setResult({type:"success",reportType:type,...summary});
+      setQboFiles(prev=>[{id:docId,...summary},...prev]);
     }catch(err){setResult({type:"error",message:err.message});}
     setImporting(false);
-    [pnlRef,custRef,expRef,payRef].forEach(r=>{if(r.current)r.current.value="";});
+    [pnlRef,bsRef,custRef,payRef].forEach(r=>{if(r?.current)r.current.value="";});
   };
 
+  // ═══ GL-based Financial Analysis ═══
+  // Expense/income categorization from account names
+  const classifyAccount=(account)=>{
+    const a=String(account).toLowerCase();
+    // Income
+    if(a.includes("delivery sales")||a.includes("sales income")||a.match(/^income/)) return {category:"revenue",subcat:"Delivery Sales"};
+    if(a.includes("misc") && a.includes("income")) return {category:"revenue",subcat:"Other Income"};
+    // Expenses — payroll
+    if(a.includes("salaries")||a.includes("wages")) return {category:"expense",subcat:"Salaries & Wages"};
+    if(a.includes("subcontractor")||a.includes("3rd party delivery")) return {category:"expense",subcat:"Subcontractors"};
+    if(a.includes("temporary services")) return {category:"expense",subcat:"Temp Labor"};
+    if(a.includes("officers salaries")) return {category:"expense",subcat:"Officer Salaries"};
+    if(a.includes("payroll tax")) return {category:"expense",subcat:"Payroll Taxes"};
+    if(a.includes("payroll fees")||a.includes("payroll deduction")||a.includes("contract labor")) return {category:"expense",subcat:"Payroll Other"};
+    // Fleet
+    if(a.includes("truck fuel")||a.includes("fuel - gas")) return {category:"expense",subcat:"Fuel"};
+    if(a.includes("truck repair")||a.includes("truck maintenance")||a.includes("truck parts")||a.includes("truck tires")||a.includes("truck wash")||a.includes("truck - misc")||a.includes("trailer repair")||a.includes("towing")) return {category:"expense",subcat:"Truck Maintenance"};
+    if(a.includes("truck lease")||a.includes("trailer rental")||a.includes("rent - equipment")) return {category:"expense",subcat:"Truck Leases"};
+    if(a.includes("taxes & licenses - trucks")||a.includes("licenses & permits")) return {category:"expense",subcat:"Truck Taxes/Licenses"};
+    // Insurance
+    if(a.includes("insurance")&&!a.includes("health")) return {category:"expense",subcat:"Insurance"};
+    if(a.includes("health plan")||a.includes("fsa")||a.includes("health & dental")||a.includes("medical")) return {category:"expense",subcat:"Health Insurance"};
+    // Facilities
+    if(a.includes("rent - office")||a.includes("rent office")) return {category:"expense",subcat:"Rent"};
+    if(a.includes("warehouse")||a.includes("propane")||a.includes("fork lift")||a.includes("forklift")) return {category:"expense",subcat:"Warehouse"};
+    if(a.includes("utilities")||a.includes("electric")||a.includes("cell phone")||a.includes("telephone")||a.includes("trash")) return {category:"expense",subcat:"Utilities"};
+    // Admin
+    if(a.includes("computer")||a.includes("internet")) return {category:"expense",subcat:"IT"};
+    if(a.includes("bank charge")||a.includes("interest")) return {category:"expense",subcat:"Bank/Interest"};
+    if(a.includes("legal")||a.includes("professional")) return {category:"expense",subcat:"Legal/Professional"};
+    if(a.includes("depreciation")) return {category:"expense",subcat:"Depreciation"};
+    if(a.includes("office")||a.includes("admin")) return {category:"expense",subcat:"Office/Admin"};
+    if(a.includes("meals")||a.includes("travel")||a.includes("seminars")) return {category:"expense",subcat:"Travel/Meals"};
+    if(a.includes("damages")||a.includes("claims")||a.includes("penalties")) return {category:"expense",subcat:"Damages/Claims"};
+    if(a.includes("uniform")) return {category:"expense",subcat:"Uniforms"};
+    if(a.includes("uline purchase")) return {category:"expense",subcat:"Uline Supplies"};
+    if(a.includes("advertis")||a.includes("promotion")) return {category:"expense",subcat:"Marketing"};
+    if(a.includes("state tax")||a.includes("property tax")||a.includes("other taxes")) return {category:"expense",subcat:"Other Taxes"};
+    if(a.includes("repair")||a.includes("maintenance")) return {category:"expense",subcat:"Repairs"};
+    if(a.includes("supplies")||a.includes("materials")||a.includes("stationery")) return {category:"expense",subcat:"Supplies"};
+    if(a.includes("retirement")||a.includes("401k")) return {category:"expense",subcat:"Retirement"};
+    if(a.includes("dues")||a.includes("subscription")) return {category:"expense",subcat:"Dues/Subs"};
+    if(a.includes("bad debt")) return {category:"expense",subcat:"Bad Debts"};
+    // Bank/equity/etc - not for P&L
+    return {category:"other",subcat:a};
+  };
+
+  const analysis=useMemo(()=>{
+    if(!glData?.transactions) return null;
+    const txns=glData.transactions;
+    // Bucket key depends on period
+    const bucketKey=t=>period==="year"?String(t.year):period==="quarter"?t.yearQuarter:t.yearMonth;
+    // Build: periodBuckets with income + expense by subcat
+    const buckets={};
+    txns.forEach(t=>{
+      const cls=classifyAccount(t.account);
+      if(cls.category==="other") return;
+      const bk=bucketKey(t);
+      if(!buckets[bk]) buckets[bk]={period:bk,revenue:0,expense:0,byCategory:{}};
+      // For revenue accounts: CREDITS increase revenue (sales booked as credits)
+      // For expense accounts: DEBITS increase expense
+      if(cls.category==="revenue"){
+        const amt=t.credit-t.debit; // net credit = new revenue
+        buckets[bk].revenue+=amt;
+        buckets[bk].byCategory[cls.subcat]=(buckets[bk].byCategory[cls.subcat]||0)+amt;
+      }else{
+        const amt=t.debit-t.credit; // net debit = new expense
+        buckets[bk].expense+=amt;
+        buckets[bk].byCategory[cls.subcat]=(buckets[bk].byCategory[cls.subcat]||0)+amt;
+      }
+    });
+    const periods=Object.values(buckets).sort((a,b)=>a.period.localeCompare(b.period));
+    periods.forEach(p=>{p.netIncome=p.revenue-p.expense;p.margin=p.revenue>0?(p.netIncome/p.revenue*100):0;});
+
+    // All-time category totals
+    const catTotals={};
+    txns.forEach(t=>{
+      const cls=classifyAccount(t.account);
+      if(cls.category==="other") return;
+      if(!catTotals[cls.subcat]) catTotals[cls.subcat]={subcat:cls.subcat,category:cls.category,total:0,count:0};
+      const amt=cls.category==="revenue"?(t.credit-t.debit):(t.debit-t.credit);
+      catTotals[cls.subcat].total+=amt;
+      catTotals[cls.subcat].count++;
+    });
+    const expCats=Object.values(catTotals).filter(c=>c.category==="expense").sort((a,b)=>b.total-a.total);
+    const revCats=Object.values(catTotals).filter(c=>c.category==="revenue").sort((a,b)=>b.total-a.total);
+
+    // Vendor spending (from txn names on expense accounts)
+    const byVendor={};
+    txns.forEach(t=>{
+      const cls=classifyAccount(t.account);
+      if(cls.category!=="expense"||!t.name) return;
+      const vendor=t.name.trim();
+      if(!byVendor[vendor]) byVendor[vendor]={vendor,total:0,count:0};
+      byVendor[vendor].total+=(t.debit-t.credit);
+      byVendor[vendor].count++;
+    });
+    const topVendors=Object.values(byVendor).filter(v=>v.total>0).sort((a,b)=>b.total-a.total).slice(0,50);
+
+    // Customer revenue (from txn names on revenue accounts)
+    const byCust={};
+    txns.forEach(t=>{
+      const cls=classifyAccount(t.account);
+      if(cls.category!=="revenue"||!t.name) return;
+      const cust=t.name.trim();
+      if(!byCust[cust]) byCust[cust]={customer:cust,revenue:0,count:0};
+      byCust[cust].revenue+=(t.credit-t.debit);
+      byCust[cust].count++;
+    });
+    const topCustomers=Object.values(byCust).filter(c=>c.revenue>0).sort((a,b)=>b.revenue-a.revenue).slice(0,50);
+
+    const totalRev=periods.reduce((s,p)=>s+p.revenue,0);
+    const totalExp=periods.reduce((s,p)=>s+p.expense,0);
+
+    // Category time-series for drill-down
+    const catTimeSeries={};
+    txns.forEach(t=>{
+      const cls=classifyAccount(t.account);
+      if(cls.category==="other") return;
+      const bk=bucketKey(t);
+      if(!catTimeSeries[cls.subcat]) catTimeSeries[cls.subcat]={};
+      if(!catTimeSeries[cls.subcat][bk]) catTimeSeries[cls.subcat][bk]=0;
+      const amt=cls.category==="revenue"?(t.credit-t.debit):(t.debit-t.credit);
+      catTimeSeries[cls.subcat][bk]+=amt;
+    });
+
+    return{periods,expCats,revCats,topVendors,topCustomers,totalRev,totalExp,netIncome:totalRev-totalExp,catTimeSeries};
+  },[glData,period]);
+
+  // Build the UI
   return(
     <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="📁" text="QuickBooks File Import" right={<Badge text="No API needed" color={T.greenText} bg={T.greenBg}/>}/>
-      <div style={{fontSize:12,color:T.textMuted,marginBottom:16}}>Export reports from QuickBooks as CSV or Excel, then upload here. No OAuth or Production keys needed.</div>
+      <SectionTitle icon="📁" text="QuickBooks Analyzer" right={glData?<Badge text={`GL: ${fmtNum(glData.txnCount)} txns`} color={T.greenText} bg={T.greenBg}/>:<Badge text="No GL loaded" color={T.textDim} bg={T.borderLight}/>}/>
+
       {result&&<div style={{...CS,borderLeft:`4px solid ${result.type==="error"?T.red:result.type==="dup"?T.yellow:T.green}`,marginBottom:16}}>
         {result.type==="error"&&<div style={{color:T.redText,fontSize:13}}>❌ {result.message}</div>}
         {result.type==="dup"&&<div style={{color:T.yellowText,fontSize:13}}>⚠️ {result.filename} already imported — skipped</div>}
-        {result.type==="success"&&result.reportType==="pnl"&&<div style={{color:T.greenText,fontSize:13}}>✅ P&L imported: Revenue {fmtK(result.totalRevenue)}, Expenses {fmtK(result.totalExpenses)}, Margin {fmtPct(result.margin)} ({result.lineItems} line items)</div>}
-        {result.type==="success"&&result.reportType==="customers"&&<div style={{color:T.greenText,fontSize:13}}>✅ Customer revenue imported: {result.customers?.length} customers, {fmtK(result.totalRevenue)} total</div>}
-        {result.type==="success"&&result.reportType==="expenses"&&<div style={{color:T.greenText,fontSize:13}}>✅ Expenses imported: {result.expenses?.length} transactions, {fmtK(result.totalExpenses)} total across {result.byVendor?.length} vendors</div>}
-        {result.type==="success"&&result.reportType==="payroll"&&<div style={{color:T.greenText,fontSize:13}}>✅ Payroll imported: {result.headcount} employees, {fmtK(result.totalGross)} gross pay</div>}
+        {result.type==="success"&&result.reportType==="gl"&&<div style={{color:T.greenText,fontSize:13}}>✅ GL imported: {fmtNum(result.txnCount)} transactions, {result.dateStart} → {result.dateEnd}</div>}
+        {result.type==="success"&&result.reportType==="pnl"&&<div style={{color:T.greenText,fontSize:13}}>✅ P&L: Revenue {fmtK(result.totalRevenue)}, Expenses {fmtK(result.totalExpenses)}, Net {fmtK(result.netIncome)}, Margin {fmtPct(result.margin)}</div>}
+        {result.type==="success"&&result.reportType==="bs"&&<div style={{color:T.greenText,fontSize:13}}>✅ Balance Sheet: Assets {fmtK(result.totalAssets)}, Liab {fmtK(result.totalLiabilities)}, Equity {fmtK(result.totalEquity)}</div>}
+        {result.type==="success"&&result.reportType==="customers"&&<div style={{color:T.greenText,fontSize:13}}>✅ {result.customers?.length} customers, {fmtK(result.totalRevenue)} total revenue</div>}
+        {result.type==="success"&&result.reportType==="payroll"&&<div style={{color:T.greenText,fontSize:13}}>✅ {result.headcount} employees, {fmtK(result.totalGross)} gross pay</div>}
       </div>}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(250px,1fr))",gap:"12px",marginBottom:16}}>
-        {[{type:"pnl",icon:"📊",title:"Profit & Loss",sub:"Export: Reports → Profit and Loss → Export to Excel",ref:pnlRef},
-          {type:"customers",icon:"🏢",title:"Sales by Customer",sub:"Export: Reports → Sales by Customer → Export to Excel",ref:custRef},
-          {type:"expenses",icon:"💸",title:"Expenses by Vendor",sub:"Export: Reports → Expenses by Vendor → Export to Excel",ref:expRef},
-          {type:"payroll",icon:"💵",title:"Payroll Summary",sub:"Export: Reports → Payroll Summary → Export to Excel",ref:payRef},
-        ].map(item=>(
-          <div key={item.type} style={CS}>
-            <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>{item.icon} {item.title}</div>
-            <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>{item.sub}</div>
-            <input ref={item.ref} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleImport(e,item.type)} style={{display:"none"}}/>
-            <PrimaryBtn text={importing?"Importing...":"Upload "+item.title} onClick={()=>item.ref.current?.click()} loading={importing} style={{width:"100%",fontSize:12,padding:"10px"}}/>
-          </div>
-        ))}
+
+      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+        <TabBtn active={view==="upload"} label="📤 Upload" onClick={()=>setView("upload")}/>
+        {glData&&<TabBtn active={view==="analyzer"} label="📊 Analyzer" onClick={()=>setView("analyzer")}/>}
+        {glData&&<TabBtn active={view==="trends"} label="📈 Trends" onClick={()=>setView("trends")}/>}
+        {glData&&<TabBtn active={view==="categories"} label="🏷️ Categories" onClick={()=>setView("categories")}/>}
+        {glData&&<TabBtn active={view==="vendors"} label="🏭 Vendors" onClick={()=>setView("vendors")}/>}
+        {glData&&<TabBtn active={view==="customers"} label="🏢 Customers" onClick={()=>setView("customers")}/>}
+        {qboFiles.length>0&&<TabBtn active={view==="history"} label="📂 History" onClick={()=>setView("history")}/>}
       </div>
-      {/* Import history */}
-      {qboFiles.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Import History ({qboFiles.length})</div>
-        <div style={{maxHeight:300,overflowY:"auto"}}>{qboFiles.map((f,i)=>(
-          <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${T.borderLight}`}}>
-            <div><div style={{fontSize:12,fontWeight:600}}>{f.filename}</div><div style={{fontSize:10,color:T.textMuted}}>{f.type} • {new Date(f.imported_at).toLocaleDateString()}</div></div>
-            <Badge text={f.type} color={T.blueText} bg={T.blueBg}/>
+
+      {view==="upload"&&(
+        <div>
+          <div style={{...CS,borderLeft:`4px solid ${T.brand}`,background:T.brandPale,marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:700,color:T.brand,marginBottom:4}}>📂 Upload General Ledger for Full Analysis</div>
+            <div style={{fontSize:12,color:T.textMuted}}>The GL contains every transaction. MarginIQ auto-generates P&L by month, quarter, and year — no need to export separately.</div>
           </div>
-        ))}</div>
-      </div>}
-      {/* Show parsed customer data if available */}
-      {result?.type==="success"&&result.reportType==="customers"&&result.customers?.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Customer Revenue Breakdown</div><BarChart data={result.customers.slice(0,15)} labelKey="name" valueKey="revenue" maxBars={15}/></div>}
-      {result?.type==="success"&&result.reportType==="expenses"&&result.byVendor?.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Vendors by Spend</div><BarChart data={result.byVendor.slice(0,15)} labelKey="vendor" valueKey="total" color={T.red} maxBars={15}/></div>}
-      {result?.type==="success"&&result.reportType==="payroll"&&result.employees?.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Payroll by Employee</div><BarChart data={result.employees.slice(0,15)} labelKey="employee" valueKey="grossPay" color={T.purple} maxBars={15}/></div>}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:"12px"}}>
+            <div style={{...CS,border:`2px solid ${T.brand}`}}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>📒 General Ledger <Badge text="PRIMARY" color={T.brand} bg={T.brandPale}/></div>
+              <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>Reports → Accountant → General Ledger. Last 12+ months.</div>
+              <input ref={glRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleGL} style={{display:"none"}}/>
+              <PrimaryBtn text={importing?"Importing...":"Upload GL"} onClick={()=>glRef.current?.click()} loading={importing} style={{width:"100%",fontSize:12}}/>
+            </div>
+            {[{type:"pnl",icon:"📊",title:"Profit & Loss",sub:"Summary totals",ref:pnlRef},
+              {type:"bs",icon:"⚖️",title:"Balance Sheet",sub:"Assets/liabilities snapshot",ref:bsRef},
+              {type:"customers",icon:"🏢",title:"Sales by Customer",sub:"Revenue per customer",ref:custRef},
+              {type:"payroll",icon:"💵",title:"Payroll Summary",sub:"Pay per employee",ref:payRef},
+            ].map(item=>(
+              <div key={item.type} style={CS}>
+                <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>{item.icon} {item.title}</div>
+                <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>{item.sub}</div>
+                <input ref={item.ref} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleSimpleReport(e,item.type)} style={{display:"none"}}/>
+                <PrimaryBtn text={importing?"Importing...":`Upload ${item.title}`} onClick={()=>item.ref.current?.click()} loading={importing} style={{width:"100%",fontSize:12}}/>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {view==="analyzer"&&analysis&&(
+        <div>
+          {/* Period selector */}
+          <div style={{...CS,marginBottom:16}}>
+            <div style={{fontSize:12,color:T.textMuted,marginBottom:8}}>Break out by:</div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {[["month","Monthly"],["quarter","Quarterly"],["year","Yearly"]].map(([k,l])=><TabBtn key={k} active={period===k} label={l} onClick={()=>setPeriod(k)}/>)}
+            </div>
+          </div>
+          {/* All-time KPIs */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"14px"}}>
+            <KPI label="Total Revenue" value={fmtK(analysis.totalRev)} sub={`${analysis.periods.length} ${period}s`} subColor={T.green}/>
+            <KPI label="Total Expenses" value={fmtK(analysis.totalExp)} subColor={T.red}/>
+            <KPI label="Net Income" value={fmtK(analysis.netIncome)} sub={fmtPct(analysis.totalRev>0?(analysis.netIncome/analysis.totalRev*100):0)+" margin"} subColor={analysis.netIncome>0?T.green:T.red}/>
+            <KPI label="Transactions" value={fmtNum(glData.txnCount)}/>
+          </div>
+          {/* P&L by period table */}
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>P&L by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
+            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:600}}>
+              <thead><tr>{["Period","Revenue","Expenses","Net Income","Margin %"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>)}</tr></thead>
+              <tbody>{analysis.periods.map((p,i)=>(
+                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{p.period}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(p.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmt(p.expense)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:p.netIncome>0?T.green:T.red}}>{fmt(p.netIncome)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={fmtPct(p.margin)} color={p.margin>=30?T.greenText:p.margin>=15?T.yellowText:T.redText} bg={p.margin>=30?T.greenBg:p.margin>=15?T.yellowBg:T.redBg}/></td></tr>
+              ))}</tbody>
+            </table></div>
+          </div>
+          {/* Chart */}
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Revenue by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
+            <BarChart data={analysis.periods} labelKey="period" valueKey="revenue" color={T.green} maxBars={Math.min(analysis.periods.length,50)}/>
+          </div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Net Income by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
+            <BarChart data={analysis.periods} labelKey="period" valueKey="netIncome" color={T.brand} maxBars={Math.min(analysis.periods.length,50)}/>
+          </div>
+        </div>
+      )}
+
+      {view==="categories"&&analysis&&(
+        <div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Expense Categories (All-Time)</div>
+            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:500}}>
+              <thead><tr>{["Category","Total Spend","% of Expenses","Transactions","Drill"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+              <tbody>{analysis.expCats.map((c,i)=>(
+                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.subcat}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmt(c.total)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtPct(analysis.totalExp>0?c.total/analysis.totalExp*100:0)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted}}>{c.count}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><button onClick={()=>setSelectedCat(c.subcat)} style={{padding:"3px 10px",fontSize:10,borderRadius:6,border:`1px solid ${T.brand}`,background:"transparent",color:T.brand,cursor:"pointer"}}>View trend →</button></td></tr>
+              ))}</tbody>
+            </table></div>
+          </div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Expense Distribution</div>
+            <BarChart data={analysis.expCats.slice(0,20)} labelKey="subcat" valueKey="total" color={T.red} maxBars={20}/>
+          </div>
+          {selectedCat&&analysis.catTimeSeries[selectedCat]&&(
+            <div style={CS}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <div style={{fontSize:13,fontWeight:700}}>📈 {selectedCat} — Trend by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
+                <button onClick={()=>setSelectedCat(null)} style={{padding:"3px 10px",fontSize:10,borderRadius:6,border:`1px solid ${T.border}`,background:"transparent",color:T.textMuted,cursor:"pointer"}}>Close</button>
+              </div>
+              <BarChart data={Object.entries(analysis.catTimeSeries[selectedCat]).map(([period,value])=>({period,value})).sort((a,b)=>a.period.localeCompare(b.period))} labelKey="period" valueKey="value" color={T.orange} maxBars={50}/>
+            </div>
+          )}
+        </div>
+      )}
+
+      {view==="trends"&&analysis&&(
+        <div>
+          <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+            {[["month","Monthly"],["quarter","Quarterly"],["year","Yearly"]].map(([k,l])=><TabBtn key={k} active={period===k} label={l} onClick={()=>setPeriod(k)}/>)}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:"12px"}}>
+            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Revenue Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="revenue" color={T.green} maxBars={50}/></div>
+            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Expense Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="expense" color={T.red} maxBars={50}/></div>
+            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Net Income Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="netIncome" color={T.brand} maxBars={50}/></div>
+            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Margin % Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="margin" color={T.purple} formatValue={v=>fmtPct(v)} maxBars={50}/></div>
+          </div>
+        </div>
+      )}
+
+      {view==="vendors"&&analysis&&(
+        <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Vendors by Spend ({analysis.topVendors.length})</div>
+          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:400}}>
+            <thead><tr>{["#","Vendor","Total Spend","Transactions"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+            <tbody>{analysis.topVendors.map((v,i)=>(
+              <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim}}>{i+1}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{v.vendor}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmt(v.total)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{v.count}</td></tr>
+            ))}</tbody>
+          </table></div>
+        </div>
+      )}
+
+      {view==="customers"&&analysis&&(
+        <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Customers by Revenue ({analysis.topCustomers.length})</div>
+          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:400}}>
+            <thead><tr>{["#","Customer","Revenue","% of Total","Invoices"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+            <tbody>{analysis.topCustomers.map((c,i)=>(
+              <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim}}>{i+1}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(c.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtPct(analysis.totalRev>0?c.revenue/analysis.totalRev*100:0)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{c.count}</td></tr>
+            ))}</tbody>
+          </table></div>
+        </div>
+      )}
+
+      {view==="history"&&(
+        <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Import History ({qboFiles.length})</div>
+          <div style={{maxHeight:400,overflowY:"auto"}}>{qboFiles.map((f,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${T.borderLight}`}}>
+              <div><div style={{fontSize:12,fontWeight:600}}>{f.filename}</div><div style={{fontSize:10,color:T.textMuted}}>{f.type} • {new Date(f.imported_at).toLocaleDateString()}</div></div>
+              <Badge text={f.type==="gl"?"General Ledger":f.type==="pnl"?"P&L":f.type==="bs"?"Balance Sheet":f.type==="customers"?"Customers":f.type==="payroll"?"Payroll":f.type} color={T.blueText} bg={T.blueBg}/>
+            </div>
+          ))}</div>
+        </div>
+      )}
     </div>
   );
 }
