@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "4.2.0";
+const APP_VERSION = "4.2.1";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -1637,7 +1637,7 @@ function MarginIQApp({user,onLogout}){
     try{const r=await fetch("/.netlify/functions/marginiq-motive?action=vehicles");if(r.ok)setMotiveConnected(true);}catch(e){}setLoading(false);})();},[]);
   const margins=useMemo(()=>calculateMargins(costs,ulineWeeks.length>0?{totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0),totalStops:ulineWeeks.reduce((s,w)=>s+(w.totalStops||0),0),weekCount:ulineWeeks.length}:null,qboData),[costs,ulineWeeks,qboData]);
   const onUline=w=>{setUlineWeeks(p=>[w,...p.filter(x=>x.week_id!==w.week_id)]);};
-  const tabs=[{id:"command",l:"🎯"},{id:"ai",l:"🤖"},{id:"import",l:"📥"},{id:"reconcile",l:"🔗"},{id:"uline",l:"📦"},{id:"routes",l:"🛣️"},{id:"trends",l:"📈"},{id:"payroll",l:"💵"},{id:"mileage",l:"⛽"},{id:"customers",l:"🏢"},{id:"fleet",l:"🚛"},{id:"qbimport",l:"📁"},{id:"integrity",l:"🛡️"},{id:"costs",l:"⚙️"},{id:"settings",l:"🔧"}];
+  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"ai",i:"🤖",l:"AI"},{id:"import",i:"📥",l:"Import"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"qbimport",i:"📁",l:"QB Import"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"settings",i:"🔧",l:"Settings"}];
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
@@ -1652,7 +1652,7 @@ function MarginIQApp({user,onLogout}){
         </div>
       </div>
       <div style={{display:"flex",gap:"2px",padding:"6px 8px",overflowX:"auto",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.7)",WebkitOverflowScrolling:"touch"}} className="hide-scrollbar">
-        {tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"6px 10px",borderRadius:"7px",border:"none",background:tab===t.id?T.brand:"transparent",color:tab===t.id?"#fff":T.textMuted,fontSize:"14px",cursor:"pointer",whiteSpace:"nowrap",flexShrink:0,minWidth:36,textAlign:"center"}}>{t.l}</button>)}
+        {tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"7px 12px",borderRadius:"7px",border:"none",background:tab===t.id?T.brand:"transparent",color:tab===t.id?"#fff":T.textMuted,fontSize:"12px",fontWeight:tab===t.id?700:500,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0,display:"flex",alignItems:"center",gap:"6px",fontFamily:"inherit"}}><span style={{fontSize:"14px"}}>{t.i}</span><span>{t.l}</span></button>)}
       </div>
       {loading&&<div style={{textAlign:"center",padding:"60px 20px"}}><div className="loading-pulse" style={{fontSize:48,marginBottom:12}}>📊</div><div style={{fontSize:14,fontWeight:600}}>Loading...</div></div>}
       {!loading&&tab==="command"&&<CommandCenter margins={margins} ulineData={ulineWeeks.length>0?{weekCount:ulineWeeks.length,totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)}:null} qboConnected={qboConnected} qboData={qboData} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}}/>}
