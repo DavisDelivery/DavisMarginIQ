@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "5.1.1";
+const APP_VERSION = "5.2.0";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -154,13 +154,35 @@ function DonutChart({data,size=180}){const total=data.reduce((s,d)=>s+d.value,0)
 // ═══════════════════════════════════════════════════════════════
 // COMMAND CENTER
 // ═══════════════════════════════════════════════════════════════
-function CommandCenter({margins:m,ulineData,qboConnected,qboData,connections}){
+function CommandCenter({margins:m,ulineData,qboConnected,qboData,qbFinancials,connections}){
   const mc=m.dailyMarginPct>=30?T.green:m.dailyMarginPct>=20?T.yellow:T.red;
-  const hasData=m.totalAnnualCost>0||m.dailyRevenue>0;
+  const hasData=m.totalAnnualCost>0||m.dailyRevenue>0||qbFinancials;
   return(
     <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
       <SectionTitle icon="🎯" text="Command Center" right={<span style={{fontSize:10,color:T.textDim}}>{new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"})}</span>}/>
       {!hasData&&<div style={{...CS,borderColor:T.yellow,background:T.yellowBg}}><div style={{display:"flex",alignItems:"center",gap:12}}><span style={{fontSize:20}}>📊</span><div><div style={{fontSize:13,fontWeight:600,color:T.yellowText}}>No data yet</div><div style={{fontSize:11,color:T.textMuted}}>Upload Uline XLSX files, connect QuickBooks, or enter costs to see real numbers</div></div></div></div>}
+
+      {/* QB Financial Summary — real numbers from GL/P&L */}
+      {qbFinancials&&qbFinancials.totalRevenue>0&&<div style={{...CS,background:T.brandPale,borderLeft:`4px solid ${T.brand}`,marginBottom:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10,flexWrap:"wrap",gap:8}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:800,color:T.brand}}>📁 QuickBooks Financial Snapshot</div>
+            <div style={{fontSize:10,color:T.textMuted}}>From {qbFinancials.source==="gl"?"General Ledger":"P&L Report"} • {qbFinancials.dateStart||"?"} → {qbFinancials.dateEnd||"?"} • {fmtNum(qbFinancials.daysInRange)} days</div>
+          </div>
+          <Badge text={qbFinancials.source==="gl"?"GL-driven":"P&L-driven"} color={T.brand} bg="#fff"/>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8}}>
+          <div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Period Revenue</div><div style={{fontSize:18,fontWeight:800,color:T.green}}>{fmtK(qbFinancials.totalRevenue)}</div></div>
+          <div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Period Expenses</div><div style={{fontSize:18,fontWeight:800,color:T.red}}>{fmtK(qbFinancials.totalExpenses)}</div></div>
+          <div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Net Income</div><div style={{fontSize:18,fontWeight:800,color:qbFinancials.netIncome>0?T.green:T.red}}>{fmtK(qbFinancials.netIncome)}</div></div>
+          <div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Margin</div><div style={{fontSize:18,fontWeight:800,color:qbFinancials.marginPct>=15?T.green:qbFinancials.marginPct>=5?T.yellow:T.red}}>{fmtPct(qbFinancials.marginPct)}</div></div>
+          <div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Annualized Rev</div><div style={{fontSize:14,fontWeight:700,color:T.green}}>{fmtK(qbFinancials.annualRevenue)}/yr</div></div>
+          <div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Annualized Cost</div><div style={{fontSize:14,fontWeight:700,color:T.red}}>{fmtK(qbFinancials.annualExpenses)}/yr</div></div>
+          {qbFinancials.totalAssets>0&&<div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Total Assets</div><div style={{fontSize:14,fontWeight:700}}>{fmtK(qbFinancials.totalAssets)}</div></div>}
+          {qbFinancials.totalLiabilities>0&&<div><div style={{fontSize:10,color:T.textDim,fontWeight:600,textTransform:"uppercase"}}>Total Liabilities</div><div style={{fontSize:14,fontWeight:700}}>{fmtK(qbFinancials.totalLiabilities)}</div></div>}
+        </div>
+      </div>}
+
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
         <KPI icon="💰" label="Daily Revenue" value={m.dailyRevenue>0?fmt(m.dailyRevenue):"—"} sub={m.ulineAnnualRevenue>0?`${fmtK(m.ulineAnnualRevenue)}/yr`:"No data"} subColor={m.dailyRevenue>0?T.green:T.textDim}/>
         <KPI icon="📉" label="Daily Cost" value={m.dailyCost>0?fmt(m.dailyCost):"—"} sub={m.totalAnnualCost>0?`${fmtK(m.totalAnnualCost)}/yr`:"Enter costs"} subColor={m.dailyCost>0?T.red:T.textDim}/>
@@ -173,10 +195,17 @@ function CommandCenter({margins:m,ulineData,qboConnected,qboData,connections}){
       </div>
       {m.totalAnnualCost>0&&<div style={{...CS,borderLeft:`4px solid ${mc}`,marginBottom:16}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}><div><div style={{fontSize:13,fontWeight:700}}>Margin Health</div><div style={{fontSize:11,color:T.textMuted}}>Target: 30%</div></div><div style={{fontSize:28,fontWeight:800,color:mc}}>{m.dailyRevenue>0?fmtPct(m.dailyMarginPct):"—"}</div></div><MiniBar pct={m.dailyMarginPct*(100/50)} color={mc} height={10}/></div>}
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:"12px"}}>
-        {m.costBreakdown.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Annual Cost Breakdown</div><DonutChart data={m.costBreakdown}/></div>}
+        {m.costBreakdown.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:4}}>Annual Cost Breakdown</div>{qbFinancials?<div style={{fontSize:10,color:T.textMuted,marginBottom:8}}>From QuickBooks GL</div>:null}<DonutChart data={m.costBreakdown}/></div>}
         {(m.revenuePerStop>0||m.costPerStop>0)&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Per-Unit Economics</div><DataRow label="Revenue/stop" value={fmt(m.revenuePerStop)} valueColor={T.green}/><DataRow label="Cost/stop" value={fmt(m.costPerStop)} valueColor={T.red}/><DataRow label="Margin/stop" value={fmt(m.marginPerStop)} valueColor={m.marginPerStop>0?T.green:T.red} bold/><div style={{height:8}}/><DataRow label="Revenue/driver/day" value={fmt(m.revenuePerDriver)}/><DataRow label="Cost/driver/day" value={fmt(m.costPerDriver)}/><DataRow label="Revenue/truck/day" value={fmt(m.revenuePerTruck)}/></div>}
       </div>
-      <div style={{...CS,marginTop:12}}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Data Sources</div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8}}>{[{name:"Uline",on:!!ulineData,sub:ulineData?`${ulineData.weekCount} wks`:"Upload xlsx"},{name:"NuVizz",on:connections.nuvizz,sub:"Configured"},{name:"QuickBooks",on:qboConnected,sub:qboConnected?"Connected":"Not connected"},{name:"Motive",on:connections.motive,sub:connections.motive?"Connected":"Check API"},{name:"CyberPay",on:true,sub:"Auto Monday"}].map(s=><div key={s.name} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",borderRadius:8,background:T.bgSurface}}><div style={{width:8,height:8,borderRadius:"50%",background:s.on?T.green:T.textDim}}/><div><div style={{fontSize:12,fontWeight:600}}>{s.name}</div><div style={{fontSize:10,color:s.on?T.green:T.textDim}}>{s.sub}</div></div></div>)}</div></div>
+
+      {/* Top QB expense categories */}
+      {qbFinancials?.categoryTotals&&Object.keys(qbFinancials.categoryTotals).length>0&&<div style={{...CS,marginTop:12}}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Expense Categories (QuickBooks)</div>
+        <BarChart data={Object.entries(qbFinancials.categoryTotals).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([name,value])=>({name,value}))} labelKey="name" valueKey="value" color={T.red} maxBars={10}/>
+      </div>}
+
+      <div style={{...CS,marginTop:12}}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Data Sources</div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8}}>{[{name:"Uline",on:!!ulineData,sub:ulineData?`${ulineData.weekCount} wks`:"Upload xlsx"},{name:"QuickBooks Files",on:!!qbFinancials,sub:qbFinancials?`${qbFinancials.source==="gl"?"GL loaded":"P&L loaded"}`:"Upload in QB Import"},{name:"NuVizz",on:connections.nuvizz,sub:"Configured"},{name:"QBO API",on:qboConnected,sub:qboConnected?"Connected":"Not connected"},{name:"Motive",on:connections.motive,sub:connections.motive?"Connected":"Check API"},{name:"CyberPay",on:true,sub:"Auto Monday"}].map(s=><div key={s.name} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",borderRadius:8,background:T.bgSurface}}><div style={{width:8,height:8,borderRadius:"50%",background:s.on?T.green:T.textDim}}/><div><div style={{fontSize:12,fontWeight:600}}>{s.name}</div><div style={{fontSize:10,color:s.on?T.green:T.textDim}}>{s.sub}</div></div></div>)}</div></div>
     </div>
   );
 }
@@ -264,18 +293,54 @@ function RouteTab({margins}){
 // ═══════════════════════════════════════════════════════════════
 // CUSTOMER PROFITABILITY
 // ═══════════════════════════════════════════════════════════════
-function CustomerTab({ulineWeeks,margins}){
-  const allStops=ulineWeeks.flatMap(w=>w.stops||[]);const byC={};allStops.forEach(s=>{const c=s.customer||"?";if(!byC[c])byC[c]={customer:c,stops:0,revenue:0,weight:0};byC[c].stops++;byC[c].revenue+=(s.newCost||s.cost);byC[c].weight+=s.weight;});
-  const customers=Object.values(byC).map(c=>({...c,avg:c.stops>0?c.revenue/c.stops:0,estCost:c.stops*margins.costPerStop,estMargin:c.revenue-(c.stops*margins.costPerStop),marginPct:c.revenue>0?((c.revenue-(c.stops*margins.costPerStop))/c.revenue*100):0})).sort((a,b)=>b.revenue-a.revenue);
+function CustomerTab({ulineWeeks,margins,qbFinancials}){
+  const allStops=ulineWeeks.flatMap(w=>w.stops||[]);const byC={};allStops.forEach(s=>{const c=s.customer||"?";if(!byC[c])byC[c]={customer:c,ulineStops:0,ulineRevenue:0,weight:0};byC[c].ulineStops++;byC[c].ulineRevenue+=(s.newCost||s.cost);byC[c].weight+=s.weight;});
+  // Merge QB customer revenue
+  const qbCustMap={};(qbFinancials?.customerRevenue||[]).forEach(qc=>{qbCustMap[qc.customer.toLowerCase()]=qc.revenue;});
+  // Combine all customer sources
+  const allCustomerNames=new Set([...Object.keys(byC),...(qbFinancials?.customerRevenue||[]).map(qc=>qc.customer)]);
+  const customers=[...allCustomerNames].map(name=>{
+    const uline=byC[name]||{customer:name,ulineStops:0,ulineRevenue:0,weight:0};
+    const qbRev=qbCustMap[name.toLowerCase()]||0;
+    const totalRev=uline.ulineRevenue+qbRev;
+    return{
+      customer:name,
+      stops:uline.ulineStops,
+      ulineRevenue:uline.ulineRevenue,
+      qbRevenue:qbRev,
+      revenue:totalRev,
+      weight:uline.weight,
+      avg:uline.ulineStops>0?uline.ulineRevenue/uline.ulineStops:0,
+      estCost:uline.ulineStops*margins.costPerStop,
+      estMargin:totalRev-(uline.ulineStops*margins.costPerStop),
+      marginPct:totalRev>0?((totalRev-(uline.ulineStops*margins.costPerStop))/totalRev*100):0,
+      sources:[uline.ulineStops>0?"Uline":null,qbRev>0?"QB":null].filter(Boolean).join("+"),
+    };
+  }).filter(c=>c.revenue>0).sort((a,b)=>b.revenue-a.revenue);
   const totalRev=customers.reduce((s,c)=>s+c.revenue,0);
+  const ulineOnlyTotal=customers.reduce((s,c)=>s+c.ulineRevenue,0);
+  const qbOnlyTotal=customers.reduce((s,c)=>s+c.qbRevenue,0);
+
   return(
     <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="🏢" text="Customer Profitability"/>
-      {customers.length===0?<EmptyState icon="🏢" title="No Customer Data" sub="Upload Uline XLSX files"/>:(
+      <SectionTitle icon="🏢" text="Customer Profitability" right={qbFinancials&&<Badge text="QB + Uline merged" color={T.greenText} bg={T.greenBg}/>}/>
+      {customers.length===0?<EmptyState icon="🏢" title="No Customer Data" sub="Upload Uline XLSX files or QuickBooks Sales by Customer / General Ledger"/>:(
         <>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"14px"}}><KPI label="Customers" value={fmtNum(customers.length)}/><KPI label="Total Revenue" value={fmtK(totalRev)} subColor={T.green}/><KPI label="#1 Customer" value={fmtK(customers[0]?.revenue)} sub={customers[0]?.customer}/></div>
-          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Rankings by Revenue</div><div style={{maxHeight:600,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}><thead><tr>{["#","Customer","Stops","Revenue","% Total","Avg/Stop","Est Cost","Margin","Margin %"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead><tbody>{customers.map((c,i)=><tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim}}>{i+1}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{c.stops}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(c.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtPct(totalRev>0?c.revenue/totalRev*100:0)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(c.avg)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmt(c.estCost)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:c.estMargin>0?T.green:T.red}}>{fmt(c.estMargin)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={fmtPct(c.marginPct)} color={c.marginPct>=30?T.greenText:c.marginPct>=15?T.yellowText:T.redText} bg={c.marginPct>=30?T.greenBg:c.marginPct>=15?T.yellowBg:T.redBg}/></td></tr>)}</tbody></table></div></div>
-          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Revenue Distribution</div><BarChart data={customers.slice(0,20)} labelKey="customer" valueKey="revenue" maxBars={20}/></div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"14px"}}>
+            <KPI label="Customers" value={fmtNum(customers.length)}/>
+            <KPI label="Total Revenue" value={fmtK(totalRev)} subColor={T.green}/>
+            {qbOnlyTotal>0&&<KPI label="From QuickBooks" value={fmtK(qbOnlyTotal)} sub="all sources" subColor={T.blue}/>}
+            {ulineOnlyTotal>0&&<KPI label="From Uline Files" value={fmtK(ulineOnlyTotal)} sub="weekly audits" subColor={T.orange}/>}
+            <KPI label="#1 Customer" value={fmtK(customers[0]?.revenue)} sub={customers[0]?.customer?.slice(0,20)}/>
+            {customers[0]&&<KPI label="Top customer %" value={fmtPct(totalRev>0?customers[0].revenue/totalRev*100:0)} sub="concentration risk" subColor={customers[0].revenue/totalRev>0.5?T.red:T.yellow}/>}
+          </div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Rankings by Revenue ({customers.length} customers)</div>
+            <div style={{maxHeight:600,overflowY:"auto",overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:700}}>
+              <thead><tr>{["#","Customer","Source","Uline Rev","QB Rev","Total","% Total","Stops","Margin","Margin %"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>)}</tr></thead>
+              <tbody>{customers.map((c,i)=><tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim}}>{i+1}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={c.sources} color={T.blueText} bg={T.blueBg}/></td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:c.ulineRevenue>0?T.orange:T.textDim}}>{c.ulineRevenue>0?fmt(c.ulineRevenue):"—"}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:c.qbRevenue>0?T.blue:T.textDim}}>{c.qbRevenue>0?fmt(c.qbRevenue):"—"}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:700}}>{fmt(c.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtPct(totalRev>0?c.revenue/totalRev*100:0)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{c.stops||"—"}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:c.estMargin>0?T.green:T.red}}>{c.stops>0?fmt(c.estMargin):"—"}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{c.stops>0?<Badge text={fmtPct(c.marginPct)} color={c.marginPct>=30?T.greenText:c.marginPct>=15?T.yellowText:T.redText} bg={c.marginPct>=30?T.greenBg:c.marginPct>=15?T.yellowBg:T.redBg}/>:<span style={{color:T.textDim,fontSize:11}}>—</span>}</td></tr>)}</tbody>
+            </table></div>
+          </div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Revenue Distribution (Top 20)</div><BarChart data={customers.slice(0,20)} labelKey="customer" valueKey="revenue" maxBars={20}/></div>
         </>
       )}
     </div>
@@ -319,20 +384,74 @@ function QBTab({connected}){
 // ═══════════════════════════════════════════════════════════════
 // COST STRUCTURE
 // ═══════════════════════════════════════════════════════════════
-function CostsTab({costs,onSave,margins}){
+function CostsTab({costs,onSave,margins,qbFinancials}){
   const [c,setC]=useState({...DEFAULT_COSTS,...costs});const [saving,setSaving]=useState(false);const [saved,setSaved]=useState(false);
   const upd=(k,v)=>setC(p=>({...p,[k]:v}));const save=async()=>{setSaving(true);await FS.saveCosts(c);onSave(c);setSaving(false);setSaved(true);setTimeout(()=>setSaved(false),2000);};
   const F=({label,field,prefix,suffix,step})=>(<div style={{marginBottom:8}}><label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>{label}</label><div style={{display:"flex",alignItems:"center",gap:4}}>{prefix&&<span style={{fontSize:12,color:T.textDim}}>{prefix}</span>}<input type="number" value={c[field]||""} step={step||"any"} onChange={e=>upd(field,parseFloat(e.target.value)||0)} style={{...IS}}/>{suffix&&<span style={{fontSize:12,color:T.textDim,whiteSpace:"nowrap"}}>{suffix}</span>}</div></div>);
+
+  // Auto-populate from QB categories
+  const autoFillFromQB=()=>{
+    if(!qbFinancials||!qbFinancials.categoryTotals) {alert("No QB data loaded. Upload General Ledger in QB Import tab first.");return;}
+    const ann=qbFinancials.daysInRange>0?365/qbFinancials.daysInRange:1;
+    const cat=qbFinancials.categoryTotals;
+    const get=(name)=>Math.round((cat[name]||0)*ann);
+    // Annual totals derived from GL categories
+    const annualWarehouse=get("Rent")+get("Warehouse")+get("Utilities");
+    const annualForklifts=get("Warehouse"); // forklift leases are in warehouse bucket
+    const annualInsurance=get("Insurance");
+    // Update cost fields based on QB data
+    const newCosts={...c,
+      warehouse:annualWarehouse,
+      forklifts:0, // already in warehouse bucket from GL
+      // Don't overwrite headcounts/rates (those are manual judgment), but show totals in UI
+    };
+    setC(newCosts);
+    alert(`QB auto-fill:\n• Warehouse + Utilities + Rent: ${fmtK(annualWarehouse)}/yr\n• Insurance: ${fmtK(annualInsurance)}/yr\n• Salaries from GL: ${fmtK(get("Salaries & Wages")+get("Subcontractors")+get("Temp Labor")+get("Officer Salaries"))}/yr\n\nReview fields and click Save to persist.`);
+  };
+
   return(
     <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
       <SectionTitle icon="⚙️" text="Cost Structure" right={<div style={{display:"flex",gap:8,alignItems:"center"}}>{saved&&<Badge text="✓ Saved" color={T.greenText} bg={T.greenBg}/>}<PrimaryBtn text="Save" onClick={save} loading={saving} style={{padding:"8px 16px",fontSize:12}}/></div>}/>
+
+      {qbFinancials&&qbFinancials.totalExpenses>0&&<div style={{...CS,background:T.brandPale,borderLeft:`4px solid ${T.brand}`,marginBottom:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:700,color:T.brand}}>📁 QuickBooks Data Available</div>
+            <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>Annual expenses from QB: <strong style={{color:T.red}}>{fmtK(qbFinancials.annualExpenses)}</strong> • Annual revenue: <strong style={{color:T.green}}>{fmtK(qbFinancials.annualRevenue)}</strong></div>
+          </div>
+          <button onClick={autoFillFromQB} style={{padding:"8px 16px",fontSize:12,fontWeight:700,borderRadius:8,border:"none",background:T.brand,color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>Auto-fill from QB →</button>
+        </div>
+      </div>}
+
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:"12px"}}>
         <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🏭 Facility</div><F label="Warehouse (annual)" field="warehouse" prefix="$"/><F label="Forklifts (annual)" field="forklifts" prefix="$"/></div>
         <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>👥 Headcounts</div><F label="Box Truck Drivers" field="count_box_drivers"/><F label="Tractor Drivers" field="count_tractor_drivers"/><F label="Dispatchers" field="count_dispatchers"/><F label="Admin" field="count_admin"/><F label="Mechanics" field="count_mechanics"/><F label="Forklift Ops" field="count_forklift_ops"/></div>
         <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>💵 Rates</div><F label="Box Driver" field="rate_box_driver" prefix="$" suffix="/hr" step="0.50"/><F label="Tractor Driver" field="rate_tractor_driver" prefix="$" suffix="/hr" step="0.50"/><F label="Dispatcher" field="rate_dispatcher" prefix="$" suffix="/hr"/><F label="Admin" field="rate_admin" prefix="$" suffix="/hr"/><F label="Mechanic" field="rate_mechanic" prefix="$" suffix="/hr"/></div>
         <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🚛 Fleet</div><F label="Box Trucks" field="truck_count_box"/><F label="Tractors" field="truck_count_tractor"/><F label="Insurance $/truck/mo" field="truck_insurance_monthly" prefix="$"/><F label="Box MPG" field="mpg_box" suffix="MPG"/><F label="Tractor MPG" field="mpg_tractor" suffix="MPG"/><F label="Fuel $/gal" field="fuel_price" prefix="$" step="0.01"/></div>
         <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>📅 Ops</div><F label="Work Days/Year" field="working_days_year"/><F label="Avg Hrs/Shift" field="avg_hours_per_shift"/><F label="Contractor %" field="contractor_pct" step="0.01"/></div>
-        {margins.totalAnnualCost>0&&<div style={{...CS,background:T.brandPale,borderColor:T.brand}}><div style={{fontSize:13,fontWeight:700,marginBottom:10,color:T.brand}}>📊 Totals</div><DataRow label="Annual Labor" value={fmtK(margins.totalAnnualLabor)} bold/><DataRow label="Annual Fixed" value={fmtK(margins.totalAnnualFixed)}/><DataRow label="Annual Fuel (est)" value={fmtK(margins.annualFuelEst)}/><div style={{height:8}}/><DataRow label="TOTAL ANNUAL" value={fmtK(margins.totalAnnualCost+margins.annualFuelEst)} valueColor={T.red} bold/><DataRow label="Daily" value={fmt(margins.dailyCost+margins.dailyFuelEst)} valueColor={T.red} bold/><DataRow label="Monthly" value={fmtK(margins.monthlyCost+margins.annualFuelEst/12)} valueColor={T.red}/></div>}
+        {margins.totalAnnualCost>0&&<div style={{...CS,background:T.brandPale,borderColor:T.brand}}><div style={{fontSize:13,fontWeight:700,marginBottom:10,color:T.brand}}>📊 Totals (Manual)</div><DataRow label="Annual Labor" value={fmtK(margins.totalAnnualLabor)} bold/><DataRow label="Annual Fixed" value={fmtK(margins.totalAnnualFixed)}/><DataRow label="Annual Fuel (est)" value={fmtK(margins.annualFuelEst)}/><div style={{height:8}}/><DataRow label="TOTAL ANNUAL" value={fmtK(margins.totalAnnualCost+margins.annualFuelEst)} valueColor={T.red} bold/><DataRow label="Daily" value={fmt(margins.dailyCost+margins.dailyFuelEst)} valueColor={T.red} bold/><DataRow label="Monthly" value={fmtK(margins.monthlyCost+margins.annualFuelEst/12)} valueColor={T.red}/></div>}
+        {qbFinancials&&qbFinancials.categoryTotals&&<div style={{...CS,background:"#f0f9ff",borderColor:T.blue}}>
+          <div style={{fontSize:13,fontWeight:700,marginBottom:10,color:T.blue}}>📁 Actual from QB (Annualized)</div>
+          {(()=>{const ann=qbFinancials.daysInRange>0?365/qbFinancials.daysInRange:1;const cat=qbFinancials.categoryTotals;const get=(n)=>Math.round((cat[n]||0)*ann);return<>
+            <DataRow label="Salaries & Wages" value={fmtK(get("Salaries & Wages"))}/>
+            <DataRow label="Subcontractors" value={fmtK(get("Subcontractors"))}/>
+            <DataRow label="Temp Labor" value={fmtK(get("Temp Labor"))}/>
+            <DataRow label="Officer Salaries" value={fmtK(get("Officer Salaries"))}/>
+            <DataRow label="Payroll Taxes" value={fmtK(get("Payroll Taxes"))}/>
+            <div style={{height:4}}/>
+            <DataRow label="Fuel" value={fmtK(get("Fuel"))}/>
+            <DataRow label="Truck Maintenance" value={fmtK(get("Truck Maintenance"))}/>
+            <DataRow label="Truck Leases" value={fmtK(get("Truck Leases"))}/>
+            <DataRow label="Insurance" value={fmtK(get("Insurance"))}/>
+            <DataRow label="Health Insurance" value={fmtK(get("Health Insurance"))}/>
+            <DataRow label="Rent" value={fmtK(get("Rent"))}/>
+            <DataRow label="Warehouse" value={fmtK(get("Warehouse"))}/>
+            <DataRow label="Utilities" value={fmtK(get("Utilities"))}/>
+            <div style={{height:8}}/>
+            <DataRow label="TOTAL QB ANNUAL" value={fmtK(qbFinancials.annualExpenses)} valueColor={T.red} bold/>
+            <DataRow label="Daily (QB)" value={fmt(qbFinancials.annualExpenses/(c.working_days_year||260))} valueColor={T.red} bold/>
+          </>;})()}
+        </div>}
       </div>
     </div>
   );
@@ -358,7 +477,7 @@ function SettingsTab({qboConnected,motiveConnected}){
 // ═══════════════════════════════════════════════════════════════
 // AI INSIGHTS (Claude API powered analysis)
 // ═══════════════════════════════════════════════════════════════
-function AIInsights({margins,ulineWeeks,costs}){
+function AIInsights({margins,ulineWeeks,costs,qbFinancials}){
   const [query,setQuery]=useState("");const [response,setResponse]=useState(null);const [loading,setLoading]=useState(false);const [history,setHistory]=useState([]);
   const [extraData,setExtraData]=useState(null);
 
@@ -397,6 +516,29 @@ function AIInsights({margins,ulineWeeks,costs}){
       if(extraData.b600Summary?.length>0){lines.push(`B600 TIME CLOCK (${extraData.b600?.length||0} records): Top drivers by hours: ${extraData.b600Summary.slice(0,10).map(d=>`${d.name}:${fmtDec(d.totalHours,1)}hrs(${d.records}days)`).join(", ")}`);}
       if(extraData.nvStops>0){lines.push(`NUVIZZ STORED STOPS: ${extraData.nvStops} total. Top drivers: ${(extraData.nvDriverSummary||[]).slice(0,10).map(d=>`${d.name}:${d.stops}`).join(", ")}`);}
       if(extraData.payrolls?.length>0){lines.push(`CYBERPAY PAYROLL: ${extraData.payrolls.length} recent runs. Latest: ${extraData.payrolls[0]?.check_date||"?"} (${extraData.payrolls[0]?.from_date} to ${extraData.payrolls[0]?.to_date})`);}
+    }
+    // QB Financials — the authoritative financial picture
+    if(qbFinancials){
+      lines.push(`\n=== QUICKBOOKS FINANCIALS (${qbFinancials.source==="gl"?"from General Ledger":"from P&L"}) ===`);
+      lines.push(`Date range: ${qbFinancials.dateStart} to ${qbFinancials.dateEnd} (${qbFinancials.daysInRange} days)`);
+      lines.push(`Period revenue: ${fmtK(qbFinancials.totalRevenue)}, expenses: ${fmtK(qbFinancials.totalExpenses)}, net income: ${fmtK(qbFinancials.netIncome)}, margin: ${fmtPct(qbFinancials.marginPct)}`);
+      lines.push(`ANNUALIZED: Revenue ${fmtK(qbFinancials.annualRevenue)}/yr, Expenses ${fmtK(qbFinancials.annualExpenses)}/yr, Net ${fmtK(qbFinancials.annualNetIncome)}/yr`);
+      if(qbFinancials.totalAssets>0) lines.push(`Balance Sheet: Assets ${fmtK(qbFinancials.totalAssets)}, Liabilities ${fmtK(qbFinancials.totalLiabilities)}, Equity ${fmtK(qbFinancials.totalEquity)}`);
+      if(Object.keys(qbFinancials.categoryTotals||{}).length>0){
+        const ann=qbFinancials.daysInRange>0?365/qbFinancials.daysInRange:1;
+        const cats=Object.entries(qbFinancials.categoryTotals).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]).slice(0,15);
+        lines.push(`TOP EXPENSE CATEGORIES (ANNUAL): ${cats.map(([n,v])=>`${n}:${fmtK(v*ann)}`).join(", ")}`);
+      }
+      if(qbFinancials.customerRevenue?.length>0){
+        lines.push(`TOP 10 QB CUSTOMERS: ${qbFinancials.customerRevenue.slice(0,10).map(c=>`${c.customer}:${fmtK(c.revenue)}`).join(", ")}`);
+      }
+      if(qbFinancials.vendorSpend?.length>0){
+        lines.push(`TOP 10 QB VENDORS: ${qbFinancials.vendorSpend.slice(0,10).map(v=>`${v.vendor}:${fmtK(v.total)}`).join(", ")}`);
+      }
+      // Monthly/quarterly trend
+      if(qbFinancials.quarterlyPnL?.length>0){
+        lines.push(`QUARTERLY P&L (last 8 quarters): ${qbFinancials.quarterlyPnL.slice(-8).map(p=>`${p.period}:Rev${fmtK(p.revenue)}/NI${fmtK(p.netIncome)}/M${fmtPct(p.margin)}`).join(" | ")}`);
+      }
     }
     return lines.join("\n");
   };
@@ -1986,7 +2128,9 @@ function MileageTab({margins,costs}){
 // ═══════════════════════════════════════════════════════════════
 // TREND CHARTS (Week-over-week analysis)
 // ═══════════════════════════════════════════════════════════════
-function TrendsTab({ulineWeeks,margins}){
+function TrendsTab({ulineWeeks,margins,qbFinancials}){
+  const [tab,setT]=useState(qbFinancials?"qb":"uline");
+  const [qbPeriod,setQbPeriod]=useState("quarter");
   // Build weekly trends from Uline data (sorted chronologically)
   const sorted=[...ulineWeeks].sort((a,b)=>(a.upload_date||a.id||"").localeCompare(b.upload_date||b.id||""));
   const weeklyData=sorted.map((w,i)=>({
@@ -2032,10 +2176,55 @@ function TrendsTab({ulineWeeks,margins}){
     );
   }
 
+  // Get QB trend data based on selected period
+  const qbTrendData=qbFinancials?(qbPeriod==="month"?qbFinancials.monthlyPnL:qbPeriod==="quarter"?qbFinancials.quarterlyPnL:qbFinancials.yearlyPnL):[];
+
   return(
     <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="📈" text="Trends & Week-Over-Week"/>
-      {weeklyData.length<2?<EmptyState icon="📈" title="Need More Data" sub="Upload at least 2 Uline weekly files to see trends"/>:(
+      <SectionTitle icon="📈" text="Trends & Performance Over Time"/>
+
+      {/* Source tabs */}
+      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+        {qbFinancials&&<TabBtn active={tab==="qb"} label="📁 QuickBooks P&L Trends" onClick={()=>setT("qb")}/>}
+        <TabBtn active={tab==="uline"} label="📦 Uline Weekly Trends" onClick={()=>setT("uline")}/>
+      </div>
+
+      {/* QB TRENDS VIEW */}
+      {tab==="qb"&&qbFinancials&&qbTrendData.length>0&&(
+        <>
+          <div style={{display:"flex",gap:6,marginBottom:12}}>
+            {[["month","Monthly"],["quarter","Quarterly"],["year","Yearly"]].map(([k,l])=><TabBtn key={k} active={qbPeriod===k} label={l} onClick={()=>setQbPeriod(k)}/>)}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"14px"}}>
+            <KPI label="Periods" value={fmtNum(qbTrendData.length)} sub={qbPeriod+"s tracked"}/>
+            <KPI label="Avg Revenue" value={fmtK(qbTrendData.reduce((s,p)=>s+p.revenue,0)/qbTrendData.length)} sub={`per ${qbPeriod}`} subColor={T.green}/>
+            <KPI label="Avg Expenses" value={fmtK(qbTrendData.reduce((s,p)=>s+p.expense,0)/qbTrendData.length)} sub={`per ${qbPeriod}`} subColor={T.red}/>
+            <KPI label="Avg Net Income" value={fmtK(qbTrendData.reduce((s,p)=>s+p.netIncome,0)/qbTrendData.length)} subColor={T.brand}/>
+            {qbTrendData.length>=2&&<KPI label="Latest Change" value={(()=>{const a=qbTrendData[qbTrendData.length-1].netIncome;const b=qbTrendData[qbTrendData.length-2].netIncome;return(a-b>=0?"+":"")+fmtK(a-b);})()} sub="vs prior period" subColor={qbTrendData[qbTrendData.length-1].netIncome-qbTrendData[qbTrendData.length-2].netIncome>=0?T.green:T.red}/>}
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:"12px",marginBottom:12}}>
+            <div style={CS}><TrendLine data={qbTrendData.map(p=>({...p,label:p.period}))} valueKey="revenue" color={T.green} label={`Revenue by ${qbPeriod}`}/></div>
+            <div style={CS}><TrendLine data={qbTrendData.map(p=>({...p,label:p.period}))} valueKey="expense" color={T.red} label={`Expenses by ${qbPeriod}`}/></div>
+            <div style={CS}><TrendLine data={qbTrendData.map(p=>({...p,label:p.period}))} valueKey="netIncome" color={T.brand} label={`Net Income by ${qbPeriod}`}/></div>
+            <div style={CS}><TrendLine data={qbTrendData.map(p=>({...p,label:p.period}))} valueKey="margin" color={T.purple} label={`Margin % by ${qbPeriod}`}/></div>
+          </div>
+
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>P&L by {qbPeriod==="month"?"Month":qbPeriod==="quarter"?"Quarter":"Year"}</div>
+            <div style={{overflowX:"auto",maxHeight:500,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:600}}>
+              <thead><tr>{["Period","Revenue","Expenses","Net Income","Margin %"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>)}</tr></thead>
+              <tbody>{qbTrendData.map((p,i)=>(
+                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{p.period}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(p.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmt(p.expense)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:p.netIncome>0?T.green:T.red}}>{fmt(p.netIncome)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={fmtPct(p.margin)} color={p.margin>=15?T.greenText:p.margin>=5?T.yellowText:T.redText} bg={p.margin>=15?T.greenBg:p.margin>=5?T.yellowBg:T.redBg}/></td></tr>
+              ))}</tbody>
+            </table></div>
+          </div>
+        </>
+      )}
+
+      {tab==="qb"&&(!qbFinancials||qbTrendData.length===0)&&<EmptyState icon="📈" title="No QB Trend Data" sub="Upload General Ledger in QB Import tab to see monthly/quarterly/yearly trends"/>}
+
+      {/* ULINE TRENDS VIEW */}
+      {tab==="uline"&&(weeklyData.length<2?<EmptyState icon="📈" title="Need More Data" sub="Upload at least 2 Uline weekly files to see trends"/>:(
         <>
           {wow&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
             <KPI label="Revenue Change" value={(wow.revChange>=0?"+":"")+fmtK(wow.revChange)} sub={`${wow.revPctChange>=0?"+":""}${fmtDec(wow.revPctChange,1)}% WoW`} subColor={wow.revChange>=0?T.green:T.red}/>
@@ -2058,7 +2247,7 @@ function TrendsTab({ulineWeeks,margins}){
             </table></div>
           </div>
         </>
-      )}
+      ))}
     </div>
   );
 }
@@ -2139,11 +2328,167 @@ function MarginIQ(){
 function MarginIQApp({user,onLogout}){
   const [tab,setTab]=useState("command");const [costs,setCosts]=useState(DEFAULT_COSTS);const [ulineWeeks,setUlineWeeks]=useState([]);
   const [qboConnected,setQboConnected]=useState(false);const [qboData,setQboData]=useState(null);const [motiveConnected,setMotiveConnected]=useState(false);const [loading,setLoading]=useState(true);
+  const [qbImports,setQbImports]=useState([]); // ALL QB file imports (GL, P&L, BS, customers, payroll)
+  const reloadQB=async()=>{if(!hasFirebase)return;try{const s=await window.db.collection("qbo_imports").orderBy("imported_at","desc").get();setQbImports(s.docs.map(d=>({id:d.id,...d.data()})));}catch(e){console.warn("QB load:",e);}};
   useEffect(()=>{(async()=>{setLoading(true);const sc=await FS.getCosts();if(sc)setCosts(p=>({...p,...sc}));setUlineWeeks(await FS.getUlineWeeks());
+    await reloadQB();
     try{const r=await fetch("/.netlify/functions/marginiq-qbo-data?action=status");const d=await r.json();if(d.connected){setQboConnected(true);const dash=await fetchQBO("dashboard",`${new Date().getFullYear()}-01-01`,new Date().toISOString().slice(0,10));if(dash)setQboData(dash);}}catch(e){}
     const p=new URLSearchParams(window.location.search);if(p.get("qbo")==="connected"){setQboConnected(true);window.history.replaceState({},"","/");}if(p.get("qbo")==="error"){alert("QBO Failed: "+(p.get("reason")||"unknown")+"\n"+(p.get("detail")?decodeURIComponent(p.get("detail")):""));window.history.replaceState({},"","/");}
     try{const r=await fetch("/.netlify/functions/marginiq-motive?action=vehicles");if(r.ok)setMotiveConnected(true);}catch(e){}setLoading(false);})();},[]);
-  const margins=useMemo(()=>calculateMargins(costs,ulineWeeks.length>0?{totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0),totalStops:ulineWeeks.reduce((s,w)=>s+(w.totalStops||0),0),weekCount:ulineWeeks.length}:null,qboData),[costs,ulineWeeks,qboData]);
+
+  // Derive consolidated QB financials from all imports
+  const qbFinancials=useMemo(()=>{
+    if(qbImports.length===0)return null;
+    const gl=qbImports.find(q=>q.type==="gl");
+    const pnl=qbImports.find(q=>q.type==="pnl");
+    const bs=qbImports.find(q=>q.type==="bs");
+    const customersImport=qbImports.find(q=>q.type==="customers");
+    const payrollImport=qbImports.find(q=>q.type==="payroll");
+
+    // Prefer GL-derived totals over P&L if we have GL transactions
+    let totalRevenue=0,totalExpenses=0,netIncome=0,dateStart=null,dateEnd=null,source="";
+    let monthlyPnL=[],quarterlyPnL=[],yearlyPnL=[];
+    let categoryTotals={},customerRevenue=[],vendorSpend=[];
+
+    if(gl?.transactions&&gl.transactions.length>0){
+      source="gl";
+      const txns=gl.transactions;
+      dateStart=gl.dateStart;dateEnd=gl.dateEnd;
+      // Inline classify (match the QBOImport logic)
+      const classify=(account)=>{
+        const a=String(account||"").toLowerCase();
+        if(a.includes("delivery sales")||a.includes("sales income")||a.match(/^income/)) return {cat:"revenue",sub:"Delivery Sales"};
+        if(a.includes("misc")&&a.includes("income")) return {cat:"revenue",sub:"Other Income"};
+        if(a.includes("salaries")||a.includes("wages")) return {cat:"expense",sub:"Salaries & Wages"};
+        if(a.includes("subcontractor")||a.includes("3rd party delivery")) return {cat:"expense",sub:"Subcontractors"};
+        if(a.includes("temporary services")) return {cat:"expense",sub:"Temp Labor"};
+        if(a.includes("officers salaries")) return {cat:"expense",sub:"Officer Salaries"};
+        if(a.includes("payroll tax")) return {cat:"expense",sub:"Payroll Taxes"};
+        if(a.includes("payroll fees")||a.includes("payroll deduction")||a.includes("contract labor")) return {cat:"expense",sub:"Payroll Other"};
+        if(a.includes("truck fuel")||a.includes("fuel - gas")) return {cat:"expense",sub:"Fuel"};
+        if(a.includes("truck repair")||a.includes("truck maintenance")||a.includes("truck parts")||a.includes("truck tires")||a.includes("truck wash")||a.includes("truck - misc")||a.includes("trailer repair")||a.includes("towing")) return {cat:"expense",sub:"Truck Maintenance"};
+        if(a.includes("truck lease")||a.includes("trailer rental")||a.includes("rent - equipment")) return {cat:"expense",sub:"Truck Leases"};
+        if(a.includes("taxes & licenses - trucks")||a.includes("licenses & permits")) return {cat:"expense",sub:"Truck Taxes/Licenses"};
+        if(a.includes("insurance")&&!a.includes("health")) return {cat:"expense",sub:"Insurance"};
+        if(a.includes("health plan")||a.includes("fsa")||a.includes("health & dental")||a.includes("medical")) return {cat:"expense",sub:"Health Insurance"};
+        if(a.includes("rent - office")||a.includes("rent office")) return {cat:"expense",sub:"Rent"};
+        if(a.includes("warehouse")||a.includes("propane")||a.includes("fork lift")||a.includes("forklift")) return {cat:"expense",sub:"Warehouse"};
+        if(a.includes("utilities")||a.includes("electric")||a.includes("cell phone")||a.includes("telephone")||a.includes("trash")) return {cat:"expense",sub:"Utilities"};
+        if(a.includes("computer")||a.includes("internet")) return {cat:"expense",sub:"IT"};
+        if(a.includes("bank charge")||a.includes("interest")) return {cat:"expense",sub:"Bank/Interest"};
+        if(a.includes("legal")||a.includes("professional")) return {cat:"expense",sub:"Legal/Professional"};
+        if(a.includes("depreciation")) return {cat:"expense",sub:"Depreciation"};
+        if(a.includes("office")||a.includes("admin")) return {cat:"expense",sub:"Office/Admin"};
+        if(a.includes("meals")||a.includes("travel")||a.includes("seminars")) return {cat:"expense",sub:"Travel/Meals"};
+        if(a.includes("damages")||a.includes("claims")||a.includes("penalties")) return {cat:"expense",sub:"Damages/Claims"};
+        if(a.includes("uniform")) return {cat:"expense",sub:"Uniforms"};
+        if(a.includes("uline purchase")) return {cat:"expense",sub:"Uline Supplies"};
+        if(a.includes("advertis")||a.includes("promotion")) return {cat:"expense",sub:"Marketing"};
+        if(a.includes("state tax")||a.includes("property tax")||a.includes("other taxes")) return {cat:"expense",sub:"Other Taxes"};
+        if(a.includes("repair")||a.includes("maintenance")) return {cat:"expense",sub:"Repairs"};
+        if(a.includes("supplies")||a.includes("materials")||a.includes("stationery")) return {cat:"expense",sub:"Supplies"};
+        if(a.includes("retirement")||a.includes("401k")) return {cat:"expense",sub:"Retirement"};
+        if(a.includes("dues")||a.includes("subscription")) return {cat:"expense",sub:"Dues/Subs"};
+        if(a.includes("bad debt")) return {cat:"expense",sub:"Bad Debts"};
+        return {cat:"other",sub:a};
+      };
+      const monthly={},quarterly={},yearly={};
+      const vendors={},customers={};
+      txns.forEach(t=>{
+        const c=classify(t.account);
+        if(c.cat==="other")return;
+        const amt=c.cat==="revenue"?(t.credit-t.debit):(t.debit-t.credit);
+        if(c.cat==="revenue") totalRevenue+=amt; else totalExpenses+=amt;
+        categoryTotals[c.sub]=(categoryTotals[c.sub]||0)+amt;
+        if(!monthly[t.yearMonth]) monthly[t.yearMonth]={period:t.yearMonth,revenue:0,expense:0};
+        if(!quarterly[t.yearQuarter]) quarterly[t.yearQuarter]={period:t.yearQuarter,revenue:0,expense:0};
+        const y=String(t.year);if(!yearly[y]) yearly[y]={period:y,revenue:0,expense:0};
+        if(c.cat==="revenue"){monthly[t.yearMonth].revenue+=amt;quarterly[t.yearQuarter].revenue+=amt;yearly[y].revenue+=amt;}
+        else{monthly[t.yearMonth].expense+=amt;quarterly[t.yearQuarter].expense+=amt;yearly[y].expense+=amt;}
+        // Vendor/customer breakdown
+        if(t.name){
+          if(c.cat==="expense"){if(!vendors[t.name])vendors[t.name]={vendor:t.name,total:0,count:0};vendors[t.name].total+=amt;vendors[t.name].count++;}
+          if(c.cat==="revenue"){if(!customers[t.name])customers[t.name]={customer:t.name,revenue:0,count:0};customers[t.name].revenue+=amt;customers[t.name].count++;}
+        }
+      });
+      const addMeta=p=>({...p,netIncome:p.revenue-p.expense,margin:p.revenue>0?(p.revenue-p.expense)/p.revenue*100:0});
+      monthlyPnL=Object.values(monthly).map(addMeta).sort((a,b)=>a.period.localeCompare(b.period));
+      quarterlyPnL=Object.values(quarterly).map(addMeta).sort((a,b)=>a.period.localeCompare(b.period));
+      yearlyPnL=Object.values(yearly).map(addMeta).sort((a,b)=>a.period.localeCompare(b.period));
+      vendorSpend=Object.values(vendors).filter(v=>v.total>0).sort((a,b)=>b.total-a.total).slice(0,100);
+      customerRevenue=Object.values(customers).filter(c=>c.revenue>0).sort((a,b)=>b.revenue-a.revenue).slice(0,200);
+      netIncome=totalRevenue-totalExpenses;
+    }else if(pnl){
+      source="pnl";
+      totalRevenue=pnl.totalRevenue||0;totalExpenses=pnl.totalExpenses||0;netIncome=pnl.netIncome||0;
+      // Extract categories from P&L items
+      (pnl.items||[]).forEach(it=>{if(it.section==="expense"&&!it.isTotal) categoryTotals[it.label]=it.value;});
+    }
+
+    // Overlay customers import if present (may be more structured)
+    if(customersImport?.customers) customerRevenue=customersImport.customers.map(c=>({customer:c.name,revenue:c.revenue,count:0}));
+
+    // Calculate date-range days for annualizing
+    let daysInRange=365;
+    if(dateStart&&dateEnd){try{daysInRange=Math.max(1,Math.round((new Date(dateEnd)-new Date(dateStart))/(1000*60*60*24)));}catch(e){}}
+    const annualizer=daysInRange>0?365/daysInRange:1;
+
+    return{
+      source, // "gl" or "pnl"
+      hasGL:!!gl,hasPnL:!!pnl,hasBS:!!bs,hasCustomers:!!customersImport,hasPayroll:!!payrollImport,
+      totalRevenue,totalExpenses,netIncome,
+      marginPct:totalRevenue>0?(netIncome/totalRevenue*100):0,
+      dateStart,dateEnd,daysInRange,
+      annualRevenue:totalRevenue*annualizer,
+      annualExpenses:totalExpenses*annualizer,
+      annualNetIncome:netIncome*annualizer,
+      monthlyPnL,quarterlyPnL,yearlyPnL,
+      categoryTotals, // sub => $
+      customerRevenue, // [{customer,revenue,count}]
+      vendorSpend, // [{vendor,total,count}]
+      bs, // raw balance sheet data
+      pnlRaw:pnl,
+      totalAssets:bs?.totalAssets||0,totalLiabilities:bs?.totalLiabilities||0,totalEquity:bs?.totalEquity||0,
+      payrollEmployees:payrollImport?.employees||[],
+    };
+  },[qbImports]);
+
+  // Enhanced margins that use QB data when available
+  const margins=useMemo(()=>{
+    const ulineAgg=ulineWeeks.length>0?{totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0),totalStops:ulineWeeks.reduce((s,w)=>s+(w.totalStops||0),0),weekCount:ulineWeeks.length}:null;
+    const m=calculateMargins(costs,ulineAgg,qboData);
+    // Enhance with QB data if available
+    if(qbFinancials){
+      const wd=costs.working_days_year||260;
+      // Use QB annualized numbers as the authoritative financial picture
+      m.qbAnnualRevenue=qbFinancials.annualRevenue;
+      m.qbAnnualExpenses=qbFinancials.annualExpenses;
+      m.qbAnnualNetIncome=qbFinancials.annualNetIncome;
+      m.qbMarginPct=qbFinancials.marginPct;
+      m.qbDailyRevenue=qbFinancials.annualRevenue/wd;
+      m.qbDailyExpenses=qbFinancials.annualExpenses/wd;
+      m.qbDailyNetIncome=qbFinancials.annualNetIncome/wd;
+      // When Uline isn't loaded, use QB daily revenue
+      if(!ulineAgg&&qbFinancials.annualRevenue>0){m.dailyRevenue=m.qbDailyRevenue;m.ulineAnnualRevenue=qbFinancials.annualRevenue;}
+      // Use QB expenses as authoritative cost if cost structure isn't set
+      if(!costs.count_box_drivers&&qbFinancials.annualExpenses>0){
+        m.totalAnnualCost=qbFinancials.annualExpenses;
+        m.dailyCost=qbFinancials.annualExpenses/wd;
+        m.monthlyCost=qbFinancials.annualExpenses/12;
+        m.dailyMargin=m.dailyRevenue-m.dailyCost;
+        m.dailyMarginPct=m.dailyRevenue>0?(m.dailyMargin/m.dailyRevenue*100):0;
+      }
+      // Real cost breakdown from QB categories
+      if(Object.keys(qbFinancials.categoryTotals).length>0){
+        const annualizer=qbFinancials.daysInRange>0?365/qbFinancials.daysInRange:1;
+        const colors=["#3b82f6","#6366f1","#f59e0b","#10b981","#ef4444","#f97316","#8b5cf6","#ec4899","#14b8a6","#78716c","#06b6d4","#84cc16"];
+        m.qbCostBreakdown=Object.entries(qbFinancials.categoryTotals).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]).slice(0,12).map(([name,value],i)=>({name,value:value*annualizer,color:colors[i%colors.length]}));
+        // If cost structure isn't manually set, show QB breakdown on command center
+        if(m.costBreakdown.length===0||!costs.count_box_drivers) m.costBreakdown=m.qbCostBreakdown;
+      }
+    }
+    return m;
+  },[costs,ulineWeeks,qboData,qbFinancials]);
   const onUline=w=>{setUlineWeeks(p=>[w,...p.filter(x=>x.week_id!==w.week_id)]);};
   const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"qbimport",i:"📁",l:"QB Import"},{id:"import",i:"📥",l:"Import"},{id:"settings",i:"🔧",l:"Settings"}];
   return(
@@ -2167,20 +2512,20 @@ function MarginIQApp({user,onLogout}){
         {tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"7px 12px",borderRadius:"7px",border:"none",background:tab===t.id?T.brand:"transparent",color:tab===t.id?"#fff":T.textMuted,fontSize:"12px",fontWeight:tab===t.id?700:500,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0,display:"flex",alignItems:"center",gap:"6px",fontFamily:"inherit"}}><span style={{fontSize:"14px"}}>{t.i}</span><span>{t.l}</span></button>)}
       </div>
       {loading&&<div style={{textAlign:"center",padding:"60px 20px"}}><div className="loading-pulse" style={{fontSize:48,marginBottom:12}}>📊</div><div style={{fontSize:14,fontWeight:600}}>Loading...</div></div>}
-      {!loading&&tab==="command"&&<CommandCenter margins={margins} ulineData={ulineWeeks.length>0?{weekCount:ulineWeeks.length,totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)}:null} qboConnected={qboConnected} qboData={qboData} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}}/>}
-      {!loading&&tab==="ai"&&<AIInsights margins={margins} ulineWeeks={ulineWeeks} costs={costs}/>}
+      {!loading&&tab==="command"&&<CommandCenter margins={margins} ulineData={ulineWeeks.length>0?{weekCount:ulineWeeks.length,totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)}:null} qboConnected={qboConnected} qboData={qboData} qbFinancials={qbFinancials} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}}/>}
+      {!loading&&tab==="ai"&&<AIInsights margins={margins} ulineWeeks={ulineWeeks} costs={costs} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="import"&&<DataImport ulineWeeks={ulineWeeks} onUlineUpload={onUline}/>}
       {!loading&&tab==="reconcile"&&<ReconciliationTab ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="integrity"&&<DataIntegrity ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="uline"&&<UlineTab ulineWeeks={ulineWeeks} onUpload={onUline} margins={margins}/>}
       {!loading&&tab==="routes"&&<RouteTab margins={margins}/>}
-      {!loading&&tab==="customers"&&<CustomerTab ulineWeeks={ulineWeeks} margins={margins}/>}
+      {!loading&&tab==="customers"&&<CustomerTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="fleet"&&<FleetTab margins={margins}/>}
-      {!loading&&tab==="qbimport"&&<QBOImport/>}
-      {!loading&&tab==="payroll"&&<PayrollTab ulineWeeks={ulineWeeks} margins={margins}/>}
+      {!loading&&tab==="qbimport"&&<QBOImport onChange={reloadQB}/>}
+      {!loading&&tab==="payroll"&&<PayrollTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="mileage"&&<MileageTab margins={margins} costs={costs}/>}
-      {!loading&&tab==="trends"&&<TrendsTab ulineWeeks={ulineWeeks} margins={margins}/>}
-      {!loading&&tab==="costs"&&<CostsTab costs={costs} onSave={setCosts} margins={margins}/>}
+      {!loading&&tab==="trends"&&<TrendsTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
+      {!loading&&tab==="costs"&&<CostsTab costs={costs} onSave={setCosts} margins={margins} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="settings"&&<SettingsTab qboConnected={qboConnected} motiveConnected={motiveConnected}/>}
     </div>
   );
