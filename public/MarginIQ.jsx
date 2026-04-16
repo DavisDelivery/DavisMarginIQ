@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "3.2.1";
+const APP_VERSION = "4.2.0";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -933,11 +933,702 @@ function DataIntegrity({ulineWeeks}){
     </div>
   );
 }
+// ═══════════════════════════════════════════════════════════════
+// ULINE ↔ NUVIZZ RECONCILIATION
+// ═══════════════════════════════════════════════════════════════
+function ReconciliationTab({ulineWeeks}){
+  const [loading,setLoading]=useState(false);
+  const [nvStops,setNvStops]=useState(null);
+  const [report,setReport]=useState(null);
+  const [view,setView]=useState("summary");
+  const [pullDates,setPullDates]=useState({from:"",to:""});
+
+  // Load stored NuVizz stops from Firebase
+  const loadNvStops=async()=>{
+    if(!hasFirebase) return {};
+    try{const s=await window.db.collection("nuvizz_stops").get();const map={};s.docs.forEach(d=>{const data=d.data();const key=String(data.stopNbr||d.id).replace(/^0+/,"");map[key]=data;});return map;}catch(e){return {};}
+  };
+
+  // Also try live NuVizz API for a date range
+  const pullLiveNuVizz=async(from,to)=>{
+    try{const j=await fetchNuVizzStops(from,to);if(!j) return {};const stops=Array.isArray(j)?j:(j.stopList||j.stops||j.data||[]);const map={};stops.forEach(s=>{const key=String(s.stopNbr||s.id||"").replace(/^0+/,"");if(key) map[key]=s;});return map;}catch(e){return {};}
+  };
+
+  const runReconciliation=async(useLive)=>{
+    setLoading(true);setReport(null);
+    try{
+      // Get all Uline PROs
+      const allStops=ulineWeeks.flatMap(w=>w.stops||[]);
+      const ulinePros=new Map();
+      allStops.forEach(s=>{
+        if(!s.pro) return;
+        const key=String(s.pro).replace(/^0+/,"");
+        if(!ulinePros.has(key)) ulinePros.set(key,{pro:key,customer:s.customer,city:s.city,state:s.state,zip:s.zip,weight:s.weight,cost:s.newCost||s.cost,skids:s.skids,order:s.order,warehouse:s.warehouse});
+        else{const existing=ulinePros.get(key);existing.cost+=(s.newCost||s.cost);} // aggregate if dup PRO
+      });
+
+      // Get NuVizz data (stored + optionally live)
+      let nvMap=await loadNvStops();
+      if(useLive&&pullDates.from&&pullDates.to){
+        const liveMap=await pullLiveNuVizz(pullDates.from,pullDates.to);
+        nvMap={...nvMap,...liveMap};
+      }
+      const nvKeys=new Set(Object.keys(nvMap));
+
+      // Build reconciliation
+      const matched=[];const ulineOnly=[];const nvOnly=[];
+      ulinePros.forEach((uData,pro)=>{
+        if(nvKeys.has(pro)){
+          const nv=nvMap[pro];
+          matched.push({
+            pro, source:"both",
+            // Uline side
+            uCustomer:uData.customer, uCity:uData.city, uState:uData.state, uZip:uData.zip,
+            uWeight:uData.weight, uCost:uData.cost, uSkids:uData.skids, uOrder:uData.order,
+            // NuVizz side
+            nDriver:nv.driverName||nv.driver||"",
+            nRoute:nv.loadNbr||nv.routeName||"",
+            nStatus:nv.stopStatus||(nv.stopExecutionInfo?.stopStatus)||"",
+            nCity:nv.city||(nv.to?.address?.city)||"",
+            nVehicle:nv.vehicleNbr||"",
+            nArrival:nv.actualArrival||(nv.stopExecutionInfo?.to?.actualArrival)||"",
+            nDeparture:nv.actualDeparture||(nv.stopExecutionInfo?.to?.actualDeparture)||"",
+            nWeight:nv.weight||0,
+            nPallets:nv.totalPallets||0,
+          });
+          nvKeys.delete(pro);
+        }else{
+          ulineOnly.push({pro,source:"uline_only",...uData});
+        }
+      });
+      // Remaining NuVizz stops not in Uline
+      nvKeys.forEach(key=>{
+        const nv=nvMap[key];
+        nvOnly.push({
+          pro:key,source:"nuvizz_only",
+          nDriver:nv.driverName||nv.driver||"",
+          nRoute:nv.loadNbr||nv.routeName||"",
+          nStatus:nv.stopStatus||(nv.stopExecutionInfo?.stopStatus)||"",
+          nCity:nv.city||(nv.to?.address?.city)||"",
+          nCustomer:nv.custName||nv.customerName||(nv.to?.address?.name)||"",
+          nWeight:nv.weight||0,
+        });
+      });
+
+      // Revenue analysis
+      const matchedRevenue=matched.reduce((s,r)=>s+r.uCost,0);
+      const ulineOnlyRevenue=ulineOnly.reduce((s,r)=>s+r.cost,0);
+      const totalUlineRevenue=matchedRevenue+ulineOnlyRevenue;
+      const matchRate=ulinePros.size>0?(matched.length/ulinePros.size*100):0;
+
+      // Status analysis on matched stops
+      const delivered=matched.filter(m=>{const st=String(m.nStatus).toLowerCase();return st.match(/90|91|deliver|complet/);});
+      const notDelivered=matched.filter(m=>{const st=String(m.nStatus).toLowerCase();return !st.match(/90|91|deliver|complet/);});
+
+      // Driver revenue from matched stops
+      const driverRevenue={};
+      matched.forEach(m=>{
+        const drv=m.nDriver||"Unknown";
+        if(!driverRevenue[drv]) driverRevenue[drv]={driver:drv,stops:0,revenue:0,weight:0,routes:new Set()};
+        driverRevenue[drv].stops++;driverRevenue[drv].revenue+=m.uCost;driverRevenue[drv].weight+=m.uWeight;
+        if(m.nRoute) driverRevenue[drv].routes.add(m.nRoute);
+      });
+      const driverArr=Object.values(driverRevenue).map(d=>({...d,routes:d.routes.size,avgPerStop:d.stops>0?d.revenue/d.stops:0})).sort((a,b)=>b.revenue-a.revenue);
+
+      // Route revenue from matched stops
+      const routeRevenue={};
+      matched.forEach(m=>{
+        const rt=m.nRoute||"Unknown";
+        if(!routeRevenue[rt]) routeRevenue[rt]={route:rt,driver:m.nDriver,stops:0,revenue:0,weight:0};
+        routeRevenue[rt].stops++;routeRevenue[rt].revenue+=m.uCost;routeRevenue[rt].weight+=m.uWeight;
+      });
+      const routeArr=Object.values(routeRevenue).sort((a,b)=>b.revenue-a.revenue);
+
+      setReport({
+        ulinePros:ulinePros.size,nvStops:Object.keys(nvMap).length+nvKeys.size,
+        matched,ulineOnly,nvOnly,
+        matchedRevenue,ulineOnlyRevenue,totalUlineRevenue,matchRate,
+        delivered,notDelivered,
+        byDriver:driverArr,byRoute:routeArr,
+      });
+    }catch(e){console.warn("Reconciliation error:",e);}
+    setLoading(false);
+  };
+
+  return(
+    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="🔗" text="Uline ↔ NuVizz Reconciliation"/>
+
+      {/* Controls */}
+      <div style={CS}>
+        <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>Match Uline billing PROs against NuVizz delivery records. Uses stored NuVizz data from Firebase. Optionally pull live NuVizz data for a date range.</div>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10}}>
+          <span style={{fontSize:12,color:T.textMuted}}>Live pull (optional):</span>
+          <input type="date" value={pullDates.from} onChange={e=>setPullDates(p=>({...p,from:e.target.value}))} style={{...IS,width:140,fontSize:12}}/>
+          <span style={{color:T.textDim}}>→</span>
+          <input type="date" value={pullDates.to} onChange={e=>setPullDates(p=>({...p,to:e.target.value}))} style={{...IS,width:140,fontSize:12}}/>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <PrimaryBtn text={loading?"Reconciling...":"Reconcile (Stored Data)"} onClick={()=>runReconciliation(false)} loading={loading}/>
+          {pullDates.from&&pullDates.to&&<PrimaryBtn text={loading?"Pulling...":"Reconcile + Live Pull"} onClick={()=>runReconciliation(true)} loading={loading} style={{background:`linear-gradient(135deg,${T.green},#059669)`}}/>}
+        </div>
+      </div>
+
+      {ulineWeeks.length===0&&<EmptyState icon="📦" title="No Uline Data" sub="Upload Uline XLSX files first, then run reconciliation"/>}
+
+      {report&&(
+        <>
+          {/* Summary KPIs */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"10px",marginBottom:"14px"}}>
+            <KPI label="Uline PROs" value={fmtNum(report.ulinePros)}/>
+            <KPI label="NuVizz Stops" value={fmtNum(report.nvStops)}/>
+            <KPI label="Matched" value={fmtNum(report.matched.length)} sub={fmtPct(report.matchRate)+" match rate"} subColor={report.matchRate>80?T.green:T.yellow}/>
+            <KPI label="Matched Revenue" value={fmtK(report.matchedRevenue)} sub="confirmed delivered" subColor={T.green}/>
+            <KPI label="Uline Only" value={fmtNum(report.ulineOnly.length)} sub={fmtK(report.ulineOnlyRevenue)} subColor={report.ulineOnly.length>0?T.yellow:T.green}/>
+            <KPI label="NuVizz Only" value={fmtNum(report.nvOnly.length)} sub="delivered, not billed?" subColor={report.nvOnly.length>0?T.red:T.green}/>
+          </div>
+
+          {/* Revenue health bar */}
+          <div style={{...CS,borderLeft:`4px solid ${report.matchRate>80?T.green:T.yellow}`,marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <div style={{fontSize:13,fontWeight:700}}>Revenue Reconciliation</div>
+              <div style={{fontSize:20,fontWeight:800,color:report.matchRate>80?T.green:T.yellow}}>{fmtPct(report.matchRate)}</div>
+            </div>
+            <MiniBar pct={report.matchRate} color={report.matchRate>80?T.green:T.yellow} height={10}/>
+            <div style={{display:"flex",justifyContent:"space-between",marginTop:8,fontSize:11}}>
+              <span style={{color:T.green}}>✅ Confirmed: {fmt(report.matchedRevenue)}</span>
+              <span style={{color:T.yellow}}>⚠️ Unmatched: {fmt(report.ulineOnlyRevenue)}</span>
+              <span style={{color:T.red}}>❓ Unbilled: {fmtNum(report.nvOnly.length)} stops</span>
+            </div>
+          </div>
+
+          <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+            {[["summary","📊 Summary"],["drivers","👤 Driver Revenue"],["routes","🛣️ Route Revenue"],["uline_only","⚠️ Billed Not Delivered"],["nv_only","❓ Delivered Not Billed"],["matched","✅ All Matched"]].map(([id,l])=><TabBtn key={id} active={view===id} label={l} onClick={()=>setView(id)}/>)}
+          </div>
+
+          {view==="summary"&&(
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:"12px"}}>
+              <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Revenue by Driver (from matched PROs)</div><BarChart data={report.byDriver.slice(0,15)} labelKey="driver" valueKey="revenue" maxBars={15}/></div>
+              <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Revenue by Route (from matched PROs)</div><BarChart data={report.byRoute.slice(0,15)} labelKey="route" valueKey="revenue" color={T.green} maxBars={15}/></div>
+            </div>
+          )}
+
+          {view==="drivers"&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Actual Revenue per Driver (Uline billing × NuVizz delivery)</div>
+            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:500}}>
+              <thead><tr>{["#","Driver","Stops","Revenue","Avg/Stop","Weight","Routes"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+              <tbody>{report.byDriver.map((d,i)=>(
+                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim}}>{i+1}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{d.driver}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{d.stops}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:700}}>{fmt(d.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(d.avgPerStop)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(d.weight)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{d.routes}</td></tr>
+              ))}</tbody>
+            </table></div>
+          </div>}
+
+          {view==="routes"&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Actual Revenue per Route</div>
+            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:500}}>
+              <thead><tr>{["Route","Driver","Stops","Revenue","Weight"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+              <tbody>{report.byRoute.map((r,i)=>(
+                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{r.route}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{r.driver}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{r.stops}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:700}}>{fmt(r.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(r.weight)}</td></tr>
+              ))}</tbody>
+            </table></div>
+          </div>}
+
+          {view==="uline_only"&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:4}}>⚠️ Billed in Uline but No NuVizz Delivery Record ({report.ulineOnly.length})</div>
+            <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These PROs appear in Uline billing but have no matching stop in NuVizz. Could be: different stop number format, stop not yet imported, or billing error.</div>
+            {report.ulineOnly.length===0?<div style={{color:T.green,padding:"20px 0",textAlign:"center",fontSize:13}}>✅ All Uline PROs have matching NuVizz records</div>:(
+              <div style={{maxHeight:400,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11,minWidth:400}}>
+                <thead><tr>{["PRO","Customer","City","Weight","Revenue"].map(h=><th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+                <tbody>{report.ulineOnly.slice(0,100).map((s,i)=>(
+                  <tr key={i} style={{background:T.yellowBg}}><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontWeight:600}}>{s.pro}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.customer}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.city}, {s.state}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(s.weight)}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.yellow,fontWeight:600}}>{fmt(s.cost)}</td></tr>
+                ))}</tbody>
+              </table>{report.ulineOnly.length>100&&<div style={{fontSize:11,color:T.textDim,marginTop:8}}>...and {report.ulineOnly.length-100} more</div>}</div>
+            )}
+          </div>}
+
+          {view==="nv_only"&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:4}}>❓ Delivered in NuVizz but No Uline Billing ({report.nvOnly.length})</div>
+            <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These stops were delivered according to NuVizz but don't appear in any uploaded Uline billing file. Potential revenue you haven't been paid for.</div>
+            {report.nvOnly.length===0?<div style={{color:T.green,padding:"20px 0",textAlign:"center",fontSize:13}}>✅ All NuVizz deliveries have matching Uline billing</div>:(
+              <div style={{maxHeight:400,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11,minWidth:400}}>
+                <thead><tr>{["Stop #","Customer","City","Driver","Route","Status"].map(h=><th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+                <tbody>{report.nvOnly.slice(0,100).map((s,i)=>(
+                  <tr key={i} style={{background:T.redBg}}><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontWeight:600}}>{s.pro}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.nCustomer}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.nCity}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.nDriver}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.nRoute}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.nStatus}</td></tr>
+                ))}</tbody>
+              </table>{report.nvOnly.length>100&&<div style={{fontSize:11,color:T.textDim,marginTop:8}}>...and {report.nvOnly.length-100} more</div>}</div>
+            )}
+          </div>}
+
+          {view==="matched"&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>✅ All Matched PROs ({report.matched.length})</div>
+            <div style={{maxHeight:400,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11,minWidth:600}}>
+              <thead><tr>{["PRO","Customer","City","Driver","Route","Revenue","Status"].map(h=><th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+              <tbody>{report.matched.slice(0,200).map((m,i)=>{
+                const isDelivered=String(m.nStatus).match(/90|91/);
+                return(<tr key={i}><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontSize:10}}>{m.pro}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:500}}>{m.uCustomer}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{m.uCity}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{m.nDriver}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{m.nRoute}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(m.uCost)}</td><td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={isDelivered?"Delivered":m.nStatus||"?"} color={isDelivered?T.greenText:T.yellowText} bg={isDelivered?T.greenBg:T.yellowBg}/></td></tr>);
+              })}</tbody>
+            </table>{report.matched.length>200&&<div style={{fontSize:11,color:T.textDim,marginTop:8}}>Showing first 200 of {report.matched.length}</div>}</div>
+          </div>}
+        </>
+      )}
+    </div>
+  );
+}
 
 // ═══════════════════════════════════════════════════════════════
-// MAIN APP
+// QBO FILE IMPORT (CSV/Excel from QuickBooks exports)
+// ═══════════════════════════════════════════════════════════════
+function QBOImport(){
+  const [view,setView]=useState("overview");
+  const [importing,setImporting]=useState(false);
+  const [result,setResult]=useState(null);
+  const [qboFiles,setQboFiles]=useState([]);
+  const pnlRef=useRef(null);const custRef=useRef(null);const expRef=useRef(null);const payRef=useRef(null);
+
+  useEffect(()=>{(async()=>{if(!hasFirebase)return;try{const s=await window.db.collection("qbo_imports").orderBy("imported_at","desc").limit(20).get();setQboFiles(s.docs.map(d=>({id:d.id,...d.data()})));}catch(e){}})();},[]);
+
+  const parseQBOFile=async(file,type)=>{
+    return new Promise((resolve,reject)=>{
+      if(typeof XLSX==="undefined") return reject(new Error("XLSX not loaded"));
+      const reader=new FileReader();
+      reader.onload=e=>{
+        try{
+          const wb=XLSX.read(e.target.result,{type:"array"});
+          const ws=wb.Sheets[wb.SheetNames[0]];
+          const raw=XLSX.utils.sheet_to_json(ws,{defval:"",header:1});
+          // Find header row (first row with multiple non-empty cells)
+          let headerIdx=0;
+          for(let i=0;i<Math.min(10,raw.length);i++){const nonEmpty=raw[i].filter(c=>c!=="").length;if(nonEmpty>=3){headerIdx=i;break;}}
+          const headers=raw[headerIdx].map(h=>String(h||"").toLowerCase().trim());
+          const rows=raw.slice(headerIdx+1).filter(r=>r.some(c=>c!==""));
+          const data=rows.map(r=>{const o={};headers.forEach((h,i)=>{if(h)o[h]=r[i]||"";});return o;});
+          resolve({type,headers,data,rowCount:data.length,filename:file.name});
+        }catch(e){reject(e);}
+      };
+      reader.onerror=reject;
+      reader.readAsArrayBuffer(file);
+    });
+  };
+
+  const handleImport=async(e,type)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    setImporting(true);setResult(null);
+    try{
+      const parsed=await parseQBOFile(file,type);
+      let summary={};
+      if(type==="pnl"){
+        // Extract revenue and expense lines
+        const revenues=parsed.data.filter(r=>{const cat=String(Object.values(r)[0]||"").toLowerCase();return cat.match(/income|revenue|sales/);});
+        const expenses=parsed.data.filter(r=>{const cat=String(Object.values(r)[0]||"").toLowerCase();return cat.match(/expense|cost|cogs/);});
+        const totalRev=revenues.reduce((s,r)=>{const vals=Object.values(r).slice(1);return s+vals.reduce((ss,v)=>ss+(parseFloat(String(v).replace(/[$,]/g,""))||0),0);},0);
+        const totalExp=expenses.reduce((s,r)=>{const vals=Object.values(r).slice(1);return s+vals.reduce((ss,v)=>ss+(parseFloat(String(v).replace(/[$,]/g,""))||0),0);},0);
+        summary={totalRevenue:totalRev,totalExpenses:totalExp,grossProfit:totalRev-totalExp,margin:totalRev>0?((totalRev-totalExp)/totalRev*100):0,lineItems:parsed.data.length};
+      }
+      if(type==="customers"){
+        const custs=parsed.data.map(r=>{const vals=Object.values(r);return{name:String(vals[0]||""),revenue:parseFloat(String(vals[vals.length-1]||"0").replace(/[$,]/g,""))||0};}).filter(c=>c.name&&c.revenue>0).sort((a,b)=>b.revenue-a.revenue);
+        summary={customers:custs,totalRevenue:custs.reduce((s,c)=>s+c.revenue,0)};
+      }
+      if(type==="expenses"){
+        const exps=parsed.data.map(r=>{const vals=Object.values(r);const amt=parseFloat(String(vals[vals.length-1]||vals[vals.length-2]||"0").replace(/[$,]/g,""))||0;return{vendor:String(vals[0]||""),date:String(vals[1]||""),amount:amt,category:String(vals[2]||"")};}).filter(e=>e.amount>0);
+        const byVendor={};exps.forEach(e=>{if(!byVendor[e.vendor])byVendor[e.vendor]={vendor:e.vendor,total:0,count:0};byVendor[e.vendor].total+=e.amount;byVendor[e.vendor].count++;});
+        summary={expenses:exps,byVendor:Object.values(byVendor).sort((a,b)=>b.total-a.total),totalExpenses:exps.reduce((s,e)=>s+e.amount,0)};
+      }
+      if(type==="payroll"){
+        const rows=parsed.data.map(r=>{const vals=Object.values(r);return{employee:String(vals[0]||""),grossPay:parseFloat(String(vals[1]||vals[vals.length-2]||"0").replace(/[$,]/g,""))||0,netPay:parseFloat(String(vals[vals.length-1]||"0").replace(/[$,]/g,""))||0};}).filter(r=>r.employee&&r.grossPay>0);
+        summary={employees:rows,totalGross:rows.reduce((s,r)=>s+r.grossPay,0),totalNet:rows.reduce((s,r)=>s+r.netPay,0),headcount:rows.length};
+      }
+      // Save to Firebase with dedup
+      const docId=`${type}_${file.name}_${parsed.rowCount}`.replace(/[\/\s\.]/g,"_").substring(0,200);
+      if(hasFirebase){
+        const existing=await window.db.collection("qbo_imports").doc(docId).get();
+        if(existing.exists){setResult({type:"dup",filename:file.name,reportType:type});setImporting(false);return;}
+        await window.db.collection("qbo_imports").doc(docId).set({...summary,type,filename:file.name,rowCount:parsed.rowCount,imported_at:new Date().toISOString()});
+      }
+      setResult({type:"success",reportType:type,filename:file.name,...summary});
+      setQboFiles(prev=>[{id:docId,type,filename:file.name,...summary,imported_at:new Date().toISOString()},...prev]);
+    }catch(err){setResult({type:"error",message:err.message});}
+    setImporting(false);
+    [pnlRef,custRef,expRef,payRef].forEach(r=>{if(r.current)r.current.value="";});
+  };
+
+  return(
+    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="📁" text="QuickBooks File Import" right={<Badge text="No API needed" color={T.greenText} bg={T.greenBg}/>}/>
+      <div style={{fontSize:12,color:T.textMuted,marginBottom:16}}>Export reports from QuickBooks as CSV or Excel, then upload here. No OAuth or Production keys needed.</div>
+      {result&&<div style={{...CS,borderLeft:`4px solid ${result.type==="error"?T.red:result.type==="dup"?T.yellow:T.green}`,marginBottom:16}}>
+        {result.type==="error"&&<div style={{color:T.redText,fontSize:13}}>❌ {result.message}</div>}
+        {result.type==="dup"&&<div style={{color:T.yellowText,fontSize:13}}>⚠️ {result.filename} already imported — skipped</div>}
+        {result.type==="success"&&result.reportType==="pnl"&&<div style={{color:T.greenText,fontSize:13}}>✅ P&L imported: Revenue {fmtK(result.totalRevenue)}, Expenses {fmtK(result.totalExpenses)}, Margin {fmtPct(result.margin)} ({result.lineItems} line items)</div>}
+        {result.type==="success"&&result.reportType==="customers"&&<div style={{color:T.greenText,fontSize:13}}>✅ Customer revenue imported: {result.customers?.length} customers, {fmtK(result.totalRevenue)} total</div>}
+        {result.type==="success"&&result.reportType==="expenses"&&<div style={{color:T.greenText,fontSize:13}}>✅ Expenses imported: {result.expenses?.length} transactions, {fmtK(result.totalExpenses)} total across {result.byVendor?.length} vendors</div>}
+        {result.type==="success"&&result.reportType==="payroll"&&<div style={{color:T.greenText,fontSize:13}}>✅ Payroll imported: {result.headcount} employees, {fmtK(result.totalGross)} gross pay</div>}
+      </div>}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(250px,1fr))",gap:"12px",marginBottom:16}}>
+        {[{type:"pnl",icon:"📊",title:"Profit & Loss",sub:"Export: Reports → Profit and Loss → Export to Excel",ref:pnlRef},
+          {type:"customers",icon:"🏢",title:"Sales by Customer",sub:"Export: Reports → Sales by Customer → Export to Excel",ref:custRef},
+          {type:"expenses",icon:"💸",title:"Expenses by Vendor",sub:"Export: Reports → Expenses by Vendor → Export to Excel",ref:expRef},
+          {type:"payroll",icon:"💵",title:"Payroll Summary",sub:"Export: Reports → Payroll Summary → Export to Excel",ref:payRef},
+        ].map(item=>(
+          <div key={item.type} style={CS}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>{item.icon} {item.title}</div>
+            <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>{item.sub}</div>
+            <input ref={item.ref} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleImport(e,item.type)} style={{display:"none"}}/>
+            <PrimaryBtn text={importing?"Importing...":"Upload "+item.title} onClick={()=>item.ref.current?.click()} loading={importing} style={{width:"100%",fontSize:12,padding:"10px"}}/>
+          </div>
+        ))}
+      </div>
+      {/* Import history */}
+      {qboFiles.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Import History ({qboFiles.length})</div>
+        <div style={{maxHeight:300,overflowY:"auto"}}>{qboFiles.map((f,i)=>(
+          <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${T.borderLight}`}}>
+            <div><div style={{fontSize:12,fontWeight:600}}>{f.filename}</div><div style={{fontSize:10,color:T.textMuted}}>{f.type} • {new Date(f.imported_at).toLocaleDateString()}</div></div>
+            <Badge text={f.type} color={T.blueText} bg={T.blueBg}/>
+          </div>
+        ))}</div>
+      </div>}
+      {/* Show parsed customer data if available */}
+      {result?.type==="success"&&result.reportType==="customers"&&result.customers?.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Customer Revenue Breakdown</div><BarChart data={result.customers.slice(0,15)} labelKey="name" valueKey="revenue" maxBars={15}/></div>}
+      {result?.type==="success"&&result.reportType==="expenses"&&result.byVendor?.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Vendors by Spend</div><BarChart data={result.byVendor.slice(0,15)} labelKey="vendor" valueKey="total" color={T.red} maxBars={15}/></div>}
+      {result?.type==="success"&&result.reportType==="payroll"&&result.employees?.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Payroll by Employee</div><BarChart data={result.employees.slice(0,15)} labelKey="employee" valueKey="grossPay" color={T.purple} maxBars={15}/></div>}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PAYROLL OVERLAY (CyberPay + QBO payroll vs driver revenue)
+// ═══════════════════════════════════════════════════════════════
+function PayrollTab({ulineWeeks,margins}){
+  const [payrollData,setPayrollData]=useState([]);
+  const [qboPayroll,setQboPayroll]=useState([]);
+  const [b600Data,setB600Data]=useState([]);
+  const [loading,setLoading]=useState(true);
+
+  useEffect(()=>{(async()=>{
+    setLoading(true);
+    if(hasFirebase){
+      try{const s=await window.db.collection("payroll_runs").orderBy("check_date","desc").limit(20).get();setPayrollData(s.docs.map(d=>({id:d.id,...d.data()})));}catch(e){}
+      try{const s=await window.db.collection("qbo_imports").where("type","==","payroll").limit(10).get();setQboPayroll(s.docs.map(d=>d.data()));}catch(e){}
+      try{const s=await window.db.collection("b600_timeclock").orderBy("date","desc").limit(500).get();setB600Data(s.docs.map(d=>d.data()));}catch(e){}
+    }
+    setLoading(false);
+  })();},[]);
+
+  // Merge B600 hours by driver
+  const driverHours={};
+  b600Data.forEach(r=>{if(!driverHours[r.name])driverHours[r.name]={name:r.name,totalHours:0,days:0,records:[]};driverHours[r.name].totalHours+=r.hours||0;driverHours[r.name].days++;driverHours[r.name].records.push(r);});
+  const driverArr=Object.values(driverHours).sort((a,b)=>b.totalHours-a.totalHours);
+
+  // Estimate revenue per driver from Uline data
+  const allStops=ulineWeeks.flatMap(w=>w.stops||[]);
+  const totalUlineRev=ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0);
+  const totalUlineStops=ulineWeeks.reduce((s,w)=>s+(w.totalStops||0),0);
+  const weekCount=ulineWeeks.length||1;
+
+  // QBO payroll employees
+  const qboEmployees=qboPayroll.flatMap(p=>p.employees||[]);
+
+  // Cross-reference: if we have QBO payroll employees AND B600 hours, overlay them
+  const overlay=driverArr.map(d=>{
+    const qboMatch=qboEmployees.find(e=>e.employee?.toLowerCase().includes(d.name.split(" ")[0]?.toLowerCase()));
+    const avgHoursPerDay=d.days>0?d.totalHours/d.days:0;
+    const weeklyHours=avgHoursPerDay*5;
+    const estWeeklyPay=weeklyHours*(margins.totalDrivers>0?(margins.totalAnnualLabor/margins.totalDrivers/52/weeklyHours||0):0);
+    const estStopsPerDay=margins.stopsPerDriver;
+    const estDailyRevenue=estStopsPerDay*margins.revenuePerStop;
+    const estDailyCost=avgHoursPerDay*(d.name.toLowerCase().match(/tractor/)?margins.costPerDriver/(margins.totalDrivers||1):23);
+    return{...d,avgHoursPerDay,weeklyHours,qboPay:qboMatch?.grossPay||0,estDailyRevenue,estDailyCost,roi:estDailyRevenue>0&&estDailyCost>0?((estDailyRevenue-estDailyCost)/estDailyCost*100):0};
+  });
+
+  return(
+    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="💵" text="Payroll & Driver Economics"/>
+      {loading?<EmptyState icon="💵" title="Loading payroll data..." sub="Pulling from Firebase"/>:(
+        <>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"16px"}}>
+            <KPI label="CyberPay Runs" value={fmtNum(payrollData.length)} sub="on file"/>
+            <KPI label="QBO Payroll" value={qboPayroll.length>0?fmtNum(qboEmployees.length)+" employees":"Not imported"} sub={qboPayroll.length>0?fmtK(qboEmployees.reduce((s,e)=>s+e.grossPay,0))+" gross":"Upload in QB Import"}/>
+            <KPI label="B600 Drivers" value={fmtNum(driverArr.length)} sub={`${fmtNum(b600Data.length)} clock records`}/>
+            <KPI label="Avg Hours/Day" value={driverArr.length>0?fmtDec(driverArr.reduce((s,d)=>s+d.avgHoursPerDay,0)/driverArr.length,1):"—"} sub="from B600"/>
+          </div>
+
+          {/* Driver hours from B600 */}
+          {driverArr.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Driver Hours (B600 Time Clock)</div>
+            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:600}}>
+              <thead><tr>{["Driver","Total Hours","Days","Avg Hrs/Day","Weekly Est","OT Risk"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+              <tbody>{overlay.map((d,i)=>{const ot=d.weeklyHours>40;return(
+                <tr key={i} style={{background:ot?T.redBg:"transparent"}}>
+                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{d.name}</td>
+                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtDec(d.totalHours,1)}</td>
+                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{d.days}</td>
+                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{fmtDec(d.avgHoursPerDay,1)}</td>
+                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtDec(d.weeklyHours,0)}</td>
+                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{ot?<Badge text="⚠️ OT" color={T.redText} bg={T.redBg}/>:<Badge text="OK" color={T.greenText} bg={T.greenBg}/>}</td>
+                </tr>
+              );})}</tbody>
+            </table></div>
+          </div>}
+
+          {/* QBO Payroll overlay */}
+          {qboEmployees.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>QBO Payroll Data</div>
+            <BarChart data={qboEmployees.slice(0,15)} labelKey="employee" valueKey="grossPay" color={T.purple} maxBars={15}/>
+          </div>}
+
+          {/* CyberPay runs */}
+          {payrollData.length>0&&<div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>CyberPay Payroll Runs</div>
+            <div style={{maxHeight:200,overflowY:"auto"}}>{payrollData.map((p,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px solid ${T.borderLight}`,fontSize:12}}>
+                <span style={{fontWeight:500}}>Check: {p.check_date}</span>
+                <span style={{color:T.textMuted}}>Period: {p.from_date} → {p.to_date}</span>
+                <span>{p.run_id}</span>
+              </div>
+            ))}</div>
+          </div>}
+
+          {driverArr.length===0&&qboEmployees.length===0&&payrollData.length===0&&<EmptyState icon="💵" title="No Payroll Data" sub="Upload B600 time clock CSV, import QBO payroll report, or wait for CyberPay Monday auto-pull"/>}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MOTIVE MILEAGE & FUEL COST
+// ═══════════════════════════════════════════════════════════════
+function MileageTab({margins,costs}){
+  const [vehicles,setVehicles]=useState(null);
+  const [trips,setTrips]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const [from,setFrom]=useState(()=>{const d=new Date();d.setDate(d.getDate()-7);return d.toISOString().slice(0,10);});
+  const [to,setTo]=useState(()=>new Date().toISOString().slice(0,10));
+
+  const loadData=async()=>{
+    setLoading(true);
+    const [vRes,tRes]=await Promise.all([
+      fetchMotive("vehicles"),
+      fetchMotive("ifta_trips",`&start=${from}&end=${to}`),
+    ]);
+    if(vRes?.vehicles||vRes?.data) setVehicles(vRes.vehicles||vRes.data||[]);
+    if(tRes) setTrips(tRes);
+    setLoading(false);
+  };
+
+  useEffect(()=>{loadData();},[]);
+
+  // Process trip data
+  const tripData=useMemo(()=>{
+    if(!trips) return null;
+    const rawTrips=trips.ifta_trips||trips.trips||trips.data||[];
+    if(!Array.isArray(rawTrips)||rawTrips.length===0) return null;
+    const byVehicle={};
+    rawTrips.forEach(t=>{
+      const trip=t.ifta_trip||t.trip||t;
+      const vNum=trip.vehicle?.number||trip.vehicle_number||"?";
+      const miles=parseFloat(trip.distance)||parseFloat(trip.odometer_distance)||0;
+      const fuelGal=parseFloat(trip.fuel_consumption)||0;
+      if(!byVehicle[vNum])byVehicle[vNum]={vehicle:vNum,totalMiles:0,totalFuel:0,tripCount:0,type:trip.vehicle?.vehicle_type||"box"};
+      byVehicle[vNum].totalMiles+=miles;
+      byVehicle[vNum].totalFuel+=fuelGal;
+      byVehicle[vNum].tripCount++;
+    });
+    const vArr=Object.values(byVehicle).map(v=>({
+      ...v,
+      mpg:v.totalFuel>0?(v.totalMiles/v.totalFuel):0,
+      fuelCost:v.totalFuel*(costs.fuel_price||3.50),
+      costPerMile:v.totalMiles>0?(v.totalFuel*(costs.fuel_price||3.50)/v.totalMiles):0,
+    })).sort((a,b)=>b.totalMiles-a.totalMiles);
+    const totalMiles=vArr.reduce((s,v)=>s+v.totalMiles,0);
+    const totalFuel=vArr.reduce((s,v)=>s+v.totalFuel,0);
+    const totalFuelCost=totalFuel*(costs.fuel_price||3.50);
+    return{byVehicle:vArr,totalMiles,totalFuel,totalFuelCost,avgMPG:totalFuel>0?totalMiles/totalFuel:0,tripCount:rawTrips.length};
+  },[trips,costs]);
+
+  return(
+    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="⛽" text="Mileage & Fuel Cost"/>
+      <div style={CS}>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={{...IS,width:145,fontSize:12}}/>
+          <span style={{color:T.textDim}}>→</span>
+          <input type="date" value={to} onChange={e=>setTo(e.target.value)} style={{...IS,width:145,fontSize:12}}/>
+          <PrimaryBtn text={loading?"Loading...":"Pull Motive Data"} onClick={loadData} loading={loading}/>
+        </div>
+      </div>
+      {tripData?(
+        <>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"16px"}}>
+            <KPI label="Total Miles" value={fmtNum(Math.round(tripData.totalMiles))} sub={`${tripData.tripCount} trips`}/>
+            <KPI label="Total Fuel" value={`${fmtNum(Math.round(tripData.totalFuel))} gal`}/>
+            <KPI label="Fuel Cost" value={fmt(tripData.totalFuelCost)} sub={`$${costs.fuel_price||3.50}/gal`} subColor={T.red}/>
+            <KPI label="Fleet MPG" value={fmtDec(tripData.avgMPG,1)} sub="actual average"/>
+            <KPI label="Cost/Mile" value={`$${fmtDec(tripData.totalMiles>0?tripData.totalFuelCost/tripData.totalMiles:0,2)}`}/>
+            <KPI label="Vehicles Active" value={fmtNum(tripData.byVehicle.length)}/>
+          </div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Miles by Vehicle</div>
+            <BarChart data={tripData.byVehicle.slice(0,20)} labelKey="vehicle" valueKey="totalMiles" formatValue={v=>fmtNum(Math.round(v))+" mi"} maxBars={20}/>
+          </div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Fuel Cost by Vehicle</div>
+            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:500}}>
+              <thead><tr>{["Vehicle","Miles","Fuel (gal)","Cost","MPG","$/Mile"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+              <tbody>{tripData.byVehicle.map((v,i)=>(
+                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{v.vehicle}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(Math.round(v.totalMiles))}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(Math.round(v.totalFuel))}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmt(v.fuelCost)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtDec(v.mpg,1)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>${fmtDec(v.costPerMile,2)}</td></tr>
+              ))}</tbody>
+            </table></div>
+          </div>
+        </>
+      ):(!loading&&<EmptyState icon="⛽" title="Pull Mileage Data" sub="Select a date range and pull from Motive to see actual miles and fuel cost per vehicle"/>)}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TREND CHARTS (Week-over-week analysis)
+// ═══════════════════════════════════════════════════════════════
+function TrendsTab({ulineWeeks,margins}){
+  // Build weekly trends from Uline data (sorted chronologically)
+  const sorted=[...ulineWeeks].sort((a,b)=>(a.upload_date||a.id||"").localeCompare(b.upload_date||b.id||""));
+  const weeklyData=sorted.map((w,i)=>({
+    label:w.filename?.replace(/\.xlsx?$/i,"").slice(-12)||`Week ${i+1}`,
+    revenue:w.totalRevenue||0,
+    stops:w.totalStops||0,
+    avgPerStop:w.avgRevenuePerStop||0,
+    contractorPay:w.contractorPayout||0,
+    netRevenue:(w.totalRevenue||0)-(w.contractorPayout||0),
+    weight:w.totalWeight||0,
+    costEst:(w.totalStops||0)*margins.costPerStop,
+    marginEst:(w.totalRevenue||0)-((w.totalStops||0)*margins.costPerStop),
+    marginPctEst:w.totalRevenue>0?((w.totalRevenue-((w.totalStops||0)*margins.costPerStop))/w.totalRevenue*100):0,
+  }));
+
+  // Calculate week-over-week changes
+  const wow=weeklyData.length>=2?{
+    revChange:weeklyData[weeklyData.length-1].revenue-weeklyData[weeklyData.length-2].revenue,
+    revPctChange:weeklyData[weeklyData.length-2].revenue>0?((weeklyData[weeklyData.length-1].revenue-weeklyData[weeklyData.length-2].revenue)/weeklyData[weeklyData.length-2].revenue*100):0,
+    stopChange:weeklyData[weeklyData.length-1].stops-weeklyData[weeklyData.length-2].stops,
+    avgChange:weeklyData[weeklyData.length-1].avgPerStop-weeklyData[weeklyData.length-2].avgPerStop,
+  }:null;
+
+  // SVG line chart
+  function TrendLine({data,valueKey,color,height=120,label}){
+    if(data.length<2) return null;
+    const vals=data.map(d=>d[valueKey]);
+    const min=Math.min(...vals);const max=Math.max(...vals);const range=max-min||1;
+    const w=300;const h=height;const padY=10;
+    const points=vals.map((v,i)=>({x:(i/(vals.length-1))*w,y:h-padY-((v-min)/range)*(h-padY*2)}));
+    const path=points.map((p,i)=>i===0?`M ${p.x} ${p.y}`:`L ${p.x} ${p.y}`).join(" ");
+    return(
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:12,fontWeight:700,marginBottom:6}}>{label}</div>
+        <svg viewBox={`-10 0 ${w+20} ${h}`} style={{width:"100%",maxWidth:400,height}}>
+          <path d={path} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+          {points.map((p,i)=><circle key={i} cx={p.x} cy={p.y} r="3" fill={color}/>)}
+          {/* Labels on first and last */}
+          <text x={points[0].x} y={points[0].y-8} textAnchor="start" fontSize="10" fill={T.textMuted}>{valueKey.includes("Pct")||valueKey.includes("margin")?fmtPct(vals[0]):valueKey.includes("stop")?fmtNum(vals[0]):fmtK(vals[0])}</text>
+          <text x={points[points.length-1].x} y={points[points.length-1].y-8} textAnchor="end" fontSize="10" fill={color} fontWeight="700">{valueKey.includes("Pct")||valueKey.includes("margin")?fmtPct(vals[vals.length-1]):valueKey.includes("stop")?fmtNum(vals[vals.length-1]):fmtK(vals[vals.length-1])}</text>
+        </svg>
+      </div>
+    );
+  }
+
+  return(
+    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="📈" text="Trends & Week-Over-Week"/>
+      {weeklyData.length<2?<EmptyState icon="📈" title="Need More Data" sub="Upload at least 2 Uline weekly files to see trends"/>:(
+        <>
+          {wow&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
+            <KPI label="Revenue Change" value={(wow.revChange>=0?"+":"")+fmtK(wow.revChange)} sub={`${wow.revPctChange>=0?"+":""}${fmtDec(wow.revPctChange,1)}% WoW`} subColor={wow.revChange>=0?T.green:T.red}/>
+            <KPI label="Stop Change" value={(wow.stopChange>=0?"+":"")+fmtNum(wow.stopChange)} sub="vs last week" subColor={wow.stopChange>=0?T.green:T.red}/>
+            <KPI label="Avg/Stop Change" value={(wow.avgChange>=0?"+$":"-$")+fmtDec(Math.abs(wow.avgChange),2)} sub="rate movement" subColor={wow.avgChange>=0?T.green:T.red}/>
+            <KPI label="Weeks Tracked" value={fmtNum(weeklyData.length)}/>
+          </div>}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:"12px"}}>
+            <div style={CS}><TrendLine data={weeklyData} valueKey="revenue" color={T.green} label="Weekly Revenue Trend"/></div>
+            <div style={CS}><TrendLine data={weeklyData} valueKey="stops" color={T.brand} label="Weekly Stop Count Trend"/></div>
+            <div style={CS}><TrendLine data={weeklyData} valueKey="avgPerStop" color={T.purple} label="Average Revenue Per Stop"/></div>
+            <div style={CS}><TrendLine data={weeklyData} valueKey="marginEst" color={weeklyData[weeklyData.length-1]?.marginEst>0?T.green:T.red} label="Estimated Weekly Margin"/></div>
+          </div>
+          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Weekly Detail</div>
+            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:600}}>
+              <thead><tr>{["Week","Revenue","Stops","Avg/Stop","Contractor","Net Rev","Est Margin","Margin %"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+              <tbody>{weeklyData.map((w,i)=>(
+                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:500,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis"}}>{w.label}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(w.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.stops)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(w.avgPerStop)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmt(w.contractorPay)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{fmt(w.netRevenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:w.marginEst>0?T.green:T.red}}>{fmt(w.marginEst)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={fmtPct(w.marginPctEst)} color={w.marginPctEst>=30?T.greenText:w.marginPctEst>=15?T.yellowText:T.redText} bg={w.marginPctEst>=30?T.greenBg:w.marginPctEst>=15?T.yellowBg:T.redBg}/></td></tr>
+              ))}</tbody>
+            </table></div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LOGIN SCREEN
+// ═══════════════════════════════════════════════════════════════
+function LoginScreen({onLogin}){
+  const [email,setEmail]=useState("");const [password,setPassword]=useState("");
+  const [loading,setLoading]=useState(false);const [error,setError]=useState("");
+  const submit=async()=>{
+    if(!email||!password){setError("Enter email and password");return;}
+    setLoading(true);setError("");
+    try{
+      if(!window.fbAuth){setError("Firebase Auth not loaded. Refresh the page.");setLoading(false);return;}
+      await window.fbAuth.signInWithEmailAndPassword(email,password);
+      // onAuthStateChanged in parent will handle the rest
+    }catch(e){
+      const code=e.code||"";
+      if(code.includes("user-not-found")||code.includes("wrong-password")||code.includes("invalid-credential")) setError("Invalid email or password");
+      else if(code.includes("too-many-requests")) setError("Too many attempts. Try again in a few minutes.");
+      else if(code.includes("network")) setError("Network error. Check your connection.");
+      else setError(e.message||"Login failed");
+    }
+    setLoading(false);
+  };
+  return(
+    <div style={{minHeight:"100vh",background:`linear-gradient(135deg,${T.brand} 0%,${T.brandDark} 100%)`,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px",fontFamily:"'DM Sans',sans-serif"}}>
+      <div style={{background:"#fff",borderRadius:"16px",padding:"32px 28px",maxWidth:400,width:"100%",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
+        <div style={{textAlign:"center",marginBottom:24}}>
+          <div style={{width:56,height:56,borderRadius:"14px",background:`linear-gradient(135deg,${T.brand},${T.brandLight})`,display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:"24px",fontWeight:800,color:"#fff",marginBottom:12,boxShadow:`0 4px 14px rgba(30,91,146,0.3)`}}>M</div>
+          <div style={{fontSize:"22px",fontWeight:800,color:T.text,letterSpacing:"-0.02em"}}>Davis MarginIQ</div>
+          <div style={{fontSize:"11px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase",marginTop:4}}>Cost Intelligence</div>
+        </div>
+        <div style={{marginBottom:12}}>
+          <label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:4,fontWeight:600}}>Email</label>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="your@email.com" style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${T.border}`,fontSize:14,outline:"none",fontFamily:"inherit"}} autoFocus/>
+        </div>
+        <div style={{marginBottom:16}}>
+          <label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:4,fontWeight:600}}>Password</label>
+          <input type="password" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="••••••••" style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${T.border}`,fontSize:14,outline:"none",fontFamily:"inherit"}}/>
+        </div>
+        {error&&<div style={{padding:"10px 14px",borderRadius:8,background:T.redBg,color:T.redText,fontSize:12,marginBottom:12}}>⚠️ {error}</div>}
+        <button onClick={submit} disabled={loading} style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:loading?"#94a3b8":`linear-gradient(135deg,${T.brand},${T.brandLight})`,color:"#fff",fontSize:14,fontWeight:700,cursor:loading?"wait":"pointer",fontFamily:"inherit"}}>{loading?"Signing in...":"Sign In"}</button>
+        <div style={{marginTop:16,fontSize:10,color:T.textDim,textAlign:"center",lineHeight:1.5}}>Secured by Firebase Authentication.<br/>Accounts created by admin in Firebase Console.</div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN APP v4.0
 // ═══════════════════════════════════════════════════════════════
 function MarginIQ(){
+  const [user,setUser]=useState(null);
+  const [authChecking,setAuthChecking]=useState(true);
+
+  // Auth state listener
+  useEffect(()=>{
+    if(!window.fbAuth){setAuthChecking(false);return;}
+    const unsub=window.fbAuth.onAuthStateChanged(u=>{
+      setUser(u);setAuthChecking(false);
+    });
+    return ()=>unsub();
+  },[]);
+
+  const logout=async()=>{try{await window.fbAuth.signOut();}catch(e){console.warn(e);}};
+
+  if(authChecking) return <div style={{minHeight:"100vh",background:T.bg,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:12,fontFamily:"'DM Sans',sans-serif"}}><div className="loading-pulse" style={{fontSize:48}}>📊</div><div style={{fontSize:13,color:T.textMuted}}>Loading...</div></div>;
+  if(!user) return <LoginScreen/>;
+
+  return <MarginIQApp user={user} onLogout={logout}/>;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// APP SHELL (authenticated)
+// ═══════════════════════════════════════════════════════════════
+function MarginIQApp({user,onLogout}){
   const [tab,setTab]=useState("command");const [costs,setCosts]=useState(DEFAULT_COSTS);const [ulineWeeks,setUlineWeeks]=useState([]);
   const [qboConnected,setQboConnected]=useState(false);const [qboData,setQboData]=useState(null);const [motiveConnected,setMotiveConnected]=useState(false);const [loading,setLoading]=useState(true);
   useEffect(()=>{(async()=>{setLoading(true);const sc=await FS.getCosts();if(sc)setCosts(p=>({...p,...sc}));setUlineWeeks(await FS.getUlineWeeks());
@@ -946,24 +1637,37 @@ function MarginIQ(){
     try{const r=await fetch("/.netlify/functions/marginiq-motive?action=vehicles");if(r.ok)setMotiveConnected(true);}catch(e){}setLoading(false);})();},[]);
   const margins=useMemo(()=>calculateMargins(costs,ulineWeeks.length>0?{totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0),totalStops:ulineWeeks.reduce((s,w)=>s+(w.totalStops||0),0),weekCount:ulineWeeks.length}:null,qboData),[costs,ulineWeeks,qboData]);
   const onUline=w=>{setUlineWeeks(p=>[w,...p.filter(x=>x.week_id!==w.week_id)]);};
-  const tabs=[{id:"command",l:"🎯 Command"},{id:"ai",l:"🤖 AI"},{id:"import",l:"📥 Import"},{id:"integrity",l:"🛡️ Integrity"},{id:"uline",l:"📦 Uline"},{id:"routes",l:"🛣️ Routes"},{id:"customers",l:"🏢 Customers"},{id:"fleet",l:"🚛 Fleet"},{id:"qb",l:"💰 QB"},{id:"costs",l:"⚙️ Costs"},{id:"settings",l:"🔧 Settings"}];
+  const tabs=[{id:"command",l:"🎯"},{id:"ai",l:"🤖"},{id:"import",l:"📥"},{id:"reconcile",l:"🔗"},{id:"uline",l:"📦"},{id:"routes",l:"🛣️"},{id:"trends",l:"📈"},{id:"payroll",l:"💵"},{id:"mileage",l:"⛽"},{id:"customers",l:"🏢"},{id:"fleet",l:"🚛"},{id:"qbimport",l:"📁"},{id:"integrity",l:"🛡️"},{id:"costs",l:"⚙️"},{id:"settings",l:"🔧"}];
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 20px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
-        <div style={{display:"flex",alignItems:"center",gap:10}}><div style={{width:36,height:36,borderRadius:"10px",background:`linear-gradient(135deg,${T.brand},${T.brandLight})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"15px",fontWeight:800,color:"#fff"}}>M</div><div><div style={{fontSize:"15px",fontWeight:800}}>Davis MarginIQ</div><div style={{fontSize:"9px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase"}}>Cost Intelligence</div></div></div>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>{qboConnected&&<Badge text="QBO" color={T.greenText} bg={T.greenBg}/>}<span style={{fontSize:"9px",color:T.textDim,padding:"3px 8px",background:T.bgSurface,borderRadius:"6px",fontWeight:600}}>v{APP_VERSION}</span></div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{width:32,height:32,borderRadius:"8px",background:`linear-gradient(135deg,${T.brand},${T.brandLight})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"14px",fontWeight:800,color:"#fff"}}>M</div>
+          <div><div style={{fontSize:"14px",fontWeight:800}}>MarginIQ</div><div style={{fontSize:"8px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase"}}>Davis Delivery</div></div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          {qboConnected&&<Badge text="QBO" color={T.greenText} bg={T.greenBg}/>}
+          <span style={{fontSize:"8px",color:T.textDim,padding:"2px 6px",background:T.bgSurface,borderRadius:"5px",fontWeight:600}}>v{APP_VERSION}</span>
+          {user&&<button onClick={onLogout} title={`Signed in as ${user.email} — click to log out`} style={{width:26,height:26,borderRadius:"50%",border:"none",background:T.brandPale,color:T.brand,fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>{(user.email||"?").charAt(0).toUpperCase()}</button>}
+        </div>
       </div>
-      <div style={{display:"flex",gap:"3px",padding:"8px 12px",overflowX:"auto",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.7)"}}>{tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"7px 12px",borderRadius:"8px",border:"none",background:tab===t.id?T.brand:"transparent",color:tab===t.id?"#fff":T.textMuted,fontSize:"11px",fontWeight:tab===t.id?700:500,cursor:"pointer",whiteSpace:"nowrap"}}>{t.l}</button>)}</div>
+      <div style={{display:"flex",gap:"2px",padding:"6px 8px",overflowX:"auto",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.7)",WebkitOverflowScrolling:"touch"}} className="hide-scrollbar">
+        {tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"6px 10px",borderRadius:"7px",border:"none",background:tab===t.id?T.brand:"transparent",color:tab===t.id?"#fff":T.textMuted,fontSize:"14px",cursor:"pointer",whiteSpace:"nowrap",flexShrink:0,minWidth:36,textAlign:"center"}}>{t.l}</button>)}
+      </div>
       {loading&&<div style={{textAlign:"center",padding:"60px 20px"}}><div className="loading-pulse" style={{fontSize:48,marginBottom:12}}>📊</div><div style={{fontSize:14,fontWeight:600}}>Loading...</div></div>}
       {!loading&&tab==="command"&&<CommandCenter margins={margins} ulineData={ulineWeeks.length>0?{weekCount:ulineWeeks.length,totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)}:null} qboConnected={qboConnected} qboData={qboData} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}}/>}
       {!loading&&tab==="ai"&&<AIInsights margins={margins} ulineWeeks={ulineWeeks} costs={costs}/>}
       {!loading&&tab==="import"&&<DataImport ulineWeeks={ulineWeeks} onUlineUpload={onUline}/>}
+      {!loading&&tab==="reconcile"&&<ReconciliationTab ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="integrity"&&<DataIntegrity ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="uline"&&<UlineTab ulineWeeks={ulineWeeks} onUpload={onUline} margins={margins}/>}
       {!loading&&tab==="routes"&&<RouteTab margins={margins}/>}
       {!loading&&tab==="customers"&&<CustomerTab ulineWeeks={ulineWeeks} margins={margins}/>}
       {!loading&&tab==="fleet"&&<FleetTab margins={margins}/>}
-      {!loading&&tab==="qb"&&<QBTab connected={qboConnected}/>}
+      {!loading&&tab==="qbimport"&&<QBOImport/>}
+      {!loading&&tab==="payroll"&&<PayrollTab ulineWeeks={ulineWeeks} margins={margins}/>}
+      {!loading&&tab==="mileage"&&<MileageTab margins={margins} costs={costs}/>}
+      {!loading&&tab==="trends"&&<TrendsTab ulineWeeks={ulineWeeks} margins={margins}/>}
       {!loading&&tab==="costs"&&<CostsTab costs={costs} onSave={setCosts} margins={margins}/>}
       {!loading&&tab==="settings"&&<SettingsTab qboConnected={qboConnected} motiveConnected={motiveConnected}/>}
     </div>

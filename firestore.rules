@@ -1,54 +1,18 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
-    // ── MarginIQ config (QBO tokens, cost structure) — read/write from web + functions ──
-    match /marginiq_config/{docId} {
-      allow read, write: if true;
-    }
-
-    // ── Payroll runs — written by GitHub Actions (service account), read-only from web ──
-    match /payroll_runs/{runId} {
-      allow read: if true;
-      allow write: if false; // service account writes via Admin SDK only
-    }
-
-    // ── 1099 reports ──
-    match /reports_1099/{docId} {
-      allow read: if true;
-      allow write: if false;
-    }
-
-    // ── Uline audits — read/write from web (uploaded via app) ──
-    match /uline_audits/{date} {
-      allow read, write: if true;
-    }
-
-    // ── NuVizz manifests ──
-    match /nuvizz_manifests/{date} {
-      allow read: if true;
-      allow write: if false;
-      match /stops/{stopId} {
-        allow read: if true;
-        allow write: if false;
-      }
-    }
-
-    // ── Driver roster — read/write from web (internal tool, no auth yet) ──
-    match /drivers/{driverId} {
-      allow read, write: if true;
-    }
-
-    // ── Daily costs — read/write from web ──
-    match /costs/{date} {
-      allow read, write: if true;
-    }
-
-    // ── Weekly margin summaries — written by scraper, read from web ──
-    match /margin_summary/{weekOf} {
-      allow read: if true;
-      allow write: if false;
-    }
-
+    // All MarginIQ data requires authentication
+    function isAuth() { return request.auth != null; }
+    match /marginiq_config/{docId} { allow read, write: if isAuth(); }
+    match /payroll_runs/{runId} { allow read: if isAuth(); allow write: if false; }
+    match /reports_1099/{docId} { allow read: if isAuth(); allow write: if false; }
+    match /uline_audits/{date} { allow read, write: if isAuth(); }
+    match /nuvizz_stops/{stopId} { allow read, write: if isAuth(); }
+    match /nuvizz_manifests/{date} { allow read, write: if isAuth(); match /stops/{stopId} { allow read, write: if isAuth(); } }
+    match /b600_timeclock/{docId} { allow read, write: if isAuth(); }
+    match /qbo_imports/{docId} { allow read, write: if isAuth(); }
+    match /drivers/{driverId} { allow read, write: if isAuth(); }
+    match /costs/{date} { allow read, write: if isAuth(); }
+    match /margin_summary/{weekOf} { allow read: if isAuth(); allow write: if false; }
   }
 }
