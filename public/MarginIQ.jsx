@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "4.2.1";
+const APP_VERSION = "4.2.2";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -1637,7 +1637,7 @@ function MarginIQApp({user,onLogout}){
     try{const r=await fetch("/.netlify/functions/marginiq-motive?action=vehicles");if(r.ok)setMotiveConnected(true);}catch(e){}setLoading(false);})();},[]);
   const margins=useMemo(()=>calculateMargins(costs,ulineWeeks.length>0?{totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0),totalStops:ulineWeeks.reduce((s,w)=>s+(w.totalStops||0),0),weekCount:ulineWeeks.length}:null,qboData),[costs,ulineWeeks,qboData]);
   const onUline=w=>{setUlineWeeks(p=>[w,...p.filter(x=>x.week_id!==w.week_id)]);};
-  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"ai",i:"🤖",l:"AI"},{id:"import",i:"📥",l:"Import"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"qbimport",i:"📁",l:"QB Import"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"settings",i:"🔧",l:"Settings"}];
+  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"qbimport",i:"📁",l:"QB Import"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"import",i:"📥",l:"Import"},{id:"settings",i:"🔧",l:"Settings"}];
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
