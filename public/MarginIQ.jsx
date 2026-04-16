@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "5.1.0";
+const APP_VERSION = "5.1.1";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -2156,7 +2156,11 @@ function MarginIQApp({user,onLogout}){
         <div style={{display:"flex",alignItems:"center",gap:6}}>
           {qboConnected&&<Badge text="QBO" color={T.greenText} bg={T.greenBg}/>}
           <span style={{fontSize:"8px",color:T.textDim,padding:"2px 6px",background:T.bgSurface,borderRadius:"5px",fontWeight:600}}>v{APP_VERSION}</span>
-          {user&&<button onClick={onLogout} title={`Signed in as ${user.email} — click to log out`} style={{width:26,height:26,borderRadius:"50%",border:"none",background:T.brandPale,color:T.brand,fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>{(user.email||"?").charAt(0).toUpperCase()}</button>}
+          {user&&<div style={{display:"flex",alignItems:"center",gap:6,padding:"3px 4px 3px 8px",borderRadius:"18px",background:T.brandPale,border:`1px solid ${T.border}`}}>
+            <div style={{width:20,height:20,borderRadius:"50%",background:T.brand,color:"#fff",fontSize:10,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center"}}>{(user.email||"?").charAt(0).toUpperCase()}</div>
+            <span style={{fontSize:11,color:T.brand,fontWeight:600,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={user.email}>{user.email?.split("@")[0]}</span>
+            <button onClick={onLogout} title="Log out" style={{padding:"3px 8px",borderRadius:"12px",border:"none",background:T.brand,color:"#fff",fontSize:10,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>Log out</button>
+          </div>}
         </div>
       </div>
       <div style={{display:"flex",gap:"2px",padding:"6px 8px",overflowX:"auto",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.7)",WebkitOverflowScrolling:"touch"}} className="hide-scrollbar">
