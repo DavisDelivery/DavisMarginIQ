@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "4.2.2";
+const APP_VERSION = "4.2.3";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -1581,8 +1581,8 @@ function LoginScreen({onLogin}){
     <div style={{minHeight:"100vh",background:`linear-gradient(135deg,${T.brand} 0%,${T.brandDark} 100%)`,display:"flex",alignItems:"center",justifyContent:"center",padding:"20px",fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{background:"#fff",borderRadius:"16px",padding:"32px 28px",maxWidth:400,width:"100%",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
         <div style={{textAlign:"center",marginBottom:24}}>
-          <div style={{width:56,height:56,borderRadius:"14px",background:`linear-gradient(135deg,${T.brand},${T.brandLight})`,display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:"24px",fontWeight:800,color:"#fff",marginBottom:12,boxShadow:`0 4px 14px rgba(30,91,146,0.3)`}}>M</div>
-          <div style={{fontSize:"22px",fontWeight:800,color:T.text,letterSpacing:"-0.02em"}}>Davis MarginIQ</div>
+          <img src="/images/davis-logo.jpg" alt="Davis Delivery" style={{height:70,width:"auto",objectFit:"contain",display:"inline-block",marginBottom:12}}/>
+          <div style={{fontSize:"22px",fontWeight:800,color:T.text,letterSpacing:"-0.02em"}}>MarginIQ</div>
           <div style={{fontSize:"11px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase",marginTop:4}}>Cost Intelligence</div>
         </div>
         <div style={{marginBottom:12}}>
@@ -1641,9 +1641,9 @@ function MarginIQApp({user,onLogout}){
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <div style={{width:32,height:32,borderRadius:"8px",background:`linear-gradient(135deg,${T.brand},${T.brandLight})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"14px",fontWeight:800,color:"#fff"}}>M</div>
-          <div><div style={{fontSize:"14px",fontWeight:800}}>MarginIQ</div><div style={{fontSize:"8px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase"}}>Davis Delivery</div></div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <img src="/images/davis-logo.jpg" alt="Davis Delivery" style={{height:40,width:"auto",objectFit:"contain",display:"block"}}/>
+          <div style={{borderLeft:`1px solid ${T.border}`,paddingLeft:10}}><div style={{fontSize:"14px",fontWeight:800}}>MarginIQ</div><div style={{fontSize:"8px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase"}}>Cost Intelligence</div></div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:6}}>
           {qboConnected&&<Badge text="QBO" color={T.greenText} bg={T.greenBg}/>}
