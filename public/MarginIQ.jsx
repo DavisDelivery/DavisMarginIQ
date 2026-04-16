@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "5.0.0";
+const APP_VERSION = "5.1.0";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -670,13 +670,121 @@ function DataImport({ulineWeeks,onUlineUpload}){
       )}
 
       {view==="history"&&(
-        <div style={CS}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>📂 All Imported Data</div>
-          <DataRow label="Uline Weeks" value={`${ulineWeeks.length} files`} valueColor={ulineWeeks.length>0?T.green:T.textDim}/>
-          <DataRow label="B600 Records" value={`${b600History.length} records`} valueColor={b600History.length>0?T.green:T.textDim}/>
-          <div style={{fontSize:11,color:T.textMuted,marginTop:12}}>NuVizz stop count requires checking Firebase — go to Settings → Data History to see full inventory.</div>
-        </div>
+        <FullImportHistory ulineWeeks={ulineWeeks} onUlineDelete={(id)=>{setUlineWeeks(prev=>prev.filter(w=>(w.week_id||w.id)!==id));}} b600History={b600History} onB600Delete={(id)=>{setB600History(prev=>prev.filter(r=>r.id!==id));}}/>
       )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FULL IMPORT HISTORY (cross-source management)
+// ═══════════════════════════════════════════════════════════════
+function FullImportHistory({ulineWeeks,onUlineDelete,b600History,onB600Delete}){
+  const [source,setSource]=useState("all");
+  const [nvStops,setNvStops]=useState([]);
+  const [qboImports,setQboImports]=useState([]);
+  const [payrollRuns,setPayrollRuns]=useState([]);
+  const [loading,setLoading]=useState(false);
+
+  const loadAll=async()=>{
+    if(!hasFirebase) return;
+    setLoading(true);
+    try{
+      const [nv,qbo,pay]=await Promise.all([
+        window.db.collection("nuvizz_stops").limit(500).get().catch(()=>({docs:[]})),
+        window.db.collection("qbo_imports").orderBy("imported_at","desc").limit(100).get().catch(()=>({docs:[]})),
+        window.db.collection("payroll_runs").orderBy("check_date","desc").limit(50).get().catch(()=>({docs:[]})),
+      ]);
+      setNvStops(nv.docs.map(d=>({id:d.id,...d.data()})));
+      setQboImports(qbo.docs.map(d=>({id:d.id,...d.data()})));
+      setPayrollRuns(pay.docs.map(d=>({id:d.id,...d.data()})));
+    }catch(e){}
+    setLoading(false);
+  };
+  useEffect(()=>{loadAll();},[]);
+
+  const deleteDoc=async(collection,id,label,onDelete)=>{
+    if(!confirm(`Delete "${label}"? This permanently removes it from MarginIQ. Cannot be undone.`)) return;
+    try{
+      await window.db.collection(collection).doc(id).delete();
+      if(onDelete) onDelete(id);
+      loadAll();
+    }catch(e){alert("Delete failed: "+e.message);}
+  };
+
+  const deleteAll=async(collection,label,count)=>{
+    if(!confirm(`Delete ALL ${count} ${label} records? This permanently wipes this entire data source from MarginIQ. Cannot be undone.`)) return;
+    if(!confirm(`Are you absolutely sure? This will delete every ${label} import. Type cancel to stop, OK to proceed.`)) return;
+    try{
+      const snap=await window.db.collection(collection).get();
+      const batch=window.db.batch();
+      snap.docs.forEach(d=>batch.delete(d.ref));
+      await batch.commit();
+      loadAll();
+      alert(`Deleted ${snap.size} records from ${label}`);
+    }catch(e){alert("Bulk delete failed: "+e.message);}
+  };
+
+  // Build unified records list
+  const allRecords=[
+    ...ulineWeeks.map(w=>({id:w.week_id||w.id,type:"uline",label:"Uline",icon:"📦",filename:w.filename,date:w.upload_date,detail:`${fmtNum(w.totalStops||0)} stops, ${fmt(w.totalRevenue||0)}`,color:T.orange,collection:"uline_audits",onDelete:onUlineDelete})),
+    ...qboImports.map(q=>({id:q.id,type:"qb",label:`QB ${q.type==="gl"?"GL":q.type==="pnl"?"P&L":q.type==="bs"?"Bal Sheet":q.type==="customers"?"Customers":q.type==="payroll"?"Payroll":q.type}`,icon:"📁",filename:q.filename,date:q.imported_at,detail:q.txnCount?`${fmtNum(q.txnCount)} txns`:q.totalRevenue?`${fmtK(q.totalRevenue)} revenue`:q.rowCount?`${q.rowCount} rows`:"",color:T.blue,collection:"qbo_imports"})),
+    ...b600History.map(r=>({id:r.id,type:"b600",label:"B600",icon:"⏰",filename:`${r.name} — ${r.date}`,date:r.imported_at||r.date,detail:`${r.clockIn}→${r.clockOut} (${r.hours||"?"}hrs)`,color:T.purple,collection:"b600_timeclock",onDelete:onB600Delete})),
+    ...nvStops.map(s=>({id:s.id,type:"nuvizz",label:"NuVizz",icon:"🚚",filename:`Stop ${s.stopNbr||s.id}`,date:s.imported_at,detail:`${s.driverName||""} ${s.custName||s.customerName||""}`.trim(),color:T.green,collection:"nuvizz_stops"})),
+    ...payrollRuns.map(p=>({id:p.id,type:"payroll",label:"CyberPay",icon:"💵",filename:`Run ${p.run_id||p.id}`,date:p.check_date||p.scraped_at,detail:`${p.from_date}→${p.to_date}`,color:T.accent,collection:"payroll_runs"})),
+  ].filter(r=>source==="all"||r.type===source);
+  allRecords.sort((a,b)=>(b.date||"").localeCompare(a.date||""));
+
+  const counts={
+    uline:ulineWeeks.length,
+    qb:qboImports.length,
+    b600:b600History.length,
+    nuvizz:nvStops.length,
+    payroll:payrollRuns.length,
+  };
+  const total=counts.uline+counts.qb+counts.b600+counts.nuvizz+counts.payroll;
+
+  return(
+    <div>
+      <div style={CS}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+          <div style={{fontSize:13,fontWeight:700}}>📂 All Imported Data ({total} records)</div>
+          <PrimaryBtn text={loading?"Loading...":"Refresh"} onClick={loadAll} loading={loading} style={{padding:"6px 14px",fontSize:11}}/>
+        </div>
+        <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+          <TabBtn active={source==="all"} label={`All (${total})`} onClick={()=>setSource("all")}/>
+          <TabBtn active={source==="uline"} label={`📦 Uline (${counts.uline})`} onClick={()=>setSource("uline")}/>
+          <TabBtn active={source==="qb"} label={`📁 QB (${counts.qb})`} onClick={()=>setSource("qb")}/>
+          <TabBtn active={source==="b600"} label={`⏰ B600 (${counts.b600})`} onClick={()=>setSource("b600")}/>
+          <TabBtn active={source==="nuvizz"} label={`🚚 NuVizz (${counts.nuvizz})`} onClick={()=>setSource("nuvizz")}/>
+          <TabBtn active={source==="payroll"} label={`💵 Payroll (${counts.payroll})`} onClick={()=>setSource("payroll")}/>
+        </div>
+        {source!=="all"&&allRecords.length>0&&(
+          <div style={{display:"flex",justifyContent:"flex-end",marginBottom:10}}>
+            <button onClick={()=>{
+              const srcMap={uline:["uline_audits",ulineWeeks.length],qb:["qbo_imports",qboImports.length],b600:["b600_timeclock",b600History.length],nuvizz:["nuvizz_stops",nvStops.length],payroll:["payroll_runs",payrollRuns.length]};
+              const [col,cnt]=srcMap[source];
+              deleteAll(col,source,cnt);
+            }} style={{padding:"6px 12px",fontSize:11,borderRadius:6,border:`1px solid ${T.red}`,background:T.redBg,color:T.redText,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>🗑️ Delete ALL {source} records</button>
+          </div>
+        )}
+        <div style={{maxHeight:500,overflowY:"auto"}}>
+          {allRecords.length===0?<div style={{textAlign:"center",padding:30,color:T.textMuted,fontSize:13}}>No records found.</div>:allRecords.map((r,i)=>(
+            <div key={`${r.type}_${r.id}`} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 12px",borderBottom:`1px solid ${T.borderLight}`,background:T.bgSurface,borderRadius:8,marginBottom:4}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+                  <Badge text={`${r.icon} ${r.label}`} color="#fff" bg={r.color}/>
+                  <span style={{fontSize:12,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.filename}</span>
+                </div>
+                <div style={{fontSize:10,color:T.textMuted}}>
+                  {r.date?new Date(r.date).toLocaleDateString():"?"} • {r.detail}
+                </div>
+              </div>
+              <button onClick={()=>deleteDoc(r.collection,r.id,r.filename,r.onDelete)} title="Delete this import" style={{marginLeft:8,padding:"6px 10px",borderRadius:6,border:`1px solid ${T.red}`,background:"transparent",color:T.red,fontSize:14,cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>🗑️</button>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1526,7 +1634,7 @@ function QBOImport(){
         {glData&&<TabBtn active={view==="categories"} label="🏷️ Categories" onClick={()=>setView("categories")}/>}
         {glData&&<TabBtn active={view==="vendors"} label="🏭 Vendors" onClick={()=>setView("vendors")}/>}
         {glData&&<TabBtn active={view==="customers"} label="🏢 Customers" onClick={()=>setView("customers")}/>}
-        {qboFiles.length>0&&<TabBtn active={view==="history"} label="📂 History" onClick={()=>setView("history")}/>}
+        {qboFiles.length>0?<TabBtn active={view==="history"} label={`📂 History (${qboFiles.length})`} onClick={()=>setView("history")}/>:<TabBtn active={view==="history"} label="📂 History" onClick={()=>setView("history")}/>}
       </div>
 
       {view==="upload"&&(
@@ -1655,13 +1763,34 @@ function QBOImport(){
       )}
 
       {view==="history"&&(
-        <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Import History ({qboFiles.length})</div>
-          <div style={{maxHeight:400,overflowY:"auto"}}>{qboFiles.map((f,i)=>(
-            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:`1px solid ${T.borderLight}`}}>
-              <div><div style={{fontSize:12,fontWeight:600}}>{f.filename}</div><div style={{fontSize:10,color:T.textMuted}}>{f.type} • {new Date(f.imported_at).toLocaleDateString()}</div></div>
-              <Badge text={f.type==="gl"?"General Ledger":f.type==="pnl"?"P&L":f.type==="bs"?"Balance Sheet":f.type==="customers"?"Customers":f.type==="payroll"?"Payroll":f.type} color={T.blueText} bg={T.blueBg}/>
+        <div style={CS}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+            <div style={{fontSize:13,fontWeight:700}}>Import History ({qboFiles.length})</div>
+            <div style={{fontSize:11,color:T.textMuted}}>Click 🗑️ to delete an import and its data</div>
+          </div>
+          <div style={{maxHeight:500,overflowY:"auto"}}>{qboFiles.map((f,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px",borderBottom:`1px solid ${T.borderLight}`,background:T.bgSurface,borderRadius:8,marginBottom:6}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:12,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.filename}</div>
+                <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>
+                  <Badge text={f.type==="gl"?"General Ledger":f.type==="pnl"?"P&L":f.type==="bs"?"Balance Sheet":f.type==="customers"?"Customers":f.type==="payroll"?"Payroll":f.type} color={T.blueText} bg={T.blueBg}/>
+                  {" "}• {new Date(f.imported_at).toLocaleDateString()} {new Date(f.imported_at).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}
+                  {f.txnCount&&` • ${fmtNum(f.txnCount)} transactions`}
+                  {f.totalRevenue&&` • ${fmtK(f.totalRevenue)} rev`}
+                </div>
+              </div>
+              <button onClick={async()=>{
+                if(!confirm(`Delete "${f.filename}"? This permanently removes the import and all its data from MarginIQ. This cannot be undone.`)) return;
+                try{
+                  if(hasFirebase) await window.db.collection("qbo_imports").doc(f.id).delete();
+                  setQboFiles(prev=>prev.filter(x=>x.id!==f.id));
+                  if(f.type==="gl"&&glData?.id===f.id) setGlData(null);
+                  setResult({type:"success",reportType:"delete",filename:f.filename,message:`Deleted ${f.filename}`});
+                }catch(err){alert("Delete failed: "+err.message);}
+              }} title="Delete this import" style={{marginLeft:8,padding:"6px 10px",borderRadius:6,border:`1px solid ${T.red}`,background:"transparent",color:T.red,fontSize:14,cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>🗑️</button>
             </div>
           ))}</div>
+          {qboFiles.length===0&&<div style={{textAlign:"center",padding:30,color:T.textMuted,fontSize:13}}>No imports yet. Upload files from the 📤 Upload tab to get started.</div>}
         </div>
       )}
     </div>
