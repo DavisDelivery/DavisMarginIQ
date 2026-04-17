@@ -5,10 +5,16 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
-# API routes handled by functions (explicit paths take precedence)
+# NuVizz API proxy
 [[redirects]]
   from = "/api/nuvizz/*"
   to = "/.netlify/functions/nuvizz/:splat"
+  status = 200
+
+# Deployer page — served directly, not caught by SPA redirect
+[[redirects]]
+  from = "/push"
+  to = "/push.html"
   status = 200
 
 # SPA catch-all (must be LAST)
@@ -16,3 +22,4 @@
   from = "/*"
   to = "/index.html"
   status = 200
+  conditions = {Query = {"!redirect" = "no"}}

@@ -1,19 +1,77 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // All MarginIQ data requires authentication
-    function isAuth() { return request.auth != null; }
-    match /marginiq_config/{docId} { allow read, write: if isAuth(); }
-    match /payroll_runs/{runId} { allow read: if isAuth(); allow write: if false; }
-    match /reports_1099/{docId} { allow read: if isAuth(); allow write: if false; }
-    match /uline_audits/{date} { allow read, write: if isAuth(); }
-    match /nuvizz_stops/{stopId} { allow read, write: if isAuth(); }
-    match /nuvizz_manifests/{date} { allow read, write: if isAuth(); match /stops/{stopId} { allow read, write: if isAuth(); } }
-    match /b600_timeclock/{docId} { allow read, write: if isAuth(); }
-    match /qbo_imports/{docId} { allow read, write: if isAuth(); }
-    match /drivers/{driverId} { allow read, write: if isAuth(); }
-    match /employees/{employeeId} { allow read, write: if isAuth(); }
-    match /costs/{date} { allow read, write: if isAuth(); }
-    match /margin_summary/{weekOf} { allow read: if isAuth(); allow write: if false; }
+
+    match /payroll_runs/{runId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /reports_1099/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Legacy uline_audits (v1.x)
+    match /uline_audits/{date} {
+      allow read, write: if true;
+    }
+
+    // v2.1 monthly (legacy, still readable)
+    match /uline_monthly/{month} {
+      allow read, write: if true;
+    }
+
+    // v2.2 weekly rollups (billed revenue)
+    match /uline_weekly/{weekId} {
+      allow read, write: if true;
+    }
+
+    // v2.2 reconciliation by week (billed vs paid)
+    match /recon_weekly/{weekId} {
+      allow read, write: if true;
+    }
+
+    // Unpaid stops queue
+    match /unpaid_stops/{proKey} {
+      allow read, write: if true;
+    }
+
+    // DDIS payment file metadata
+    match /ddis_files/{fileId} {
+      allow read, write: if true;
+    }
+
+    // File upload log
+    match /file_log/{fileId} {
+      allow read, write: if true;
+    }
+
+    match /nuvizz_manifests/{date} {
+      allow read: if true;
+      allow write: if false;
+      match /stops/{stopId} {
+        allow read: if true;
+        allow write: if false;
+      }
+    }
+
+    match /drivers/{driverId} {
+      allow read, write: if true;
+    }
+
+    match /costs/{date} {
+      allow read, write: if true;
+    }
+
+    match /marginiq_config/{docId} {
+      allow read, write: if true;
+    }
+
+    match /margin_summary/{weekOf} {
+      allow read: if true;
+      allow write: if false;
+    }
+
   }
 }

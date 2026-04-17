@@ -1,15 +1,15 @@
-// Davis MarginIQ v2.0 — Cost Intelligence Platform
-// Firebase loaded globally via compat SDK in index.html (window.db, window.fbStorage)
-// SheetJS loaded globally via CDN (window.XLSX)
+// Davis MarginIQ v2.2 — Cost Intelligence Platform
+// Revenue (billed) drives margins. Reconciliation (paid) is separate monitoring.
+// Data completeness scanner flags missing weeks.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "2.2.0";
 
-// ─── Design Tokens (Davis Brand Blue) ────────────────────────
+// ─── Design Tokens ──────────────────────────────────────────
 const T = {
   brand:"#1e5b92", brandLight:"#2a7bc8", brandDark:"#143f66", brandPale:"#e8f0f8",
   accent:"#10b981", accentWarn:"#f59e0b", accentDanger:"#ef4444",
-  bg:"#f0f4f8", bgWhite:"#ffffff", bgCard:"#ffffff", bgSurface:"#f8fafc", bgHover:"#f1f5f9",
+  bg:"#f0f4f8", bgWhite:"#ffffff", bgCard:"#ffffff", bgSurface:"#f8fafc",
   text:"#0f172a", textMuted:"#64748b", textDim:"#94a3b8",
   border:"#e2e8f0", borderLight:"#f1f5f9",
   green:"#10b981", greenBg:"#ecfdf5", greenText:"#065f46",
@@ -17,38 +17,21 @@ const T = {
   yellow:"#f59e0b", yellowBg:"#fffbeb", yellowText:"#92400e",
   blue:"#3b82f6", blueBg:"#eff6ff", blueText:"#1e40af",
   purple:"#8b5cf6", purpleBg:"#f5f3ff",
-  radius:"12px", radiusSm:"8px", radiusLg:"16px",
+  radius:"12px", radiusSm:"8px",
   shadow:"0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06)",
-  shadowMd:"0 4px 12px rgba(0,0,0,0.08)",
-  shadowLg:"0 10px 30px rgba(0,0,0,0.1)",
 };
 
-// ─── Default Cost Structure ──────────────────────────────────
 const DEFAULT_COSTS = {
-  warehouse: 450000,
-  forklifts: 84000,
-  forklift_operators: 416000,
-  truck_insurance_monthly: 1000,
-  truck_count_box: 30,
-  truck_count_tractor: 20,
-  rate_box_driver: 23,
-  rate_tractor_driver: 27.50,
-  rate_dispatcher: 20,
-  rate_admin: 18,
-  rate_mechanic: 28,
-  count_box_drivers: 16,
-  count_tractor_drivers: 19,
-  count_dispatchers: 2,
-  count_admin: 3,
-  count_mechanics: 2,
-  count_forklift_ops: 10,
-  mpg_box: 8,
-  mpg_tractor: 6,
-  fuel_price: 3.50,
-  working_days_year: 260,
-  avg_hours_per_shift: 10,
-  contractor_pct: 0.40,
+  warehouse: 450000, forklifts: 84000, forklift_operators: 416000,
+  truck_insurance_monthly: 1000, truck_count_box: 30, truck_count_tractor: 20,
+  rate_box_driver: 23, rate_tractor_driver: 27.50, rate_dispatcher: 20, rate_admin: 18, rate_mechanic: 28,
+  count_box_drivers: 16, count_tractor_drivers: 19, count_dispatchers: 2, count_admin: 3, count_mechanics: 2, count_forklift_ops: 10,
+  mpg_box: 8, mpg_tractor: 6, fuel_price: 3.50,
+  working_days_year: 260, avg_hours_per_shift: 10, contractor_pct: 0.40,
 };
+
+// Earliest date we consider "business started" — before this, sparse data is expected
+const BUSINESS_START = "2023-03-01";
 
 // ─── Formatters ──────────────────────────────────────────────
 const fmt = n => n==null||isNaN(n)?"$0":"$"+Number(n).toLocaleString("en-US",{maximumFractionDigits:0});
@@ -57,115 +40,263 @@ const fmtDec = (n,d=2) => n==null||isNaN(n)?"0":Number(n).toLocaleString("en-US"
 const fmtPct = (n,d=1) => n==null||isNaN(n)?"0%":fmtDec(n,d)+"%";
 const fmtNum = n => n==null||isNaN(n)?"0":Number(n).toLocaleString("en-US",{maximumFractionDigits:0});
 
+const puToDate = pu => { if (!pu) return null; const s = String(Math.floor(pu)); if (s.length !== 8) return null; return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`; };
+const puToMonth = pu => { if (!pu) return null; const s = String(Math.floor(pu)); if (s.length !== 8) return null; return `${s.slice(0,4)}-${s.slice(4,6)}`; };
+const parseDateMDY = s => { if (!s) return null; const m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); if (!m) return null; return `${m[3]}-${m[1].padStart(2,"0")}-${m[2].padStart(2,"0")}`; };
+const dateToMonth = d => d ? d.slice(0,7) : null;
+
+// Compute the Friday week-ending for a YYYY-MM-DD date
+function weekEndingFriday(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + "T00:00:00");
+  if (isNaN(d)) return null;
+  const day = d.getDay(); // Sun=0...Sat=6
+  // Distance to Friday (day 5): if already Fri, 0. Else roll forward to Fri.
+  let add = (5 - day + 7) % 7;
+  // If Sat or Sun, roll back to prev Fri
+  if (day === 6) add = -1;
+  if (day === 0) add = -2;
+  const f = new Date(d);
+  f.setDate(d.getDate() + add);
+  return f.toISOString().slice(0,10);
+}
+function addDays(dateStr, n) { const d = new Date(dateStr+"T00:00:00"); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); }
+function weekLabel(friday) { if (!friday) return "—"; const d = new Date(friday+"T00:00:00"); return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"}); }
+
 // ─── Firebase Helpers ────────────────────────────────────────
 const hasFirebase = typeof window !== "undefined" && window.db;
 const FS = {
-  async getCosts() {
-    if (!hasFirebase) return null;
-    try { const d=await window.db.collection("marginiq_config").doc("cost_structure").get(); return d.exists?d.data():null; } catch(e) { return null; }
-  },
-  async saveCosts(data) {
-    if (!hasFirebase) return false;
-    try { await window.db.collection("marginiq_config").doc("cost_structure").set({...data, updated_at:new Date().toISOString()}); return true; } catch(e) { return false; }
-  },
-  async getUlineWeeks() {
-    if (!hasFirebase) return [];
-    try { const s=await window.db.collection("uline_audits").orderBy("upload_date","desc").limit(52).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; }
-  },
-  async saveUlineWeek(weekId, data) {
-    if (!hasFirebase) return false;
-    try { await window.db.collection("uline_audits").doc(weekId).set(data); return true; } catch(e) { return false; }
-  },
-  async getDrivers() {
-    if (!hasFirebase) return [];
-    try { const s=await window.db.collection("drivers").get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; }
-  },
+  async getCosts() { if (!hasFirebase) return null; try { const d=await window.db.collection("marginiq_config").doc("cost_structure").get(); return d.exists?d.data():null; } catch(e) { return null; } },
+  async saveCosts(data) { if (!hasFirebase) return false; try { await window.db.collection("marginiq_config").doc("cost_structure").set({...data, updated_at:new Date().toISOString()}); return true; } catch(e) { return false; } },
+  async getWeeklyRollups() { if (!hasFirebase) return []; try { const s=await window.db.collection("uline_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveWeeklyRollup(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("uline_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getReconWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("recon_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveReconWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("recon_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getReconMeta() { if (!hasFirebase) return null; try { const d = await window.db.collection("marginiq_config").doc("recon_meta").get(); return d.exists?d.data():null; } catch(e) { return null; } },
+  async saveReconMeta(data) { if (!hasFirebase) return false; try { await window.db.collection("marginiq_config").doc("recon_meta").set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async saveUnpaidStop(proKey, data) { if (!hasFirebase) return false; try { await window.db.collection("unpaid_stops").doc(String(proKey)).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getUnpaidStops(limit=500) { if (!hasFirebase) return []; try { const s=await window.db.collection("unpaid_stops").orderBy("billed","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveDDISFile(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("ddis_files").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getDDISFiles() { if (!hasFirebase) return []; try { const s=await window.db.collection("ddis_files").orderBy("latest_bill_date","desc").get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveFileLog(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("file_log").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getFileLog(limit=500) { if (!hasFirebase) return []; try { const s=await window.db.collection("file_log").orderBy("uploaded_at","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
 };
 
-// ─── Uline XLSX Parser ──────────────────────────────────────
-function parseUlineXlsx(file) {
+// ─── File Type Detection ────────────────────────────────────
+function detectFileType(filename, firstRow) {
+  const fn = filename.toLowerCase();
+  if (fn.startsWith("ddis820") || fn.includes("ddis")) return "ddis";
+  if (fn.startsWith("master")) return "master";
+  if (fn.includes("accessorial") || fn.includes("acesorial") || fn.includes("acessorial") || fn.includes("accesorial") || fn.includes("acceessorial")) return "accessorials";
+  if (fn.startsWith("das") || fn.startsWith("das ")) return "original";
+  if (firstRow) {
+    const keys = Object.keys(firstRow).map(k => k.toLowerCase().trim());
+    if (keys.includes("voucher#") || keys.includes("check#")) return "ddis";
+    if (keys.some(k => k === "pro" || k === "pro#") && keys.includes("new cost")) {
+      return firstRow.code ? "accessorials" : "original";
+    }
+  }
+  return "unknown";
+}
+
+async function readWorkbook(file) {
   return new Promise((resolve, reject) => {
-    if (typeof XLSX === "undefined") return reject(new Error("XLSX library not loaded"));
-    const reader = new FileReader();
-    reader.onload = (e) => {
+    const r = new FileReader();
+    r.onload = e => {
       try {
         const wb = XLSX.read(e.target.result, { type: "array" });
         const ws = wb.Sheets[wb.SheetNames[0]];
-        const raw = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        const rows = raw.map(r => {
-          const n = {};
-          Object.keys(r).forEach(k => { n[k.toLowerCase().trim()] = r[k]; });
-          return n;
-        });
-        const stops = rows.filter(r => r.pro || r.order).map(r => ({
-          pro: String(r.pro||"").replace(/^0+/,""),
-          order: String(r.order||""),
-          customer: String(r.customer||r.consignee||""),
-          city: String(r.city||""),
-          state: String(r.st||r.state||""),
-          zip: String(r.zip||""),
-          pickup: String(r.pu||r.pickup||""),
-          cost: parseFloat(r.cost||r.amount||0) || 0,
-          weight: parseFloat(r.wgt||r.weight||0) || 0,
-          skids: parseInt(r.skid||r.skids||r.pallets||0) || 0,
-          loose: parseInt(r.loose||0) || 0,
-          pieces: (parseInt(r.skid||r.skids||0)||0) + (parseInt(r.loose||0)||0),
-          via: String(r.via||""),
-          extraCost: parseFloat(r["extra cost"]||r.extra_cost||0) || 0,
-          code: String(r.code||""),
-          newCost: parseFloat(r["new cost"]||r.new_cost||0) || 0,
-          notes: String(r.notes||""),
-          warehouse: String(r.wh||r.warehouse||""),
-        }));
-        const totalRevenue = stops.reduce((s,r) => s + (r.newCost || r.cost), 0);
-        const totalWeight = stops.reduce((s,r) => s + r.weight, 0);
-        const totalStops = stops.length;
-        const byCity = {};
-        stops.forEach(s => { const c=s.city||"Unknown"; if(!byCity[c]) byCity[c]={city:c,stops:0,revenue:0,weight:0}; byCity[c].stops++; byCity[c].revenue+=(s.newCost||s.cost); byCity[c].weight+=s.weight; });
-        const byZip = {};
-        stops.forEach(s => { const z=s.zip||"Unknown"; if(!byZip[z]) byZip[z]={zip:z,stops:0,revenue:0}; byZip[z].stops++; byZip[z].revenue+=(s.newCost||s.cost); });
-        resolve({
-          stops, totalRevenue, totalWeight, totalStops,
-          byCity: Object.values(byCity).sort((a,b)=>b.revenue-a.revenue),
-          byZip: Object.values(byZip).sort((a,b)=>b.revenue-a.revenue),
-          avgRevenuePerStop: totalStops>0 ? totalRevenue/totalStops : 0,
-          avgWeightPerStop: totalStops>0 ? totalWeight/totalStops : 0,
-        });
-      } catch(e) { reject(e); }
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+        const norm = rows.map(r => { const o = {}; Object.keys(r).forEach(k => o[String(k).toLowerCase().trim()] = r[k]); return o; });
+        resolve(norm);
+      } catch(err) { reject(err); }
     };
-    reader.onerror = reject;
-    reader.readAsArrayBuffer(file);
+    r.onerror = reject;
+    r.readAsArrayBuffer(file);
+  });
+}
+async function readCSV(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = e => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "string" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+        const norm = rows.map(r => { const o = {}; Object.keys(r).forEach(k => o[String(k).toLowerCase().trim()] = r[k]); return o; });
+        resolve(norm);
+      } catch(err) { reject(err); }
+    };
+    r.onerror = reject;
+    r.readAsText(file);
   });
 }
 
-// ─── API Helpers ─────────────────────────────────────────────
-async function fetchNuVizz(path) {
-  try { const r = await fetch(`/api/nuvizz/${path}`); if (!r.ok) throw new Error(`NuVizz ${r.status}`); return await r.json(); }
-  catch(e) { console.warn("NuVizz:", e); return null; }
+function normalizePro(v) {
+  if (v == null) return null;
+  let s = String(v).trim();
+  if (s === "") return null;
+  s = s.replace(/\.0+$/,"");
+  const stripped = s.replace(/^0+/,"");
+  return stripped || s;
 }
-async function fetchNuVizzStops(from, to) {
-  return fetchNuVizz(`stops?fromDTTM=${encodeURIComponent(from+"T00:00:00")}&toDTTM=${encodeURIComponent(to+"T23:59:59")}`);
+
+function parseOriginalOrAccessorial(rows) {
+  const stops = [];
+  for (const r of rows) {
+    const proRaw = r.pro ?? r["pro#"];
+    if (!proRaw) continue;
+    const proStr = String(proRaw).toLowerCase();
+    if (proStr === "pro" || proStr === "pro#") continue;
+    const pro = normalizePro(proRaw);
+    if (!pro) continue;
+    const cost = parseFloat(r.cost) || 0;
+    const newCost = parseFloat(r["new cost"]) || 0;
+    const extraCost = parseFloat(r["extra cost"]) || 0;
+    const wgt = parseFloat(r.wgt) || 0;
+    const skid = parseInt(r.skid) || 0;
+    const loose = parseInt(r.loose) || 0;
+    const pu = r.pu ? parseInt(r.pu) : null;
+    stops.push({
+      pro,
+      order: r.order ? String(r.order) : null,
+      customer: r.customer ? String(r.customer).trim() : null,
+      city: r.city ? String(r.city).trim() : null,
+      state: r.st ? String(r.st).trim() : null,
+      zip: r.zip ? String(r.zip).trim() : null,
+      pu, pu_date: pu ? puToDate(pu) : null,
+      month: pu ? puToMonth(pu) : null,
+      week_ending: pu ? weekEndingFriday(puToDate(pu)) : null,
+      cost, new_cost: newCost || cost, extra_cost: extraCost,
+      warehouse: r.wh ? String(r.wh).trim() : null,
+      skid, loose, weight: wgt,
+      via: r.via ? String(r.via).trim() : null,
+      code: r.code ? String(r.code).trim() : null,
+      is_accessorial: !!r.code && (extraCost > 0),
+    });
+  }
+  return stops;
 }
-async function fetchMotive(action) {
-  try { const r = await fetch(`/.netlify/functions/marginiq-motive?action=${action}`); if (!r.ok) throw new Error(`Motive ${r.status}`); return await r.json(); }
-  catch(e) { console.warn("Motive:", e); return null; }
+
+function parseDDIS(rows) {
+  const payments = [];
+  for (const r of rows) {
+    const proRaw = r["pro#"];
+    if (!proRaw) continue;
+    const pro = normalizePro(proRaw);
+    if (!pro) continue;
+    const paidAmount = parseFloat(r["paid amount"]) || 0;
+    const billDate = parseDateMDY(r["bill date"]);
+    payments.push({
+      pro,
+      voucher: r["voucher#"] ? String(r["voucher#"]) : null,
+      check: r["check#"] ? String(r["check#"]) : null,
+      bill_date: billDate,
+      paid: paidAmount,
+    });
+  }
+  return payments;
 }
-async function fetchQBO(action, start, end) {
-  try {
-    let url = `/.netlify/functions/marginiq-qbo-data?action=${action}`;
-    if (start) url += `&start=${start}`;
-    if (end) url += `&end=${end}`;
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    return await r.json();
-  } catch(e) { return null; }
+
+// ─── Build Weekly Rollups ──────────────────────────────────
+function buildWeeklyRollups(stops) {
+  const byWeek = {};
+  for (const s of stops) {
+    if (!s.week_ending) continue;
+    const w = s.week_ending;
+    if (!byWeek[w]) {
+      byWeek[w] = {
+        week_ending: w,
+        month: s.month,
+        stops: 0, revenue: 0, base_revenue: 0, accessorial_revenue: 0,
+        weight: 0, skids: 0,
+        accessorial_count: 0,
+        unique_pros: new Set(),
+        customers: {},
+        cities: {},
+      };
+    }
+    const bw = byWeek[w];
+    bw.stops++;
+    bw.revenue += s.new_cost || 0;
+    bw.base_revenue += s.cost || 0;
+    bw.accessorial_revenue += s.extra_cost || 0;
+    bw.weight += s.weight || 0;
+    bw.skids += s.skid || 0;
+    bw.unique_pros.add(s.pro);
+    if (s.is_accessorial) bw.accessorial_count++;
+    if (s.customer) {
+      if (!bw.customers[s.customer]) bw.customers[s.customer] = { stops:0, revenue:0 };
+      bw.customers[s.customer].stops++;
+      bw.customers[s.customer].revenue += s.new_cost || 0;
+    }
+    if (s.city) {
+      if (!bw.cities[s.city]) bw.cities[s.city] = { stops:0, revenue:0 };
+      bw.cities[s.city].stops++;
+      bw.cities[s.city].revenue += s.new_cost || 0;
+    }
+  }
+  return Object.values(byWeek).map(w => ({
+    ...w,
+    unique_pros: w.unique_pros.size,
+    // Keep top 20 customers and cities for Firebase storage
+    top_customers: Object.entries(w.customers).sort((a,b) => b[1].revenue - a[1].revenue).slice(0,20).map(([name, v]) => ({name, ...v})),
+    top_cities: Object.entries(w.cities).sort((a,b) => b[1].revenue - a[1].revenue).slice(0,20).map(([name, v]) => ({name, ...v})),
+    customers: undefined,
+    cities: undefined,
+  }));
+}
+
+// ─── Data Completeness Scanner ──────────────────────────────
+function scanCompleteness(weeklyRollups, ulineFiles, fromDate=BUSINESS_START) {
+  if (weeklyRollups.length === 0) return { expected: [], gaps: [], sparseWeeks: [], missingAccessorials: [] };
+
+  // Get all week-endings from business start to latest in data
+  const sorted = [...weeklyRollups].sort((a,b) => a.week_ending.localeCompare(b.week_ending));
+  const firstWE = sorted[0].week_ending;
+  const lastWE = sorted[sorted.length-1].week_ending;
+  const startWE = firstWE < fromDate ? weekEndingFriday(fromDate) : firstWE;
+
+  // Generate expected Fridays from startWE to lastWE
+  const expected = [];
+  let cur = startWE;
+  while (cur <= lastWE) {
+    expected.push(cur);
+    cur = addDays(cur, 7);
+  }
+
+  const actual = new Set(weeklyRollups.map(r => r.week_ending));
+  const gaps = expected.filter(w => !actual.has(w));
+
+  // Avg stops for sparse detection
+  const validRollups = weeklyRollups.filter(r => r.week_ending >= fromDate && r.stops > 100);
+  const avgStops = validRollups.length > 0 ? validRollups.reduce((s,r) => s+r.stops, 0) / validRollups.length : 0;
+  const sparseThreshold = Math.max(100, avgStops * 0.3);
+  const sparseWeeks = weeklyRollups
+    .filter(r => r.week_ending >= fromDate && r.stops < sparseThreshold)
+    .map(r => ({ week_ending: r.week_ending, stops: r.stops, revenue: r.revenue, expected_avg: Math.round(avgStops) }));
+
+  // Weeks with stops but no accessorials at all — suspicious given that accessorial rate avg ~1-5%
+  const missingAccessorials = weeklyRollups
+    .filter(r => r.week_ending >= fromDate && r.stops >= 100 && r.accessorial_count === 0)
+    .map(r => ({ week_ending: r.week_ending, stops: r.stops, revenue: r.revenue }));
+
+  return { expected, gaps, sparseWeeks, missingAccessorials, avgStops: Math.round(avgStops), firstWE: startWE, lastWE };
+}
+
+// ─── Reconciliation Matching ────────────────────────────────
+function buildReconWeekly(weeklyRollups, paymentByPro) {
+  // For each weekly rollup, sum up how much was paid against those PROs
+  // This requires going back to stop-level data, which we only have in-memory during ingest.
+  // So instead we store per-pro paid, then in the recon view we show collection rate at week level
+  // Actually we rebuild recon during ingest from the stops we just parsed
+  return [];
 }
 
 // ─── MARGIN ENGINE ──────────────────────────────────────────
-function calculateMargins(costs, ulineData, qboData) {
+function calculateMargins(costs, weeklyWindow) {
   const c = { ...DEFAULT_COSTS, ...costs };
   const wd = c.working_days_year || 260;
-
   const annualBoxDrivers = c.count_box_drivers * c.rate_box_driver * c.avg_hours_per_shift * wd;
   const annualTractorDrivers = c.count_tractor_drivers * c.rate_tractor_driver * c.avg_hours_per_shift * wd;
   const annualDispatchers = c.count_dispatchers * c.rate_dispatcher * 8 * wd;
@@ -173,52 +304,47 @@ function calculateMargins(costs, ulineData, qboData) {
   const annualMechanics = c.count_mechanics * c.rate_mechanic * 8 * wd;
   const annualForkliftOps = c.count_forklift_ops * 20 * 8 * wd;
   const totalAnnualLabor = annualBoxDrivers + annualTractorDrivers + annualDispatchers + annualAdmin + annualMechanics + annualForkliftOps;
-
   const totalTrucks = (c.truck_count_box||0) + (c.truck_count_tractor||0);
   const annualInsurance = c.truck_insurance_monthly * totalTrucks * 12;
   const annualWarehouse = c.warehouse || 0;
   const annualForklifts = c.forklifts || 0;
   const totalAnnualFixed = annualWarehouse + annualForklifts + annualInsurance;
-
   const totalAnnualCost = totalAnnualLabor + totalAnnualFixed;
   const dailyCost = totalAnnualCost / wd;
   const monthlyCost = totalAnnualCost / 12;
 
-  const dailyStops = ulineData ? (ulineData.totalStops / (ulineData.weekCount||1) / 5) : 600;
-  const costPerStop = dailyCost / dailyStops;
+  let dailyStops = 600;
+  let dailyRevenue = 0;
+  let annualRevenue = 0;
 
-  const ulineRevenue = ulineData ? ulineData.totalRevenue : 0;
-  const ulineWeeklyRevenue = ulineData ? ulineRevenue / (ulineData.weekCount||1) : 0;
-  const ulineDailyRevenue = ulineWeeklyRevenue / 5;
-  const ulineAnnualRevenue = ulineWeeklyRevenue * 52;
+  if (weeklyWindow && weeklyWindow.weeksCount > 0) {
+    const weeklyAvgRevenue = weeklyWindow.totalRevenue / weeklyWindow.weeksCount;
+    const weeklyAvgStops = weeklyWindow.totalStops / weeklyWindow.weeksCount;
+    annualRevenue = weeklyAvgRevenue * 52;
+    dailyRevenue = weeklyAvgRevenue / 5;
+    dailyStops = weeklyAvgStops / 5;
+  }
 
-  const qboRevenue = qboData?.revenue || 0;
-
-  const dailyRevenue = ulineDailyRevenue || (qboRevenue / wd) || 0;
+  const costPerStop = dailyCost / (dailyStops || 1);
   const dailyMargin = dailyRevenue - dailyCost;
   const dailyMarginPct = dailyRevenue > 0 ? (dailyMargin / dailyRevenue * 100) : 0;
-
   const revenuePerStop = dailyStops > 0 ? dailyRevenue / dailyStops : 0;
   const marginPerStop = revenuePerStop - costPerStop;
   const marginPerStopPct = revenuePerStop > 0 ? (marginPerStop / revenuePerStop * 100) : 0;
-
   const totalDrivers = c.count_box_drivers + c.count_tractor_drivers;
   const stopsPerDriver = dailyStops / (totalDrivers || 1);
   const revenuePerDriver = dailyRevenue / (totalDrivers || 1);
   const costPerDriver = dailyCost / (totalDrivers || 1);
   const marginPerDriver = revenuePerDriver - costPerDriver;
-
   const revenuePerTruck = dailyRevenue / (totalTrucks || 1);
   const costPerTruck = dailyCost / (totalTrucks || 1);
-
   const breakEvenStopsDaily = revenuePerStop > 0 ? (dailyCost / revenuePerStop) : 0;
 
   return {
     totalAnnualCost, totalAnnualLabor, totalAnnualFixed,
     annualBoxDrivers, annualTractorDrivers, annualDispatchers, annualAdmin, annualMechanics, annualForkliftOps,
     annualInsurance, annualWarehouse, annualForklifts,
-    ulineAnnualRevenue, qboRevenue,
-    monthlyCost,
+    annualRevenue, monthlyCost,
     dailyCost, dailyRevenue, dailyMargin, dailyMarginPct, dailyStops,
     costPerStop, revenuePerStop, marginPerStop, marginPerStopPct,
     totalDrivers, stopsPerDriver, revenuePerDriver, costPerDriver, marginPerDriver,
@@ -238,686 +364,943 @@ function calculateMargins(costs, ulineData, qboData) {
   };
 }
 
-// ─── Shared Components ──────────────────────────────────────
+// ─── Shared UI ──────────────────────────────────────────────
 const cardStyle = { background:T.bgCard, borderRadius:T.radius, padding:"16px", border:`1px solid ${T.border}`, boxShadow:T.shadow, marginBottom:"12px" };
 const inputStyle = { width:"100%", padding:"8px 12px", borderRadius:"8px", border:`1px solid ${T.border}`, background:T.bgSurface, color:T.text, fontSize:"13px", outline:"none", fontFamily:"inherit" };
 
 function KPI({ label, value, sub, subColor, icon }) {
-  return (
-    <div style={{...cardStyle, padding:"14px 16px", marginBottom:0}}>
-      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
-        {icon && <span style={{fontSize:14}}>{icon}</span>}
-        <span style={{fontSize:"10px",color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600}}>{label}</span>
-      </div>
-      <div style={{fontSize:"22px",fontWeight:700,color:T.text,letterSpacing:"-0.02em"}}>{value}</div>
-      {sub && <div style={{fontSize:"11px",marginTop:"3px",fontWeight:500,color:subColor||T.textMuted}}>{sub}</div>}
+  return <div style={{...cardStyle, padding:"14px 16px", marginBottom:0}}>
+    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
+      {icon && <span style={{fontSize:14}}>{icon}</span>}
+      <span style={{fontSize:"10px",color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600}}>{label}</span>
     </div>
-  );
+    <div style={{fontSize:"22px",fontWeight:700,color:T.text,letterSpacing:"-0.02em"}}>{value}</div>
+    {sub && <div style={{fontSize:"11px",marginTop:"3px",fontWeight:500,color:subColor||T.textMuted}}>{sub}</div>}
+  </div>;
 }
 function Badge({ text, color, bg }) {
   return <span style={{fontSize:"10px",fontWeight:700,color:color||T.brand,background:bg||T.brandPale,padding:"2px 8px",borderRadius:"5px",whiteSpace:"nowrap"}}>{text}</span>;
 }
 function MiniBar({ pct, color, height=6 }) {
-  return (
-    <div style={{width:"100%",height,borderRadius:3,background:T.borderLight,overflow:"hidden"}}>
-      <div style={{height:"100%",borderRadius:3,background:color||T.brand,width:`${Math.min(Math.max(pct||0,0),100)}%`,transition:"width 0.6s"}} />
-    </div>
-  );
+  return <div style={{width:"100%",height,borderRadius:3,background:T.borderLight,overflow:"hidden"}}>
+    <div style={{height:"100%",borderRadius:3,background:color||T.brand,width:`${Math.min(Math.max(pct||0,0),100)}%`,transition:"width 0.6s"}} />
+  </div>;
 }
 function SectionTitle({ icon, text, right }) {
-  return (
-    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px"}}>
-      <div style={{fontSize:"15px",fontWeight:700,color:T.text,display:"flex",alignItems:"center",gap:"8px"}}>
-        {icon && <span>{icon}</span>}{text}
-      </div>
-      {right}
+  return <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px"}}>
+    <div style={{fontSize:"15px",fontWeight:700,color:T.text,display:"flex",alignItems:"center",gap:"8px"}}>
+      {icon && <span>{icon}</span>}{text}
     </div>
-  );
+    {right}
+  </div>;
 }
 function DataRow({ label, value, valueColor, bold }) {
-  return (
-    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:`1px solid ${T.borderLight}`}}>
-      <span style={{fontSize:"12px",color:T.textMuted}}>{label}</span>
-      <span style={{fontSize:"13px",fontWeight:bold?700:600,color:valueColor||T.text}}>{value}</span>
-    </div>
-  );
+  return <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:`1px solid ${T.borderLight}`}}>
+    <span style={{fontSize:"12px",color:T.textMuted}}>{label}</span>
+    <span style={{fontSize:"13px",fontWeight:bold?700:600,color:valueColor||T.text}}>{value}</span>
+  </div>;
 }
 function EmptyState({ icon, title, sub }) {
-  return (
-    <div style={{textAlign:"center",padding:"40px 20px",color:T.textMuted}}>
-      <div style={{fontSize:36,marginBottom:8}}>{icon||"📊"}</div>
-      <div style={{fontSize:14,fontWeight:600,color:T.text,marginBottom:4}}>{title}</div>
-      <div style={{fontSize:12}}>{sub}</div>
-    </div>
-  );
+  return <div style={{textAlign:"center",padding:"40px 20px",color:T.textMuted}}>
+    <div style={{fontSize:36,marginBottom:8}}>{icon||"📊"}</div>
+    <div style={{fontSize:14,fontWeight:600,color:T.text,marginBottom:4}}>{title}</div>
+    <div style={{fontSize:12}}>{sub}</div>
+  </div>;
 }
 function TabButton({ active, label, onClick }) {
-  return (
-    <button onClick={onClick} style={{
-      padding:"8px 16px", borderRadius:"8px", border:"none",
-      background:active?T.brand:"transparent", color:active?"#fff":T.textMuted,
-      fontSize:"12px", fontWeight:active?700:500, cursor:"pointer", whiteSpace:"nowrap", transition:"all 0.2s",
-    }}>{label}</button>
-  );
+  return <button onClick={onClick} style={{padding:"8px 16px",borderRadius:"8px",border:"none",background:active?T.brand:"transparent",color:active?"#fff":T.textMuted,fontSize:"12px",fontWeight:active?700:500,cursor:"pointer",whiteSpace:"nowrap",transition:"all 0.2s"}}>{label}</button>;
 }
-function PrimaryBtn({ text, onClick, loading, style:sx }) {
-  return (
-    <button onClick={onClick} disabled={loading} style={{
-      padding:"10px 20px", borderRadius:"10px", border:"none",
-      background:loading?"#94a3b8":`linear-gradient(135deg,${T.brand},${T.brandLight})`,
-      color:"#fff", fontSize:"13px", fontWeight:700, cursor:loading?"wait":"pointer", ...sx,
-    }}>{loading?"Loading...":text}</button>
-  );
+function PrimaryBtn({ text, onClick, loading, disabled, style:sx }) {
+  return <button onClick={onClick} disabled={loading||disabled} style={{padding:"10px 20px",borderRadius:"10px",border:"none",background:(loading||disabled)?"#94a3b8":`linear-gradient(135deg,${T.brand},${T.brandLight})`,color:"#fff",fontSize:"13px",fontWeight:700,cursor:(loading||disabled)?"not-allowed":"pointer",...sx}}>{loading?"Loading...":text}</button>;
 }
 function BarChart({ data, labelKey, valueKey, color, maxBars=15, formatValue }) {
   const items = data.slice(0, maxBars);
   const max = Math.max(...items.map(d => d[valueKey] || 0), 1);
   const fv = formatValue || fmt;
-  return (
-    <div>
-      {items.map((d, i) => {
-        const pct = (d[valueKey] || 0) / max * 100;
-        return (
-          <div key={i} style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
-            <div style={{width:90,fontSize:11,color:T.textMuted,flexShrink:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={d[labelKey]}>{d[labelKey]}</div>
-            <div style={{flex:1,height:22,background:T.borderLight,borderRadius:4,overflow:"hidden"}}>
-              <div style={{height:"100%",width:`${pct}%`,background:color||`linear-gradient(90deg,${T.brand},${T.brandLight})`,borderRadius:4,display:"flex",alignItems:"center",paddingLeft:8,transition:"width 0.4s"}}>
-                {pct>20&&<span style={{fontSize:10,color:"#fff",fontWeight:700}}>{fv(d[valueKey])}</span>}
-              </div>
-            </div>
-            <div style={{width:60,fontSize:12,fontWeight:700,textAlign:"right",color:T.text}}>{fv(d[valueKey])}</div>
-          </div>
-        );
-      })}
-    </div>
-  );
+  return <div>{items.map((d, i) => {
+    const pct = (d[valueKey] || 0) / max * 100;
+    return <div key={i} style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
+      <div style={{width:90,fontSize:11,color:T.textMuted,flexShrink:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={d[labelKey]}>{d[labelKey]}</div>
+      <div style={{flex:1,height:22,background:T.borderLight,borderRadius:4,overflow:"hidden"}}>
+        <div style={{height:"100%",width:`${pct}%`,background:color||`linear-gradient(90deg,${T.brand},${T.brandLight})`,borderRadius:4,display:"flex",alignItems:"center",paddingLeft:8,transition:"width 0.4s"}}>
+          {pct>20&&<span style={{fontSize:10,color:"#fff",fontWeight:700}}>{fv(d[valueKey])}</span>}
+        </div>
+      </div>
+      <div style={{width:70,fontSize:12,fontWeight:700,textAlign:"right",color:T.text}}>{fv(d[valueKey])}</div>
+    </div>;
+  })}</div>;
 }
 function DonutChart({ data, size=180 }) {
   const total = data.reduce((s,d) => s+d.value, 0);
   if (total === 0) return null;
   const cx=size/2, cy=size/2, r=size*0.35, strokeW=size*0.15;
-  let cumAngle = -90;
+  let cum = -90;
   const arcs = data.map(d => {
-    const pct = d.value / total;
-    const angle = pct * 360;
-    const startAngle = cumAngle;
-    cumAngle += angle;
-    const endAngle = cumAngle;
-    const largeArc = angle > 180 ? 1 : 0;
-    const rad = Math.PI / 180;
-    const x1 = cx + r * Math.cos(startAngle * rad);
-    const y1 = cy + r * Math.sin(startAngle * rad);
-    const x2 = cx + r * Math.cos(endAngle * rad);
-    const y2 = cy + r * Math.sin(endAngle * rad);
-    return { ...d, pct, path: `M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2}` };
+    const pct = d.value / total, angle = pct * 360;
+    const start = cum; cum += angle; const end = cum;
+    const la = angle > 180 ? 1 : 0, rad = Math.PI/180;
+    const x1 = cx + r*Math.cos(start*rad), y1 = cy + r*Math.sin(start*rad);
+    const x2 = cx + r*Math.cos(end*rad), y2 = cy + r*Math.sin(end*rad);
+    return { ...d, pct, path: `M ${x1} ${y1} A ${r} ${r} 0 ${la} 1 ${x2} ${y2}` };
   });
-  return (
-    <div style={{display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
-      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-        {arcs.map((a,i) => (
-          <path key={i} d={a.path} fill="none" stroke={a.color} strokeWidth={strokeW} strokeLinecap="butt" />
-        ))}
-        <text x={cx} y={cy-6} textAnchor="middle" fill={T.text} fontSize="16" fontWeight="800" fontFamily="DM Sans">{fmtK(total)}</text>
-        <text x={cx} y={cy+10} textAnchor="middle" fill={T.textMuted} fontSize="9" fontFamily="DM Sans">ANNUAL</text>
-      </svg>
-      <div style={{flex:1,minWidth:120}}>
-        {arcs.filter(a=>a.pct>0.02).map((a,i) => (
-          <div key={i} style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
-            <div style={{width:8,height:8,borderRadius:2,background:a.color,flexShrink:0}} />
-            <span style={{fontSize:11,color:T.textMuted,flex:1}}>{a.name}</span>
-            <span style={{fontSize:11,fontWeight:700,color:T.text}}>{fmtPct(a.pct*100,0)}</span>
-          </div>
-        ))}
-      </div>
+  return <div style={{display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      {arcs.map((a,i) => <path key={i} d={a.path} fill="none" stroke={a.color} strokeWidth={strokeW} strokeLinecap="butt" />)}
+      <text x={cx} y={cy-6} textAnchor="middle" fill={T.text} fontSize="16" fontWeight="800" fontFamily="DM Sans">{fmtK(total)}</text>
+      <text x={cx} y={cy+10} textAnchor="middle" fill={T.textMuted} fontSize="9" fontFamily="DM Sans">ANNUAL</text>
+    </svg>
+    <div style={{flex:1,minWidth:120}}>
+      {arcs.filter(a=>a.pct>0.02).map((a,i) => <div key={i} style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+        <div style={{width:8,height:8,borderRadius:2,background:a.color,flexShrink:0}} />
+        <span style={{fontSize:11,color:T.textMuted,flex:1}}>{a.name}</span>
+        <span style={{fontSize:11,fontWeight:700,color:T.text}}>{fmtPct(a.pct*100,0)}</span>
+      </div>)}
     </div>
-  );
+  </div>;
+}
+function LineTrend({ data, xKey, yKey, y2Key, label, y2Label, color, color2, height=200 }) {
+  if (!data || data.length === 0) return null;
+  const W = 640, H = height, pad = { t:20, r:20, b:40, l:60 };
+  const chartW = W - pad.l - pad.r, chartH = H - pad.t - pad.b;
+  const maxY = Math.max(...data.map(d => Math.max(d[yKey]||0, d[y2Key]||0)), 1);
+  const xStep = chartW / Math.max(data.length-1, 1);
+  const points1 = data.map((d,i) => [pad.l + i*xStep, pad.t + chartH - (d[yKey]/maxY)*chartH]);
+  const points2 = y2Key ? data.map((d,i) => [pad.l + i*xStep, pad.t + chartH - (d[y2Key]/maxY)*chartH]) : null;
+  const path1 = "M " + points1.map(p => `${p[0]} ${p[1]}`).join(" L ");
+  const path2 = points2 ? "M " + points2.map(p => `${p[0]} ${p[1]}`).join(" L ") : null;
+  return <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height,overflow:"visible"}}>
+    {[0, 0.25, 0.5, 0.75, 1].map((t,i) => {
+      const y = pad.t + chartH - t*chartH;
+      return <g key={i}>
+        <line x1={pad.l} y1={y} x2={pad.l+chartW} y2={y} stroke={T.borderLight} strokeWidth="1" />
+        <text x={pad.l-8} y={y+4} textAnchor="end" fontSize="10" fill={T.textDim}>{fmtK(maxY*t)}</text>
+      </g>;
+    })}
+    {data.map((d,i) => {
+      if (data.length > 12 && i % Math.ceil(data.length/12) !== 0) return null;
+      const x = pad.l + i*xStep;
+      return <text key={i} x={x} y={H-pad.b+18} textAnchor="middle" fontSize="9" fill={T.textDim}>{String(d[xKey]).slice(5)}</text>;
+    })}
+    <path d={path1} fill="none" stroke={color||T.brand} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+    {path2 && <path d={path2} fill="none" stroke={color2||T.green} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" strokeDasharray="4 4" />}
+    {points1.map((p,i) => <circle key={i} cx={p[0]} cy={p[1]} r="3" fill={color||T.brand} />)}
+    {points2 && points2.map((p,i) => <circle key={i} cx={p[0]} cy={p[1]} r="3" fill={color2||T.green} />)}
+    <g transform={`translate(${pad.l}, 4)`}>
+      <circle cx="4" cy="8" r="3" fill={color||T.brand} />
+      <text x="12" y="12" fontSize="10" fill={T.text} fontWeight="600">{label||"Series 1"}</text>
+      {y2Label && <>
+        <circle cx="80" cy="8" r="3" fill={color2||T.green} />
+        <text x="88" y="12" fontSize="10" fill={T.text} fontWeight="600">{y2Label}</text>
+      </>}
+    </g>
+  </svg>;
 }
 
-// ═══ TAB: COMMAND CENTER ═══════════════════════════════════
-function CommandCenter({ margins, ulineData, qboConnected, qboData, connections, setTab }) {
+// ═══ COMMAND CENTER ════════════════════════════════════════════
+function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, reconMeta, connections, setTab }) {
   const m = margins;
   const marginColor = m.dailyMarginPct >= 30 ? T.green : m.dailyMarginPct >= 20 ? T.yellow : T.red;
 
-  return (
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="🎯" text="Command Center" right={<span style={{fontSize:10,color:T.textDim}}>{new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"})}</span>} />
+  // Monthly rollup for chart
+  const byMonth = {};
+  for (const w of weeklyRollups) {
+    const mo = w.month;
+    if (!mo) continue;
+    if (!byMonth[mo]) byMonth[mo] = { month: mo, revenue: 0, stops: 0 };
+    byMonth[mo].revenue += w.revenue || 0;
+    byMonth[mo].stops += w.stops || 0;
+  }
+  const monthly = Object.values(byMonth).sort((a,b) => a.month.localeCompare(b.month)).slice(-18);
 
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
-        <KPI icon="💰" label="Daily Revenue" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.ulineAnnualRevenue||m.qboRevenue)}/yr projected`} subColor={T.green} />
-        <KPI icon="📉" label="Daily Cost" value={fmt(m.dailyCost)} sub={`${fmtK(m.totalAnnualCost)}/yr total`} subColor={T.red} />
-        <KPI icon="📊" label="Daily Margin" value={fmt(m.dailyMargin)} sub={fmtPct(m.dailyMarginPct)+" margin"} subColor={marginColor} />
-        <KPI icon="🚚" label="Daily Stops" value={fmtNum(m.dailyStops)} sub={`${fmtNum(m.breakEvenStopsDaily)} break-even`} />
-        <KPI icon="🎯" label="Rev/Stop" value={fmt(m.revenuePerStop)} sub={`${fmt(m.costPerStop)} cost`} subColor={T.blue} />
-        <KPI icon="👤" label="Rev/Driver" value={fmt(m.revenuePerDriver)} sub={`${fmtNum(m.stopsPerDriver)} stops/day`} />
-      </div>
+  const hasGaps = completeness && completeness.gaps.length > 0;
+  const hasSparse = completeness && completeness.sparseWeeks.length > 0;
 
-      <div style={{...cardStyle, borderLeft:`4px solid ${marginColor}`, marginBottom:16}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
-          <div>
-            <div style={{fontSize:13,fontWeight:700,color:T.text}}>Margin Health</div>
-            <div style={{fontSize:11,color:T.textMuted}}>Target: 30% gross margin</div>
-          </div>
-          <div style={{fontSize:28,fontWeight:800,color:marginColor}}>{fmtPct(m.dailyMarginPct)}</div>
-        </div>
-        <MiniBar pct={m.dailyMarginPct * (100/50)} color={marginColor} height={10} />
-      </div>
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="🎯" text="Command Center" right={<span style={{fontSize:10,color:T.textDim}}>{new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"})}</span>} />
 
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:"12px"}}>
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Annual Cost Breakdown</div>
-          <DonutChart data={m.costBreakdown} />
-        </div>
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Per-Unit Economics</div>
-          <DataRow label="Revenue per stop" value={fmt(m.revenuePerStop)} valueColor={T.green} />
-          <DataRow label="Cost per stop" value={fmt(m.costPerStop)} valueColor={T.red} />
-          <DataRow label="Margin per stop" value={fmt(m.marginPerStop)} valueColor={m.marginPerStop>0?T.green:T.red} bold />
-          <div style={{height:12}} />
-          <DataRow label="Revenue per driver/day" value={fmt(m.revenuePerDriver)} valueColor={T.green} />
-          <DataRow label="Cost per driver/day" value={fmt(m.costPerDriver)} valueColor={T.red} />
-          <DataRow label="Margin per driver/day" value={fmt(m.marginPerDriver)} valueColor={m.marginPerDriver>0?T.green:T.red} bold />
-          <div style={{height:12}} />
-          <DataRow label="Revenue per truck/day" value={fmt(m.revenuePerTruck)} valueColor={T.green} />
-          <DataRow label="Cost per truck/day" value={fmt(m.costPerTruck)} valueColor={T.red} />
-          <DataRow label="Trucks in fleet" value={m.totalTrucks} />
-          <DataRow label="Drivers" value={m.totalDrivers} />
-        </div>
-      </div>
-
-      <div style={{...cardStyle, marginTop:12}}>
-        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Data Sources</div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8}}>
-          {[
-            { name:"Uline XLSX", on:!!ulineData, sub:ulineData?`${ulineData.weekCount} weeks loaded`:"Upload weekly audit files" },
-            { name:"NuVizz", on:connections.nuvizz, sub:connections.nuvizz?"Connected":"Check API" },
-            { name:"QuickBooks", on:qboConnected, sub:qboConnected?"Connected":"Connect in Settings" },
-            { name:"Motive", on:connections.motive, sub:connections.motive?"Connected":"Check API" },
-            { name:"CyberPay", on:connections.cyberpay, sub:"Auto-scrape Mondays" },
-          ].map(s => (
-            <div key={s.name} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",borderRadius:8,background:T.bgSurface}}>
-              <div style={{width:8,height:8,borderRadius:"50%",background:s.on?T.green:T.textDim,boxShadow:s.on?`0 0 6px ${T.green}`:"none"}} />
-              <div>
-                <div style={{fontSize:12,fontWeight:600}}>{s.name}</div>
-                <div style={{fontSize:10,color:s.on?T.green:T.textDim}}>{s.sub}</div>
+    {(hasGaps || hasSparse) && (
+      <div style={{...cardStyle, borderLeft:`4px solid ${T.yellow}`, background:T.yellowBg, marginBottom:12}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,justifyContent:"space-between"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,flex:1}}>
+            <span style={{fontSize:20}}>⚠️</span>
+            <div>
+              <div style={{fontSize:13,fontWeight:700,color:T.yellowText}}>Incomplete Data Detected</div>
+              <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>
+                {hasGaps && <span>{completeness.gaps.length} missing week(s)</span>}
+                {hasGaps && hasSparse && " · "}
+                {hasSparse && <span>{completeness.sparseWeeks.length} suspiciously low-volume week(s)</span>}
+                {" · Your revenue numbers may be understated."}
               </div>
             </div>
-          ))}
+          </div>
+          <button onClick={()=>setTab("completeness")} style={{padding:"6px 14px",borderRadius:8,border:`1px solid ${T.yellow}`,background:"transparent",color:T.yellowText,fontSize:12,fontWeight:600,cursor:"pointer"}}>Review →</button>
         </div>
       </div>
+    )}
+
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
+      <KPI icon="💰" label="Daily Revenue" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.annualRevenue)}/yr projected`} subColor={T.green} />
+      <KPI icon="📉" label="Daily Cost" value={fmt(m.dailyCost)} sub={`${fmtK(m.totalAnnualCost)}/yr`} subColor={T.red} />
+      <KPI icon="📊" label="Daily Margin" value={fmt(m.dailyMargin)} sub={fmtPct(m.dailyMarginPct)+" margin"} subColor={marginColor} />
+      <KPI icon="🚚" label="Daily Stops" value={fmtNum(m.dailyStops)} sub={`${fmtNum(m.breakEvenStopsDaily)} break-even`} />
+      <KPI icon="🎯" label="Rev/Stop" value={fmt(m.revenuePerStop)} sub={`${fmt(m.costPerStop)} cost`} subColor={T.blue} />
+      <KPI icon="👤" label="Rev/Driver" value={fmt(m.revenuePerDriver)} sub={`${fmtNum(m.stopsPerDriver)} stops/day`} />
     </div>
-  );
+
+    <div style={{...cardStyle, borderLeft:`4px solid ${marginColor}`, marginBottom:16}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:700,color:T.text}}>Margin Health</div>
+          <div style={{fontSize:11,color:T.textMuted}}>Target: 30% gross margin on billed revenue</div>
+        </div>
+        <div style={{fontSize:28,fontWeight:800,color:marginColor}}>{fmtPct(m.dailyMarginPct)}</div>
+      </div>
+      <MiniBar pct={m.dailyMarginPct * 2} color={marginColor} height={10} />
+    </div>
+
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:"12px"}}>
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Annual Cost Breakdown</div>
+        <DonutChart data={m.costBreakdown} />
+      </div>
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Per-Unit Economics</div>
+        <DataRow label="Revenue per stop" value={fmt(m.revenuePerStop)} valueColor={T.green} />
+        <DataRow label="Cost per stop" value={fmt(m.costPerStop)} valueColor={T.red} />
+        <DataRow label="Margin per stop" value={fmt(m.marginPerStop)} valueColor={m.marginPerStop>0?T.green:T.red} bold />
+        <div style={{height:12}} />
+        <DataRow label="Revenue per driver/day" value={fmt(m.revenuePerDriver)} valueColor={T.green} />
+        <DataRow label="Cost per driver/day" value={fmt(m.costPerDriver)} valueColor={T.red} />
+        <DataRow label="Margin per driver/day" value={fmt(m.marginPerDriver)} valueColor={m.marginPerDriver>0?T.green:T.red} bold />
+        <div style={{height:12}} />
+        <DataRow label="Trucks in fleet" value={m.totalTrucks} />
+        <DataRow label="Drivers" value={m.totalDrivers} />
+      </div>
+    </div>
+
+    {monthly.length > 0 && (
+      <div style={{...cardStyle, marginTop:12}}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Monthly Revenue Trend (Billed)</div>
+        <LineTrend data={monthly} xKey="month" yKey="revenue" label="Billed Revenue" color={T.brand} height={220} />
+      </div>
+    )}
+
+    <div style={{...cardStyle, marginTop:12}}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Data Sources</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8}}>
+        {[
+          { name:"Uline Weekly", on:weeklyRollups.length>0, sub:weeklyRollups.length>0?`${weeklyRollups.length} weeks loaded`:"Upload weekly files" },
+          { name:"DDIS Reconciliation", on:reconMeta && reconMeta.files_count>0, sub:reconMeta?`${reconMeta.files_count} reconciliations`:"Upload DDIS files" },
+          { name:"NuVizz", on:connections.nuvizz, sub:connections.nuvizz?"Connected":"Check API" },
+          { name:"QuickBooks", on:qboConnected, sub:qboConnected?"Connected":"Connect in Settings" },
+          { name:"Motive", on:connections.motive, sub:connections.motive?"Connected":"Check API" },
+        ].map(s => <div key={s.name} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",borderRadius:8,background:T.bgSurface}}>
+          <div style={{width:8,height:8,borderRadius:"50%",background:s.on?T.green:T.textDim,boxShadow:s.on?`0 0 6px ${T.green}`:"none"}} />
+          <div>
+            <div style={{fontSize:12,fontWeight:600}}>{s.name}</div>
+            <div style={{fontSize:10,color:s.on?T.green:T.textDim}}>{s.sub}</div>
+          </div>
+        </div>)}
+      </div>
+    </div>
+  </div>;
 }
 
-// ═══ TAB: ULINE ═══════════════════════════════════════════
-function UlineAnalysis({ ulineWeeks, onUpload, margins }) {
-  const [uploading, setUploading] = useState(false);
-  const [selectedWeek, setSelectedWeek] = useState(null);
-  const fileRef = useRef(null);
+// ═══ ULINE REVENUE (Billed data) ═══════════════════════════
+function UlineRevenue({ weeklyRollups }) {
+  const [periodFilter, setPeriodFilter] = useState("ytd");
+  const [view, setView] = useState("weekly");
 
-  const handleUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUploading(true);
-    try {
-      const parsed = await parseUlineXlsx(file);
-      const weekId = new Date().toISOString().slice(0,10) + "_" + file.name.replace(/[^a-z0-9]/gi, "_").slice(0, 30);
-      const weekData = { ...parsed, filename: file.name, upload_date: new Date().toISOString(), week_id: weekId };
-      await FS.saveUlineWeek(weekId, weekData);
-      onUpload(weekData);
-    } catch(e) { alert("Error parsing file: " + e.message); }
-    setUploading(false);
-    if (fileRef.current) fileRef.current.value = "";
-  };
+  const { filtered, startDate, endDate } = useMemo(() => {
+    const now = new Date();
+    let start = null;
+    if (periodFilter === "ytd") start = `${now.getFullYear()}-01-01`;
+    else if (periodFilter === "last12") { const d = new Date(now); d.setMonth(d.getMonth()-12); start = d.toISOString().slice(0,10); }
+    else if (periodFilter === "last6") { const d = new Date(now); d.setMonth(d.getMonth()-6); start = d.toISOString().slice(0,10); }
+    else if (periodFilter === "last3") { const d = new Date(now); d.setMonth(d.getMonth()-3); start = d.toISOString().slice(0,10); }
+    const f = weeklyRollups.filter(r => !start || r.week_ending >= start);
+    return { filtered: f.sort((a,b) => a.week_ending.localeCompare(b.week_ending)), startDate: start, endDate: now.toISOString().slice(0,10) };
+  }, [weeklyRollups, periodFilter]);
 
-  const allStops = ulineWeeks.flatMap(w => w.stops || []);
-  const totalRevenue = ulineWeeks.reduce((s,w) => s + (w.totalRevenue||0), 0);
-  const totalStops = ulineWeeks.reduce((s,w) => s + (w.totalStops||0), 0);
-  const weekCount = ulineWeeks.length;
+  const totalRevenue = filtered.reduce((s,r) => s + (r.revenue||0), 0);
+  const totalStops = filtered.reduce((s,r) => s + (r.stops||0), 0);
+  const totalWeight = filtered.reduce((s,r) => s + (r.weight||0), 0);
+  const totalAccessorials = filtered.reduce((s,r) => s + (r.accessorial_revenue||0), 0);
+  const weeksInPeriod = filtered.length;
+  const avgWeeklyRevenue = weeksInPeriod > 0 ? totalRevenue / weeksInPeriod : 0;
+  const avgStopsPerWeek = weeksInPeriod > 0 ? totalStops / weeksInPeriod : 0;
+  const avgRevPerStop = totalStops > 0 ? totalRevenue / totalStops : 0;
 
-  const byCity = {};
-  allStops.forEach(s => { const c=s.city||"Unknown"; if(!byCity[c]) byCity[c]={city:c,stops:0,revenue:0,weight:0}; byCity[c].stops++; byCity[c].revenue+=(s.newCost||s.cost); byCity[c].weight+=s.weight; });
-  const cityData = Object.values(byCity).sort((a,b)=>b.revenue-a.revenue);
+  // Build monthly from weekly
+  const byMonth = {};
+  for (const w of filtered) {
+    const m = w.month;
+    if (!m) continue;
+    if (!byMonth[m]) byMonth[m] = { month: m, stops:0, revenue:0, weight:0, weeks:0, accessorial_revenue:0 };
+    byMonth[m].stops += w.stops || 0;
+    byMonth[m].revenue += w.revenue || 0;
+    byMonth[m].weight += w.weight || 0;
+    byMonth[m].accessorial_revenue += w.accessorial_revenue || 0;
+    byMonth[m].weeks++;
+  }
+  const monthly = Object.values(byMonth).sort((a,b) => a.month.localeCompare(b.month));
 
-  const weightBands = [{label:"0-200 lbs",min:0,max:200},{label:"201-500",min:201,max:500},{label:"501-1000",min:501,max:1000},{label:"1001-2000",min:1001,max:2000},{label:"2000+",min:2001,max:99999}];
-  const byWeight = weightBands.map(b => {
-    const stops = allStops.filter(s => s.weight >= b.min && s.weight <= b.max);
-    return { label:b.label, stops:stops.length, revenue:stops.reduce((s,r)=>s+(r.newCost||r.cost),0), avgRate:stops.length>0?stops.reduce((s,r)=>s+(r.newCost||r.cost),0)/stops.length:0 };
-  });
+  // Top customers across period
+  const custAgg = {};
+  for (const w of filtered) {
+    for (const c of (w.top_customers||[])) {
+      if (!custAgg[c.name]) custAgg[c.name] = { customer: c.name, stops:0, revenue:0 };
+      custAgg[c.name].stops += c.stops;
+      custAgg[c.name].revenue += c.revenue;
+    }
+  }
+  const topCustomers = Object.values(custAgg).sort((a,b) => b.revenue - a.revenue).slice(0,20);
 
-  const detail = selectedWeek || (ulineWeeks.length>0 ? ulineWeeks[0] : null);
+  // Top cities
+  const cityAgg = {};
+  for (const w of filtered) {
+    for (const c of (w.top_cities||[])) {
+      if (!cityAgg[c.name]) cityAgg[c.name] = { city: c.name, stops:0, revenue:0 };
+      cityAgg[c.name].stops += c.stops;
+      cityAgg[c.name].revenue += c.revenue;
+    }
+  }
+  const topCities = Object.values(cityAgg).sort((a,b) => b.revenue - a.revenue).slice(0,20);
 
-  return (
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="📦" text="Uline Revenue Analysis" right={
-        <div>
-          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleUpload} style={{display:"none"}} />
-          <PrimaryBtn text={uploading?"Parsing...":"Upload Uline XLSX"} onClick={()=>fileRef.current?.click()} loading={uploading} />
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="💰" text="Uline Revenue" right={
+      <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+        {[["last3","Last 3mo"],["last6","Last 6mo"],["last12","Last 12mo"],["ytd","YTD"],["all","All Time"]].map(([id,l])=>
+          <TabButton key={id} active={periodFilter===id} label={l} onClick={()=>setPeriodFilter(id)} />
+        )}
+      </div>
+    } />
+
+    {weeklyRollups.length === 0 ? (
+      <EmptyState icon="📤" title="No Revenue Data Yet" sub="Upload your master file, weekly originals, and accessorials in the Data Ingest tab." />
+    ) : (
+      <>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"16px"}}>
+          <KPI label="Total Revenue" value={fmtK(totalRevenue)} sub={`${weeksInPeriod} weeks`} subColor={T.green} />
+          <KPI label="Total Stops" value={fmtNum(totalStops)} sub={`${fmtNum(avgStopsPerWeek)}/week avg`} />
+          <KPI label="Avg Rev/Stop" value={fmt(avgRevPerStop)} />
+          <KPI label="Weekly Avg" value={fmtK(avgWeeklyRevenue)} subColor={T.green} />
+          <KPI label="Accessorials" value={fmtK(totalAccessorials)} sub={totalRevenue>0?fmtPct(totalAccessorials/totalRevenue*100)+" of revenue":"—"} subColor={T.purple} />
+          <KPI label="Total Weight" value={fmtNum(totalWeight)+" lbs"} />
         </div>
-      } />
 
-      {totalStops === 0 ? (
-        <EmptyState icon="📤" title="No Uline Data Yet" sub="Upload your weekly Uline audit XLSX files to see revenue analysis" />
-      ) : (
-        <>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"16px"}}>
-            <KPI label="Total Revenue" value={fmtK(totalRevenue)} sub={`${weekCount} week${weekCount>1?"s":""} loaded`} subColor={T.green} />
-            <KPI label="Total Stops" value={fmtNum(totalStops)} sub={`${fmtNum(Math.round(totalStops/weekCount/5))}/day avg`} />
-            <KPI label="Avg Rev/Stop" value={fmt(totalStops>0?totalRevenue/totalStops:0)} />
-            <KPI label="Weekly Revenue" value={fmtK(weekCount>0?totalRevenue/weekCount:0)} sub="average" />
-            <KPI label="Margin/Stop" value={fmt(margins.marginPerStop)} subColor={margins.marginPerStop>0?T.green:T.red} sub={fmtPct(margins.marginPerStopPct)} />
-            <KPI label="Cost/Stop" value={fmt(margins.costPerStop)} sub="fully loaded" subColor={T.red} />
-          </div>
+        <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+          {[["weekly","📅 Weekly"],["monthly","📊 Monthly"],["customers","🏢 Customers"],["cities","📍 Cities"]].map(([id,l])=>
+            <TabButton key={id} active={view===id} label={l} onClick={()=>setView(id)} />
+          )}
+        </div>
 
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:"12px"}}>
-            <div style={cardStyle}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Revenue by City (Top 15)</div>
-              <BarChart data={cityData} labelKey="city" valueKey="revenue" maxBars={15} />
-            </div>
-            <div style={cardStyle}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Revenue by Weight Band</div>
-              <BarChart data={byWeight} labelKey="label" valueKey="revenue" color={T.green} />
-              <div style={{marginTop:12,fontSize:12,fontWeight:700,color:T.text}}>Avg Rate by Weight</div>
-              {byWeight.map((b,i) => (
-                <DataRow key={i} label={b.label} value={`${fmt(b.avgRate)} × ${fmtNum(b.stops)} stops`} />
-              ))}
-            </div>
-          </div>
-
-          <div style={{...cardStyle, marginTop:12}}>
-            <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Uploaded Weeks</div>
-            <div style={{overflowX:"auto"}}>
+        {view === "weekly" && (
+          <div style={cardStyle}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Weekly Revenue Trend</div>
+            <LineTrend data={filtered.slice(-26)} xKey="week_ending" yKey="revenue" label="Billed" color={T.brand} height={220} />
+            <div style={{marginTop:16,overflowX:"auto",maxHeight:500}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead>
-                  <tr>{["File","Stops","Revenue","Avg/Stop","Weight"].map(h=><th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr>
-                </thead>
+                <thead><tr>{["Week Ending","Stops","Revenue","Base","Accessorials","Avg/Stop","Weight"].map(h=>
+                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite,zIndex:1}}>{h}</th>
+                )}</tr></thead>
                 <tbody>
-                  {ulineWeeks.map((w,i) => (
-                    <tr key={i} onClick={()=>setSelectedWeek(w)} style={{cursor:"pointer",background:detail===w?T.brandPale:"transparent"}}>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600,maxWidth:200,overflow:"hidden",textOverflow:"ellipsis"}}>{w.filename||w.id}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.totalStops)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:T.green}}>{fmt(w.totalRevenue)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(w.avgRevenuePerStop)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.totalWeight)} lbs</td>
+                  {filtered.slice().reverse().map((w,i) => (
+                    <tr key={i}>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{weekLabel(w.week_ending)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.stops)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:700}}>{fmt(w.revenue)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(w.base_revenue)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.purple}}>{w.accessorial_revenue?fmt(w.accessorial_revenue):"—"}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(w.stops>0?w.revenue/w.stops:0)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted,fontSize:11}}>{fmtNum(w.weight)} lbs</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           </div>
-        </>
-      )}
-    </div>
-  );
+        )}
+
+        {view === "monthly" && (
+          <div style={cardStyle}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Monthly Revenue Trend</div>
+            <LineTrend data={monthly} xKey="month" yKey="revenue" label="Billed" color={T.brand} height={220} />
+            <div style={{marginTop:16,overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>{["Month","Weeks","Stops","Revenue","Accessorials","Avg/Stop","Avg/Week"].map(h=>
+                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
+                )}</tr></thead>
+                <tbody>
+                  {monthly.slice().reverse().map((m,i) => (
+                    <tr key={i}>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{m.month}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{m.weeks}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(m.stops)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:700}}>{fmt(m.revenue)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.purple}}>{m.accessorial_revenue?fmt(m.accessorial_revenue):"—"}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(m.stops>0?m.revenue/m.stops:0)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(m.weeks>0?m.revenue/m.weeks:0)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {view === "customers" && (
+          <div style={cardStyle}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Top Customers by Revenue</div>
+            <BarChart data={topCustomers} labelKey="customer" valueKey="revenue" color={T.green} maxBars={20} />
+            <div style={{marginTop:16,overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>{["Customer","Stops","Revenue","Avg/Stop","% of Total"].map(h=>
+                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
+                )}</tr></thead>
+                <tbody>
+                  {topCustomers.map((c,i) => (
+                    <tr key={i}>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(c.stops)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:700}}>{fmt(c.revenue)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(c.stops>0?c.revenue/c.stops:0)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtPct(totalRevenue>0?c.revenue/totalRevenue*100:0)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {view === "cities" && (
+          <div style={cardStyle}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Top Cities by Revenue</div>
+            <BarChart data={topCities} labelKey="city" valueKey="revenue" color={T.blue} maxBars={20} />
+            <div style={{marginTop:16,overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>{["City","Stops","Revenue","Avg/Stop"].map(h=>
+                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
+                )}</tr></thead>
+                <tbody>
+                  {topCities.map((c,i) => (
+                    <tr key={i}>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.city}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(c.stops)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.blue,fontWeight:700}}>{fmt(c.revenue)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(c.stops>0?c.revenue/c.stops:0)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </>
+    )}
+  </div>;
 }
 
-// ═══ TAB: OPERATIONS (NuVizz) ═════════════════════════════
-function Operations({ margins }) {
-  const fmtD = d => d.toISOString().slice(0,10);
-  const buildRange = p => {
-    const now = new Date();
-    if (p==="today") return {from:fmtD(now),to:fmtD(now)};
-    if (p==="yesterday") { const y=new Date(now); y.setDate(y.getDate()-1); return {from:fmtD(y),to:fmtD(y)}; }
-    if (p==="week") { const m=new Date(now); m.setDate(now.getDate()-now.getDay()+(now.getDay()===0?-6:1)); return {from:fmtD(m),to:fmtD(now)}; }
-    if (p==="month") return {from:`${fmtD(now).slice(0,7)}-01`,to:fmtD(now)};
-    return {from:fmtD(now),to:fmtD(now)};
-  };
-  const [period, setPeriod] = useState("week");
-  const [from, setFrom] = useState(()=>buildRange("week").from);
-  const [to, setTo] = useState(()=>buildRange("week").to);
-  const [loading, setLoading] = useState(false);
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-  const [view, setView] = useState("overview");
+// ═══ DATA COMPLETENESS TAB ════════════════════════════════════
+function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
+  if (!completeness || weeklyRollups.length === 0) {
+    return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="✅" text="Data Completeness" />
+      <EmptyState icon="📤" title="No Data Loaded" sub="Upload files in the Data Ingest tab first." />
+    </div>;
+  }
 
-  const applyPeriod = p => { setPeriod(p); const r=buildRange(p); setFrom(r.from); setTo(r.to); };
+  const { expected, gaps, sparseWeeks, missingAccessorials, avgStops, firstWE, lastWE } = completeness;
+  const completePct = expected.length > 0 ? ((expected.length - gaps.length) / expected.length * 100) : 100;
 
-  const run = async () => {
-    setLoading(true); setError(null);
-    try {
-      const j = await fetchNuVizzStops(from, to);
-      if (!j) throw new Error("No response from NuVizz");
-      const stops = Array.isArray(j) ? j : (j.stopList||j.stops||j.data||[]);
-      setData(stops);
-    } catch(e) { setError(e.message); }
-    setLoading(false);
-  };
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="✅" text="Data Completeness" />
 
-  const stats = useMemo(() => {
-    if (!data) return null;
-    const total = data.length;
-    const delivered = data.filter(s=>(s.stopStatus||"").toLowerCase().match(/deliver|complet/)).length;
-    const failed = data.filter(s=>(s.stopStatus||"").toLowerCase().match(/fail|cancel/)).length;
-    const byDriver = {};
-    data.forEach(s => {
-      const d = s.driverName||s.driver||"Unassigned";
-      if (!byDriver[d]) byDriver[d]={name:d,stops:0,delivered:0,weight:0};
-      byDriver[d].stops++;
-      byDriver[d].weight += parseFloat(s.weight||s.totalWeight||0)||0;
-      if ((s.stopStatus||"").toLowerCase().match(/deliver|complet/)) byDriver[d].delivered++;
-    });
-    const byDay = {};
-    data.forEach(s => {
-      const day = (s.schedDTTM||s.scheduledDate||"").slice(0,10);
-      if (day) { if(!byDay[day]) byDay[day]={day,stops:0}; byDay[day].stops++; }
-    });
-    const byRoute = {};
-    data.forEach(s => {
-      const r = s.loadNbr||s.routeName||"Unknown";
-      if (!byRoute[r]) byRoute[r]={route:r,stops:0,driver:s.driverName||"",weight:0};
-      byRoute[r].stops++;
-      byRoute[r].weight += parseFloat(s.weight||0)||0;
-    });
-    const daysWorked = Object.keys(byDay).length || 1;
-    return {
-      total, delivered, failed, pending:total-delivered-failed,
-      rate:total>0?(delivered/total*100):0,
-      byDriver:Object.values(byDriver).sort((a,b)=>b.stops-a.stops),
-      byDay:Object.values(byDay).sort((a,b)=>a.day.localeCompare(b.day)),
-      byRoute:Object.values(byRoute).sort((a,b)=>b.stops-a.stops),
-      avgPerDay:Math.round(total/daysWorked),
-      daysWorked,
-      estTotalRevenue: total * margins.revenuePerStop,
-      estTotalCost: total * margins.costPerStop,
-      estMargin: total * margins.marginPerStop,
-      estMarginPct: margins.marginPerStopPct,
-    };
-  }, [data, margins]);
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
+      <KPI label="Coverage" value={fmtPct(completePct,0)} subColor={completePct>=95?T.green:completePct>=85?T.yellow:T.red} sub={`${expected.length-gaps.length}/${expected.length} weeks`} />
+      <KPI label="Missing Weeks" value={fmtNum(gaps.length)} subColor={gaps.length>0?T.red:T.green} sub="Zero data" />
+      <KPI label="Sparse Weeks" value={fmtNum(sparseWeeks.length)} subColor={sparseWeeks.length>0?T.yellow:T.green} sub="Possible partial" />
+      <KPI label="No Accessorials" value={fmtNum(missingAccessorials.length)} subColor={missingAccessorials.length>0?T.yellow:T.green} sub="Weeks missing acc file" />
+      <KPI label="Avg Stops/Week" value={fmtNum(avgStops)} sub={`${weekLabel(firstWE)} → ${weekLabel(lastWE)}`} />
+    </div>
 
-  const periods = [{id:"today",l:"Today"},{id:"yesterday",l:"Yesterday"},{id:"week",l:"This Week"},{id:"month",l:"This Month"}];
-
-  return (
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="🚚" text="Operations (NuVizz)" />
-
+    {gaps.length > 0 && (
       <div style={cardStyle}>
-        <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
-          {periods.map(p => <TabButton key={p.id} active={period===p.id} label={p.l} onClick={()=>applyPeriod(p.id)} />)}
-        </div>
-        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-          <input type="date" value={from} onChange={e=>{setFrom(e.target.value);setPeriod("custom");}} style={{...inputStyle,width:145,fontSize:12}} />
-          <span style={{color:T.textDim}}>→</span>
-          <input type="date" value={to} onChange={e=>{setTo(e.target.value);setPeriod("custom");}} style={{...inputStyle,width:145,fontSize:12}} />
-          <PrimaryBtn text="Run Report" onClick={run} loading={loading} />
+        <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.red}}>🚨 Missing Weeks — No Data At All ({gaps.length})</div>
+        <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have zero stops in the system. You worked these weeks — find the Uline files and re-upload.</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6}}>
+          {gaps.map(w => (
+            <div key={w} style={{padding:"8px 12px",borderRadius:6,background:T.redBg,color:T.redText,fontSize:12,fontWeight:600,textAlign:"center",border:`1px solid ${T.red}30`}}>
+              WE {weekLabel(w)}
+            </div>
+          ))}
         </div>
       </div>
+    )}
 
-      {error && <div style={{background:T.redBg,color:T.redText,padding:"10px 14px",borderRadius:8,marginBottom:12,fontSize:12}}>⚠️ {error}</div>}
-
-      {stats && (
-        <>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"10px",marginBottom:"14px"}}>
-            <KPI label="Total Stops" value={fmtNum(stats.total)} sub={`${fmtNum(stats.avgPerDay)}/day avg`} />
-            <KPI label="Delivered" value={fmtNum(stats.delivered)} subColor={T.green} sub={fmtPct(stats.rate)+" rate"} />
-            <KPI label="Failed" value={fmtNum(stats.failed)} subColor={T.red} />
-            <KPI label="Est. Revenue" value={fmtK(stats.estTotalRevenue)} subColor={T.green} sub="from stop volume" />
-            <KPI label="Est. Cost" value={fmtK(stats.estTotalCost)} subColor={T.red} />
-            <KPI label="Est. Margin" value={fmtK(stats.estMargin)} subColor={stats.estMargin>0?T.green:T.red} sub={fmtPct(stats.estMarginPct)} />
-          </div>
-
-          <div style={{display:"flex",gap:6,marginBottom:12}}>
-            {[["overview","📊 Overview"],["drivers","👤 Drivers"],["routes","🛣 Routes"],["stops","📋 Stops"]].map(([id,l])=>(
-              <TabButton key={id} active={view===id} label={l} onClick={()=>setView(id)} />
-            ))}
-          </div>
-
-          {view==="overview" && (
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:"12px"}}>
-              <div style={cardStyle}>
-                <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Stops by Day</div>
-                <BarChart data={stats.byDay} labelKey="day" valueKey="stops" formatValue={fmtNum} />
-              </div>
-              <div style={cardStyle}>
-                <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Top Drivers by Volume</div>
-                <BarChart data={stats.byDriver.slice(0,10)} labelKey="name" valueKey="stops" color={T.green} formatValue={fmtNum} />
-              </div>
-            </div>
-          )}
-
-          {view==="drivers" && (
-            <div style={cardStyle}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Driver Performance</div>
-              <div style={{overflowX:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead><tr>{["Driver","Stops","Delivered","Rate","Est. Revenue","Est. Cost","Est. Margin"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
-                  <tbody>
-                    {stats.byDriver.map((d,i) => {
-                      const rate=d.stops>0?(d.delivered/d.stops*100):0;
-                      const estRev = d.stops * margins.revenuePerStop;
-                      const estCost = d.stops * margins.costPerStop;
-                      const estMargin = estRev - estCost;
-                      return (
-                        <tr key={i}>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{d.name}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{d.stops}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{d.delivered}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={fmtPct(rate)} color={rate>=90?T.greenText:T.redText} bg={rate>=90?T.greenBg:T.redBg} /></td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(estRev)}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmt(estCost)}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:estMargin>0?T.green:T.red}}>{fmt(estMargin)}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {view==="routes" && (
-            <div style={cardStyle}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Route Analysis</div>
-              <div style={{overflowX:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead><tr>{["Route/Load","Driver","Stops","Weight","Est. Revenue","Est. Cost","Est. Margin"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
-                  <tbody>
-                    {stats.byRoute.slice(0,50).map((r,i) => {
-                      const estRev = r.stops * margins.revenuePerStop;
-                      const estCost = r.stops * margins.costPerStop;
-                      return (
-                        <tr key={i}>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{r.route}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{r.driver||"—"}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{r.stops}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(r.weight)} lbs</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(estRev)}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmt(estCost)}</td>
-                          <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:(estRev-estCost)>0?T.green:T.red}}>{fmt(estRev-estCost)}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {view==="stops" && (
-            <div style={cardStyle}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Stop Detail ({fmtNum(stats.total)} total — showing first 200)</div>
-              <div style={{maxHeight:400,overflowY:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-                  <thead><tr>{["Stop#","Customer","City","Driver","Status","Weight"].map(h=><th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>)}</tr></thead>
-                  <tbody>
-                    {data.slice(0,200).map((s,i) => {
-                      const st=(s.stopStatus||"").toLowerCase();
-                      const isOk=st.match(/deliver|complet/);
-                      return (
-                        <tr key={i}>
-                          <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.stopNbr||"—"}</td>
-                          <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:500}}>{s.custName||s.customerName||"—"}</td>
-                          <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.city||"—"}</td>
-                          <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.driverName||s.driver||"—"}</td>
-                          <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={s.stopStatus||"—"} color={isOk?T.greenText:T.yellowText} bg={isOk?T.greenBg:T.yellowBg} /></td>
-                          <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{s.weight||"—"}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-        </>
-      )}
-
-      {!stats && !loading && <EmptyState icon="🚚" title="Pull NuVizz Data" sub="Select a date range and hit Run Report to see operations data" />}
-    </div>
-  );
-}
-
-// ═══ TAB: FLEET ════════════════════════════════════════════
-function Fleet({ margins }) {
-  const [vehicles, setVehicles] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [drivers, setDrivers] = useState([]);
-
-  const loadFleet = async () => {
-    setLoading(true);
-    const [vData, dData] = await Promise.all([fetchMotive("vehicles"), FS.getDrivers()]);
-    if (vData?.vehicles || vData?.data) setVehicles(vData.vehicles || vData.data || []);
-    setDrivers(dData);
-    setLoading(false);
-  };
-
-  useEffect(() => { loadFleet(); }, []);
-
-  return (
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="🚛" text="Fleet & Drivers" right={<PrimaryBtn text="Refresh" onClick={loadFleet} loading={loading} style={{padding:"6px 14px",fontSize:11}} />} />
-
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"16px"}}>
-        <KPI label="Total Vehicles" value={vehicles?fmtNum(vehicles.length):"—"} />
-        <KPI label="Rev/Truck/Day" value={fmt(margins.revenuePerTruck)} subColor={T.green} />
-        <KPI label="Cost/Truck/Day" value={fmt(margins.costPerTruck)} subColor={T.red} />
-        <KPI label="Drivers" value={fmtNum(margins.totalDrivers)} />
-      </div>
-
-      {vehicles && vehicles.length > 0 && (
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Motive Vehicles ({vehicles.length})</div>
-          <div style={{maxHeight:400,overflowY:"auto"}}>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-              <thead><tr>{["Vehicle #","Make/Model","Year","Status","Driver"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>)}</tr></thead>
-              <tbody>
-                {vehicles.map((v,i) => (
-                  <tr key={i}>
-                    <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{v.number||v.vehicle_number||v.id||"—"}</td>
-                    <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{[v.make,v.model].filter(Boolean).join(" ")||"—"}</td>
-                    <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{v.year||"—"}</td>
-                    <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={v.status||"active"} color={T.greenText} bg={T.greenBg} /></td>
-                    <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{v.current_driver?.first_name?`${v.current_driver.first_name} ${v.current_driver.last_name||""}`:(v.driver_name||"—")}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {drivers.length > 0 && (
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Driver Roster ({drivers.length})</div>
+    {sparseWeeks.length > 0 && (
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.yellowText}}>⚠️ Suspiciously Low-Volume Weeks ({sparseWeeks.length})</div>
+        <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have far fewer stops than your average of <strong>{fmtNum(avgStops)}</strong>. Data may be partial or a holiday week.</div>
+        <div style={{overflowX:"auto"}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-            <thead><tr>{["Name","Type","Pay Rate","Status"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+            <thead><tr>{["Week Ending","Stops","Revenue","Expected Stops","Gap"].map(h=>
+              <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
+            )}</tr></thead>
             <tbody>
-              {drivers.map(d => (
-                <tr key={d.id}>
-                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{d.name}</td>
-                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={d.type||"W2"} color={d.type==="1099"?T.greenText:T.blueText} bg={d.type==="1099"?T.greenBg:T.blueBg} /></td>
-                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{d.pay_rate?fmt(d.pay_rate)+"/wk":"—"}</td>
-                  <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={d.active!==false?"Active":"Inactive"} color={d.active!==false?T.greenText:T.textDim} bg={d.active!==false?T.greenBg:T.borderLight} /></td>
+              {sparseWeeks.map((w,i) => (
+                <tr key={i}>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(w.week_ending)}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmtNum(w.stops)}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(w.revenue)}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted}}>{fmtNum(w.expected_avg)}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmtNum(w.expected_avg - w.stops)} missing</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-      )}
+      </div>
+    )}
 
-      {!vehicles && !loading && <EmptyState icon="🚛" title="Loading Fleet Data" sub="Fetching from Motive..." />}
-    </div>
-  );
+    {missingAccessorials.length > 0 && (
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.yellowText}}>📄 Weeks Missing Accessorials File ({missingAccessorials.length})</div>
+        <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have original data but no accessorial charges were found. Either you had zero accessorials that week (rare) or the accessorial file wasn't uploaded.</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6}}>
+          {missingAccessorials.map((w,i) => (
+            <div key={i} style={{padding:"8px 12px",borderRadius:6,background:T.yellowBg,color:T.yellowText,fontSize:12,fontWeight:600,textAlign:"center",border:`1px solid ${T.yellow}30`}}>
+              WE {weekLabel(w.week_ending)}
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
+
+    {gaps.length === 0 && sparseWeeks.length === 0 && missingAccessorials.length === 0 && (
+      <div style={{...cardStyle, background:T.greenBg, borderColor:T.green, textAlign:"center", padding:30}}>
+        <div style={{fontSize:40,marginBottom:8}}>✅</div>
+        <div style={{fontSize:16,fontWeight:700,color:T.greenText,marginBottom:4}}>All Weeks Accounted For</div>
+        <div style={{fontSize:12,color:T.textMuted}}>Every week from {weekLabel(firstWE)} to {weekLabel(lastWE)} has data loaded.</div>
+      </div>
+    )}
+
+    {fileLog.length > 0 && (
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Upload Log (last {Math.min(fileLog.length,50)})</div>
+        <div style={{overflowX:"auto",maxHeight:400}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+            <thead><tr>{["Filename","Type","Rows","Uploaded"].map(h=>
+              <th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>
+            )}</tr></thead>
+            <tbody>
+              {fileLog.slice(0,50).map((f,i) => (
+                <tr key={i}>
+                  <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontSize:10}}>{f.filename}</td>
+                  <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={f.kind} color={T.brand} bg={T.brandPale} /></td>
+                  <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(f.row_count)}</td>
+                  <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted,fontSize:10}}>{f.uploaded_at?new Date(f.uploaded_at).toLocaleString():"—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    )}
+  </div>;
 }
 
-// ═══ TAB: QUICKBOOKS ═══════════════════════════════════════
-function QuickBooksTab({ connected }) {
-  const [action, setAction] = useState("pnl");
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const year = new Date().getFullYear();
-  const [start, setStart] = useState(`${year}-01-01`);
-  const [end, setEnd] = useState(new Date().toISOString().slice(0,10));
+// ═══ DATA INGEST ═══════════════════════════════════════════
+function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
+  const [uploading, setUploading] = useState(false);
+  const [status, setStatus] = useState("");
+  const [progress, setProgress] = useState({ current:0, total:0 });
+  const [lastResult, setLastResult] = useState(null);
+  const fileRef = useRef(null);
 
-  const run = async () => {
-    setLoading(true);
-    const d = await fetchQBO(action, start, end);
-    setData(d);
-    setLoading(false);
+  const handleFiles = async (files) => {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    setStatus(`Processing ${files.length} file${files.length>1?"s":""}...`);
+    setProgress({ current:0, total:files.length });
+
+    const results = { master:[], original:[], accessorials:[], ddis:[], unknown:[] };
+    const stopsByPro = {}; // pro -> merged stop (for dedup when both orig and acc files exist)
+    const paymentByPro = {};
+    const paymentsByWeek = {};
+    const ddisFileRecords = [];
+    const fileLogs = [];
+
+    for (let i=0; i<files.length; i++) {
+      const file = files[i];
+      setProgress({ current: i+1, total: files.length });
+      setStatus(`[${i+1}/${files.length}] ${file.name}...`);
+      const fileId = file.name.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
+
+      try {
+        let rows;
+        const isCSV = file.name.toLowerCase().endsWith(".csv");
+        if (isCSV) rows = await readCSV(file);
+        else rows = await readWorkbook(file);
+        if (!rows || rows.length === 0) { results.unknown.push(file.name); continue; }
+
+        const kind = detectFileType(file.name, rows[0]);
+        fileLogs.push({ file_id: fileId, filename: file.name, kind, row_count: rows.length, uploaded_at: new Date().toISOString() });
+
+        if (kind === "master" || kind === "original" || kind === "accessorials") {
+          const stops = parseOriginalOrAccessorial(rows);
+          for (const s of stops) {
+            if (!s.pro || !s.week_ending) continue;
+            // Dedup: if we already have this PRO, keep the row with the higher new_cost (usually accessorial version)
+            const existing = stopsByPro[s.pro];
+            if (!existing || (s.new_cost > existing.new_cost)) {
+              stopsByPro[s.pro] = s;
+            }
+          }
+          results[kind].push({ name:file.name, stops:stops.length });
+        } else if (kind === "ddis") {
+          const payments = parseDDIS(rows);
+          const billDates = payments.map(p => p.bill_date).filter(Boolean).sort();
+          const totalPaid = payments.reduce((s,p) => s + p.paid, 0);
+          ddisFileRecords.push({
+            file_id: fileId, filename: file.name,
+            record_count: payments.length, total_paid: totalPaid,
+            earliest_bill_date: billDates[0] || null,
+            latest_bill_date: billDates[billDates.length-1] || null,
+            checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
+            uploaded_at: new Date().toISOString(),
+          });
+          for (const p of payments) {
+            paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
+            if (p.bill_date) {
+              const we = weekEndingFriday(p.bill_date);
+              if (we) {
+                if (!paymentsByWeek[we]) paymentsByWeek[we] = { total:0, count:0 };
+                paymentsByWeek[we].total += p.paid;
+                paymentsByWeek[we].count++;
+              }
+            }
+          }
+          results.ddis.push({ name:file.name, records:payments.length, paid:totalPaid });
+        } else {
+          results.unknown.push(file.name);
+        }
+      } catch(e) {
+        console.error("File error:", file.name, e);
+        results.unknown.push(file.name + " (err: " + e.message + ")");
+      }
+    }
+
+    // Build weekly rollups
+    setStatus("Building weekly rollups...");
+    const allStops = Object.values(stopsByPro);
+    const rollups = buildWeeklyRollups(allStops);
+
+    // Build reconciliation: for each week, sum billed vs paid-matched-against-those-PROs
+    setStatus("Matching payments to billings...");
+    const reconByWeek = {};
+    const unpaidStops = [];
+    for (const s of allStops) {
+      const paid = paymentByPro[s.pro] || 0;
+      if (!reconByWeek[s.week_ending]) reconByWeek[s.week_ending] = { week_ending: s.week_ending, month: s.month, billed:0, paid_matched:0, unpaid_count:0, unpaid_amount:0 };
+      reconByWeek[s.week_ending].billed += s.new_cost || 0;
+      reconByWeek[s.week_ending].paid_matched += paid;
+      if (paid === 0 && (s.new_cost||0) > 0) {
+        reconByWeek[s.week_ending].unpaid_count++;
+        reconByWeek[s.week_ending].unpaid_amount += s.new_cost;
+        if (unpaidStops.length < 2000) {
+          unpaidStops.push({
+            pro: s.pro, customer: s.customer, city: s.city, state: s.state, zip: s.zip,
+            pu_date: s.pu_date, week_ending: s.week_ending, month: s.month, billed: s.new_cost,
+            code: s.code, weight: s.weight, order: s.order
+          });
+        }
+      }
+    }
+    for (const r of Object.values(reconByWeek)) {
+      r.collection_rate = r.billed > 0 ? (r.paid_matched / r.billed * 100) : null;
+    }
+
+    // Save weekly rollups
+    setStatus("Saving weekly rollups to Firebase...");
+    let savedWeeks = 0;
+    for (const r of rollups) {
+      const weekId = r.week_ending;
+      const ok = await FS.saveWeeklyRollup(weekId, {...r, updated_at:new Date().toISOString()});
+      if (ok) savedWeeks++;
+    }
+
+    setStatus("Saving reconciliation data...");
+    let savedRecon = 0;
+    for (const r of Object.values(reconByWeek)) {
+      const ok = await FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()});
+      if (ok) savedRecon++;
+    }
+
+    setStatus("Saving DDIS metadata...");
+    for (const f of ddisFileRecords) await FS.saveDDISFile(f.file_id, f);
+
+    setStatus("Saving unpaid queue...");
+    const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, 500);
+    for (const s of topUnpaid) await FS.saveUnpaidStop(s.pro, s);
+
+    setStatus("Logging files...");
+    for (const l of fileLogs) await FS.saveFileLog(l.file_id, l);
+
+    const existingMeta = await FS.getReconMeta() || {};
+    await FS.saveReconMeta({
+      files_count: (existingMeta.files_count || 0) + ddisFileRecords.length,
+      last_upload: new Date().toISOString(),
+      total_stops_processed: (existingMeta.total_stops_processed || 0) + allStops.length,
+    });
+
+    setLastResult({
+      files_processed: files.length,
+      master_count: results.master.length,
+      originals_count: results.original.length,
+      accessorials_count: results.accessorials.length,
+      ddis_count: results.ddis.length,
+      unknown: results.unknown,
+      stops_parsed: allStops.length,
+      payments_parsed: Object.keys(paymentByPro).length,
+      weeks_saved: savedWeeks,
+      recon_saved: savedRecon,
+      unpaid_saved: topUnpaid.length,
+    });
+    setStatus(`✓ Processed ${files.length} files → ${allStops.length.toLocaleString()} stops → ${savedWeeks} weeks saved`);
+    setUploading(false);
+    if (fileRef.current) fileRef.current.value = "";
+    onRefresh();
   };
 
-  if (!connected) {
-    return (
-      <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-        <SectionTitle icon="💰" text="QuickBooks Online" />
-        <div style={{...cardStyle, borderColor:T.yellow, background:T.yellowBg, textAlign:"center", padding:30}}>
-          <div style={{fontSize:28,marginBottom:8}}>🔗</div>
-          <div style={{fontSize:14,fontWeight:700,color:T.yellowText,marginBottom:4}}>QuickBooks Not Connected</div>
-          <div style={{fontSize:12,color:T.textMuted,marginBottom:16}}>Connect your QuickBooks Online account to pull live P&L, invoices, expenses, and payroll data.</div>
-          <a href="/.netlify/functions/marginiq-qbo-auth" style={{display:"inline-block",padding:"10px 24px",borderRadius:10,background:T.brand,color:"#fff",fontSize:13,fontWeight:700,textDecoration:"none"}}>Connect QuickBooks →</a>
-        </div>
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="📤" text="Data Ingest" right={
+      <div>
+        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" multiple onChange={e=>handleFiles(e.target.files)} style={{display:"none"}} />
+        <PrimaryBtn text={uploading?"Processing...":"Upload Files"} onClick={()=>fileRef.current?.click()} loading={uploading} />
       </div>
-    );
-  }
+    } />
 
-  const actions = [
-    {id:"pnl",l:"P&L Report"},{id:"invoices",l:"Invoices"},{id:"bills",l:"Bills"},
-    {id:"expenses",l:"Expenses"},{id:"customers",l:"Customers"},{id:"vendors",l:"Vendors"},
-    {id:"employees",l:"Employees"},{id:"accounts",l:"Chart of Accounts"},
-  ];
-
-  return (
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="💰" text="QuickBooks Online" right={<Badge text="Connected" color={T.greenText} bg={T.greenBg} />} />
-      <div style={cardStyle}>
-        <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
-          {actions.map(a => <TabButton key={a.id} active={action===a.id} label={a.l} onClick={()=>setAction(a.id)} />)}
-        </div>
-        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-          <input type="date" value={start} onChange={e=>setStart(e.target.value)} style={{...inputStyle,width:145,fontSize:12}} />
-          <span style={{color:T.textDim}}>→</span>
-          <input type="date" value={end} onChange={e=>setEnd(e.target.value)} style={{...inputStyle,width:145,fontSize:12}} />
-          <PrimaryBtn text="Pull Data" onClick={run} loading={loading} />
-        </div>
+    <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand}}>📤 Bulk Upload Everything</div>
+      <div style={{fontSize:12,color:T.text,lineHeight:1.6}}>
+        Select all your Uline files at once — master, originals, accessorials, DDIS. The app auto-detects each type and:
+        <ul style={{marginTop:8,marginLeft:20,fontSize:12}}>
+          <li><strong>Master / original / accessorial</strong> → parsed into weekly revenue rollups</li>
+          <li><strong>DDIS payment files</strong> → matched to PROs and stored separately for the Reconciliation tab</li>
+          <li>Dedupe handled automatically — accessorial versions of a PRO override original billing</li>
+          <li>Every file logged with timestamp so you can track what's been processed</li>
+        </ul>
       </div>
-
-      {data && (
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Results — {actions.find(a=>a.id===action)?.l}</div>
-          <pre style={{background:T.bgSurface,padding:14,borderRadius:8,overflow:"auto",maxHeight:500,fontSize:11,color:T.text,fontFamily:"'DM Mono','Courier New',monospace",whiteSpace:"pre-wrap",wordBreak:"break-word"}}>
-            {JSON.stringify(data, null, 2)}
-          </pre>
-        </div>
-      )}
     </div>
-  );
+
+    {uploading && (
+      <div style={{...cardStyle, background:T.yellowBg, borderColor:T.yellow}}>
+        <div style={{fontSize:12,fontWeight:600,color:T.yellowText,marginBottom:8}}>⏳ {status}</div>
+        <MiniBar pct={progress.total>0?(progress.current/progress.total*100):0} color={T.yellow} height={8} />
+        <div style={{fontSize:10,color:T.textMuted,marginTop:4,textAlign:"right"}}>{progress.current} / {progress.total}</div>
+      </div>
+    )}
+
+    {lastResult && !uploading && (
+      <div style={{...cardStyle, background:T.greenBg, borderColor:T.green}}>
+        <div style={{fontSize:13,fontWeight:700,color:T.greenText,marginBottom:8}}>✓ Import Complete</div>
+        <div style={{fontSize:12,color:T.text,lineHeight:1.8}}>
+          <div>Files processed: <strong>{lastResult.files_processed}</strong> ({lastResult.master_count} master, {lastResult.originals_count} orig, {lastResult.accessorials_count} acc, {lastResult.ddis_count} ddis)</div>
+          <div>Stops parsed: <strong>{fmtNum(lastResult.stops_parsed)}</strong></div>
+          <div>Payments parsed: <strong>{fmtNum(lastResult.payments_parsed)}</strong></div>
+          <div>Weekly rollups saved: <strong>{lastResult.weeks_saved}</strong></div>
+          <div>Reconciliation weeks saved: <strong>{lastResult.recon_saved}</strong></div>
+          <div>Unpaid stops queued: <strong>{fmtNum(lastResult.unpaid_saved)}</strong></div>
+          {lastResult.unknown.length > 0 && <div style={{color:T.yellowText,marginTop:6}}>⚠️ Unrecognized: {lastResult.unknown.join(", ")}</div>}
+        </div>
+      </div>
+    )}
+
+    {weeklyRollups.length > 0 && (
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginTop:16}}>
+        <KPI label="Weeks Loaded" value={weeklyRollups.length} subColor={T.green} />
+        <KPI label="Total Stops" value={fmtNum(weeklyRollups.reduce((s,r)=>s+(r.stops||0),0))} />
+        <KPI label="Total Revenue" value={fmtK(weeklyRollups.reduce((s,r)=>s+(r.revenue||0),0))} subColor={T.green} />
+        <KPI label="DDIS Files" value={reconMeta?reconMeta.files_count:0} sub="reconciliation files" />
+      </div>
+    )}
+  </div>;
 }
 
-// ═══ TAB: COSTS ════════════════════════════════════════════
+// ═══ RECONCILIATION (separate from revenue) ═══════════════════
+function Reconciliation({ reconWeekly, weeklyRollups }) {
+  const [unpaid, setUnpaid] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState("weekly");
+  const [searchFilter, setSearchFilter] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const u = await FS.getUnpaidStops(500);
+      setUnpaid(u);
+      setLoading(false);
+    })();
+  }, []);
+
+  // Only show reconciliation for weeks that HAVE any paid data
+  // This avoids false alarms on weeks with no DDIS yet
+  const reconWithPayments = reconWeekly.filter(r => r.paid_matched > 0);
+  const reconWeeks = reconWithPayments.sort((a,b) => a.week_ending.localeCompare(b.week_ending));
+
+  const totalBilled = reconWithPayments.reduce((s,r) => s + (r.billed||0), 0);
+  const totalPaid = reconWithPayments.reduce((s,r) => s + (r.paid_matched||0), 0);
+  const overallCollectionRate = totalBilled > 0 ? (totalPaid / totalBilled * 100) : 0;
+  const totalUnpaidAmount = reconWithPayments.reduce((s,r) => s + (r.unpaid_amount||0), 0);
+  const totalUnpaidCount = reconWithPayments.reduce((s,r) => s + (r.unpaid_count||0), 0);
+
+  const reconStart = reconWeeks[0]?.week_ending;
+  const reconEnd = reconWeeks[reconWeeks.length-1]?.week_ending;
+
+  // By customer
+  const byCustomer = {};
+  for (const u of unpaid) {
+    const c = u.customer || "Unknown";
+    if (!byCustomer[c]) byCustomer[c] = { customer:c, count:0, amount:0 };
+    byCustomer[c].count++;
+    byCustomer[c].amount += u.billed || 0;
+  }
+  const topUnpaidCustomers = Object.values(byCustomer).sort((a,b) => b.amount-a.amount).slice(0,15);
+
+  const filteredUnpaid = unpaid.filter(u => {
+    if (!searchFilter) return true;
+    const q = searchFilter.toLowerCase();
+    return (u.customer||"").toLowerCase().includes(q) || (u.city||"").toLowerCase().includes(q) || (u.pro||"").toLowerCase().includes(q);
+  });
+
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="🧾" text="Reconciliation (Going Forward)" right={reconStart?<span style={{fontSize:10,color:T.textDim}}>Window: {weekLabel(reconStart)} → {weekLabel(reconEnd)}</span>:null} />
+
+    {reconWithPayments.length === 0 ? (
+      <div style={cardStyle}>
+        <EmptyState icon="🧾" title="No Reconciliation Data Yet" sub="Upload DDIS payment files (CSV) in Data Ingest to begin monitoring collections going forward." />
+        <div style={{fontSize:12,color:T.textMuted,textAlign:"center",marginTop:12,padding:"0 20px"}}>
+          Reconciliation tracks which Uline bills actually got paid. This data only exists for the window where you have DDIS files — it's NOT used for total revenue calculations.
+        </div>
+      </div>
+    ) : (
+      <>
+        <div style={{...cardStyle, background:T.blueBg, borderColor:T.blue, marginBottom:12}}>
+          <div style={{fontSize:12,color:T.blueText,lineHeight:1.5}}>
+            <strong>ℹ️ About this tab:</strong> Reconciliation only covers weeks where DDIS payment files have been uploaded. It's a monitoring tool for going forward — total revenue and margins in the other tabs use the full billed amount (source of truth), not paid amount.
+          </div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
+          <KPI label="Collection Rate" value={fmtPct(overallCollectionRate)} subColor={overallCollectionRate>=95?T.green:overallCollectionRate>=85?T.yellow:T.red} sub={`${fmtK(totalPaid)} / ${fmtK(totalBilled)}`} />
+          <KPI label="Total Leakage" value={fmt(totalBilled-totalPaid)} subColor={T.red} sub={`${reconWeeks.length} weeks tracked`} />
+          <KPI label="Unpaid Stops" value={fmtNum(totalUnpaidCount)} subColor={T.red} sub={`${fmt(totalUnpaidAmount)} outstanding`} />
+          <KPI label="Avg Weekly Leak" value={fmt(reconWeeks.length>0?(totalBilled-totalPaid)/reconWeeks.length:0)} subColor={T.red} />
+        </div>
+
+        <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+          {[["weekly","📅 By Week"],["customers","🏢 By Customer"],["unpaid","📋 Unpaid Queue"]].map(([id,l])=>
+            <TabButton key={id} active={view===id} label={l} onClick={()=>setView(id)} />
+          )}
+        </div>
+
+        {view === "weekly" && (
+          <div style={cardStyle}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Billed vs Paid by Week</div>
+            <LineTrend data={reconWeeks} xKey="week_ending" yKey="billed" y2Key="paid_matched" label="Billed" y2Label="Paid" height={240} />
+            <div style={{marginTop:16,overflowX:"auto",maxHeight:500}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>{["Week Ending","Billed","Paid","Gap","Collect %","Unpaid #","Unpaid $"].map(h=>
+                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>
+                )}</tr></thead>
+                <tbody>
+                  {reconWeeks.slice().reverse().map((r,i) => {
+                    const cr = r.collection_rate;
+                    const crColor = cr==null?T.textDim : cr>=95?T.green : cr>=85?T.yellow : T.red;
+                    const gap = (r.paid_matched||0) - (r.billed||0);
+                    return <tr key={i}>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(r.week_ending)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.green}}>{fmt(r.billed)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(r.paid_matched)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:gap<0?T.red:T.green}}>{fmt(gap)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{cr!=null?<Badge text={fmtPct(cr)} color={crColor} bg={crColor===T.green?T.greenBg:crColor===T.yellow?T.yellowBg:T.redBg} />:"—"}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{r.unpaid_count||0}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{r.unpaid_amount?fmt(r.unpaid_amount):"—"}</td>
+                    </tr>;
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {view === "customers" && (
+          <div style={cardStyle}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Top Customers With Unpaid Stops</div>
+            <BarChart data={topUnpaidCustomers} labelKey="customer" valueKey="amount" color={T.red} maxBars={15} />
+            <div style={{marginTop:16,overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>{["Customer","Unpaid Stops","Total Unpaid","Avg/Stop"].map(h=>
+                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
+                )}</tr></thead>
+                <tbody>
+                  {topUnpaidCustomers.map((c,i) => (
+                    <tr key={i}>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{c.count}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:700}}>{fmt(c.amount)}</td>
+                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(c.amount/c.count)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {view === "unpaid" && (
+          <div style={cardStyle}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+              <div style={{fontSize:13,fontWeight:700}}>Unpaid Queue ({filteredUnpaid.length})</div>
+              <input type="text" placeholder="Search PRO, customer, city..." value={searchFilter} onChange={e=>setSearchFilter(e.target.value)} style={{...inputStyle,maxWidth:260,fontSize:12}} />
+            </div>
+            {loading ? <EmptyState icon="⏳" title="Loading..." sub="" /> : (
+              <div style={{maxHeight:500,overflowY:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                  <thead><tr>{["PRO","Customer","City","Pickup","Billed","Code"].map(h=>
+                    <th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite,zIndex:1}}>{h}</th>
+                  )}</tr></thead>
+                  <tbody>
+                    {filteredUnpaid.slice(0,500).map((u,i) => (
+                      <tr key={i}>
+                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontWeight:600}}>{u.pro}</td>
+                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:500}}>{u.customer||"—"}</td>
+                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{u.city||"—"}</td>
+                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{u.pu_date||"—"}</td>
+                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:700}}>{fmt(u.billed)}</td>
+                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted,fontSize:10}}>{u.code||"—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </>
+    )}
+  </div>;
+}
+
+// ═══ COSTS ═══════════════════════════════════════════════════
 function CostStructure({ costs, onSave, margins }) {
   const [c, setC] = useState({...DEFAULT_COSTS, ...costs});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-
   const upd = (k, v) => setC(prev => ({...prev, [k]: v}));
-
-  const save = async () => {
-    setSaving(true);
-    await FS.saveCosts(c);
-    onSave(c);
-    setSaving(false);
-    setSaved(true);
-    setTimeout(()=>setSaved(false), 2000);
-  };
-
+  const save = async () => { setSaving(true); await FS.saveCosts(c); onSave(c); setSaving(false); setSaved(true); setTimeout(()=>setSaved(false), 2000); };
   const Field = ({ label, field, prefix, suffix, step }) => (
     <div style={{marginBottom:8}}>
       <label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>{label}</label>
@@ -928,220 +1311,197 @@ function CostStructure({ costs, onSave, margins }) {
       </div>
     </div>
   );
-
-  return (
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="⚙️" text="Cost Structure" right={
-        <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          {saved && <Badge text="✓ Saved" color={T.greenText} bg={T.greenBg} />}
-          <PrimaryBtn text="Save Changes" onClick={save} loading={saving} style={{padding:"8px 16px",fontSize:12}} />
-        </div>
-      } />
-
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:"12px"}}>
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🏭 Facility Costs</div>
-          <Field label="Warehouse (annual)" field="warehouse" prefix="$" />
-          <Field label="Forklifts (annual)" field="forklifts" prefix="$" />
-        </div>
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>👥 Headcounts</div>
-          <Field label="Box Truck Drivers" field="count_box_drivers" />
-          <Field label="Tractor Trailer Drivers" field="count_tractor_drivers" />
-          <Field label="Dispatchers" field="count_dispatchers" />
-          <Field label="Admin/Office" field="count_admin" />
-          <Field label="Mechanics" field="count_mechanics" />
-          <Field label="Forklift Operators" field="count_forklift_ops" />
-        </div>
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>💵 Hourly Rates</div>
-          <Field label="Box Truck Driver" field="rate_box_driver" prefix="$" suffix="/hr" step="0.50" />
-          <Field label="Tractor Driver" field="rate_tractor_driver" prefix="$" suffix="/hr" step="0.50" />
-          <Field label="Dispatcher" field="rate_dispatcher" prefix="$" suffix="/hr" step="0.50" />
-          <Field label="Admin" field="rate_admin" prefix="$" suffix="/hr" step="0.50" />
-          <Field label="Mechanic" field="rate_mechanic" prefix="$" suffix="/hr" step="0.50" />
-        </div>
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🚛 Fleet & Fuel</div>
-          <Field label="Box Truck Count" field="truck_count_box" />
-          <Field label="Tractor Count" field="truck_count_tractor" />
-          <Field label="Insurance per truck/month" field="truck_insurance_monthly" prefix="$" />
-          <Field label="Box Truck MPG" field="mpg_box" suffix="MPG" />
-          <Field label="Tractor MPG" field="mpg_tractor" suffix="MPG" />
-          <Field label="Fuel Price" field="fuel_price" prefix="$" suffix="/gal" step="0.01" />
-        </div>
-        <div style={cardStyle}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>📅 Operations</div>
-          <Field label="Working Days/Year" field="working_days_year" />
-          <Field label="Avg Hours/Shift" field="avg_hours_per_shift" />
-          <Field label="Contractor Payout %" field="contractor_pct" step="0.01" />
-        </div>
-        <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:10,color:T.brand}}>📊 Calculated Totals</div>
-          <DataRow label="Annual Labor" value={fmtK(margins.totalAnnualLabor)} valueColor={T.brand} bold />
-          <DataRow label="  Box Truck Drivers" value={fmtK(margins.annualBoxDrivers)} />
-          <DataRow label="  Tractor Drivers" value={fmtK(margins.annualTractorDrivers)} />
-          <DataRow label="  Dispatch" value={fmtK(margins.annualDispatchers)} />
-          <DataRow label="  Admin" value={fmtK(margins.annualAdmin)} />
-          <DataRow label="  Mechanics" value={fmtK(margins.annualMechanics)} />
-          <DataRow label="  Forklift Ops" value={fmtK(margins.annualForkliftOps)} />
-          <div style={{height:8}} />
-          <DataRow label="Annual Fixed" value={fmtK(margins.totalAnnualFixed)} valueColor={T.brand} bold />
-          <DataRow label="  Warehouse" value={fmtK(margins.annualWarehouse)} />
-          <DataRow label="  Forklifts" value={fmtK(margins.annualForklifts)} />
-          <DataRow label="  Insurance" value={fmtK(margins.annualInsurance)} />
-          <div style={{height:8}} />
-          <DataRow label="TOTAL ANNUAL COST" value={fmtK(margins.totalAnnualCost)} valueColor={T.red} bold />
-          <DataRow label="Daily Cost" value={fmt(margins.dailyCost)} valueColor={T.red} bold />
-          <DataRow label="Monthly Cost" value={fmtK(margins.monthlyCost)} valueColor={T.red} bold />
-        </div>
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="⚙️" text="Cost Structure" right={
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        {saved && <Badge text="✓ Saved" color={T.greenText} bg={T.greenBg} />}
+        <PrimaryBtn text="Save Changes" onClick={save} loading={saving} style={{padding:"8px 16px",fontSize:12}} />
       </div>
-    </div>
-  );
-}
-
-// ═══ TAB: SETTINGS ═════════════════════════════════════════
-function Settings({ qboConnected, motiveConnected }) {
-  return (
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="⚙️" text="Settings & Connections" />
+    } />
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:"12px"}}>
       <div style={cardStyle}>
-        <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Data Connections</div>
-        {[
-          { name:"QuickBooks Online", on:qboConnected, sub:qboConnected?"Connected — pulling P&L, invoices, expenses":"Not connected", action:!qboConnected?"/.netlify/functions/marginiq-qbo-auth":null },
-          { name:"NuVizz", on:true, sub:"Connected — stops, loads, driver data" },
-          { name:"CyberPay (Payroll)", on:true, sub:"Auto-pulls every Monday 9am ET → Firebase" },
-          { name:"Motive (Fleet)", on:motiveConnected, sub:motiveConnected?"Connected":"Checking..." },
-        ].map((s,i) => (
-          <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 0",borderBottom:i<3?`1px solid ${T.border}`:"none"}}>
-            <div style={{width:10,height:10,borderRadius:"50%",background:s.on?T.green:T.textDim,boxShadow:s.on?`0 0 8px ${T.green}`:"none",flexShrink:0}} />
-            <div style={{flex:1}}>
-              <div style={{fontSize:13,fontWeight:600}}>{s.name}</div>
-              <div style={{fontSize:11,color:s.on?T.green:T.textDim}}>{s.sub}</div>
-            </div>
-            {s.action && <a href={s.action} style={{padding:"6px 14px",borderRadius:8,border:`1px solid ${T.brand}`,color:T.brand,fontSize:12,fontWeight:600,textDecoration:"none"}}>Connect</a>}
-          </div>
-        ))}
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🏭 Facility</div>
+        <Field label="Warehouse (annual)" field="warehouse" prefix="$" />
+        <Field label="Forklifts (annual)" field="forklifts" prefix="$" />
       </div>
       <div style={cardStyle}>
-        <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>System Info</div>
-        {[["Firebase","davismarginiq"],["Netlify","davis-marginiq.netlify.app"],["Version",APP_VERSION],["Firestore","nam5 (US multi-region)"]].map(([l,v])=>(
-          <DataRow key={l} label={l} value={v} />
-        ))}
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>👥 Headcounts</div>
+        <Field label="Box Truck Drivers" field="count_box_drivers" />
+        <Field label="Tractor Trailer Drivers" field="count_tractor_drivers" />
+        <Field label="Dispatchers" field="count_dispatchers" />
+        <Field label="Admin/Office" field="count_admin" />
+        <Field label="Mechanics" field="count_mechanics" />
+        <Field label="Forklift Operators" field="count_forklift_ops" />
+      </div>
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>💵 Hourly Rates</div>
+        <Field label="Box Truck Driver" field="rate_box_driver" prefix="$" suffix="/hr" step="0.50" />
+        <Field label="Tractor Driver" field="rate_tractor_driver" prefix="$" suffix="/hr" step="0.50" />
+        <Field label="Dispatcher" field="rate_dispatcher" prefix="$" suffix="/hr" step="0.50" />
+        <Field label="Admin" field="rate_admin" prefix="$" suffix="/hr" step="0.50" />
+        <Field label="Mechanic" field="rate_mechanic" prefix="$" suffix="/hr" step="0.50" />
+      </div>
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>🚛 Fleet</div>
+        <Field label="Box Truck Count" field="truck_count_box" />
+        <Field label="Tractor Count" field="truck_count_tractor" />
+        <Field label="Insurance per truck/month" field="truck_insurance_monthly" prefix="$" />
+        <Field label="Box Truck MPG" field="mpg_box" suffix="MPG" />
+        <Field label="Tractor MPG" field="mpg_tractor" suffix="MPG" />
+        <Field label="Fuel Price" field="fuel_price" prefix="$" suffix="/gal" step="0.01" />
+      </div>
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>📅 Operations</div>
+        <Field label="Working Days/Year" field="working_days_year" />
+        <Field label="Avg Hours/Shift" field="avg_hours_per_shift" />
+        <Field label="Contractor Payout %" field="contractor_pct" step="0.01" />
+      </div>
+      <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:10,color:T.brand}}>📊 Calculated Totals</div>
+        <DataRow label="Annual Labor" value={fmtK(margins.totalAnnualLabor)} valueColor={T.brand} bold />
+        <DataRow label="Annual Fixed" value={fmtK(margins.totalAnnualFixed)} valueColor={T.brand} bold />
+        <DataRow label="TOTAL ANNUAL COST" value={fmtK(margins.totalAnnualCost)} valueColor={T.red} bold />
+        <DataRow label="Daily Cost" value={fmt(margins.dailyCost)} valueColor={T.red} />
+        <DataRow label="Monthly Cost" value={fmtK(margins.monthlyCost)} valueColor={T.red} />
       </div>
     </div>
-  );
+  </div>;
 }
 
-// ═══ MAIN APP ══════════════════════════════════════════════
+// ═══ SETTINGS ═══════════════════════════════════════════════
+function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups }) {
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="⚙️" text="Settings & Connections" />
+    <div style={cardStyle}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Data Connections</div>
+      {[
+        { name:"QuickBooks Online", on:qboConnected, sub:qboConnected?"Connected":"Not connected", action:!qboConnected?"/.netlify/functions/marginiq-qbo-auth":null },
+        { name:"NuVizz", on:true, sub:"Connected" },
+        { name:"CyberPay (Payroll)", on:true, sub:"Auto-pulls Mondays" },
+        { name:"Motive (Fleet)", on:motiveConnected, sub:motiveConnected?"Connected":"Checking..." },
+      ].map((s,i) => <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 0",borderBottom:i<3?`1px solid ${T.border}`:"none"}}>
+        <div style={{width:10,height:10,borderRadius:"50%",background:s.on?T.green:T.textDim,boxShadow:s.on?`0 0 8px ${T.green}`:"none",flexShrink:0}} />
+        <div style={{flex:1}}>
+          <div style={{fontSize:13,fontWeight:600}}>{s.name}</div>
+          <div style={{fontSize:11,color:s.on?T.green:T.textDim}}>{s.sub}</div>
+        </div>
+        {s.action && <a href={s.action} style={{padding:"6px 14px",borderRadius:8,border:`1px solid ${T.brand}`,color:T.brand,fontSize:12,fontWeight:600,textDecoration:"none"}}>Connect</a>}
+      </div>)}
+    </div>
+    <div style={cardStyle}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>System Info</div>
+      {[["Firebase","davismarginiq"],["Netlify","davis-marginiq.netlify.app"],["Version",APP_VERSION],["Weekly Rollups",weeklyRollups.length],["DDIS Files Loaded",reconMeta?reconMeta.files_count:0],["Last Upload",reconMeta?.last_upload?new Date(reconMeta.last_upload).toLocaleString():"Never"]].map(([l,v])=>
+        <DataRow key={l} label={l} value={String(v)} />
+      )}
+    </div>
+  </div>;
+}
+
+// ═══ MAIN ═══════════════════════════════════════════════════
 function MarginIQ() {
   const [tab, setTab] = useState("command");
   const [costs, setCosts] = useState(DEFAULT_COSTS);
-  const [ulineWeeks, setUlineWeeks] = useState([]);
+  const [weeklyRollups, setWeeklyRollups] = useState([]);
+  const [reconWeekly, setReconWeekly] = useState([]);
+  const [fileLog, setFileLog] = useState([]);
+  const [reconMeta, setReconMeta] = useState(null);
   const [qboConnected, setQboConnected] = useState(false);
-  const [qboData, setQboData] = useState(null);
   const [motiveConnected, setMotiveConnected] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  const refreshData = async () => {
+    const [weekly, recon, meta, log] = await Promise.all([
+      FS.getWeeklyRollups(), FS.getReconWeekly(), FS.getReconMeta(), FS.getFileLog(100),
+    ]);
+    setWeeklyRollups(weekly.sort((a,b) => a.week_ending.localeCompare(b.week_ending)));
+    setReconWeekly(recon);
+    setReconMeta(meta);
+    setFileLog(log);
+  };
 
   useEffect(() => {
     const init = async () => {
       setLoading(true);
       const savedCosts = await FS.getCosts();
       if (savedCosts) setCosts(prev => ({...prev, ...savedCosts}));
-
-      const weeks = await FS.getUlineWeeks();
-      setUlineWeeks(weeks);
-
+      await refreshData();
       try {
         const r = await fetch("/.netlify/functions/marginiq-qbo-data?action=status");
         const d = await r.json();
-        if (d.connected) {
-          setQboConnected(true);
-          const yr = new Date().getFullYear();
-          const dash = await fetchQBO("dashboard", `${yr}-01-01`, new Date().toISOString().slice(0,10));
-          if (dash) setQboData(dash);
-        }
+        if (d.connected) setQboConnected(true);
       } catch(e) {}
-
       const params = new URLSearchParams(window.location.search);
       if (params.get("qbo")==="connected") { setQboConnected(true); window.history.replaceState({},"","/"); }
-
       try {
         const r = await fetch("/.netlify/functions/marginiq-motive?action=vehicles");
         if (r.ok) setMotiveConnected(true);
       } catch(e) {}
-
       setLoading(false);
     };
     init();
   }, []);
 
+  // Margin uses last 12 full weeks of BILLED revenue (source of truth)
   const margins = useMemo(() => {
-    const ulineAgg = ulineWeeks.length > 0 ? {
-      totalRevenue: ulineWeeks.reduce((s,w) => s+(w.totalRevenue||0), 0),
-      totalStops: ulineWeeks.reduce((s,w) => s+(w.totalStops||0), 0),
-      weekCount: ulineWeeks.length,
-    } : null;
-    return calculateMargins(costs, ulineAgg, qboData);
-  }, [costs, ulineWeeks, qboData]);
+    const now = new Date().toISOString().slice(0,10);
+    const usable = weeklyRollups.filter(r => r.week_ending < now).slice(-52);
+    let weeklyWindow = null;
+    if (usable.length > 0) {
+      weeklyWindow = {
+        totalRevenue: usable.reduce((s,r) => s + (r.revenue||0), 0),
+        totalStops: usable.reduce((s,r) => s + (r.stops||0), 0),
+        weeksCount: usable.length,
+      };
+    }
+    return calculateMargins(costs, weeklyWindow);
+  }, [costs, weeklyRollups]);
 
-  const handleUlineUpload = (weekData) => {
-    setUlineWeeks(prev => [weekData, ...prev.filter(w => w.week_id !== weekData.week_id)]);
-  };
+  // Data completeness scan
+  const completeness = useMemo(() => {
+    if (weeklyRollups.length === 0) return null;
+    return scanCompleteness(weeklyRollups, null, BUSINESS_START);
+  }, [weeklyRollups]);
 
   const tabs = [
-    { id:"command", icon:"🎯", label:"Command Center" },
-    { id:"uline", icon:"📦", label:"Uline" },
-    { id:"operations", icon:"🚚", label:"Operations" },
-    { id:"fleet", icon:"🚛", label:"Fleet" },
-    { id:"quickbooks", icon:"💰", label:"QuickBooks" },
+    { id:"command", icon:"🎯", label:"Command" },
+    { id:"revenue", icon:"💰", label:"Uline Revenue" },
+    { id:"recon", icon:"🧾", label:"Reconciliation" },
+    { id:"completeness", icon:"✅", label:"Data Health" },
+    { id:"ingest", icon:"📤", label:"Data Ingest" },
     { id:"costs", icon:"⚙️", label:"Costs" },
     { id:"settings", icon:"🔧", label:"Settings" },
   ];
 
-  return (
-    <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 20px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100,boxShadow:"0 1px 4px rgba(0,0,0,0.04)"}}>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <div style={{width:36,height:36,borderRadius:"10px",background:`linear-gradient(135deg,${T.brand},${T.brandLight})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"15px",fontWeight:800,color:"#fff",boxShadow:`0 2px 8px rgba(30,91,146,0.3)`}}>M</div>
-          <div>
-            <div style={{fontSize:"15px",fontWeight:800,letterSpacing:"-0.02em",color:T.text}}>Davis MarginIQ</div>
-            <div style={{fontSize:"9px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase"}}>Cost Intelligence Platform</div>
-          </div>
-        </div>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          {qboConnected && <Badge text="QBO ✓" color={T.greenText} bg={T.greenBg} />}
-          <span style={{fontSize:"9px",color:T.textDim,padding:"3px 8px",background:T.bgSurface,borderRadius:"6px",fontWeight:600}}>v{APP_VERSION}</span>
+  return <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 20px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100,boxShadow:"0 1px 4px rgba(0,0,0,0.04)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <div style={{width:36,height:36,borderRadius:"10px",background:`linear-gradient(135deg,${T.brand},${T.brandLight})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"15px",fontWeight:800,color:"#fff",boxShadow:"0 2px 8px rgba(30,91,146,0.3)"}}>M</div>
+        <div>
+          <div style={{fontSize:"15px",fontWeight:800,letterSpacing:"-0.02em"}}>Davis MarginIQ</div>
+          <div style={{fontSize:"9px",color:T.textDim,letterSpacing:"0.1em",textTransform:"uppercase"}}>Cost Intelligence Platform</div>
         </div>
       </div>
-
-      <div style={{display:"flex",gap:"3px",padding:"8px 12px",overflowX:"auto",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.7)"}}>
-        {tabs.map(t => (
-          <button key={t.id} onClick={()=>setTab(t.id)} style={{
-            padding:"7px 14px", borderRadius:"8px", border:"none",
-            background:tab===t.id?T.brand:"transparent", color:tab===t.id?"#fff":T.textMuted,
-            fontSize:"12px", fontWeight:tab===t.id?700:500, cursor:"pointer", whiteSpace:"nowrap", transition:"all 0.2s",
-          }}>{t.icon} {t.label}</button>
-        ))}
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {completeness && completeness.gaps.length > 0 && <Badge text={`${completeness.gaps.length} gaps`} color={T.yellowText} bg={T.yellowBg} />}
+        {qboConnected && <Badge text="QBO ✓" color={T.greenText} bg={T.greenBg} />}
+        <span style={{fontSize:"9px",color:T.textDim,padding:"3px 8px",background:T.bgSurface,borderRadius:"6px",fontWeight:600}}>v{APP_VERSION}</span>
       </div>
-
-      {loading && (
-        <div style={{textAlign:"center",padding:"60px 20px"}}>
-          <div className="loading-pulse" style={{fontSize:48,marginBottom:12}}>📊</div>
-          <div style={{fontSize:14,fontWeight:600,color:T.text}}>Loading MarginIQ...</div>
-          <div style={{fontSize:12,color:T.textMuted,marginTop:4}}>Connecting to data sources</div>
-        </div>
-      )}
-
-      {!loading && tab==="command" && <CommandCenter margins={margins} ulineData={ulineWeeks.length>0?{weekCount:ulineWeeks.length,totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)}:null} qboConnected={qboConnected} qboData={qboData} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
-      {!loading && tab==="uline" && <UlineAnalysis ulineWeeks={ulineWeeks} onUpload={handleUlineUpload} margins={margins} />}
-      {!loading && tab==="operations" && <Operations margins={margins} />}
-      {!loading && tab==="fleet" && <Fleet margins={margins} />}
-      {!loading && tab==="quickbooks" && <QuickBooksTab connected={qboConnected} />}
-      {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
-      {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} />}
     </div>
-  );
+    <div style={{display:"flex",gap:"3px",padding:"8px 12px",overflowX:"auto",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.7)"}}>
+      {tabs.map(t => <button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"7px 14px",borderRadius:"8px",border:"none",background:tab===t.id?T.brand:"transparent",color:tab===t.id?"#fff":T.textMuted,fontSize:"12px",fontWeight:tab===t.id?700:500,cursor:"pointer",whiteSpace:"nowrap",transition:"all 0.2s"}}>{t.icon} {t.label}</button>)}
+    </div>
+    {loading && <div style={{textAlign:"center",padding:"60px 20px"}}>
+      <div className="loading-pulse" style={{fontSize:48,marginBottom:12}}>📊</div>
+      <div style={{fontSize:14,fontWeight:600}}>Loading MarginIQ...</div>
+    </div>}
+    {!loading && tab==="command" && <CommandCenter margins={margins} weeklyRollups={weeklyRollups} completeness={completeness} qboConnected={qboConnected} reconMeta={reconMeta} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
+    {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
+    {!loading && tab==="recon" && <Reconciliation reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
+    {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
+    {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} onRefresh={refreshData} />}
+    {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
+    {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} />}
+  </div>;
 }
 
 if (typeof ReactDOM !== "undefined" && document.getElementById("root")) {
