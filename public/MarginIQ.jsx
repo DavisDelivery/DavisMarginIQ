@@ -2,9 +2,12 @@
 // Revenue (billed) drives margins. Reconciliation (paid) is separate monitoring.
 // Data completeness scanner flags missing weeks.
 // v2.3: Multi-source ingest (Uline + NuVizz + Time Clock + Payroll + QBO)
+// v2.3.1: Drivers tab for W2/1099 classification of historical drivers.
+//         Revenue source of truth = Uline "new cost". NuVizz SealNbr is ONLY
+//         for 1099 contractor pay calculation (40% of SealNbr per stop).
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.3.0";
+const APP_VERSION = "2.3.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -80,6 +83,12 @@ function normalizeName(v) {
   return s.replace(/\s+/g," ").split(" ").map(w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(" ");
 }
 
+// Firestore-safe key for a driver name: "Chris Head" → "chris_head"
+function driverKey(name) {
+  if (!name) return null;
+  return String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"").slice(0, 140) || null;
+}
+
 // Parse duration strings like "8:30" (H:MM) or "8.5" to decimal hours
 function parseHours(v) {
   if (v == null) return 0;
@@ -142,6 +151,12 @@ const FS = {
   async saveQBOHistory(periodId, data) { if (!hasFirebase) return false; try { await window.db.collection("qbo_history").doc(periodId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getQBOHistory() { if (!hasFirebase) return []; try { const s=await window.db.collection("qbo_history").orderBy("period","desc").limit(120).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveSourceFile(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("source_files").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+
+  // ─── Driver Classifications (W2 / 1099 / Unknown) ───────────
+  // Key is normalized_name (e.g. "chris head"). Lets us tag historical drivers
+  // who aren't in the current Fleet Management roster.
+  async getDriverClassifications() { if (!hasFirebase) return []; try { const s=await window.db.collection("driver_classifications").get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveDriverClassification(key, data) { if (!hasFirebase) return false; try { await window.db.collection("driver_classifications").doc(key).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
 };
 
 // ─── File Type Detection ────────────────────────────────────
@@ -1533,8 +1548,8 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
       <div style={{fontSize:12,color:T.text,lineHeight:1.6}}>
         Select any combination of files. MarginIQ auto-detects each type and routes to the right parser:
         <ul style={{marginTop:8,marginLeft:20,fontSize:12}}>
-          <li><strong>Uline</strong> (master / originals / accessorials / DDIS) → weekly revenue + reconciliation</li>
-          <li><strong>NuVizz</strong> (driver stops export) → weekly driver rollups + 1099 contractor pay (40% of SealNbr)</li>
+          <li><strong>Uline</strong> (master / originals / accessorials / DDIS) → weekly revenue (source of truth) + reconciliation</li>
+          <li><strong>NuVizz</strong> (driver stops export) → weekly driver rollups + 1099 contractor pay base (40% per stop). <em>Not revenue.</em></li>
           <li><strong>Time Clock</strong> (SENTINEL / B600 punches) → weekly hours by employee</li>
           <li><strong>Payroll</strong> (CyberPay register) → weekly gross, hours, OT by employee</li>
           <li><strong>QuickBooks</strong> (P&L, Trial Balance, GL exports) → financial history</li>
@@ -1846,7 +1861,192 @@ function CostStructure({ costs, onSave, margins }) {
   </div>;
 }
 
-// ═══ SETTINGS ═══════════════════════════════════════════════
+// ═══ DRIVERS — W2/1099 Classification ═══════════════════════
+// Reads all unique driver names from NuVizz weekly rollups and payroll weeks,
+// merges with saved classifications, and lets user tag each as W2 / 1099 / Unknown.
+// Calculates true contractor cost by only applying 40% to drivers marked 1099.
+function Drivers() {
+  const [nvWeekly, setNvWeekly] = useState([]);
+  const [payWeekly, setPayWeekly] = useState([]);
+  const [classifications, setClassifications] = useState({}); // key -> {classification, notes, source}
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState({}); // key -> bool
+  const [filter, setFilter] = useState("all"); // all | unknown | w2 | 1099
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const [nv, pw, cls] = await Promise.all([
+        FS.getNuVizzWeekly(), FS.getPayrollWeekly(), FS.getDriverClassifications(),
+      ]);
+      setNvWeekly(nv);
+      setPayWeekly(pw);
+      const clsMap = {};
+      for (const c of cls) clsMap[c.id] = c;
+      setClassifications(clsMap);
+      setLoading(false);
+    })();
+  }, []);
+
+  // Aggregate all drivers seen across NuVizz + Payroll
+  const drivers = useMemo(() => {
+    const agg = {}; // key -> {name, nv_stops, nv_pay_base, pay_weeks_seen, last_seen, sources}
+    for (const w of nvWeekly) {
+      if (!w.top_drivers) continue;
+      for (const d of w.top_drivers) {
+        if (!d.name) continue;
+        const key = driverKey(d.name);
+        if (!key) continue;
+        if (!agg[key]) agg[key] = { key, name: d.name, nv_stops:0, nv_pay_base:0, nv_pay_at_40:0, pay_weeks:0, pay_gross:0, pay_hours:0, last_seen:null, sources:new Set() };
+        agg[key].nv_stops += d.stops || 0;
+        agg[key].nv_pay_base += d.pay_base || 0;
+        agg[key].nv_pay_at_40 += d.pay_at_40 || 0;
+        agg[key].sources.add("nuvizz");
+        if (!agg[key].last_seen || w.week_ending > agg[key].last_seen) agg[key].last_seen = w.week_ending;
+      }
+    }
+    for (const w of payWeekly) {
+      if (!w.employees) continue;
+      for (const e of w.employees) {
+        if (!e.name) continue;
+        const key = driverKey(e.name);
+        if (!key) continue;
+        if (!agg[key]) agg[key] = { key, name: e.name, nv_stops:0, nv_pay_base:0, nv_pay_at_40:0, pay_weeks:0, pay_gross:0, pay_hours:0, last_seen:null, sources:new Set() };
+        agg[key].pay_weeks++;
+        agg[key].pay_gross += e.gross || 0;
+        agg[key].pay_hours += e.hours || 0;
+        agg[key].sources.add("payroll");
+        if (!agg[key].last_seen || w.week_ending > agg[key].last_seen) agg[key].last_seen = w.week_ending;
+      }
+    }
+    return Object.values(agg).map(d => ({...d, sources: Array.from(d.sources)}));
+  }, [nvWeekly, payWeekly]);
+
+  // Merge with saved classifications
+  const classified = useMemo(() => drivers.map(d => {
+    const cls = classifications[d.key];
+    return {
+      ...d,
+      classification: cls?.classification || "unknown",
+      notes: cls?.notes || "",
+      class_source: cls?.source || null,
+    };
+  }).sort((a,b) => b.nv_stops - a.nv_stops), [drivers, classifications]);
+
+  const filtered = useMemo(() => {
+    let arr = classified;
+    if (filter !== "all") arr = arr.filter(d => d.classification === filter);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      arr = arr.filter(d => d.name.toLowerCase().includes(q));
+    }
+    return arr;
+  }, [classified, filter, search]);
+
+  const setClass = async (key, name, newClass) => {
+    setSaving(prev => ({...prev, [key]:true}));
+    setClassifications(prev => ({...prev, [key]: {...(prev[key]||{}), classification: newClass, name, source: "manual"}}));
+    await FS.saveDriverClassification(key, { name, classification: newClass, source: "manual" });
+    setSaving(prev => ({...prev, [key]:false}));
+  };
+
+  // Totals
+  const totals = useMemo(() => {
+    const t = { all:0, w2:0, contractor_1099:0, unknown:0,
+                nv_pay_base_all:0, nv_pay_base_1099:0, contractor_cost_actual:0,
+                contractor_cost_unknown:0 };
+    for (const d of classified) {
+      t.all++;
+      if (d.classification === "w2") t.w2++;
+      else if (d.classification === "1099") { t.contractor_1099++; t.nv_pay_base_1099 += d.nv_pay_base; t.contractor_cost_actual += d.nv_pay_at_40; }
+      else { t.unknown++; t.contractor_cost_unknown += d.nv_pay_at_40; }
+      t.nv_pay_base_all += d.nv_pay_base;
+    }
+    return t;
+  }, [classified]);
+
+  if (loading) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading drivers...</div>;
+
+  if (drivers.length === 0) {
+    return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="👥" text="Drivers" />
+      <EmptyState icon="👥" title="No Drivers Found" sub="Upload NuVizz or Payroll files in Data Ingest. Drivers appearing there will show up here for classification." />
+    </div>;
+  }
+
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="👥" text="Drivers — W2 / 1099 Classification" />
+
+    <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
+      <div style={{fontSize:12,color:T.text,lineHeight:1.6}}>
+        <strong>Why this matters:</strong> NuVizz "Stop SealNbr" is the base for 1099 contractor pay (they get 40%). W2 drivers are paid hourly via CyberPay, not per stop. Tag each driver once — MarginIQ applies the right cost formula automatically. Historical drivers who've left still need to be tagged so past-period margins are accurate.
+      </div>
+    </div>
+
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginTop:12}}>
+      <KPI label="Total Drivers" value={totals.all} sub={`${totals.w2} W2 • ${totals.contractor_1099} 1099 • ${totals.unknown} unknown`} />
+      <KPI label="Actual 1099 Cost" value={fmtK(totals.contractor_cost_actual)} sub="40% of their SealNbr totals" subColor={T.green} />
+      <KPI label="Unclassified Pay Base" value={fmtK(totals.contractor_cost_unknown)} sub="cost if these are 1099" subColor={totals.unknown>0?T.yellowText:T.textMuted} />
+      <KPI label="Upper Bound (All 1099)" value={fmtK(totals.nv_pay_base_all * 0.40)} sub="ceiling if every driver were 1099" />
+    </div>
+
+    <div style={{display:"flex",gap:8,marginTop:16,alignItems:"center",flexWrap:"wrap"}}>
+      <input type="text" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search driver..." style={{flex:"1 1 200px",padding:"8px 12px",borderRadius:8,border:`1px solid ${T.border}`,fontSize:12}} />
+      {[["all","All"],["unknown","Unknown"],["w2","W2"],["1099","1099"]].map(([v,l]) => (
+        <button key={v} onClick={()=>setFilter(v)} style={{padding:"7px 12px",borderRadius:8,border:`1px solid ${filter===v?T.brand:T.border}`,background:filter===v?T.brand:T.bgWhite,color:filter===v?"#fff":T.text,fontSize:12,fontWeight:600,cursor:"pointer"}}>{l}</button>
+      ))}
+    </div>
+
+    <div style={{...cardStyle, padding:0, marginTop:12, overflow:"hidden"}}>
+      <table style={{width:"100%",fontSize:12,borderCollapse:"collapse"}}>
+        <thead>
+          <tr style={{background:T.bgSurface,borderBottom:`1px solid ${T.border}`}}>
+            {["Driver","Stops","Pay Base (SealNbr)","@40% (if 1099)","Payroll $","Sources","Last Seen","Classification"].map(h =>
+              <th key={h} style={{textAlign:"left",padding:"8px 10px",fontWeight:700,color:T.textMuted,fontSize:11}}>{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map(d => {
+            const isSaving = saving[d.key];
+            const cls = d.classification;
+            return <tr key={d.key} style={{borderBottom:`1px solid ${T.borderLight}`}}>
+              <td style={{padding:"8px 10px",fontWeight:600}}>{d.name}</td>
+              <td style={{padding:"8px 10px"}}>{fmtNum(d.nv_stops)}</td>
+              <td style={{padding:"8px 10px"}}>{fmt(d.nv_pay_base)}</td>
+              <td style={{padding:"8px 10px",color:cls==="1099"?T.green:T.textMuted}}>{fmt(d.nv_pay_at_40)}</td>
+              <td style={{padding:"8px 10px"}}>{d.pay_gross>0?fmt(d.pay_gross):"—"}</td>
+              <td style={{padding:"8px 10px",fontSize:10,color:T.textMuted}}>{d.sources.join(", ")}</td>
+              <td style={{padding:"8px 10px",fontSize:10,color:T.textMuted}}>{d.last_seen || "—"}</td>
+              <td style={{padding:"6px 10px"}}>
+                <div style={{display:"flex",gap:4}}>
+                  {[["w2","W2",T.blue],["1099","1099",T.green],["unknown","?",T.textMuted]].map(([v,l,c]) => (
+                    <button key={v} onClick={()=>setClass(d.key, d.name, v)} disabled={isSaving}
+                      style={{padding:"4px 10px",borderRadius:6,border:`1px solid ${cls===v?c:T.border}`,background:cls===v?c:T.bgWhite,color:cls===v?"#fff":T.text,fontSize:11,fontWeight:700,cursor:isSaving?"wait":"pointer",opacity:isSaving?0.5:1}}>{l}</button>
+                  ))}
+                </div>
+              </td>
+            </tr>;
+          })}
+        </tbody>
+      </table>
+      {filtered.length === 0 && (
+        <div style={{padding:"24px",textAlign:"center",color:T.textMuted,fontSize:12}}>No drivers match the filter.</div>
+      )}
+    </div>
+
+    <div style={{...cardStyle, background:T.bgSurface, marginTop:12}}>
+      <div style={{fontSize:11,color:T.textMuted,lineHeight:1.6}}>
+        <strong>How cost is calculated per driver:</strong><br/>
+        • <strong>1099:</strong> NuVizz SealNbr × 40% per stop<br/>
+        • <strong>W2:</strong> Hours from CyberPay × hourly rate (from cost structure)<br/>
+        • <strong>Unknown:</strong> Excluded from margin calcs until classified — shown above as "Unclassified Pay Base"<br/>
+        Current Fleet Management drivers can be auto-classified in a future update (we read from the shared Firebase).
+      </div>
+    </div>
+  </div>;
+}
+
 function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups }) {
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="⚙️" text="Settings & Connections" />
@@ -1944,6 +2144,7 @@ function MarginIQ() {
     { id:"command", icon:"🎯", label:"Command" },
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Reconciliation" },
+    { id:"drivers", icon:"👥", label:"Drivers" },
     { id:"completeness", icon:"✅", label:"Data Health" },
     { id:"ingest", icon:"📤", label:"Data Ingest" },
     { id:"costs", icon:"⚙️", label:"Costs" },
@@ -1975,6 +2176,7 @@ function MarginIQ() {
     {!loading && tab==="command" && <CommandCenter margins={margins} weeklyRollups={weeklyRollups} completeness={completeness} qboConnected={qboConnected} reconMeta={reconMeta} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
     {!loading && tab==="recon" && <Reconciliation reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
+    {!loading && tab==="drivers" && <Drivers />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} onRefresh={refreshData} />}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}

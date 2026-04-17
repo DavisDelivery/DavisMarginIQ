@@ -83,6 +83,11 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // Driver W2/1099 classifications (manual + fleet-mgmt sourced)
+    match /driver_classifications/{driverKey} {
+      allow read, write: if true;
+    }
+
     match /nuvizz_manifests/{date} {
       allow read: if true;
       allow write: if false;
