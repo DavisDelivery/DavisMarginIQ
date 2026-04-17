@@ -12,6 +12,7 @@ service cloud.firestore {
     match /b600_timeclock/{docId} { allow read, write: if isAuth(); }
     match /qbo_imports/{docId} { allow read, write: if isAuth(); }
     match /drivers/{driverId} { allow read, write: if isAuth(); }
+    match /employees/{employeeId} { allow read, write: if isAuth(); }
     match /costs/{date} { allow read, write: if isAuth(); }
     match /margin_summary/{weekOf} { allow read: if isAuth(); allow write: if false; }
   }
