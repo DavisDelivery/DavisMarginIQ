@@ -1,13 +1,12 @@
-// Davis MarginIQ v2.3 — Cost Intelligence Platform
+// Davis MarginIQ v2.4 — Cost Intelligence Platform
 // Revenue (billed) drives margins. Reconciliation (paid) is separate monitoring.
-// Data completeness scanner flags missing weeks.
 // v2.3: Multi-source ingest (Uline + NuVizz + Time Clock + Payroll + QBO)
-// v2.3.1: Drivers tab for W2/1099 classification of historical drivers.
-//         Revenue source of truth = Uline "new cost". NuVizz SealNbr is ONLY
-//         for 1099 contractor pay calculation (40% of SealNbr per stop).
+// v2.3.1: Drivers tab for W2/1099 classification
+// v2.4: Gmail Sync — auto-import NuVizz + Uline reports from inbox via OAuth.
+//       Shared ingestFiles() pipeline used by both manual upload and Gmail.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.3.1";
+const APP_VERSION = "2.4.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -88,6 +87,380 @@ function driverKey(name) {
   if (!name) return null;
   return String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"").slice(0, 140) || null;
 }
+
+// ─── Shared Ingest Pipeline ─────────────────────────────────
+// Takes an array of File objects + a status callback, returns a summary.
+// Used by both the manual upload flow and the Gmail auto-import flow.
+async function ingestFiles(files, onStatus = () => {}) {
+  const stopsByPro = {};
+  const paymentByPro = {};
+  const ddisFileRecords = [];
+  const nuvizzStops = [];
+  const timeClockEntries = [];
+  const payrollEntries = [];
+  const qboEntries = [];
+  const fileLogs = [];
+  const sourceFilesLog = [];
+  const countsByKind = { master:0, original:0, accessorials:0, ddis:0, nuvizz:0, timeclock:0, payroll:0, qbo_pl:0, qbo_tb:0, qbo_gl:0, unknown:0 };
+  const unknownFiles = [];
+
+  for (let i=0; i<files.length; i++) {
+    const file = files[i];
+    onStatus({ phase:"read", current:i+1, total:files.length, name:file.name });
+    const fileId = file.name.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
+    try {
+      let rows;
+      const isCSV = file.name.toLowerCase().endsWith(".csv");
+      if (isCSV) rows = await readCSV(file);
+      else rows = await readWorkbook(file);
+      if (!rows || rows.length === 0) { unknownFiles.push(file.name + " (empty)"); countsByKind.unknown++; continue; }
+      const kind = detectFileType(file.name, rows[0]);
+      const group = sourceGroup(kind);
+      countsByKind[kind] = (countsByKind[kind]||0) + 1;
+      fileLogs.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
+      sourceFilesLog.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
+      if (kind === "master" || kind === "original" || kind === "accessorials") {
+        const stops = parseOriginalOrAccessorial(rows);
+        for (const s of stops) {
+          if (!s.pro || !s.week_ending) continue;
+          const existing = stopsByPro[s.pro];
+          if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[s.pro] = s;
+        }
+      } else if (kind === "ddis") {
+        const payments = parseDDIS(rows);
+        const billDates = payments.map(p => p.bill_date).filter(Boolean).sort();
+        const totalPaid = payments.reduce((s,p) => s + p.paid, 0);
+        ddisFileRecords.push({
+          file_id: fileId, filename: file.name,
+          record_count: payments.length, total_paid: totalPaid,
+          earliest_bill_date: billDates[0] || null,
+          latest_bill_date: billDates[billDates.length-1] || null,
+          checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
+          uploaded_at: new Date().toISOString(),
+        });
+        for (const p of payments) paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
+      } else if (kind === "nuvizz") {
+        nuvizzStops.push(...parseNuVizz(rows));
+      } else if (kind === "timeclock") {
+        timeClockEntries.push(...parseTimeClock(rows));
+      } else if (kind === "payroll") {
+        payrollEntries.push(...parsePayroll(rows));
+      } else if (kind === "qbo_pl" || kind === "qbo_tb" || kind === "qbo_gl") {
+        qboEntries.push(...parseQBO(rows, kind).map(e => ({...e, source_file: file.name})));
+      } else {
+        unknownFiles.push(file.name);
+      }
+    } catch(e) {
+      console.error("ingest err:", file.name, e);
+      unknownFiles.push(file.name + " (err: " + e.message + ")");
+      countsByKind.unknown++;
+    }
+  }
+
+  // Uline rollups
+  onStatus({ phase:"rollup", message:"Building Uline weekly rollups..." });
+  const allStops = Object.values(stopsByPro);
+  const rollups = buildWeeklyRollups(allStops);
+  const reconByWeek = {};
+  const unpaidStops = [];
+  for (const s of allStops) {
+    const paid = paymentByPro[s.pro] || 0;
+    if (!reconByWeek[s.week_ending]) reconByWeek[s.week_ending] = { week_ending: s.week_ending, month: s.month, billed:0, paid_matched:0, unpaid_count:0, unpaid_amount:0 };
+    reconByWeek[s.week_ending].billed += s.new_cost || 0;
+    reconByWeek[s.week_ending].paid_matched += paid;
+    if (paid === 0 && (s.new_cost||0) > 0) {
+      reconByWeek[s.week_ending].unpaid_count++;
+      reconByWeek[s.week_ending].unpaid_amount += s.new_cost;
+      if (unpaidStops.length < 2000) {
+        unpaidStops.push({
+          pro: s.pro, customer: s.customer, city: s.city, state: s.state, zip: s.zip,
+          pu_date: s.pu_date, week_ending: s.week_ending, month: s.month, billed: s.new_cost,
+          code: s.code, weight: s.weight, order: s.order
+        });
+      }
+    }
+  }
+  for (const r of Object.values(reconByWeek)) r.collection_rate = r.billed > 0 ? (r.paid_matched / r.billed * 100) : null;
+
+  onStatus({ phase:"save", message:"Saving to Firebase..." });
+  let savedWeeks = 0, savedRecon = 0;
+  for (const r of rollups) { if (await FS.saveWeeklyRollup(r.week_ending, {...r, updated_at:new Date().toISOString()})) savedWeeks++; }
+  for (const r of Object.values(reconByWeek)) { if (await FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()})) savedRecon++; }
+  for (const f of ddisFileRecords) await FS.saveDDISFile(f.file_id, f);
+  const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, 500);
+  for (const s of topUnpaid) await FS.saveUnpaidStop(s.pro, s);
+
+  // NuVizz
+  let nvWeeksSaved = 0, nvStopsSaved = 0;
+  if (nuvizzStops.length > 0) {
+    onStatus({ phase:"save", message:`Saving NuVizz (${nuvizzStops.length} stops)...` });
+    const nvWeekly = buildNuVizzWeekly(nuvizzStops);
+    for (const w of nvWeekly) { if (await FS.saveNuVizzWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()})) nvWeeksSaved++; }
+    const recent = nuvizzStops.filter(s => s.pro && s.delivery_date).sort((a,b) => (b.delivery_date||"").localeCompare(a.delivery_date||"")).slice(0, 2000);
+    for (const s of recent) {
+      const key = s.pro || s.stop_number;
+      if (!key) continue;
+      if (await FS.saveNuVizzStop(key, s)) nvStopsSaved++;
+    }
+  }
+
+  // Time Clock
+  let tcWeeksSaved = 0;
+  if (timeClockEntries.length > 0) {
+    const tcWeekly = buildTimeClockWeekly(timeClockEntries);
+    for (const w of tcWeekly) { if (await FS.saveTimeClockWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()})) tcWeeksSaved++; }
+  }
+
+  // Payroll
+  let payWeeksSaved = 0;
+  if (payrollEntries.length > 0) {
+    const payWeekly = buildPayrollWeekly(payrollEntries);
+    for (const w of payWeekly) { if (await FS.savePayrollWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()})) payWeeksSaved++; }
+  }
+
+  // QBO
+  let qboPeriodsSaved = 0;
+  if (qboEntries.length > 0) {
+    const byPeriod = {};
+    for (const e of qboEntries) {
+      const pid = `${e.report_type}_${e.source_file || "unknown"}`.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
+      if (!byPeriod[pid]) byPeriod[pid] = { period: e.period || null, report_type: e.report_type, source_file: e.source_file, accounts: [] };
+      byPeriod[pid].accounts.push({ account: e.account, amount: e.amount, debit: e.debit, credit: e.credit });
+    }
+    for (const [pid, data] of Object.entries(byPeriod)) { if (await FS.saveQBOHistory(pid, {...data, uploaded_at: new Date().toISOString()})) qboPeriodsSaved++; }
+  }
+
+  // File logs
+  for (const l of fileLogs) await FS.saveFileLog(l.file_id, l);
+  for (const sf of sourceFilesLog) await FS.saveSourceFile(sf.file_id, sf);
+
+  const existingMeta = await FS.getReconMeta() || {};
+  await FS.saveReconMeta({
+    files_count: (existingMeta.files_count || 0) + ddisFileRecords.length,
+    last_upload: new Date().toISOString(),
+    total_stops_processed: (existingMeta.total_stops_processed || 0) + allStops.length,
+  });
+
+  return {
+    files_processed: files.length,
+    counts: countsByKind,
+    uline: { stops: allStops.length, weeks_saved: savedWeeks, recon_saved: savedRecon, unpaid_saved: topUnpaid.length, payments: Object.keys(paymentByPro).length },
+    nuvizz: { stops: nuvizzStops.length, weeks_saved: nvWeeksSaved, stops_saved: nvStopsSaved },
+    timeclock: { entries: timeClockEntries.length, weeks_saved: tcWeeksSaved },
+    payroll: { entries: payrollEntries.length, weeks_saved: payWeeksSaved },
+    qbo: { lines: qboEntries.length, periods_saved: qboPeriodsSaved },
+    unknown: unknownFiles,
+  };
+}
+
+// ═══ GMAIL SYNC — Auto-import weekly reports from inbox ═════
+function GmailSync({ onRefresh }) {
+  const [gmailConn, setGmailConn] = useState(null);
+  const [loadingConn, setLoadingConn] = useState(true);
+  const [results, setResults] = useState({}); // vendor -> emails array
+  const [loading, setLoading] = useState({}); // vendor -> bool
+  const [importing, setImporting] = useState({}); // emailId:attachmentId -> bool
+  const [imported, setImported] = useState({}); // emailId:attachmentId -> result summary
+  const [importStatus, setImportStatus] = useState("");
+
+  // Load Gmail connection state
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) { setLoadingConn(false); return; }
+      try {
+        const d = await window.db.collection("marginiq_config").doc("gmail_tokens").get();
+        if (d.exists) {
+          const data = d.data();
+          setGmailConn({ email: data.email, connected_at: data.connected_at });
+        }
+      } catch(e) {}
+      setLoadingConn(false);
+    })();
+    // Handle OAuth callback redirect (?gmail=connected)
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("gmail") === "connected") {
+      window.history.replaceState({}, "", "/");
+      setTimeout(() => window.location.reload(), 200);
+    }
+  }, []);
+
+  const disconnect = async () => {
+    if (!confirm("Disconnect Gmail? You'll need to reconnect to pull new reports.")) return;
+    try { await window.db.collection("marginiq_config").doc("gmail_tokens").delete(); } catch(e) {}
+    setGmailConn(null);
+    setResults({});
+  };
+
+  const searchVendor = async (vendor) => {
+    setLoading(prev => ({...prev, [vendor]: true}));
+    try {
+      // Default to last 60 days
+      const d = new Date();
+      d.setDate(d.getDate() - 60);
+      const afterDate = `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()}`;
+      const resp = await fetch("/.netlify/functions/marginiq-gmail-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ vendor, afterDate, maxResults: 30 }),
+      });
+      const data = await resp.json();
+      if (data.error) {
+        setResults(prev => ({...prev, [vendor]: { error: data.error }}));
+      } else {
+        setResults(prev => ({...prev, [vendor]: { list: data.results || [], query: data.query }}));
+      }
+    } catch(e) {
+      setResults(prev => ({...prev, [vendor]: { error: e.message }}));
+    }
+    setLoading(prev => ({...prev, [vendor]: false}));
+  };
+
+  const importAttachment = async (email, attachment) => {
+    const refKey = `${email.emailId}:${attachment.attachmentId}`;
+    setImporting(prev => ({...prev, [refKey]: true}));
+    setImportStatus(`Downloading ${attachment.filename}...`);
+    try {
+      // 1. Download attachment bytes
+      const dlResp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messageId: email.emailId, attachmentId: attachment.attachmentId }),
+      });
+      const dlData = await dlResp.json();
+      if (dlData.error) throw new Error(dlData.error);
+
+      // 2. Base64 → File
+      const binary = atob(dlData.data);
+      const bytes = new Uint8Array(binary.length);
+      for (let i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const mimeType = attachment.mimeType || (attachment.filename.endsWith(".csv") ? "text/csv" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      const blob = new Blob([bytes], { type: mimeType });
+      const file = new File([blob], attachment.filename, { type: mimeType });
+
+      // 3. Route through shared ingest pipeline
+      setImportStatus(`Parsing ${attachment.filename}...`);
+      const result = await ingestFiles([file], (s) => {
+        if (s.message) setImportStatus(s.message);
+      });
+
+      setImported(prev => ({...prev, [refKey]: result}));
+      setImportStatus(`✓ Imported ${attachment.filename}`);
+      if (onRefresh) onRefresh();
+    } catch(e) {
+      setImported(prev => ({...prev, [refKey]: { error: e.message }}));
+      setImportStatus(`✗ Failed: ${e.message}`);
+    }
+    setImporting(prev => ({...prev, [refKey]: false}));
+  };
+
+  if (loadingConn) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading Gmail...</div>;
+
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="📧" text="Gmail Sync" />
+
+    {!gmailConn ? (
+      <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand}}>Connect Gmail</div>
+        <div style={{fontSize:12,color:T.text,lineHeight:1.6,marginBottom:12}}>
+          Auto-import weekly reports directly from your inbox. MarginIQ will search your Gmail (read-only) for attachments from known vendors and route them through the same parsers as manual upload.
+          <br/><br/>
+          <strong>What we search for:</strong>
+          <ul style={{marginTop:6,marginLeft:20}}>
+            <li><strong>NuVizz:</strong> from <code>nuvizzapps@nuvizzapps.com</code>, CSV attachments</li>
+            <li><strong>Uline:</strong> from any <code>@uline.com</code> sender, XLSX/CSV attachments</li>
+          </ul>
+        </div>
+        <a href="/.netlify/functions/marginiq-gmail-auth" style={{display:"inline-block",padding:"10px 18px",background:T.brand,color:"#fff",borderRadius:8,textDecoration:"none",fontSize:13,fontWeight:700}}>
+          📧 Connect Gmail
+        </a>
+      </div>
+    ) : (
+      <>
+        <div style={{...cardStyle, background:T.greenBg, borderColor:T.green}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+            <div>
+              <div style={{fontSize:12,fontWeight:700,color:T.greenText}}>✓ Connected</div>
+              <div style={{fontSize:13,fontWeight:600,marginTop:2}}>{gmailConn.email}</div>
+              {gmailConn.connected_at && <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>Connected {new Date(gmailConn.connected_at).toLocaleString()}</div>}
+            </div>
+            <button onClick={disconnect} style={{padding:"6px 12px",borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,fontSize:11,cursor:"pointer"}}>Disconnect</button>
+          </div>
+        </div>
+
+        {importStatus && (
+          <div style={{...cardStyle, background:T.yellowBg, borderColor:T.yellow, fontSize:12, color:T.yellowText, fontWeight:600}}>
+            {importStatus}
+          </div>
+        )}
+
+        {/* Vendor Panels */}
+        {[
+          { key:"nuvizz", icon:"🚚", label:"NuVizz", desc:"Weekly driver stops from nuvizzapps@nuvizzapps.com", color:T.blue },
+          { key:"uline", icon:"📦", label:"Uline", desc:"Weekly billing + DDIS from @uline.com senders", color:T.brand },
+        ].map(v => {
+          const r = results[v.key];
+          const isLoading = loading[v.key];
+          return (
+            <div key={v.key} style={{...cardStyle, borderLeft:`3px solid ${v.color}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:8}}>
+                <div>
+                  <div style={{fontSize:14,fontWeight:700}}>{v.icon} {v.label}</div>
+                  <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>{v.desc}</div>
+                </div>
+                <PrimaryBtn text={isLoading ? "Searching..." : "Search Last 60 Days"} onClick={() => searchVendor(v.key)} loading={isLoading} />
+              </div>
+
+              {r?.error && <div style={{fontSize:12,color:T.redText,background:T.redBg,padding:"8px 10px",borderRadius:6,marginTop:8}}>✗ {r.error}</div>}
+
+              {r?.list && r.list.length === 0 && (
+                <div style={{fontSize:12,color:T.textMuted,padding:8}}>No matching emails in the last 60 days.</div>
+              )}
+
+              {r?.list && r.list.length > 0 && (
+                <div style={{marginTop:8}}>
+                  <div style={{fontSize:10,color:T.textDim,marginBottom:6}}>Found {r.list.length} email{r.list.length>1?"s":""}. Click Import on any attachment to download + parse.</div>
+                  {r.list.map((em, idx) => (
+                    <div key={em.emailId} style={{padding:"8px 10px",borderTop:idx>0?`1px solid ${T.borderLight}`:"none"}}>
+                      <div style={{fontSize:12,fontWeight:600}}>{em.emailSubject || "(no subject)"}</div>
+                      <div style={{fontSize:10,color:T.textMuted}}>{em.from} • {em.emailDate ? new Date(em.emailDate).toLocaleString() : "—"}</div>
+                      {em.attachments?.length > 0 ? (
+                        <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
+                          {em.attachments.map(a => {
+                            const refKey = `${em.emailId}:${a.attachmentId}`;
+                            const isImp = importing[refKey];
+                            const imp = imported[refKey];
+                            return (
+                              <div key={a.attachmentId} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"4px 8px",background:T.bgSurface,borderRadius:6}}>
+                                <div style={{flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>📎 {a.filename} <span style={{color:T.textDim}}>({Math.round(a.size/1024)} KB)</span></div>
+                                {imp?.error ? (
+                                  <span style={{fontSize:10,color:T.redText}}>✗ {imp.error.substring(0,40)}</span>
+                                ) : imp ? (
+                                  <span style={{fontSize:10,color:T.greenText,fontWeight:600}}>✓ Imported</span>
+                                ) : (
+                                  <button onClick={() => importAttachment(em, a)} disabled={isImp}
+                                    style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${v.color}`,background:isImp?T.bgSurface:v.color,color:isImp?T.text:"#fff",cursor:isImp?"wait":"pointer",opacity:isImp?0.6:1}}>
+                                    {isImp ? "..." : "→ Import"}
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div style={{fontSize:10,color:T.textDim,marginTop:4}}>No data attachments (.xlsx/.csv)</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </>
+    )}
+  </div>;
+}
+
 
 // Parse duration strings like "8:30" (H:MM) or "8.5" to decimal hours
 function parseHours(v) {
@@ -2147,6 +2520,7 @@ function MarginIQ() {
     { id:"drivers", icon:"👥", label:"Drivers" },
     { id:"completeness", icon:"✅", label:"Data Health" },
     { id:"ingest", icon:"📤", label:"Data Ingest" },
+    { id:"gmail", icon:"📧", label:"Gmail Sync" },
     { id:"costs", icon:"⚙️", label:"Costs" },
     { id:"settings", icon:"🔧", label:"Settings" },
   ];
@@ -2179,6 +2553,7 @@ function MarginIQ() {
     {!loading && tab==="drivers" && <Drivers />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} onRefresh={refreshData} />}
+    {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
     {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} />}
   </div>;
