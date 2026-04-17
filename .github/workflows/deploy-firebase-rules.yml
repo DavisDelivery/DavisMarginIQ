@@ -7,6 +7,7 @@ on:
       - "firestore.rules"
       - "storage.rules"
       - "firebase.json"
+  workflow_dispatch: # allow manual re-run from Actions tab
 
 jobs:
   deploy-rules:
@@ -17,5 +18,16 @@ jobs:
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
 
-      - name: Deploy Firestore rules
-        run: firebase deploy --only firestore:rules,storage --project davismarginiq --token "${{ secrets.FIREBASE_TOKEN }}"
+      - name: Write service account to disk
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > "$RUNNER_TEMP/sa.json"
+          if [ ! -s "$RUNNER_TEMP/sa.json" ]; then
+            echo "::error::FIREBASE_SERVICE_ACCOUNT secret is empty or missing."
+            echo "Add a service-account JSON key as a repo secret named FIREBASE_SERVICE_ACCOUNT."
+            exit 1
+          fi
+
+      - name: Deploy Firestore + Storage rules
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+        run: firebase deploy --only firestore:rules,storage --project davismarginiq --non-interactive
