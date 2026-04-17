@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "6.0.0";
+const APP_VERSION = "6.1.0";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -596,224 +596,517 @@ ${ctx||"No data loaded yet - recommend user upload Uline files and enter cost st
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DATA IMPORT HUB (B600, Uline dedup, NuVizz bulk)
+// UNIFIED DATA IMPORT HUB
+// All data sources in one place: Uline, QB (5 files), B600, NuVizz, CyberPay
+// Replaces the separate DataImport + QBOImport tabs
 // ═══════════════════════════════════════════════════════════════
-function DataImport({ulineWeeks,onUlineUpload}){
-  const [view,setView]=useState("overview");
-  const [importing,setImporting]=useState(false);
-  const [importResult,setImportResult]=useState(null);
-  const [b600Data,setB600Data]=useState([]);
-  const [nvFrom,setNvFrom]=useState(()=>new Date().toISOString().slice(0,10));
+function DataImportHub({ulineWeeks,onUlineUpload,onQBChange}){
+  // State per source
+  const [importing,setImporting]=useState(null); // which source is importing
+  const [result,setResult]=useState(null);
+  const [stats,setStats]=useState({uline:null,qb:null,b600:null,nuvizz:null,payroll:null});
+  const [nvFrom,setNvFrom]=useState(()=>{const d=new Date();d.setDate(d.getDate()-7);return d.toISOString().slice(0,10);});
   const [nvTo,setNvTo]=useState(()=>new Date().toISOString().slice(0,10));
-  const b600Ref=useRef(null);const ulineRef=useRef(null);
 
-  // ── B600 Time Clock CSV Parser ──
-  const parseB600=async(file)=>{
-    return new Promise((resolve,reject)=>{
-      const reader=new FileReader();
-      reader.onload=e=>{
-        try{
-          const text=e.target.result;
-          const lines=text.split("\n").map(l=>l.trim()).filter(l=>l);
-          if(lines.length<2) return reject(new Error("Empty CSV"));
-          // Parse header
-          const header=lines[0].toLowerCase().split(",").map(h=>h.trim().replace(/"/g,""));
-          const nameIdx=header.findIndex(h=>h.match(/employee|name|driver|person/));
-          const dateIdx=header.findIndex(h=>h.match(/^date$/));
-          const inIdx=header.findIndex(h=>h.match(/in|clock.?in|start|punch.?in/));
-          const outIdx=header.findIndex(h=>h.match(/out|clock.?out|end|punch.?out/));
-          const hoursIdx=header.findIndex(h=>h.match(/hours|total|duration/));
-          const records=[];
-          for(let i=1;i<lines.length;i++){
-            const cols=lines[i].split(",").map(c=>c.trim().replace(/"/g,""));
-            if(cols.length<3) continue;
-            const name=nameIdx>=0?cols[nameIdx]:(cols[0]||"");
-            const date=dateIdx>=0?cols[dateIdx]:(cols[1]||"");
-            const clockIn=inIdx>=0?cols[inIdx]:(cols[2]||"");
-            const clockOut=outIdx>=0?cols[outIdx]:(cols[3]||"");
-            const hours=hoursIdx>=0?parseFloat(cols[hoursIdx])||0:0;
-            if(!name||!date) continue;
-            records.push({name,date,clockIn,clockOut,hours,raw:lines[i]});
-          }
-          resolve(records);
-        }catch(e){reject(e);}
-      };
-      reader.onerror=reject;
-      reader.readAsText(file);
-    });
+  // Refs for hidden file inputs
+  const ulineRef=useRef(null);
+  const glRef=useRef(null);const pnlRef=useRef(null);const bsRef=useRef(null);const custRef=useRef(null);const qbPayRef=useRef(null);
+  const b600Ref=useRef(null);const cyberPayRef=useRef(null);
+
+  // ─── Load stats from Firebase ───
+  const loadStats=async()=>{
+    if(!hasFirebase) return;
+    try{
+      const [qb,b600,nv,pay]=await Promise.all([
+        window.db.collection("qbo_imports").orderBy("imported_at","desc").limit(50).get().catch(()=>({docs:[]})),
+        window.db.collection("b600_timeclock").limit(1000).get().catch(()=>({docs:[]})),
+        window.db.collection("nuvizz_stops").limit(1000).get().catch(()=>({docs:[]})),
+        window.db.collection("payroll_runs").orderBy("check_date","desc").limit(50).get().catch(()=>({docs:[]})),
+      ]);
+      const qbFiles=qb.docs.map(d=>({id:d.id,...d.data()}));
+      const gl=qbFiles.find(f=>f.type==="gl");
+      const qbPnL=qbFiles.find(f=>f.type==="pnl");
+      const qbBS=qbFiles.find(f=>f.type==="bs");
+      const qbCust=qbFiles.find(f=>f.type==="customers");
+      const qbPay=qbFiles.find(f=>f.type==="payroll");
+      const b600Docs=b600.docs.map(d=>d.data());
+      const b600Dates=b600Docs.map(r=>r.date).filter(Boolean).sort();
+      setStats({
+        uline:{count:ulineWeeks.length,lastUpload:ulineWeeks[0]?.upload_date,totalStops:ulineWeeks.reduce((s,w)=>s+(w.totalStops||0),0),totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)},
+        qb:{files:qbFiles,hasGL:!!gl,hasPnL:!!qbPnL,hasBS:!!qbBS,hasCust:!!qbCust,hasPay:!!qbPay,gl,pnl:qbPnL,bs:qbBS,cust:qbCust,pay:qbPay},
+        b600:{count:b600Docs.length,lastDate:b600Dates[b600Dates.length-1],firstDate:b600Dates[0]},
+        nuvizz:{count:nv.size},
+        payroll:{count:pay.size,latest:pay.docs[0]?.data()},
+      });
+    }catch(e){console.warn("Stats load:",e);}
+  };
+  useEffect(()=>{loadStats();},[ulineWeeks.length]);
+
+  // ─── Uline XLSX handler ───
+  const handleUline=async(e)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    setImporting("uline");setResult(null);
+    try{
+      const parsed=await parseUlineXlsx(file);
+      const existingPros=new Set();ulineWeeks.forEach(w=>(w.stops||[]).forEach(s=>{if(s.pro)existingPros.add(s.pro);}));
+      const dupPros=parsed.stops.filter(s=>s.pro&&existingPros.has(s.pro)).map(s=>s.pro);
+      const newStops=parsed.stops.filter(s=>!s.pro||!existingPros.has(s.pro));
+      if(newStops.length===0){
+        setResult({source:"uline",type:"dup",message:`All ${dupPros.length} stops already imported (dedup by PRO). File skipped.`,filename:file.name});
+      }else{
+        const rev=newStops.reduce((s,r)=>s+(r.newCost||r.cost),0);
+        const wt=newStops.reduce((s,r)=>s+r.weight,0);
+        const cs=newStops.filter(s=>s.sealNbr);const cp=cs.reduce((s,r)=>s+(r.newCost||r.cost),0)*0.40;
+        const weekId=`${file.name}_${Date.now()}`.replace(/[\/\s\.]/g,"_").substring(0,200);
+        const weekData={stops:newStops,totalRevenue:rev,totalWeight:wt,totalStops:newStops.length,avgRevenuePerStop:newStops.length>0?rev/newStops.length:0,avgWeightPerStop:newStops.length>0?wt/newStops.length:0,contractorStops:cs.length,contractorPayout:cp,filename:file.name,upload_date:new Date().toISOString(),week_id:weekId};
+        await FS.saveUlineWeek(weekId,weekData);
+        onUlineUpload(weekData);
+        setResult({source:"uline",type:"success",message:`✅ Saved ${newStops.length} stops${dupPros.length>0?` (${dupPros.length} duplicates skipped)`:""}, ${fmtK(rev)} revenue`,filename:file.name});
+      }
+      await loadStats();
+    }catch(err){setResult({source:"uline",type:"error",message:err.message});}
+    setImporting(null);if(ulineRef.current)ulineRef.current.value="";
   };
 
-  const handleB600Upload=async(e)=>{
+  // ─── QB XLSX Parser (generic — returns array of rows) ───
+  const parseXLSX=(file)=>new Promise((resolve,reject)=>{
+    if(typeof XLSX==="undefined")return reject(new Error("XLSX library not loaded"));
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{const wb=XLSX.read(e.target.result,{type:"array",cellDates:true});const ws=wb.Sheets[wb.SheetNames[0]];resolve(XLSX.utils.sheet_to_json(ws,{defval:"",header:1,raw:false}));}
+      catch(err){reject(err);}
+    };
+    reader.onerror=reject;reader.readAsArrayBuffer(file);
+  });
+
+  // ─── GL Parser ───
+  const parseGL=async(file)=>{
+    const raw=await parseXLSX(file);
+    let headerIdx=-1;let cols={};
+    for(let i=0;i<Math.min(20,raw.length);i++){
+      const lc=raw[i].map(c=>String(c||"").toLowerCase().trim());
+      if(lc.includes("date")&&(lc.includes("debit")||lc.includes("credit"))){headerIdx=i;lc.forEach((h,j)=>{cols[h]=j;});break;}
+    }
+    if(headerIdx<0) throw new Error("Could not find GL header row with Date, Debit, Credit columns");
+    const txns=[];let currentAcct=null;
+    for(let i=headerIdx+1;i<raw.length;i++){
+      const row=raw[i];if(!row||row.length===0) continue;
+      const firstCell=String(row[0]||"").trim();const dateCell=row[cols["date"]];
+      if(firstCell&&!dateCell&&!String(firstCell).toLowerCase().startsWith("total")){currentAcct=firstCell;continue;}
+      if(String(firstCell).toLowerCase().startsWith("total")){currentAcct=null;continue;}
+      if(!dateCell) continue;
+      let date=null;
+      if(dateCell instanceof Date) date=dateCell;
+      else if(typeof dateCell==="string"&&dateCell.includes("/")){const p=dateCell.split("/");if(p.length===3){date=new Date(parseInt(p[2]),parseInt(p[0])-1,parseInt(p[1]));}}
+      if(!date||isNaN(date.getTime())) continue;
+      const account=row[cols["account"]]||currentAcct||"";
+      if(!account) continue;
+      const debit=parseFloat(String(row[cols["debit"]]||"0").replace(/[$,]/g,""))||0;
+      const credit=parseFloat(String(row[cols["credit"]]||"0").replace(/[$,]/g,""))||0;
+      txns.push({
+        date:date.toISOString().slice(0,10),year:date.getFullYear(),month:date.getMonth()+1,quarter:Math.floor(date.getMonth()/3)+1,
+        yearMonth:`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}`,
+        yearQuarter:`${date.getFullYear()}-Q${Math.floor(date.getMonth()/3)+1}`,
+        type:String(row[cols["transaction type"]||cols["type"]]||""),
+        num:String(row[cols["num"]]||""),name:String(row[cols["name"]]||""),
+        memo:String(row[cols["memo/description"]||cols["memo"]]||""),
+        account:String(account).trim(),debit,credit,
+      });
+    }
+    return txns;
+  };
+
+  const handleGL=async(e)=>{
     const file=e.target.files?.[0];if(!file)return;
-    setImporting(true);setImportResult(null);
+    setImporting("gl");setResult(null);
+    try{
+      const txns=await parseGL(file);
+      if(txns.length===0) throw new Error("No transactions found");
+      const dates=txns.map(t=>t.date).sort();
+      const totalDebit=txns.reduce((s,t)=>s+t.debit,0);const totalCredit=txns.reduce((s,t)=>s+t.credit,0);
+      const summary={type:"gl",filename:file.name,txnCount:txns.length,totalDebit,totalCredit,dateStart:dates[0],dateEnd:dates[dates.length-1],imported_at:new Date().toISOString()};
+      if(hasFirebase){
+        const docId=`gl_${file.name}`.replace(/[\/\s\.]/g,"_").substring(0,200);
+        const existing=await window.db.collection("qbo_imports").doc(docId).get();
+        if(existing.exists){setResult({source:"qb",type:"dup",message:`${file.name} already imported. Delete existing import first to re-upload.`,filename:file.name});setImporting(null);return;}
+        try{await window.db.collection("qbo_imports").doc(docId).set({...summary,transactions:txns});}
+        catch(err){await window.db.collection("qbo_imports").doc(docId).set({...summary,note:"Txns too large"});}
+      }
+      setResult({source:"qb",type:"success",message:`✅ GL loaded: ${fmtNum(txns.length)} transactions, ${dates[0]} → ${dates[dates.length-1]}`,filename:file.name});
+      await loadStats();if(onQBChange)onQBChange();
+    }catch(err){setResult({source:"qb",type:"error",message:err.message});}
+    setImporting(null);if(glRef.current)glRef.current.value="";
+  };
+
+  // ─── Simple QB report parser (P&L, BS, Customers, Payroll) ───
+  const handleQBReport=async(e,type)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    setImporting(type);setResult(null);
+    try{
+      const raw=await parseXLSX(file);
+      const rows=raw.filter(r=>r.some(c=>c!==""));
+      let summary={type,filename:file.name,rowCount:rows.length,imported_at:new Date().toISOString()};
+
+      if(type==="pnl"){
+        const items=[];let section=null;
+        for(const row of rows){
+          const label=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
+          if(!label) continue;
+          if(label==="Income") section="income";
+          else if(label==="Expenses") section="expense";
+          else if(label==="Other Income") section="other_income";
+          else if(label==="Other Expenses") section="other_expense";
+          else if(label==="Gross Profit"||label==="Net Income"||label==="Net Operating Income"||label==="Net Other Income") continue;
+          else if(!isNaN(val)&&val!==0&&section){items.push({label,value:val,section,isTotal:label.toLowerCase().startsWith("total ")});}
+        }
+        summary.items=items;
+        summary.totalRevenue=items.filter(i=>i.section==="income"&&i.isTotal).reduce((s,i)=>s+i.value,0)||items.filter(i=>i.section==="income"&&!i.isTotal).reduce((s,i)=>s+i.value,0);
+        summary.totalExpenses=items.filter(i=>i.section==="expense"&&i.isTotal).reduce((s,i)=>s+i.value,0)||items.filter(i=>i.section==="expense"&&!i.isTotal).reduce((s,i)=>s+i.value,0);
+        summary.netIncome=summary.totalRevenue-summary.totalExpenses;
+        summary.margin=summary.totalRevenue>0?(summary.netIncome/summary.totalRevenue*100):0;
+      }
+      if(type==="bs"){
+        const items=[];let section=null;
+        for(const row of rows){
+          const label=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
+          if(!label) continue;
+          if(label==="Assets") section="asset";
+          else if(label==="Liabilities") section="liability";
+          else if(label==="Equity") section="equity";
+          else if(label.startsWith("Total for")) continue;
+          else if(!isNaN(val)&&val!==0&&section) items.push({label,value:val,section});
+        }
+        summary.items=items;
+        summary.totalAssets=items.filter(i=>i.section==="asset").reduce((s,i)=>s+i.value,0);
+        summary.totalLiabilities=items.filter(i=>i.section==="liability").reduce((s,i)=>s+i.value,0);
+        summary.totalEquity=items.filter(i=>i.section==="equity").reduce((s,i)=>s+i.value,0);
+      }
+      if(type==="customers"){
+        const customers=[];
+        for(const row of rows){
+          const name=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
+          if(name&&!isNaN(val)&&val!==0&&!name.startsWith("Total")&&name!=="Sales by Customer Summary"&&name!=="Davis Delivery Service"&&!name.match(/^\d{4}/)) customers.push({name,revenue:val});
+        }
+        customers.sort((a,b)=>b.revenue-a.revenue);
+        summary.customers=customers;summary.totalRevenue=customers.reduce((s,c)=>s+c.revenue,0);
+      }
+      if(type==="payroll"){
+        const employees=[];
+        for(const row of rows){
+          const name=String(row[0]||"").trim();if(!name||name.startsWith("Total")||name==="TOTAL") continue;
+          const vals=row.slice(1).map(c=>parseFloat(String(c||"0").replace(/[$,]/g,""))||0);
+          if(vals.some(v=>v>0)) employees.push({employee:name,grossPay:vals[0]||0,totalPay:vals[vals.length-1]||vals[0]||0});
+        }
+        summary.employees=employees;summary.totalGross=employees.reduce((s,e)=>s+e.grossPay,0);summary.headcount=employees.length;
+      }
+
+      const docId=`${type}_${file.name}`.replace(/[\/\s\.]/g,"_").substring(0,200);
+      if(hasFirebase){
+        const existing=await window.db.collection("qbo_imports").doc(docId).get();
+        if(existing.exists){setResult({source:"qb",type:"dup",message:`${file.name} already imported. Delete existing first to re-upload.`,filename:file.name});setImporting(null);return;}
+        await window.db.collection("qbo_imports").doc(docId).set(summary);
+      }
+
+      const msg=type==="pnl"?`✅ P&L loaded: Revenue ${fmtK(summary.totalRevenue)}, Expenses ${fmtK(summary.totalExpenses)}, Net ${fmtK(summary.netIncome)}`
+        :type==="bs"?`✅ Balance Sheet loaded: Assets ${fmtK(summary.totalAssets)}, Liabilities ${fmtK(summary.totalLiabilities)}, Equity ${fmtK(summary.totalEquity)}`
+        :type==="customers"?`✅ Sales by Customer loaded: ${summary.customers?.length} customers, ${fmtK(summary.totalRevenue)} total`
+        :`✅ Payroll loaded: ${summary.headcount} employees, ${fmtK(summary.totalGross)} gross`;
+      setResult({source:"qb",type:"success",message:msg,filename:file.name});
+      await loadStats();if(onQBChange)onQBChange();
+    }catch(err){setResult({source:"qb",type:"error",message:err.message});}
+    setImporting(null);
+    [pnlRef,bsRef,custRef,qbPayRef].forEach(r=>{if(r?.current)r.current.value="";});
+  };
+
+  // ─── B600 CSV ───
+  const parseB600=async(file)=>new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const text=e.target.result;const lines=text.split("\n").map(l=>l.trim()).filter(l=>l);
+        if(lines.length<2) return reject(new Error("Empty CSV"));
+        const header=lines[0].toLowerCase().split(",").map(h=>h.trim().replace(/"/g,""));
+        const nameIdx=header.findIndex(h=>h.match(/employee|name|driver|person/));
+        const dateIdx=header.findIndex(h=>h.match(/^date$/));
+        const inIdx=header.findIndex(h=>h.match(/in|clock.?in|start|punch.?in/));
+        const outIdx=header.findIndex(h=>h.match(/out|clock.?out|end|punch.?out/));
+        const hoursIdx=header.findIndex(h=>h.match(/hours|total|duration/));
+        const records=[];
+        for(let i=1;i<lines.length;i++){
+          const cols=lines[i].split(",").map(c=>c.trim().replace(/"/g,""));
+          if(cols.length<3) continue;
+          const name=nameIdx>=0?cols[nameIdx]:(cols[0]||"");const date=dateIdx>=0?cols[dateIdx]:(cols[1]||"");
+          const clockIn=inIdx>=0?cols[inIdx]:(cols[2]||"");const clockOut=outIdx>=0?cols[outIdx]:(cols[3]||"");
+          const hours=hoursIdx>=0?parseFloat(cols[hoursIdx])||0:0;
+          if(!name||!date) continue;
+          records.push({name,date,clockIn,clockOut,hours});
+        }
+        resolve(records);
+      }catch(e){reject(e);}
+    };
+    reader.onerror=reject;reader.readAsText(file);
+  });
+
+  const handleB600=async(e)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    setImporting("b600");setResult(null);
     try{
       const records=await parseB600(file);
-      // Dedup: use date_name as document ID
       let saved=0,skipped=0;
       if(hasFirebase){
         for(const r of records){
           const docId=`${r.date}_${r.name}`.replace(/[\/\s]/g,"_").substring(0,200);
-          try{
-            const existing=await window.db.collection("b600_timeclock").doc(docId).get();
-            if(existing.exists){skipped++;continue;}
-            await window.db.collection("b600_timeclock").doc(docId).set({...r,imported_at:new Date().toISOString(),source:file.name});
-            saved++;
-          }catch(err){console.warn("B600 save error:",err);}
+          const existing=await window.db.collection("b600_timeclock").doc(docId).get();
+          if(existing.exists){skipped++;continue;}
+          await window.db.collection("b600_timeclock").doc(docId).set({...r,imported_at:new Date().toISOString(),source:file.name});
+          saved++;
         }
       }
-      setB600Data(records);
-      setImportResult({type:"b600",total:records.length,saved,skipped,filename:file.name});
-    }catch(err){setImportResult({type:"error",message:err.message});}
-    setImporting(false);
-    if(b600Ref.current)b600Ref.current.value="";
+      setResult({source:"b600",type:"success",message:`✅ Saved ${saved} records${skipped>0?` (${skipped} duplicates skipped)`:""}`,filename:file.name});
+      await loadStats();
+    }catch(err){setResult({source:"b600",type:"error",message:err.message});}
+    setImporting(null);if(b600Ref.current)b600Ref.current.value="";
   };
 
-  // ── Uline with dedup ──
-  const handleUlineUpload=async(e)=>{
-    const file=e.target.files?.[0];if(!file)return;
-    setImporting(true);setImportResult(null);
-    try{
-      const parsed=await parseUlineXlsx(file);
-      // ── PRO-based dedup: check incoming PROs against all previously loaded weeks ──
-      const existingPros=new Set();
-      ulineWeeks.forEach(w=>(w.stops||[]).forEach(s=>{if(s.pro)existingPros.add(s.pro);}));
-      const incomingPros=parsed.stops.filter(s=>s.pro).map(s=>s.pro);
-      const dupPros=incomingPros.filter(p=>existingPros.has(p));
-      const newStops=parsed.stops.filter(s=>!s.pro||!existingPros.has(s.pro));
-
-      if(dupPros.length>0&&newStops.length===0){
-        // ALL stops are duplicates — skip entirely
-        setImportResult({type:"uline_dup",filename:file.name,totalStops:parsed.totalStops,dupCount:dupPros.length,samplePros:dupPros.slice(0,5).join(", ")});
-      }else if(dupPros.length>0&&newStops.length>0){
-        // Partial overlap — save only new stops
-        const newRevenue=newStops.reduce((s,r)=>s+(r.newCost||r.cost),0);
-        const newWeight=newStops.reduce((s,r)=>s+r.weight,0);
-        const contractorStops=newStops.filter(s=>s.sealNbr);
-        const contractorPayout=contractorStops.reduce((s,r)=>s+(r.newCost||r.cost),0)*0.40;
-        const weekId=`${file.name}_${Date.now()}`.replace(/[\/\s\.]/g,"_").substring(0,200);
-        const weekData={stops:newStops,totalRevenue:newRevenue,totalWeight:newWeight,totalStops:newStops.length,avgRevenuePerStop:newStops.length>0?newRevenue/newStops.length:0,avgWeightPerStop:newStops.length>0?newWeight/newStops.length:0,contractorStops:contractorStops.length,contractorPayout,filename:file.name,upload_date:new Date().toISOString(),week_id:weekId};
-        await FS.saveUlineWeek(weekId,weekData);
-        onUlineUpload(weekData);
-        setImportResult({type:"uline_partial",filename:file.name,newCount:newStops.length,dupCount:dupPros.length,revenue:newRevenue,samplePros:dupPros.slice(0,5).join(", ")});
-      }else{
-        // No duplicates — save everything
-        const weekId=`${file.name}_${Date.now()}`.replace(/[\/\s\.]/g,"_").substring(0,200);
-        const weekData={...parsed,filename:file.name,upload_date:new Date().toISOString(),week_id:weekId};
-        await FS.saveUlineWeek(weekId,weekData);
-        onUlineUpload(weekData);
-        setImportResult({type:"uline",filename:file.name,totalStops:parsed.totalStops,totalRevenue:parsed.totalRevenue});
-      }
-    }catch(err){setImportResult({type:"error",message:err.message});}
-    setImporting(false);
-    if(ulineRef.current)ulineRef.current.value="";
-  };
-
-  // ── NuVizz Bulk Import ──
-  const handleNuVizzBulk=async()=>{
-    setImporting(true);setImportResult(null);
+  // ─── NuVizz live pull ───
+  const handleNuVizzPull=async()=>{
+    setImporting("nuvizz");setResult(null);
     try{
       const j=await fetchNuVizzStops(nvFrom,nvTo);
-      if(!j) throw new Error("No response from NuVizz API");
+      if(!j) throw new Error("No response from NuVizz");
       const stops=Array.isArray(j)?j:(j.stopList||j.stops||j.data||[]);
-      if(stops.length===0) throw new Error("No stops returned for date range");
-      // Save to Firebase with dedup by stopNbr
+      if(stops.length===0){setResult({source:"nuvizz",type:"dup",message:`No stops returned for ${nvFrom} → ${nvTo}`});setImporting(null);return;}
       let saved=0,skipped=0;
       if(hasFirebase){
         for(const s of stops){
-          const stopNbr=s.stopNbr||s.id||`${Date.now()}_${Math.random()}`;
-          const docId=String(stopNbr).replace(/[\/\s]/g,"_").substring(0,200);
-          try{
-            const existing=await window.db.collection("nuvizz_stops").doc(docId).get();
-            if(existing.exists){skipped++;continue;}
-            await window.db.collection("nuvizz_stops").doc(docId).set({...s,imported_at:new Date().toISOString(),import_range:`${nvFrom}_${nvTo}`});
-            saved++;
-          }catch(err){console.warn("NuVizz save:",err);}
+          const stopId=String(s.stopNbr||s.id||s.stopId||`nv_${Date.now()}_${Math.random()}`);
+          const docId=stopId.replace(/[\/\s]/g,"_").substring(0,200);
+          const existing=await window.db.collection("nuvizz_stops").doc(docId).get();
+          if(existing.exists){skipped++;continue;}
+          await window.db.collection("nuvizz_stops").doc(docId).set({...s,imported_at:new Date().toISOString(),from_date:nvFrom,to_date:nvTo});
+          saved++;
         }
       }
-      setImportResult({type:"nuvizz",total:stops.length,saved,skipped,from:nvFrom,to:nvTo});
-    }catch(err){setImportResult({type:"error",message:err.message});}
-    setImporting(false);
+      setResult({source:"nuvizz",type:"success",message:`✅ Pulled ${stops.length} stops — saved ${saved}${skipped>0?`, skipped ${skipped} duplicates`:""}`});
+      await loadStats();
+    }catch(err){setResult({source:"nuvizz",type:"error",message:err.message});}
+    setImporting(null);
   };
 
-  // ── B600 History from Firebase ──
-  const [b600History,setB600History]=useState([]);
-  const loadB600History=async()=>{
-    if(!hasFirebase)return;
-    try{const s=await window.db.collection("b600_timeclock").orderBy("date","desc").limit(100).get();setB600History(s.docs.map(d=>({id:d.id,...d.data()})));}catch(e){}
+  // ─── CyberPay PDF Parser ───
+  // Loads pdfjs-dist on demand, extracts text, regex-parses employee/gross/net
+  const parseCyberPayPDF=async(file)=>{
+    // Load pdfjs if not already loaded
+    if(typeof window.pdfjsLib==="undefined"){
+      await new Promise((resolve,reject)=>{
+        const s=document.createElement("script");
+        s.src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+        s.onload=()=>{
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+          resolve();
+        };
+        s.onerror=reject;
+        document.head.appendChild(s);
+      });
+    }
+    const ab=await file.arrayBuffer();
+    const pdf=await window.pdfjsLib.getDocument({data:ab}).promise;
+    let fullText="";
+    for(let i=1;i<=pdf.numPages;i++){
+      const page=await pdf.getPage(i);
+      const content=await page.getTextContent();
+      const text=content.items.map(it=>it.str).join(" ");
+      fullText+=text+"\n";
+    }
+    return fullText;
   };
-  useEffect(()=>{loadB600History();},[]);
 
-  return(
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="📥" text="Data Import" right={<Badge text="Dedup enabled" color={T.greenText} bg={T.greenBg}/>}/>
+  const handleCyberPay=async(e)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    setImporting("cyberpay");setResult(null);
+    try{
+      const text=await parseCyberPayPDF(file);
+      // Extract run metadata
+      const checkDateMatch=text.match(/Check\s*Date[:\s]+(\d{1,2}\/\d{1,2}\/\d{2,4})/i)||text.match(/Pay\s*Date[:\s]+(\d{1,2}\/\d{1,2}\/\d{2,4})/i);
+      const periodMatch=text.match(/Period[:\s]+(\d{1,2}\/\d{1,2}\/\d{2,4})\s*(?:to|-|\u2013)\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i);
+      const checkDate=checkDateMatch?checkDateMatch[1]:null;
+      const fromDate=periodMatch?periodMatch[1]:null;
+      const toDate=periodMatch?periodMatch[2]:null;
 
-      {/* Import result banner */}
-      {importResult&&(
-        <div style={{...CS,borderLeft:`4px solid ${importResult.type==="error"?T.red:importResult.type==="uline_dup"?T.yellow:importResult.type==="uline_partial"?T.blue:T.green}`,marginBottom:16}}>
-          {importResult.type==="error"&&<div style={{color:T.redText,fontSize:13}}>❌ Error: {importResult.message}</div>}
-          {importResult.type==="uline_dup"&&<div style={{color:T.yellowText,fontSize:13}}>⚠️ All {fmtNum(importResult.totalStops)} stops already imported — {importResult.dupCount} duplicate PROs found (e.g. {importResult.samplePros})</div>}
-          {importResult.type==="uline_partial"&&<div style={{color:T.blueText,fontSize:13}}>ℹ️ Imported {fmtNum(importResult.newCount)} new stops from <strong>{importResult.filename}</strong> ({fmt(importResult.revenue)} revenue). Skipped {importResult.dupCount} duplicate PROs (e.g. {importResult.samplePros})</div>}
-          {importResult.type==="uline"&&<div style={{color:T.greenText,fontSize:13}}>✅ Imported <strong>{importResult.filename}</strong>: {fmtNum(importResult.totalStops)} stops, {fmt(importResult.totalRevenue)} revenue</div>}
-          {importResult.type==="b600"&&<div style={{color:T.greenText,fontSize:13}}>✅ B600: {importResult.saved} records saved, {importResult.skipped} duplicates skipped (from {importResult.filename})</div>}
-          {importResult.type==="nuvizz"&&<div style={{color:T.greenText,fontSize:13}}>✅ NuVizz: {importResult.saved} stops saved, {importResult.skipped} duplicates skipped ({importResult.from} → {importResult.to})</div>}
+      // Parse employee rows. CyberPay stubs usually list:
+      // EmployeeName  Regular Hours  OT Hours  Gross  Net
+      // or: EmployeeName  Gross  Taxes  Deductions  Net
+      // Split by common patterns — look for lines with $ amounts
+      const employees=[];
+      const lines=text.split(/\n/).map(l=>l.trim()).filter(l=>l);
+      const dollarPattern=/\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/g;
+      for(const line of lines){
+        // Extract all dollar-like numbers
+        const matches=[...line.matchAll(dollarPattern)].map(m=>parseFloat(m[1].replace(/,/g,"")));
+        const dollars=matches.filter(n=>n>0&&n<500000);
+        if(dollars.length<2) continue;
+        // Extract potential name (leading text before first number)
+        const nameMatch=line.match(/^([A-Z][A-Za-z\s\.,\-']{3,40})[\s\d$]/);
+        if(!nameMatch) continue;
+        const name=nameMatch[1].trim();
+        if(name.match(/^(Total|Check|Period|Company|Department|Date|Run|Page)/i)) continue;
+        // Assume: first $ = gross, last $ = net (most common layout)
+        const gross=Math.max(...dollars);
+        const net=dollars[dollars.length-1]<gross?dollars[dollars.length-1]:dollars.find(d=>d<gross)||gross*0.70;
+        if(gross<100||gross>50000) continue; // sanity bounds
+        employees.push({name,gross,net,raw:line.slice(0,120)});
+      }
+
+      const totalGross=employees.reduce((s,e)=>s+e.gross,0);
+      const totalNet=employees.reduce((s,e)=>s+e.net,0);
+      const runId=`${checkDate||Date.now()}_${file.name}`.replace(/[\/\s\.]/g,"_").substring(0,200);
+      const runData={run_id:runId,filename:file.name,check_date:checkDate,from_date:fromDate,to_date:toDate,employee_count:employees.length,total_gross:totalGross,total_net:totalNet,employees,scraped_at:new Date().toISOString(),source:"cyberpay_pdf"};
+      if(hasFirebase){
+        const existing=await window.db.collection("payroll_runs").doc(runId).get();
+        if(existing.exists){setResult({source:"cyberpay",type:"dup",message:`Payroll run already imported (${checkDate||file.name}). Delete existing first.`,filename:file.name});setImporting(null);return;}
+        await window.db.collection("payroll_runs").doc(runId).set(runData);
+      }
+      setResult({source:"cyberpay",type:"success",message:`✅ Parsed payroll: ${employees.length} employees, ${fmtK(totalGross)} gross${checkDate?` (check date ${checkDate})`:""}`,filename:file.name});
+      await loadStats();
+    }catch(err){setResult({source:"cyberpay",type:"error",message:`Failed to parse PDF: ${err.message}. Try a different format or paste text manually.`});}
+    setImporting(null);if(cyberPayRef.current)cyberPayRef.current.value="";
+  };
+
+  // ─── Source Card Component ───
+  const SourceCard=({icon,title,subtitle,status,statusColor,lastUpdate,children,highlight})=>(
+    <div style={{...CS,borderLeft:`4px solid ${statusColor||T.border}`,marginBottom:14,background:highlight?T.brandPale:T.bgCard}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:12,marginBottom:12}}>
+        <div style={{flex:"1 1 200px",minWidth:0}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
+            <span style={{fontSize:22}}>{icon}</span>
+            <div style={{fontSize:14,fontWeight:800}}>{title}</div>
+          </div>
+          <div style={{fontSize:11,color:T.textMuted,marginLeft:30}}>{subtitle}</div>
         </div>
-      )}
+        <div style={{textAlign:"right",flex:"0 0 auto"}}>
+          <Badge text={status} color={statusColor||T.textDim} bg={statusColor===T.green?T.greenBg:statusColor===T.yellow?T.yellowBg:statusColor===T.red?T.redBg:T.borderLight}/>
+          {lastUpdate&&<div style={{fontSize:10,color:T.textDim,marginTop:3}}>{lastUpdate}</div>}
+        </div>
+      </div>
+      {children}
+    </div>
+  );
 
-      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
-        {[["overview","📊 Overview"],["uline","📦 Uline XLSX"],["b600","⏰ B600 Clock"],["nuvizz","🚚 NuVizz Bulk"],["history","📂 Import History"]].map(([id,l])=><TabBtn key={id} active={view===id} label={l} onClick={()=>setView(id)}/>)}
+  // ─── Render ───
+  return(
+    <div style={{padding:"16px",maxWidth:1100,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="📥" text="Data Import Hub" right={<span style={{fontSize:10,color:T.textDim}}>One place for every data source</span>}/>
+
+      {result&&<div style={{...CS,borderLeft:`4px solid ${result.type==="success"?T.green:result.type==="dup"?T.yellow:T.red}`,background:result.type==="success"?T.greenBg:result.type==="dup"?T.yellowBg:T.redBg,marginBottom:14}}>
+        <div style={{fontSize:13,color:result.type==="success"?T.greenText:result.type==="dup"?T.yellowText:T.redText,fontWeight:600}}>{result.type==="error"?"❌ ":""}{result.message}</div>
+        {result.filename&&<div style={{fontSize:10,color:T.textMuted,marginTop:2}}>File: {result.filename}</div>}
+      </div>}
+
+      {/* Overview KPIs */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:18}}>
+        <KPI icon="📦" label="Uline Weeks" value={fmtNum(stats.uline?.count||0)} sub={stats.uline?.totalStops?`${fmtNum(stats.uline.totalStops)} stops`:"none"} subColor={stats.uline?.count>0?T.green:T.textDim}/>
+        <KPI icon="📁" label="QB Files" value={fmtNum(stats.qb?.files?.length||0)} sub={stats.qb?.hasGL?"GL loaded":"No GL yet"} subColor={stats.qb?.hasGL?T.green:T.textDim}/>
+        <KPI icon="⏰" label="B600 Records" value={fmtNum(stats.b600?.count||0)} sub={stats.b600?.lastDate?`Latest: ${stats.b600.lastDate}`:"none"} subColor={stats.b600?.count>0?T.green:T.textDim}/>
+        <KPI icon="🚚" label="NuVizz Stops" value={fmtNum(stats.nuvizz?.count||0)} sub={stats.nuvizz?.count>0?"stored":"none"} subColor={stats.nuvizz?.count>0?T.green:T.textDim}/>
+        <KPI icon="💵" label="Payroll Runs" value={fmtNum(stats.payroll?.count||0)} sub={stats.payroll?.latest?.check_date||"none"} subColor={stats.payroll?.count>0?T.green:T.textDim}/>
       </div>
 
-      {view==="overview"&&(
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:"12px"}}>
-          <div style={{...CS,cursor:"pointer",border:`2px dashed ${T.border}`}} onClick={()=>setView("uline")}>
-            <div style={{textAlign:"center",padding:"20px 0"}}><div style={{fontSize:36,marginBottom:8}}>📦</div><div style={{fontSize:14,fontWeight:700}}>Uline Weekly Audit</div><div style={{fontSize:12,color:T.textMuted,marginTop:4}}>Upload .xlsx files from Uline billing emails</div><div style={{fontSize:11,color:T.green,marginTop:8}}>{ulineWeeks.length} weeks loaded</div></div>
-          </div>
-          <div style={{...CS,cursor:"pointer",border:`2px dashed ${T.border}`}} onClick={()=>setView("b600")}>
-            <div style={{textAlign:"center",padding:"20px 0"}}><div style={{fontSize:36,marginBottom:8}}>⏰</div><div style={{fontSize:14,fontWeight:700}}>B600 Time Clock</div><div style={{fontSize:12,color:T.textMuted,marginTop:4}}>Upload CSV exports from TotalPass B600</div><div style={{fontSize:11,color:T.green,marginTop:8}}>{b600History.length} records stored</div></div>
-          </div>
-          <div style={{...CS,cursor:"pointer",border:`2px dashed ${T.border}`}} onClick={()=>setView("nuvizz")}>
-            <div style={{textAlign:"center",padding:"20px 0"}}><div style={{fontSize:36,marginBottom:8}}>🚚</div><div style={{fontSize:14,fontWeight:700}}>NuVizz Delivery Data</div><div style={{fontSize:12,color:T.textMuted,marginTop:4}}>Pull stops by date range and save to Firebase</div><div style={{fontSize:11,color:T.textMuted,marginTop:8}}>Pulls from portal.nuvizz.com API</div></div>
-          </div>
+      {/* ── ULINE ── */}
+      <SourceCard icon="📦" title="Uline Weekly Audit XLSX"
+        subtitle="Weekly billing file from Uline (subject: 'Uline Davis File [dates]'). PRO-level dedup — safe to re-upload."
+        status={stats.uline?.count>0?`${stats.uline.count} weeks loaded`:"No data"}
+        statusColor={stats.uline?.count>0?T.green:T.textDim}
+        lastUpdate={stats.uline?.lastUpload?new Date(stats.uline.lastUpload).toLocaleDateString():null}>
+        <input ref={ulineRef} type="file" accept=".xlsx,.xls" onChange={handleUline} style={{display:"none"}}/>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <PrimaryBtn text={importing==="uline"?"Uploading...":"Upload Uline XLSX"} onClick={()=>ulineRef.current?.click()} loading={importing==="uline"}/>
+          {stats.uline?.totalRevenue>0&&<div style={{padding:"10px 14px",background:T.greenBg,borderRadius:8,fontSize:11,color:T.greenText,fontWeight:600}}>Total: {fmtK(stats.uline.totalRevenue)} rev across {fmtNum(stats.uline.totalStops)} stops</div>}
         </div>
-      )}
+      </SourceCard>
 
-      {view==="uline"&&(
-        <div style={CS}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>📦 Upload Uline Weekly Audit XLSX</div>
-          <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>Upload the weekly audit xlsx from Uline billing emails. Duplicate files are automatically detected and skipped.</div>
-          <input ref={ulineRef} type="file" accept=".xlsx,.xls" onChange={handleUlineUpload} style={{display:"none"}}/>
-          <PrimaryBtn text={importing?"Importing...":"Choose Uline XLSX File"} onClick={()=>ulineRef.current?.click()} loading={importing}/>
-          {ulineWeeks.length>0&&<div style={{marginTop:16}}><div style={{fontSize:12,fontWeight:700,marginBottom:8}}>Previously Loaded ({ulineWeeks.length} weeks)</div>{ulineWeeks.map((w,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px solid ${T.borderLight}`,fontSize:12}}><span style={{fontWeight:500}}>{w.filename||w.id}</span><span style={{color:T.green,fontWeight:600}}>{fmt(w.totalRevenue)} ({fmtNum(w.totalStops)} stops)</span></div>)}</div>}
+      {/* ── QUICKBOOKS ── */}
+      <SourceCard icon="📁" title="QuickBooks File Exports"
+        subtitle="Primary: General Ledger (contains everything). Also supports P&L, Balance Sheet, Sales by Customer, Payroll Summary."
+        status={stats.qb?.hasGL?"GL + "+[stats.qb.hasPnL,stats.qb.hasBS,stats.qb.hasCust,stats.qb.hasPay].filter(Boolean).length+" reports":stats.qb?.files?.length>0?`${stats.qb.files.length} files`:"No data"}
+        statusColor={stats.qb?.hasGL?T.green:stats.qb?.files?.length>0?T.yellow:T.textDim}
+        lastUpdate={stats.qb?.files?.[0]?.imported_at?new Date(stats.qb.files[0].imported_at).toLocaleDateString():null}
+        highlight={true}>
+        <input ref={glRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleGL} style={{display:"none"}}/>
+        <input ref={pnlRef} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleQBReport(e,"pnl")} style={{display:"none"}}/>
+        <input ref={bsRef} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleQBReport(e,"bs")} style={{display:"none"}}/>
+        <input ref={custRef} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleQBReport(e,"customers")} style={{display:"none"}}/>
+        <input ref={qbPayRef} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleQBReport(e,"payroll")} style={{display:"none"}}/>
+
+        <div style={{marginBottom:10,padding:"10px 12px",background:T.bgSurface,borderRadius:8,border:`1px dashed ${T.brand}`}}>
+          <div style={{fontSize:11,fontWeight:700,color:T.brand,marginBottom:4}}>⭐ START HERE</div>
+          <div style={{fontSize:11,color:T.textMuted,marginBottom:8}}>The General Ledger contains every transaction and auto-generates your P&L by month/quarter/year.</div>
+          <PrimaryBtn text={importing==="gl"?"Loading GL (may take 10-30s)...":(stats.qb?.hasGL?"Replace General Ledger":"Upload General Ledger")} onClick={()=>glRef.current?.click()} loading={importing==="gl"} style={{fontSize:12}}/>
         </div>
-      )}
 
-      {view==="b600"&&(
-        <div style={CS}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>⏰ Import B600 Time Clock Data</div>
-          <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>Export CSV from the TotalPass B600 time clock (b600.atlantafreightquotes.com). Expected columns: Employee/Name, Date, Clock In, Clock Out, Hours. Duplicates (same date + employee) are automatically skipped.</div>
-          <input ref={b600Ref} type="file" accept=".csv,.txt" onChange={handleB600Upload} style={{display:"none"}}/>
-          <PrimaryBtn text={importing?"Importing...":"Choose B600 CSV File"} onClick={()=>b600Ref.current?.click()} loading={importing}/>
-          {b600Data.length>0&&<div style={{marginTop:16}}><div style={{fontSize:12,fontWeight:700,marginBottom:8}}>Just Imported ({b600Data.length} records)</div><div style={{maxHeight:300,overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}><thead><tr>{["Name","Date","In","Out","Hours"].map(h=><th key={h} style={{textAlign:"left",padding:"6px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead><tbody>{b600Data.slice(0,50).map((r,i)=><tr key={i}><td style={{padding:"6px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:500}}>{r.name}</td><td style={{padding:"6px",borderBottom:`1px solid ${T.borderLight}`}}>{r.date}</td><td style={{padding:"6px",borderBottom:`1px solid ${T.borderLight}`}}>{r.clockIn}</td><td style={{padding:"6px",borderBottom:`1px solid ${T.borderLight}`}}>{r.clockOut}</td><td style={{padding:"6px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{r.hours||"—"}</td></tr>)}</tbody></table></div></div>}
-          {b600History.length>0&&b600Data.length===0&&<div style={{marginTop:16}}><div style={{fontSize:12,fontWeight:700,marginBottom:8}}>Stored Records ({b600History.length})</div><div style={{maxHeight:200,overflowY:"auto"}}>{b600History.slice(0,30).map((r,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:`1px solid ${T.borderLight}`,fontSize:11}}><span>{r.name}</span><span>{r.date}</span><span>{r.clockIn}→{r.clockOut}</span><span style={{fontWeight:600}}>{r.hours||"—"}h</span></div>)}</div></div>}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:8}}>
+          {[{type:"pnl",ref:pnlRef,label:"Profit & Loss",has:stats.qb?.hasPnL},
+            {type:"bs",ref:bsRef,label:"Balance Sheet",has:stats.qb?.hasBS},
+            {type:"customers",ref:custRef,label:"Sales by Customer",has:stats.qb?.hasCust},
+            {type:"payroll",ref:qbPayRef,label:"Payroll Summary",has:stats.qb?.hasPay},
+          ].map(item=>(
+            <button key={item.type} onClick={()=>item.ref.current?.click()} disabled={importing!==null} style={{padding:"10px 12px",borderRadius:8,border:`1px solid ${item.has?T.green:T.border}`,background:item.has?T.greenBg:"transparent",color:item.has?T.greenText:T.textMuted,fontSize:11,fontWeight:600,cursor:importing?"wait":"pointer",fontFamily:"inherit",textAlign:"left"}}>
+              {item.has?"✓ ":"+ "}{item.label}
+              <div style={{fontSize:9,marginTop:2,fontWeight:400,opacity:0.8}}>{item.has?"Uploaded":"Click to upload"}</div>
+            </button>
+          ))}
         </div>
-      )}
+      </SourceCard>
 
-      {view==="nuvizz"&&(
-        <div style={CS}>
-          <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>🚚 Pull NuVizz Delivery Data</div>
-          <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>Pull all stops for a date range from the NuVizz API and save to Firebase. Each stop is stored by its stop number — duplicates are automatically skipped.</div>
-          <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-            <input type="date" value={nvFrom} onChange={e=>setNvFrom(e.target.value)} style={{...IS,width:150,fontSize:12}}/>
-            <span style={{color:T.textDim}}>→</span>
-            <input type="date" value={nvTo} onChange={e=>setNvTo(e.target.value)} style={{...IS,width:150,fontSize:12}}/>
-            <PrimaryBtn text={importing?"Pulling...":"Pull & Save Stops"} onClick={handleNuVizzBulk} loading={importing}/>
-          </div>
+      {/* ── B600 TIME CLOCK ── */}
+      <SourceCard icon="⏰" title="B600 Time Clock CSV"
+        subtitle="Export from b600.atlantafreightquotes.com TotalPass terminal. Dedupes by date + employee."
+        status={stats.b600?.count>0?`${stats.b600.count} records`:"No data"}
+        statusColor={stats.b600?.count>0?T.green:T.textDim}
+        lastUpdate={stats.b600?.lastDate?`Latest: ${stats.b600.lastDate}`:null}>
+        <input ref={b600Ref} type="file" accept=".csv,.txt" onChange={handleB600} style={{display:"none"}}/>
+        <PrimaryBtn text={importing==="b600"?"Uploading...":"Upload B600 CSV"} onClick={()=>b600Ref.current?.click()} loading={importing==="b600"}/>
+      </SourceCard>
+
+      {/* ── CYBERPAY ── */}
+      <SourceCard icon="💵" title="CyberPay Payroll PDF"
+        subtitle="Weekly payroll stubs from Southern Payroll Services / CyberPay Online (company code 0190). PDF → text extraction → employee gross/net parsing."
+        status={stats.payroll?.count>0?`${stats.payroll.count} runs`:"No data"}
+        statusColor={stats.payroll?.count>0?T.green:T.textDim}
+        lastUpdate={stats.payroll?.latest?.check_date||null}>
+        <input ref={cyberPayRef} type="file" accept=".pdf" onChange={handleCyberPay} style={{display:"none"}}/>
+        <PrimaryBtn text={importing==="cyberpay"?"Parsing PDF...":"Upload CyberPay PDF"} onClick={()=>cyberPayRef.current?.click()} loading={importing==="cyberpay"}/>
+        <div style={{fontSize:10,color:T.textMuted,marginTop:6}}>PDF parsing uses best-effort text extraction. Results vary by PDF layout — verify parsed employees after upload.</div>
+      </SourceCard>
+
+      {/* ── NUVIZZ LIVE PULL ── */}
+      <SourceCard icon="🚚" title="NuVizz Delivery API"
+        subtitle={`Live pull from portal.nuvizz.com — your TMS. Fetches stops for a date range. Dedupes by stop number.`}
+        status={stats.nuvizz?.count>0?`${stats.nuvizz.count} stops stored`:"Connected — no data yet"}
+        statusColor={stats.nuvizz?.count>0?T.green:T.yellow}>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <input type="date" value={nvFrom} onChange={e=>setNvFrom(e.target.value)} style={{...IS,width:145,fontSize:12}}/>
+          <span style={{color:T.textDim}}>→</span>
+          <input type="date" value={nvTo} onChange={e=>setNvTo(e.target.value)} style={{...IS,width:145,fontSize:12}}/>
+          <PrimaryBtn text={importing==="nuvizz"?"Pulling...":"Pull & Save Stops"} onClick={handleNuVizzPull} loading={importing==="nuvizz"}/>
         </div>
-      )}
+      </SourceCard>
 
-      {view==="history"&&(
-        <FullImportHistory ulineWeeks={ulineWeeks} onUlineDelete={(id)=>{setUlineWeeks(prev=>prev.filter(w=>(w.week_id||w.id)!==id));}} b600History={b600History} onB600Delete={(id)=>{setB600History(prev=>prev.filter(r=>r.id!==id));}}/>
-      )}
+      {/* ── Note about Motive/QBO APIs ── */}
+      <div style={{...CS,background:T.bgSurface,border:`1px dashed ${T.border}`}}>
+        <div style={{fontSize:12,fontWeight:700,marginBottom:6}}>🔌 Also Connected (via API)</div>
+        <div style={{fontSize:11,color:T.textMuted,lineHeight:1.5}}>
+          <strong>Motive</strong> — Fleet GPS, IFTA trips, driver scoring. Auto-pulled by Fleet & Mileage tabs.<br/>
+          <strong>QuickBooks Online API</strong> — Live financials. Requires Intuit production keys. Currently using file imports instead.
+        </div>
+      </div>
+
+      {/* ── Import History link ── */}
+      <div style={{...CS,marginTop:14,textAlign:"center",background:T.brandPale,border:`1px solid ${T.brand}`}}>
+        <div style={{fontSize:12,color:T.brand,marginBottom:6,fontWeight:700}}>Need to delete imports or see full history?</div>
+        <div style={{fontSize:11,color:T.textMuted}}>Use the 📁 Import History section below.</div>
+      </div>
+
+      <FullImportHistory ulineWeeks={ulineWeeks} onUlineDelete={()=>loadStats()} b600History={[]} onB600Delete={()=>loadStats()}/>
     </div>
   );
 }
@@ -1415,525 +1708,6 @@ function ReconciliationTab({ulineWeeks}){
             </table>{report.matched.length>200&&<div style={{fontSize:11,color:T.textDim,marginTop:8}}>Showing first 200 of {report.matched.length}</div>}</div>
           </div>}
         </>
-      )}
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════
-// QB FILE IMPORT + FINANCIAL ANALYZER (v5 — quarterly/monthly/yearly)
-// ═══════════════════════════════════════════════════════════════
-function QBOImport(){
-  const [view,setView]=useState("upload");
-  const [importing,setImporting]=useState(false);
-  const [result,setResult]=useState(null);
-  const [qboFiles,setQboFiles]=useState([]);
-  const [glData,setGlData]=useState(null);
-  const [period,setPeriod]=useState("quarter"); // month | quarter | year
-  const [selectedCat,setSelectedCat]=useState(null);
-  const glRef=useRef(null);const pnlRef=useRef(null);const bsRef=useRef(null);const custRef=useRef(null);const payRef=useRef(null);
-
-  // Load existing imports from Firebase
-  useEffect(()=>{(async()=>{
-    if(!hasFirebase) return;
-    try{const s=await window.db.collection("qbo_imports").orderBy("imported_at","desc").limit(50).get();
-      const files=s.docs.map(d=>({id:d.id,...d.data()}));
-      setQboFiles(files);
-      // If we have a GL import, load it
-      const glImport=files.find(f=>f.type==="gl");
-      if(glImport?.transactions) setGlData(glImport);
-    }catch(e){}
-  })();},[]);
-
-  // ── Generic XLSX parser ──
-  const parseXLSX=(file)=>new Promise((resolve,reject)=>{
-    if(typeof XLSX==="undefined")return reject(new Error("XLSX not loaded"));
-    const reader=new FileReader();
-    reader.onload=e=>{
-      try{const wb=XLSX.read(e.target.result,{type:"array",cellDates:true});const ws=wb.Sheets[wb.SheetNames[0]];const raw=XLSX.utils.sheet_to_json(ws,{defval:"",header:1,raw:false});resolve(raw);}
-      catch(err){reject(err);}
-    };
-    reader.onerror=reject;reader.readAsArrayBuffer(file);
-  });
-
-  // ── General Ledger Parser (the big one) ──
-  const parseGL=async(file)=>{
-    const raw=await parseXLSX(file);
-    // Find header row (row with "Date", "Debit", "Credit" columns)
-    let headerIdx=-1;let cols={};
-    for(let i=0;i<Math.min(20,raw.length);i++){
-      const lc=raw[i].map(c=>String(c||"").toLowerCase().trim());
-      if(lc.includes("date")&&(lc.includes("debit")||lc.includes("credit"))){
-        headerIdx=i;
-        lc.forEach((h,j)=>{cols[h]=j;});
-        break;
-      }
-    }
-    if(headerIdx<0) throw new Error("Could not find GL header row. Expected 'Date', 'Debit', 'Credit' columns.");
-
-    const dateCol=cols["date"];const typeCol=cols["transaction type"]||cols["type"];const numCol=cols["num"];
-    const nameCol=cols["name"];const memoCol=cols["memo/description"]||cols["memo"];
-    const accountCol=cols["account"];const debitCol=cols["debit"];const creditCol=cols["credit"];
-
-    const txns=[];let currentAcct=null;
-    for(let i=headerIdx+1;i<raw.length;i++){
-      const row=raw[i];if(!row||row.length===0) continue;
-      const firstCell=String(row[0]||"").trim();
-      const dateCell=row[dateCol];
-      // Account header row: something in col 0, no date
-      if(firstCell&&!dateCell&&!String(firstCell).toLowerCase().startsWith("total")){
-        currentAcct=firstCell;continue;
-      }
-      if(String(firstCell).toLowerCase().startsWith("total")){currentAcct=null;continue;}
-      if(!dateCell) continue;
-      // Parse date (MM/DD/YYYY)
-      let date=null;
-      if(dateCell instanceof Date) date=dateCell;
-      else if(typeof dateCell==="string"&&dateCell.includes("/")){
-        const p=dateCell.split("/");
-        if(p.length===3){date=new Date(parseInt(p[2]),parseInt(p[0])-1,parseInt(p[1]));}
-      }
-      if(!date||isNaN(date.getTime())) continue;
-      const account=row[accountCol]||currentAcct||"";
-      if(!account) continue;
-      const debit=parseFloat(String(row[debitCol]||"0").replace(/[$,]/g,""))||0;
-      const credit=parseFloat(String(row[creditCol]||"0").replace(/[$,]/g,""))||0;
-      txns.push({
-        date:date.toISOString().slice(0,10),
-        year:date.getFullYear(),
-        month:date.getMonth()+1,
-        quarter:Math.floor(date.getMonth()/3)+1,
-        yearMonth:`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}`,
-        yearQuarter:`${date.getFullYear()}-Q${Math.floor(date.getMonth()/3)+1}`,
-        type:String(row[typeCol]||""),
-        num:String(row[numCol]||""),
-        name:String(row[nameCol]||""),
-        memo:String(row[memoCol]||""),
-        account:String(account).trim(),
-        debit,credit,
-        net:debit-credit, // positive = debit (expense/asset), negative = credit (income/liability)
-      });
-    }
-    return txns;
-  };
-
-  // ── Handle GL upload (the big one) ──
-  const handleGL=async(e)=>{
-    const file=e.target.files?.[0];if(!file)return;
-    setImporting(true);setResult(null);
-    try{
-      const txns=await parseGL(file);
-      if(txns.length===0) throw new Error("No transactions found in file");
-      // Store metadata + transactions. Firebase doc limit is 1MB, so compress if needed
-      const totalDebit=txns.reduce((s,t)=>s+t.debit,0);
-      const totalCredit=txns.reduce((s,t)=>s+t.credit,0);
-      const dates=txns.map(t=>t.date).sort();
-      const summary={type:"gl",filename:file.name,txnCount:txns.length,totalDebit,totalCredit,dateStart:dates[0],dateEnd:dates[dates.length-1],imported_at:new Date().toISOString()};
-      // Store transactions in chunks if large (Firestore doc limit ~1MB)
-      if(hasFirebase){
-        const docId=`gl_${file.name}`.replace(/[\/\s\.]/g,"_").substring(0,200);
-        // Check dedup
-        const existing=await window.db.collection("qbo_imports").doc(docId).get();
-        if(existing.exists){setResult({type:"dup",filename:file.name,reportType:"gl"});setImporting(false);return;}
-        // Compact transaction storage — we save the full list for analysis
-        try{
-          await window.db.collection("qbo_imports").doc(docId).set({...summary,transactions:txns});
-        }catch(err){
-          // Too large — save summary only
-          await window.db.collection("qbo_imports").doc(docId).set({...summary,note:"Transactions too large for single doc, stored in memory only"});
-        }
-      }
-      setGlData({...summary,transactions:txns});
-      setResult({type:"success",reportType:"gl",filename:file.name,...summary});
-      setView("analyzer");
-    }catch(err){setResult({type:"error",message:err.message});}
-    setImporting(false);if(glRef.current)glRef.current.value="";
-  };
-
-  // ── Handle P&L, BS, Customers, Payroll uploads (summary-style) ──
-  const handleSimpleReport=async(e,type)=>{
-    const file=e.target.files?.[0];if(!file)return;
-    setImporting(true);setResult(null);
-    try{
-      const raw=await parseXLSX(file);
-      const rows=raw.filter(r=>r.some(c=>c!==""));
-      let summary={type,filename:file.name,rowCount:rows.length,imported_at:new Date().toISOString()};
-
-      if(type==="pnl"){
-        const items=[];let section=null;
-        for(const row of rows){
-          const label=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
-          if(!label) continue;
-          if(label==="Income") section="income";
-          else if(label==="Expenses") section="expense";
-          else if(label==="Other Income") section="other_income";
-          else if(label==="Other Expenses") section="other_expense";
-          else if(label==="Gross Profit"||label==="Net Income"||label==="Net Operating Income"||label==="Net Other Income") continue;
-          else if(!isNaN(val)&&val!==0&&section){
-            items.push({label,value:val,section,isTotal:label.toLowerCase().startsWith("total ")});
-          }
-        }
-        const totalIncome=items.filter(i=>i.section==="income"&&i.isTotal).reduce((s,i)=>s+i.value,0)||items.filter(i=>i.section==="income"&&!i.isTotal).reduce((s,i)=>s+i.value,0);
-        const totalExpense=items.filter(i=>i.section==="expense"&&i.isTotal).reduce((s,i)=>s+i.value,0)||items.filter(i=>i.section==="expense"&&!i.isTotal).reduce((s,i)=>s+i.value,0);
-        summary.items=items;summary.totalRevenue=totalIncome;summary.totalExpenses=totalExpense;summary.netIncome=totalIncome-totalExpense;summary.margin=totalIncome>0?((totalIncome-totalExpense)/totalIncome*100):0;
-      }
-      if(type==="bs"){
-        const items=[];let section=null;
-        for(const row of rows){
-          const label=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
-          if(!label) continue;
-          if(label==="Assets") section="asset";
-          else if(label==="Liabilities") section="liability";
-          else if(label==="Equity") section="equity";
-          else if(label.startsWith("Total for")) continue;
-          else if(!isNaN(val)&&val!==0&&section) items.push({label,value:val,section});
-        }
-        summary.items=items;summary.totalAssets=items.filter(i=>i.section==="asset").reduce((s,i)=>s+i.value,0);
-        summary.totalLiabilities=items.filter(i=>i.section==="liability").reduce((s,i)=>s+i.value,0);
-        summary.totalEquity=items.filter(i=>i.section==="equity").reduce((s,i)=>s+i.value,0);
-      }
-      if(type==="customers"){
-        const customers=[];
-        for(const row of rows){
-          const name=String(row[0]||"").trim();const val=parseFloat(String(row[1]||"0").replace(/[$,]/g,""));
-          if(name&&!isNaN(val)&&val!==0&&!name.startsWith("Total")&&name!=="Sales by Customer Summary"&&name!=="Davis Delivery Service"&&!name.match(/^\d{4}/)) customers.push({name,revenue:val});
-        }
-        customers.sort((a,b)=>b.revenue-a.revenue);
-        summary.customers=customers;summary.totalRevenue=customers.reduce((s,c)=>s+c.revenue,0);
-      }
-      if(type==="payroll"){
-        const employees=[];
-        for(const row of rows){
-          const name=String(row[0]||"").trim();if(!name||name.startsWith("Total")||name==="TOTAL") continue;
-          const vals=row.slice(1).map(c=>parseFloat(String(c||"0").replace(/[$,]/g,""))||0);
-          if(vals.some(v=>v>0)) employees.push({employee:name,grossPay:vals[0]||0,totalPay:vals[vals.length-1]||vals[0]||0});
-        }
-        summary.employees=employees;summary.totalGross=employees.reduce((s,e)=>s+e.grossPay,0);summary.headcount=employees.length;
-      }
-
-      // Dedup
-      const docId=`${type}_${file.name}`.replace(/[\/\s\.]/g,"_").substring(0,200);
-      if(hasFirebase){
-        const existing=await window.db.collection("qbo_imports").doc(docId).get();
-        if(existing.exists){setResult({type:"dup",filename:file.name,reportType:type});setImporting(false);return;}
-        await window.db.collection("qbo_imports").doc(docId).set(summary);
-      }
-      setResult({type:"success",reportType:type,...summary});
-      setQboFiles(prev=>[{id:docId,...summary},...prev]);
-    }catch(err){setResult({type:"error",message:err.message});}
-    setImporting(false);
-    [pnlRef,bsRef,custRef,payRef].forEach(r=>{if(r?.current)r.current.value="";});
-  };
-
-  // ═══ GL-based Financial Analysis ═══
-  // Expense/income categorization from account names
-  const classifyAccount=(account)=>{
-    const a=String(account).toLowerCase();
-    // Income
-    if(a.includes("delivery sales")||a.includes("sales income")||a.match(/^income/)) return {category:"revenue",subcat:"Delivery Sales"};
-    if(a.includes("misc") && a.includes("income")) return {category:"revenue",subcat:"Other Income"};
-    // Expenses — payroll
-    if(a.includes("salaries")||a.includes("wages")) return {category:"expense",subcat:"Salaries & Wages"};
-    if(a.includes("subcontractor")||a.includes("3rd party delivery")) return {category:"expense",subcat:"Subcontractors"};
-    if(a.includes("temporary services")) return {category:"expense",subcat:"Temp Labor"};
-    if(a.includes("officers salaries")) return {category:"expense",subcat:"Officer Salaries"};
-    if(a.includes("payroll tax")) return {category:"expense",subcat:"Payroll Taxes"};
-    if(a.includes("payroll fees")||a.includes("payroll deduction")||a.includes("contract labor")) return {category:"expense",subcat:"Payroll Other"};
-    // Fleet
-    if(a.includes("truck fuel")||a.includes("fuel - gas")) return {category:"expense",subcat:"Fuel"};
-    if(a.includes("truck repair")||a.includes("truck maintenance")||a.includes("truck parts")||a.includes("truck tires")||a.includes("truck wash")||a.includes("truck - misc")||a.includes("trailer repair")||a.includes("towing")) return {category:"expense",subcat:"Truck Maintenance"};
-    if(a.includes("truck lease")||a.includes("trailer rental")||a.includes("rent - equipment")) return {category:"expense",subcat:"Truck Leases"};
-    if(a.includes("taxes & licenses - trucks")||a.includes("licenses & permits")) return {category:"expense",subcat:"Truck Taxes/Licenses"};
-    // Insurance
-    if(a.includes("insurance")&&!a.includes("health")) return {category:"expense",subcat:"Insurance"};
-    if(a.includes("health plan")||a.includes("fsa")||a.includes("health & dental")||a.includes("medical")) return {category:"expense",subcat:"Health Insurance"};
-    // Facilities
-    if(a.includes("rent - office")||a.includes("rent office")) return {category:"expense",subcat:"Rent"};
-    if(a.includes("warehouse")||a.includes("propane")||a.includes("fork lift")||a.includes("forklift")) return {category:"expense",subcat:"Warehouse"};
-    if(a.includes("utilities")||a.includes("electric")||a.includes("cell phone")||a.includes("telephone")||a.includes("trash")) return {category:"expense",subcat:"Utilities"};
-    // Admin
-    if(a.includes("computer")||a.includes("internet")) return {category:"expense",subcat:"IT"};
-    if(a.includes("bank charge")||a.includes("interest")) return {category:"expense",subcat:"Bank/Interest"};
-    if(a.includes("legal")||a.includes("professional")) return {category:"expense",subcat:"Legal/Professional"};
-    if(a.includes("depreciation")) return {category:"expense",subcat:"Depreciation"};
-    if(a.includes("office")||a.includes("admin")) return {category:"expense",subcat:"Office/Admin"};
-    if(a.includes("meals")||a.includes("travel")||a.includes("seminars")) return {category:"expense",subcat:"Travel/Meals"};
-    if(a.includes("damages")||a.includes("claims")||a.includes("penalties")) return {category:"expense",subcat:"Damages/Claims"};
-    if(a.includes("uniform")) return {category:"expense",subcat:"Uniforms"};
-    if(a.includes("uline purchase")) return {category:"expense",subcat:"Uline Supplies"};
-    if(a.includes("advertis")||a.includes("promotion")) return {category:"expense",subcat:"Marketing"};
-    if(a.includes("state tax")||a.includes("property tax")||a.includes("other taxes")) return {category:"expense",subcat:"Other Taxes"};
-    if(a.includes("repair")||a.includes("maintenance")) return {category:"expense",subcat:"Repairs"};
-    if(a.includes("supplies")||a.includes("materials")||a.includes("stationery")) return {category:"expense",subcat:"Supplies"};
-    if(a.includes("retirement")||a.includes("401k")) return {category:"expense",subcat:"Retirement"};
-    if(a.includes("dues")||a.includes("subscription")) return {category:"expense",subcat:"Dues/Subs"};
-    if(a.includes("bad debt")) return {category:"expense",subcat:"Bad Debts"};
-    // Bank/equity/etc - not for P&L
-    return {category:"other",subcat:a};
-  };
-
-  const analysis=useMemo(()=>{
-    if(!glData?.transactions) return null;
-    const txns=glData.transactions;
-    // Bucket key depends on period
-    const bucketKey=t=>period==="year"?String(t.year):period==="quarter"?t.yearQuarter:t.yearMonth;
-    // Build: periodBuckets with income + expense by subcat
-    const buckets={};
-    txns.forEach(t=>{
-      const cls=classifyAccount(t.account);
-      if(cls.category==="other") return;
-      const bk=bucketKey(t);
-      if(!buckets[bk]) buckets[bk]={period:bk,revenue:0,expense:0,byCategory:{}};
-      // For revenue accounts: CREDITS increase revenue (sales booked as credits)
-      // For expense accounts: DEBITS increase expense
-      if(cls.category==="revenue"){
-        const amt=t.credit-t.debit; // net credit = new revenue
-        buckets[bk].revenue+=amt;
-        buckets[bk].byCategory[cls.subcat]=(buckets[bk].byCategory[cls.subcat]||0)+amt;
-      }else{
-        const amt=t.debit-t.credit; // net debit = new expense
-        buckets[bk].expense+=amt;
-        buckets[bk].byCategory[cls.subcat]=(buckets[bk].byCategory[cls.subcat]||0)+amt;
-      }
-    });
-    const periods=Object.values(buckets).sort((a,b)=>a.period.localeCompare(b.period));
-    periods.forEach(p=>{p.netIncome=p.revenue-p.expense;p.margin=p.revenue>0?(p.netIncome/p.revenue*100):0;});
-
-    // All-time category totals
-    const catTotals={};
-    txns.forEach(t=>{
-      const cls=classifyAccount(t.account);
-      if(cls.category==="other") return;
-      if(!catTotals[cls.subcat]) catTotals[cls.subcat]={subcat:cls.subcat,category:cls.category,total:0,count:0};
-      const amt=cls.category==="revenue"?(t.credit-t.debit):(t.debit-t.credit);
-      catTotals[cls.subcat].total+=amt;
-      catTotals[cls.subcat].count++;
-    });
-    const expCats=Object.values(catTotals).filter(c=>c.category==="expense").sort((a,b)=>b.total-a.total);
-    const revCats=Object.values(catTotals).filter(c=>c.category==="revenue").sort((a,b)=>b.total-a.total);
-
-    // Vendor spending (from txn names on expense accounts)
-    const byVendor={};
-    txns.forEach(t=>{
-      const cls=classifyAccount(t.account);
-      if(cls.category!=="expense"||!t.name) return;
-      const vendor=t.name.trim();
-      if(!byVendor[vendor]) byVendor[vendor]={vendor,total:0,count:0};
-      byVendor[vendor].total+=(t.debit-t.credit);
-      byVendor[vendor].count++;
-    });
-    const topVendors=Object.values(byVendor).filter(v=>v.total>0).sort((a,b)=>b.total-a.total).slice(0,50);
-
-    // Customer revenue (from txn names on revenue accounts)
-    const byCust={};
-    txns.forEach(t=>{
-      const cls=classifyAccount(t.account);
-      if(cls.category!=="revenue"||!t.name) return;
-      const cust=t.name.trim();
-      if(!byCust[cust]) byCust[cust]={customer:cust,revenue:0,count:0};
-      byCust[cust].revenue+=(t.credit-t.debit);
-      byCust[cust].count++;
-    });
-    const topCustomers=Object.values(byCust).filter(c=>c.revenue>0).sort((a,b)=>b.revenue-a.revenue).slice(0,50);
-
-    const totalRev=periods.reduce((s,p)=>s+p.revenue,0);
-    const totalExp=periods.reduce((s,p)=>s+p.expense,0);
-
-    // Category time-series for drill-down
-    const catTimeSeries={};
-    txns.forEach(t=>{
-      const cls=classifyAccount(t.account);
-      if(cls.category==="other") return;
-      const bk=bucketKey(t);
-      if(!catTimeSeries[cls.subcat]) catTimeSeries[cls.subcat]={};
-      if(!catTimeSeries[cls.subcat][bk]) catTimeSeries[cls.subcat][bk]=0;
-      const amt=cls.category==="revenue"?(t.credit-t.debit):(t.debit-t.credit);
-      catTimeSeries[cls.subcat][bk]+=amt;
-    });
-
-    return{periods,expCats,revCats,topVendors,topCustomers,totalRev,totalExp,netIncome:totalRev-totalExp,catTimeSeries};
-  },[glData,period]);
-
-  // Build the UI
-  return(
-    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="📁" text="QuickBooks Analyzer" right={glData?<Badge text={`GL: ${fmtNum(glData.txnCount)} txns`} color={T.greenText} bg={T.greenBg}/>:<Badge text="No GL loaded" color={T.textDim} bg={T.borderLight}/>}/>
-
-      {result&&<div style={{...CS,borderLeft:`4px solid ${result.type==="error"?T.red:result.type==="dup"?T.yellow:T.green}`,marginBottom:16}}>
-        {result.type==="error"&&<div style={{color:T.redText,fontSize:13}}>❌ {result.message}</div>}
-        {result.type==="dup"&&<div style={{color:T.yellowText,fontSize:13}}>⚠️ {result.filename} already imported — skipped</div>}
-        {result.type==="success"&&result.reportType==="gl"&&<div style={{color:T.greenText,fontSize:13}}>✅ GL imported: {fmtNum(result.txnCount)} transactions, {result.dateStart} → {result.dateEnd}</div>}
-        {result.type==="success"&&result.reportType==="pnl"&&<div style={{color:T.greenText,fontSize:13}}>✅ P&L: Revenue {fmtK(result.totalRevenue)}, Expenses {fmtK(result.totalExpenses)}, Net {fmtK(result.netIncome)}, Margin {fmtPct(result.margin)}</div>}
-        {result.type==="success"&&result.reportType==="bs"&&<div style={{color:T.greenText,fontSize:13}}>✅ Balance Sheet: Assets {fmtK(result.totalAssets)}, Liab {fmtK(result.totalLiabilities)}, Equity {fmtK(result.totalEquity)}</div>}
-        {result.type==="success"&&result.reportType==="customers"&&<div style={{color:T.greenText,fontSize:13}}>✅ {result.customers?.length} customers, {fmtK(result.totalRevenue)} total revenue</div>}
-        {result.type==="success"&&result.reportType==="payroll"&&<div style={{color:T.greenText,fontSize:13}}>✅ {result.headcount} employees, {fmtK(result.totalGross)} gross pay</div>}
-      </div>}
-
-      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
-        <TabBtn active={view==="upload"} label="📤 Upload" onClick={()=>setView("upload")}/>
-        {glData&&<TabBtn active={view==="analyzer"} label="📊 Analyzer" onClick={()=>setView("analyzer")}/>}
-        {glData&&<TabBtn active={view==="trends"} label="📈 Trends" onClick={()=>setView("trends")}/>}
-        {glData&&<TabBtn active={view==="categories"} label="🏷️ Categories" onClick={()=>setView("categories")}/>}
-        {glData&&<TabBtn active={view==="vendors"} label="🏭 Vendors" onClick={()=>setView("vendors")}/>}
-        {glData&&<TabBtn active={view==="customers"} label="🏢 Customers" onClick={()=>setView("customers")}/>}
-        {qboFiles.length>0?<TabBtn active={view==="history"} label={`📂 History (${qboFiles.length})`} onClick={()=>setView("history")}/>:<TabBtn active={view==="history"} label="📂 History" onClick={()=>setView("history")}/>}
-      </div>
-
-      {view==="upload"&&(
-        <div>
-          <div style={{...CS,borderLeft:`4px solid ${T.brand}`,background:T.brandPale,marginBottom:16}}>
-            <div style={{fontSize:13,fontWeight:700,color:T.brand,marginBottom:4}}>📂 Upload General Ledger for Full Analysis</div>
-            <div style={{fontSize:12,color:T.textMuted}}>The GL contains every transaction. MarginIQ auto-generates P&L by month, quarter, and year — no need to export separately.</div>
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:"12px"}}>
-            <div style={{...CS,border:`2px solid ${T.brand}`}}>
-              <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>📒 General Ledger <Badge text="PRIMARY" color={T.brand} bg={T.brandPale}/></div>
-              <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>Reports → Accountant → General Ledger. Last 12+ months.</div>
-              <input ref={glRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleGL} style={{display:"none"}}/>
-              <PrimaryBtn text={importing?"Importing...":"Upload GL"} onClick={()=>glRef.current?.click()} loading={importing} style={{width:"100%",fontSize:12}}/>
-            </div>
-            {[{type:"pnl",icon:"📊",title:"Profit & Loss",sub:"Summary totals",ref:pnlRef},
-              {type:"bs",icon:"⚖️",title:"Balance Sheet",sub:"Assets/liabilities snapshot",ref:bsRef},
-              {type:"customers",icon:"🏢",title:"Sales by Customer",sub:"Revenue per customer",ref:custRef},
-              {type:"payroll",icon:"💵",title:"Payroll Summary",sub:"Pay per employee",ref:payRef},
-            ].map(item=>(
-              <div key={item.type} style={CS}>
-                <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>{item.icon} {item.title}</div>
-                <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>{item.sub}</div>
-                <input ref={item.ref} type="file" accept=".xlsx,.xls,.csv" onChange={e=>handleSimpleReport(e,item.type)} style={{display:"none"}}/>
-                <PrimaryBtn text={importing?"Importing...":`Upload ${item.title}`} onClick={()=>item.ref.current?.click()} loading={importing} style={{width:"100%",fontSize:12}}/>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {view==="analyzer"&&analysis&&(
-        <div>
-          {/* Period selector */}
-          <div style={{...CS,marginBottom:16}}>
-            <div style={{fontSize:12,color:T.textMuted,marginBottom:8}}>Break out by:</div>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {[["month","Monthly"],["quarter","Quarterly"],["year","Yearly"]].map(([k,l])=><TabBtn key={k} active={period===k} label={l} onClick={()=>setPeriod(k)}/>)}
-            </div>
-          </div>
-          {/* All-time KPIs */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:"14px"}}>
-            <KPI label="Total Revenue" value={fmtK(analysis.totalRev)} sub={`${analysis.periods.length} ${period}s`} subColor={T.green}/>
-            <KPI label="Total Expenses" value={fmtK(analysis.totalExp)} subColor={T.red}/>
-            <KPI label="Net Income" value={fmtK(analysis.netIncome)} sub={fmtPct(analysis.totalRev>0?(analysis.netIncome/analysis.totalRev*100):0)+" margin"} subColor={analysis.netIncome>0?T.green:T.red}/>
-            <KPI label="Transactions" value={fmtNum(glData.txnCount)}/>
-          </div>
-          {/* P&L by period table */}
-          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>P&L by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
-            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:600}}>
-              <thead><tr>{["Period","Revenue","Expenses","Net Income","Margin %"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>)}</tr></thead>
-              <tbody>{analysis.periods.map((p,i)=>(
-                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{p.period}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(p.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmt(p.expense)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:700,color:p.netIncome>0?T.green:T.red}}>{fmt(p.netIncome)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={fmtPct(p.margin)} color={p.margin>=30?T.greenText:p.margin>=15?T.yellowText:T.redText} bg={p.margin>=30?T.greenBg:p.margin>=15?T.yellowBg:T.redBg}/></td></tr>
-              ))}</tbody>
-            </table></div>
-          </div>
-          {/* Chart */}
-          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Revenue by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
-            <BarChart data={analysis.periods} labelKey="period" valueKey="revenue" color={T.green} maxBars={Math.min(analysis.periods.length,50)}/>
-          </div>
-          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Net Income by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
-            <BarChart data={analysis.periods} labelKey="period" valueKey="netIncome" color={T.brand} maxBars={Math.min(analysis.periods.length,50)}/>
-          </div>
-        </div>
-      )}
-
-      {view==="categories"&&analysis&&(
-        <div>
-          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Expense Categories (All-Time)</div>
-            <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:500}}>
-              <thead><tr>{["Category","Total Spend","% of Expenses","Transactions","Drill"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
-              <tbody>{analysis.expCats.map((c,i)=>(
-                <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.subcat}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmt(c.total)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtPct(analysis.totalExp>0?c.total/analysis.totalExp*100:0)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted}}>{c.count}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><button onClick={()=>setSelectedCat(c.subcat)} style={{padding:"3px 10px",fontSize:10,borderRadius:6,border:`1px solid ${T.brand}`,background:"transparent",color:T.brand,cursor:"pointer"}}>View trend →</button></td></tr>
-              ))}</tbody>
-            </table></div>
-          </div>
-          <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Expense Distribution</div>
-            <BarChart data={analysis.expCats.slice(0,20)} labelKey="subcat" valueKey="total" color={T.red} maxBars={20}/>
-          </div>
-          {selectedCat&&analysis.catTimeSeries[selectedCat]&&(
-            <div style={CS}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-                <div style={{fontSize:13,fontWeight:700}}>📈 {selectedCat} — Trend by {period==="month"?"Month":period==="quarter"?"Quarter":"Year"}</div>
-                <button onClick={()=>setSelectedCat(null)} style={{padding:"3px 10px",fontSize:10,borderRadius:6,border:`1px solid ${T.border}`,background:"transparent",color:T.textMuted,cursor:"pointer"}}>Close</button>
-              </div>
-              <BarChart data={Object.entries(analysis.catTimeSeries[selectedCat]).map(([period,value])=>({period,value})).sort((a,b)=>a.period.localeCompare(b.period))} labelKey="period" valueKey="value" color={T.orange} maxBars={50}/>
-            </div>
-          )}
-        </div>
-      )}
-
-      {view==="trends"&&analysis&&(
-        <div>
-          <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
-            {[["month","Monthly"],["quarter","Quarterly"],["year","Yearly"]].map(([k,l])=><TabBtn key={k} active={period===k} label={l} onClick={()=>setPeriod(k)}/>)}
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:"12px"}}>
-            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Revenue Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="revenue" color={T.green} maxBars={50}/></div>
-            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Expense Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="expense" color={T.red} maxBars={50}/></div>
-            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Net Income Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="netIncome" color={T.brand} maxBars={50}/></div>
-            <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Margin % Trend</div><BarChart data={analysis.periods} labelKey="period" valueKey="margin" color={T.purple} formatValue={v=>fmtPct(v)} maxBars={50}/></div>
-          </div>
-        </div>
-      )}
-
-      {view==="vendors"&&analysis&&(
-        <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Vendors by Spend ({analysis.topVendors.length})</div>
-          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:400}}>
-            <thead><tr>{["#","Vendor","Total Spend","Transactions"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
-            <tbody>{analysis.topVendors.map((v,i)=>(
-              <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim}}>{i+1}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{v.vendor}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmt(v.total)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{v.count}</td></tr>
-            ))}</tbody>
-          </table></div>
-        </div>
-      )}
-
-      {view==="customers"&&analysis&&(
-        <div style={CS}><div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Customers by Revenue ({analysis.topCustomers.length})</div>
-          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:400}}>
-            <thead><tr>{["#","Customer","Revenue","% of Total","Invoices"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
-            <tbody>{analysis.topCustomers.map((c,i)=>(
-              <tr key={i}><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim}}>{i+1}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{fmt(c.revenue)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtPct(analysis.totalRev>0?c.revenue/analysis.totalRev*100:0)}</td><td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}>{c.count}</td></tr>
-            ))}</tbody>
-          </table></div>
-        </div>
-      )}
-
-      {view==="history"&&(
-        <div style={CS}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-            <div style={{fontSize:13,fontWeight:700}}>Import History ({qboFiles.length})</div>
-            <div style={{fontSize:11,color:T.textMuted}}>Click 🗑️ to delete an import and its data</div>
-          </div>
-          <div style={{maxHeight:500,overflowY:"auto"}}>{qboFiles.map((f,i)=>(
-            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px",borderBottom:`1px solid ${T.borderLight}`,background:T.bgSurface,borderRadius:8,marginBottom:6}}>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontSize:12,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.filename}</div>
-                <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>
-                  <Badge text={f.type==="gl"?"General Ledger":f.type==="pnl"?"P&L":f.type==="bs"?"Balance Sheet":f.type==="customers"?"Customers":f.type==="payroll"?"Payroll":f.type} color={T.blueText} bg={T.blueBg}/>
-                  {" "}• {new Date(f.imported_at).toLocaleDateString()} {new Date(f.imported_at).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}
-                  {f.txnCount&&` • ${fmtNum(f.txnCount)} transactions`}
-                  {f.totalRevenue&&` • ${fmtK(f.totalRevenue)} rev`}
-                </div>
-              </div>
-              <button onClick={async()=>{
-                if(!confirm(`Delete "${f.filename}"? This permanently removes the import and all its data from MarginIQ. This cannot be undone.`)) return;
-                try{
-                  if(hasFirebase) await window.db.collection("qbo_imports").doc(f.id).delete();
-                  setQboFiles(prev=>prev.filter(x=>x.id!==f.id));
-                  if(f.type==="gl"&&glData?.id===f.id) setGlData(null);
-                  setResult({type:"success",reportType:"delete",filename:f.filename,message:`Deleted ${f.filename}`});
-                }catch(err){alert("Delete failed: "+err.message);}
-              }} title="Delete this import" style={{marginLeft:8,padding:"6px 10px",borderRadius:6,border:`1px solid ${T.red}`,background:"transparent",color:T.red,fontSize:14,cursor:"pointer",fontFamily:"inherit",flexShrink:0}}>🗑️</button>
-            </div>
-          ))}</div>
-          {qboFiles.length===0&&<div style={{textAlign:"center",padding:30,color:T.textMuted,fontSize:13}}>No imports yet. Upload files from the 📤 Upload tab to get started.</div>}
-        </div>
       )}
     </div>
   );
@@ -3117,7 +2891,7 @@ function MarginIQApp({user,onLogout}){
     return m;
   },[costs,ulineWeeks,qboData,qbFinancials]);
   const onUline=w=>{setUlineWeeks(p=>[w,...p.filter(x=>x.week_id!==w.week_id)]);};
-  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"pricing",i:"💎",l:"Pricing"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"qbimport",i:"📁",l:"QB Import"},{id:"import",i:"📥",l:"Import"},{id:"settings",i:"🔧",l:"Settings"}];
+  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"pricing",i:"💎",l:"Pricing"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"import",i:"📥",l:"Data Import"},{id:"settings",i:"🔧",l:"Settings"}];
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
@@ -3142,14 +2916,13 @@ function MarginIQApp({user,onLogout}){
       {!loading&&tab==="command"&&<CommandCenter margins={margins} ulineData={ulineWeeks.length>0?{weekCount:ulineWeeks.length,totalRevenue:ulineWeeks.reduce((s,w)=>s+(w.totalRevenue||0),0)}:null} qboConnected={qboConnected} qboData={qboData} qbFinancials={qbFinancials} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}}/>}
       {!loading&&tab==="ai"&&<AIInsights margins={margins} ulineWeeks={ulineWeeks} costs={costs} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="pricing"&&<PricingTab qbFinancials={qbFinancials} costs={costs} ulineWeeks={ulineWeeks}/>}
-      {!loading&&tab==="import"&&<DataImport ulineWeeks={ulineWeeks} onUlineUpload={onUline}/>}
+      {!loading&&tab==="import"&&<DataImportHub ulineWeeks={ulineWeeks} onUlineUpload={onUline} onQBChange={reloadQB}/>}
       {!loading&&tab==="reconcile"&&<ReconciliationTab ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="integrity"&&<DataIntegrity ulineWeeks={ulineWeeks}/>}
       {!loading&&tab==="uline"&&<UlineTab ulineWeeks={ulineWeeks} onUpload={onUline} margins={margins}/>}
       {!loading&&tab==="routes"&&<RouteTab margins={margins}/>}
       {!loading&&tab==="customers"&&<CustomerTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="fleet"&&<FleetTab margins={margins}/>}
-      {!loading&&tab==="qbimport"&&<QBOImport onChange={reloadQB}/>}
       {!loading&&tab==="payroll"&&<PayrollTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="mileage"&&<MileageTab margins={margins} costs={costs}/>}
       {!loading&&tab==="trends"&&<TrendsTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
