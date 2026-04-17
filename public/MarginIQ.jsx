@@ -3,7 +3,7 @@
 // SheetJS loaded globally via CDN (window.XLSX)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "6.1.0";
+const APP_VERSION = "6.2.0";
 
 // ─── Design Tokens (Davis Brand Blue) ────────────────────────
 const T = {
@@ -819,27 +819,88 @@ function DataImportHub({ulineWeeks,onUlineUpload,onQBChange}){
   };
 
   // ─── B600 CSV ───
+  // Proper CSV parser that handles quoted fields with commas
+  const parseCSVLine=(line)=>{
+    const result=[];let cur="";let inQuotes=false;
+    for(let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch==='"'){
+        if(inQuotes&&line[i+1]==='"'){cur+='"';i++;}
+        else inQuotes=!inQuotes;
+      }else if(ch===","&&!inQuotes){result.push(cur);cur="";}
+      else cur+=ch;
+    }
+    result.push(cur);
+    return result.map(c=>c.trim());
+  };
+
   const parseB600=async(file)=>new Promise((resolve,reject)=>{
     const reader=new FileReader();
     reader.onload=e=>{
       try{
-        const text=e.target.result;const lines=text.split("\n").map(l=>l.trim()).filter(l=>l);
+        const text=e.target.result.replace(/\r\n/g,"\n").replace(/\r/g,"\n");
+        const lines=text.split("\n").filter(l=>l.trim());
         if(lines.length<2) return reject(new Error("Empty CSV"));
-        const header=lines[0].toLowerCase().split(",").map(h=>h.trim().replace(/"/g,""));
-        const nameIdx=header.findIndex(h=>h.match(/employee|name|driver|person/));
-        const dateIdx=header.findIndex(h=>h.match(/^date$/));
-        const inIdx=header.findIndex(h=>h.match(/in|clock.?in|start|punch.?in/));
-        const outIdx=header.findIndex(h=>h.match(/out|clock.?out|end|punch.?out/));
-        const hoursIdx=header.findIndex(h=>h.match(/hours|total|duration/));
+        const header=parseCSVLine(lines[0]).map(h=>h.toLowerCase());
+        // Exact matches for B600 TotalPass export format
+        const idx=(name)=>header.indexOf(name.toLowerCase());
+        const col={
+          name: idx("display name")>=0?idx("display name"):idx("employee"),
+          displayId: idx("display id"),
+          payrollId: idx("payroll id"),
+          date: idx("date"),
+          inDay: idx("in day"),
+          inTime: idx("in time"),
+          outDay: idx("out day"),
+          outTime: idx("out time"),
+          dept: idx("department"),
+          deptCode: idx("dept. code"),
+          lunch: idx("lunch"),
+          adj: idx("adj"),
+          reg: idx("reg"),
+          ot1: idx("ot1"),
+          ot2: idx("ot2"),
+          vac: idx("vac"),
+          sick: idx("sick"),
+          per: idx("per"),
+          hol: idx("hol"),
+          total: idx("total"),
+          inNote: idx("in note"),
+          outNote: idx("out note"),
+        };
+        if(col.name<0||col.date<0) return reject(new Error("CSV missing required columns (Display Name, Date)"));
+        const num=(v)=>{const n=parseFloat((v||"").toString().replace(/[^\d.-]/g,""));return isNaN(n)?0:n;};
         const records=[];
         for(let i=1;i<lines.length;i++){
-          const cols=lines[i].split(",").map(c=>c.trim().replace(/"/g,""));
+          const cols=parseCSVLine(lines[i]);
           if(cols.length<3) continue;
-          const name=nameIdx>=0?cols[nameIdx]:(cols[0]||"");const date=dateIdx>=0?cols[dateIdx]:(cols[1]||"");
-          const clockIn=inIdx>=0?cols[inIdx]:(cols[2]||"");const clockOut=outIdx>=0?cols[outIdx]:(cols[3]||"");
-          const hours=hoursIdx>=0?parseFloat(cols[hoursIdx])||0:0;
+          const name=(cols[col.name]||"").trim();
+          const date=(cols[col.date]||"").trim();
           if(!name||!date) continue;
-          records.push({name,date,clockIn,clockOut,hours});
+          // Normalize date to YYYY-MM-DD
+          let normDate=date;
+          const m=date.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+          if(m){
+            const yr=m[3].length===2?`20${m[3]}`:m[3];
+            normDate=`${yr}-${m[1].padStart(2,"0")}-${m[2].padStart(2,"0")}`;
+          }
+          records.push({
+            name, displayId:cols[col.displayId]||"",
+            date:normDate,
+            clockIn:cols[col.inTime]||"",
+            clockOut:cols[col.outTime]||"",
+            dept:cols[col.dept]||"",
+            lunch:num(cols[col.lunch]),
+            reg:num(cols[col.reg]),
+            ot1:num(cols[col.ot1]),
+            ot2:num(cols[col.ot2]),
+            vac:num(cols[col.vac]),
+            sick:num(cols[col.sick]),
+            per:num(cols[col.per]),
+            hol:num(cols[col.hol]),
+            hours:num(cols[col.total]),
+            notes:[cols[col.inNote],cols[col.outNote]].filter(Boolean).join(" | ").trim(),
+          });
         }
         resolve(records);
       }catch(e){reject(e);}
@@ -852,19 +913,82 @@ function DataImportHub({ulineWeeks,onUlineUpload,onQBChange}){
     setImporting("b600");setResult(null);
     try{
       const records=await parseB600(file);
-      let saved=0,skipped=0;
-      if(hasFirebase){
-        for(const r of records){
-          const docId=`${r.date}_${r.name}`.replace(/[\/\s]/g,"_").substring(0,200);
-          const existing=await window.db.collection("b600_timeclock").doc(docId).get();
-          if(existing.exists){skipped++;continue;}
-          await window.db.collection("b600_timeclock").doc(docId).set({...r,imported_at:new Date().toISOString(),source:file.name});
-          saved++;
+      if(records.length===0){setResult({source:"b600",type:"error",message:"No valid records parsed from CSV"});setImporting(null);return;}
+
+      // ─── ROSTER LINKING ───
+      // Load roster and cross-reference each record's displayId
+      const roster=await Roster.getAll(true);
+      const rosterByDisplayId=new Map(roster.map(e=>[toEmpId(e.display_id),e]));
+      const seenDisplayIds=new Set();
+      const newEmployees=[];
+      for(const r of records){
+        const dId=toEmpId(r.displayId||r.name);
+        seenDisplayIds.add(dId);
+        if(!rosterByDisplayId.has(dId)){
+          // New employee not in roster — flag for auto-add
+          if(!newEmployees.find(n=>toEmpId(n.display_id)===dId)){
+            newEmployees.push({
+              display_id:r.displayId||r.name,
+              first_name:r.name.split(" ")[0]||"",
+              last_name:r.name.split(" ").slice(1).join(" ")||"",
+              full_name:r.name,
+              aliases:[r.name.toUpperCase()],
+              status:"active",type:"W2",pay_rate:0,department:r.dept||"",
+              auto_created:true,
+            });
+          }
         }
       }
-      setResult({source:"b600",type:"success",message:`✅ Saved ${saved} records${skipped>0?` (${skipped} duplicates skipped)`:""}`,filename:file.name});
+      // Auto-add new employees to roster
+      if(newEmployees.length>0&&hasFirebase){
+        const batch=window.db.batch();
+        for(const n of newEmployees){
+          const empId=toEmpId(n.display_id);
+          batch.set(window.db.collection("employees").doc(empId),{
+            ...n,employee_id:empId,
+            created_at:new Date().toISOString(),updated_at:new Date().toISOString(),
+          },{merge:true});
+        }
+        await batch.commit();
+        Roster.invalidate();
+      }
+      // Detect potentially-terminated employees (in active roster but not in this CSV)
+      const missing=roster.filter(e=>e.status==="active"&&!seenDisplayIds.has(toEmpId(e.display_id)));
+
+      let saved=0,skipped=0,errors=0;
+      if(hasFirebase){
+        const BATCH_SIZE=400;
+        for(let i=0;i<records.length;i+=BATCH_SIZE){
+          const chunk=records.slice(i,i+BATCH_SIZE);
+          const batch=window.db.batch();
+          let batchCount=0;
+          for(const r of chunk){
+            const empId=toEmpId(r.displayId||r.name);
+            const docId=`${r.date}_${empId}`.replace(/[\/\s@.]/g,"_").substring(0,200);
+            batch.set(window.db.collection("b600_timeclock").doc(docId),{
+              ...r,employee_id:empId,imported_at:new Date().toISOString(),source:file.name,
+            },{merge:true});
+            batchCount++;
+          }
+          try{await batch.commit();saved+=batchCount;}
+          catch(err){console.warn("Batch error:",err);errors+=batchCount;}
+          setResult({source:"b600",type:"progress",message:`Uploading... ${Math.min(i+BATCH_SIZE,records.length)}/${records.length}`});
+        }
+      }
+      const totalHours=records.reduce((s,r)=>s+(r.hours||0),0);
+      const regHours=records.reduce((s,r)=>s+(r.reg||0),0);
+      const otHours=records.reduce((s,r)=>s+(r.ot1||0)+(r.ot2||0),0);
+      const uniqueEmployees=new Set(records.map(r=>r.name)).size;
+      let extras=[];
+      if(newEmployees.length>0) extras.push(`➕ ${newEmployees.length} new employee${newEmployees.length>1?"s":""} auto-added to roster`);
+      if(missing.length>0) extras.push(`⚠️ ${missing.length} roster employee${missing.length>1?"s":""} not in this file — review Roster tab for potential terminations`);
+      setResult({
+        source:"b600",type:"success",
+        message:`✅ Saved ${saved} records · ${uniqueEmployees} employees · ${fmtDec(totalHours,0)} total hours (${fmtDec(regHours,0)} REG + ${fmtDec(otHours,0)} OT)${errors>0?` · ${errors} errors`:""}${extras.length>0?"\n"+extras.join("\n"):""}`,
+        filename:file.name,
+      });
       await loadStats();
-    }catch(err){setResult({source:"b600",type:"error",message:err.message});}
+    }catch(err){console.error(err);setResult({source:"b600",type:"error",message:err.message});}
     setImporting(null);if(b600Ref.current)b600Ref.current.value="";
   };
 
@@ -2700,6 +2824,323 @@ function LoginScreen({onLogin}){
 }
 
 // ═══════════════════════════════════════════════════════════════
+// EMPLOYEE ROSTER — Canonical master list across all data sources
+// ═══════════════════════════════════════════════════════════════
+// Display ID from B600 is the primary bridge key. Also stores name aliases
+// so CyberPay/NuVizz imports can match by fuzzy name lookup.
+// Never deletes — only marks status changes so historical data stays linked.
+
+const ROSTER_SEED = [
+  { displayId:"AKYEA E", first:"Enock", last:"Akyea", aliases:["ENOCK AKYEA"] },
+  { displayId:"ATTAH R", first:"Richard", last:"Attah", aliases:["RICHARD ATTAH"] },
+  { displayId:"BEST R", first:"Robert", last:"Best", aliases:["ROBERT BEST"] },
+  { displayId:"BISHOP M", first:"Montel", last:"Bishop", aliases:["MONTEL BISHOP"] },
+  { displayId:"BONNETT L", first:"Lori", last:"Bonnett", status:"inactive", aliases:["LORI BONNETT"] },
+  { displayId:"BOURDA J", first:"Joseph", last:"Bourda", aliases:["JOSEPH BOURDA"] },
+  { displayId:"BRADBERRY", first:"Brandi", last:"Bradberry", status:"inactive", aliases:["B BRADBERRY","BRANDI BRADBERRY"] },
+  { displayId:"Bryan Den", first:"Denali", last:"Bryan", aliases:["DENALI BRYAN"] },
+  { displayId:"BUCKLE P", first:"Prince", last:"Buckle", aliases:["PRINCE BUCKLE"] },
+  { displayId:"R Burrowe", first:"Ricardo", last:"Burrowes", aliases:["RICARDO BURROWES"] },
+  { displayId:"BYRD B", first:"Brenton", last:"Byrd", aliases:["BRENTON BYRD"] },
+  { displayId:"Gerardo", first:"Gerardo", last:"Casterjon", aliases:["GERARDO CASTERJON"] },
+  { displayId:"Darvin Ce", first:"Darvin", last:"Cepeda", aliases:["DARVIN CEPEDA"] },
+  { displayId:"Claiborne", first:"Dannie", last:"Claiborne", aliases:["DANNIE CLAIBORNE"] },
+  { displayId:"M Crumpto", first:"Marcus", last:"Crumpton", aliases:["MARCUS CRUMPTON"] },
+  { displayId:"James", first:"James", last:"Davis", aliases:["JAMES DAVIS","JAMES"] },
+  { displayId:"B DIXON", first:"Brent", last:"Dixon", aliases:["BRENT DIXON"] },
+  { displayId:"FERNANDEZ", first:"Victor", last:"Fernandez", aliases:["VICTOR FERNANDEZ"] },
+  { displayId:"FRYE M", first:"Michael", last:"Frye", aliases:["MICHAEL FRYE"] },
+  { displayId:"GAMBRELL", first:"Terry", last:"Gambrell", aliases:["T GAMBRELL","TERRY GAMBRELL"] },
+  { displayId:"GEORGE J", first:"Javier", last:"George", aliases:["JAVIER GEORGE","JAVIER"] },
+  { displayId:"GIBBS J", first:"Joveski", last:"Gibbs", aliases:["JOE GIBBS","JOVESKI GIBBS"] },
+  { displayId:"GOODROE B", first:"Brad", last:"Goodroe", aliases:["BRAD GOODROE"] },
+  { displayId:"W Goodwin", first:"William", last:"Goodwin", aliases:["WILLIAM GOODWIN"] },
+  { displayId:"D Graham", first:"DeAngelo", last:"Graham", aliases:["DEANGELO GRAHAM"] },
+  { displayId:"GRAHAM S", first:"Sammy", last:"Graham", aliases:["SAMMY GRAHAM"] },
+  { displayId:"HAMMOU T", first:"Tariq", last:"Hammou", aliases:["TARIQ HAMMOU"] },
+  { displayId:"HANKERSON", first:"Mikel", last:"Hankerson", aliases:["MIKEL HANKERSON"] },
+  { displayId:"HART S", first:"William", last:"Hart", middle:"S", aliases:["WILLIAM HART","WILLIAM S HART"] },
+  { displayId:"HEAD C", first:"Chris", last:"Head", aliases:["C HEAD","CHRIS HEAD"] },
+  { displayId:"HOWARD T", first:"Trevarr", last:"Howard", aliases:["TREVARR HOWARD"] },
+  { displayId:"Ernest", first:"Ernest", last:"Hurt Jr.", status:"inactive", aliases:["ERNEST HURT","ERNEST HURT JR","3259","ERNEST"] },
+  { displayId:"JEFFREY K", first:"Kemar", last:"Jeffrey", aliases:["KEMAR JEFFREY"] },
+  { displayId:"JOHNSON T", first:"Tobias", last:"Johnson", aliases:["TOBIAS JOHNSON"] },
+  { displayId:"JOHNSON M", first:"Mareese", last:"Johnson", aliases:["MAREESE JOHNSON"] },
+  { displayId:"KEAT J", first:"James", last:"Keat", aliases:["JAMES KEAT"] },
+  { displayId:"KIDD W", first:"William", last:"Kidd", aliases:["WILLIAM KIDD"] },
+  { displayId:"Kostner A", first:"Anthony", last:"Kostner", aliases:["ANTHONY KOSTNER"] },
+  { displayId:"Andrus", first:"Andrus", last:"Langston", aliases:["ANDRUS LANGSTON","ANDRUS"] },
+  { displayId:"MARLBOROU", first:"Mandi", last:"Marlborough", aliases:["MANDI MARLBOROUGH","MANDI MARLBOROUG"] },
+  { displayId:"A Mitchel", first:"Aaron", last:"Mitchell", aliases:["AARON MITCHELL"] },
+  { displayId:"I Mitchel", first:"Isaac", last:"Mitchell", aliases:["ISAAC MITCHELL"] },
+  { displayId:"O Morriso", first:"Ondra", last:"Morrison", aliases:["ONDRA MORRISON"] },
+  { displayId:"Andre", first:"Andre", last:"Murphy", aliases:["ANDRE MURPHY","ANDRE"] },
+  { displayId:"PALLET J", first:"Jim", last:"Pallett", status:"inactive", aliases:["JIM PALLETT"] },
+  { displayId:"PITTS G", first:"Garry", last:"Pitts", aliases:["GARRY PITTS"] },
+  { displayId:"ROBERTS C", first:"Che", last:"Roberts", aliases:["CHE ROBERTS"] },
+  { displayId:"SAGE E", first:"Eugene", last:"Sage", aliases:["EUGENE SAGE"] },
+  { displayId:"SAGE J", first:"Jessica", last:"Sage", aliases:["JESSICA SAGE"] },
+  { displayId:"Salikic D", first:"Denis", last:"Salkic", aliases:["DENIS SALKIC","DENIS SALIKIC"] },
+  { displayId:"Bubba", first:"Christopher", last:"Sandoval", aliases:["CHRISTOPHER SANDOVAL","CHRISTOPHER"] },
+  { displayId:"SMITH L", first:"Leroy", last:"Smith, Jr.", aliases:["LEROY SMITH","LEROY SMITH JR"] },
+  { displayId:"T Solomon", first:"Tristan", last:"Solomon", aliases:["TRISTAN SOLOMON"] },
+  { displayId:"SPRADLEY", first:"Brett", last:"Spradley", status:"inactive", aliases:["BRETT SPRADLEY"] },
+  { displayId:"SULJIC R", first:"Rasko", last:"Suljic", aliases:["RASKO SULJIC"] },
+  { displayId:"T SYERS", first:"Trevor", last:"Syers", aliases:["TREVOR SYERS"] },
+  { displayId:"T Taylor", first:"Terrance", last:"Taylor", aliases:["TERRANCE TAYLOR"] },
+  { displayId:"M Tharp", first:"Michael", last:"Tharp", aliases:["MICHAEL THARP"] },
+  { displayId:"J THOMAS", first:"Junior", last:"Thomas", aliases:["JUNIOR THOMAS","JUNIOR THOAMAS"] },
+  { displayId:"Leslie", first:"Leslie", last:"Thomas", aliases:["LESLIE THOMAS","LESLIE"] },
+  { displayId:"THOMPSON", first:"John", last:"Thompson", aliases:["JOHN THOMPSON"] },
+  { displayId:"TILLERY B", first:"Bill", last:"Tillery", aliases:["WILLIAM TILLERY","BILL TILLERY"] },
+  { displayId:"A Virgil", first:"Alex", last:"Virgil", aliases:["ALEX VIRGIL"] },
+  { displayId:"WILLIAMS", first:"Jew", last:"Williams", status:"inactive", aliases:["JEW WILLIAMS"] },
+  { displayId:"WILSON D", first:"David", last:"Wilson", aliases:["DAVID WILSON"] },
+  { displayId:"Woods Ant", first:"Antwain", last:"Woods", aliases:["ANTWAIN WOODS"] },
+  { displayId:"WORLEY B", first:"Brian", last:"Worley", aliases:["BRIAN WORLEY"] },
+  { displayId:"M Young", first:"Marcus", last:"Young", aliases:["MARCUS YOUNG"] },
+];
+
+const toEmpId=(displayId)=>(displayId||"").toString().replace(/[\/\s@.]/g,"_").toLowerCase();
+const normName=(s)=>(s||"").toString().toUpperCase().trim().replace(/\s+/g," ").replace(/[.,]/g,"");
+
+const Roster={
+  _cache:null,
+  async getAll(force=false){
+    if(!hasFirebase) return [];
+    if(this._cache&&!force) return this._cache;
+    try{const snap=await window.db.collection("employees").get();this._cache=snap.docs.map(d=>({id:d.id,...d.data()}));return this._cache;}
+    catch(e){console.warn("Roster.getAll:",e);return [];}
+  },
+  invalidate(){this._cache=null;},
+  async seedIfEmpty(){
+    if(!hasFirebase) return {seeded:0,skipped:0};
+    const existing=await this.getAll(true);
+    const existingIds=new Set(existing.map(e=>e.id));
+    let seeded=0;
+    const batch=window.db.batch();
+    for(const s of ROSTER_SEED){
+      const empId=toEmpId(s.displayId);
+      if(existingIds.has(empId)) continue;
+      const doc={
+        employee_id:empId,display_id:s.displayId,
+        first_name:s.first,last_name:s.last,middle_name:s.middle||"",
+        full_name:s.middle?`${s.first} ${s.middle} ${s.last}`:`${s.first} ${s.last}`,
+        aliases:s.aliases||[],status:s.status||"active",type:"W2",
+        pay_rate:0,department:"",hire_date:null,termination_date:null,notes:"",
+        created_at:new Date().toISOString(),updated_at:new Date().toISOString(),
+      };
+      batch.set(window.db.collection("employees").doc(empId),doc,{merge:true});
+      seeded++;
+    }
+    if(seeded>0){await batch.commit();this.invalidate();}
+    return {seeded,skipped:existing.length};
+  },
+  async findByDisplayId(displayId){
+    const all=await this.getAll();const empId=toEmpId(displayId);
+    return all.find(e=>e.employee_id===empId||toEmpId(e.display_id)===empId);
+  },
+  async findByName(name){
+    if(!name) return null;
+    const all=await this.getAll();const norm=normName(name);
+    let match=all.find(e=>normName(e.full_name)===norm);if(match) return match;
+    match=all.find(e=>(e.aliases||[]).some(a=>normName(a)===norm));if(match) return match;
+    const swapped=norm.replace(/^([^\s,]+),?\s+(.+)$/,"$2 $1");
+    match=all.find(e=>normName(e.full_name)===swapped);if(match) return match;
+    const parts=norm.split(" ");
+    if(parts.length>=2){
+      const last=parts[parts.length-1];const firstInit=parts[0][0];
+      match=all.find(e=>normName(e.last_name).replace(/[^A-Z]/g,"")===last.replace(/[^A-Z]/g,"")&&normName(e.first_name)[0]===firstInit);
+      if(match) return match;
+    }
+    return null;
+  },
+  async save(emp){
+    if(!hasFirebase) return false;
+    try{
+      const empId=emp.employee_id||toEmpId(emp.display_id);
+      await window.db.collection("employees").doc(empId).set({...emp,employee_id:empId,updated_at:new Date().toISOString()},{merge:true});
+      this.invalidate();return true;
+    }catch(e){console.warn("Roster.save:",e);return false;}
+  },
+  async add(data){
+    const empId=toEmpId(data.display_id||`${data.first_name}_${data.last_name}_${Date.now()}`);
+    return this.save({
+      employee_id:empId,display_id:data.display_id||empId,
+      first_name:data.first_name||"",last_name:data.last_name||"",middle_name:data.middle_name||"",
+      full_name:data.middle_name?`${data.first_name} ${data.middle_name} ${data.last_name}`:`${data.first_name} ${data.last_name}`,
+      aliases:data.aliases||[],status:data.status||"active",type:data.type||"W2",
+      pay_rate:data.pay_rate||0,department:data.department||"",
+      hire_date:data.hire_date||null,termination_date:null,notes:data.notes||"",
+      created_at:new Date().toISOString(),
+    });
+  },
+  async setStatus(employeeId,status){
+    if(!hasFirebase) return false;
+    try{
+      const update={status,updated_at:new Date().toISOString()};
+      if(status==="terminated"||status==="inactive") update.termination_date=new Date().toISOString().slice(0,10);
+      await window.db.collection("employees").doc(employeeId).update(update);
+      this.invalidate();return true;
+    }catch(e){console.warn("Roster.setStatus:",e);return false;}
+  },
+};
+
+function RosterTab(){
+  const [employees,setEmployees]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [seeding,setSeeding]=useState(false);
+  const [filter,setFilter]=useState("active");
+  const [search,setSearch]=useState("");
+  const [editing,setEditing]=useState(null);
+  const [adding,setAdding]=useState(false);
+
+  const reload=async()=>{setLoading(true);const all=await Roster.getAll(true);setEmployees(all);setLoading(false);};
+  useEffect(()=>{reload();},[]);
+
+  const seedRoster=async()=>{
+    setSeeding(true);const res=await Roster.seedIfEmpty();await reload();setSeeding(false);
+    alert(`Seeded ${res.seeded} employees (${res.skipped} already existed)`);
+  };
+
+  const filtered=employees.filter(e=>{
+    if(filter==="active"&&e.status!=="active") return false;
+    if(filter==="inactive"&&e.status==="active") return false;
+    if(search&&!(e.full_name||"").toLowerCase().includes(search.toLowerCase())&&!(e.display_id||"").toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  }).sort((a,b)=>(a.last_name||"").localeCompare(b.last_name||""));
+
+  const activeCount=employees.filter(e=>e.status==="active").length;
+  const inactiveCount=employees.filter(e=>e.status!=="active").length;
+
+  return(
+    <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+      <SectionTitle icon="👥" text="Employee Roster" right={
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {employees.length===0&&<PrimaryBtn text={seeding?"Seeding...":"Seed 68 Employees"} onClick={seedRoster} loading={seeding} style={{padding:"6px 14px",fontSize:11}}/>}
+          <PrimaryBtn text="+ Add Employee" onClick={()=>setAdding(true)} style={{padding:"6px 14px",fontSize:11}}/>
+        </div>
+      }/>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginBottom:16}}>
+        <KPI label="Total Employees" value={fmtNum(employees.length)} sub="all-time roster"/>
+        <KPI label="Active" value={fmtNum(activeCount)} subColor={T.green} sub="currently employed"/>
+        <KPI label="Inactive" value={fmtNum(inactiveCount)} subColor={T.textDim} sub="historical"/>
+        <KPI label="W2" value={fmtNum(employees.filter(e=>e.type==="W2").length)} sub="employees"/>
+        <KPI label="1099" value={fmtNum(employees.filter(e=>e.type==="1099").length)} sub="contractors"/>
+      </div>
+
+      {employees.length===0&&!loading&&(
+        <div style={{...cardStyle,textAlign:"center",padding:40}}>
+          <div style={{fontSize:48,marginBottom:12}}>👥</div>
+          <div style={{fontSize:14,fontWeight:600,marginBottom:6}}>No Roster Yet</div>
+          <div style={{fontSize:12,color:T.textMuted,marginBottom:16}}>Click "Seed 68 Employees" to populate with your existing B600 roster data.</div>
+          <PrimaryBtn text={seeding?"Seeding...":"Seed 68 Employees Now"} onClick={seedRoster} loading={seeding}/>
+        </div>
+      )}
+
+      {employees.length>0&&(
+        <>
+          <div style={{...cardStyle}}>
+            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              <input type="text" placeholder="Search by name or display ID..." value={search} onChange={e=>setSearch(e.target.value)} style={{...inputStyle,flex:1,minWidth:180}}/>
+              {["active","inactive","all"].map(f=>(
+                <TabButton key={f} active={filter===f} label={f==="active"?`Active (${activeCount})`:f==="inactive"?`Inactive (${inactiveCount})`:`All (${employees.length})`} onClick={()=>setFilter(f)}/>
+              ))}
+            </div>
+          </div>
+
+          <div style={{...cardStyle}}>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr>{["Name","Display ID","Type","Status","Aliases","Actions"].map(h=><th key={h} style={{textAlign:"left",padding:"8px",borderBottom:`2px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {filtered.map(e=>(
+                    <tr key={e.id} style={{background:e.status==="active"?"transparent":T.bgSurface,opacity:e.status==="active"?1:0.7}}>
+                      <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{e.full_name}</td>
+                      <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontSize:11}}>{e.display_id}</td>
+                      <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={e.type||"W2"} color={e.type==="1099"?T.greenText:T.blueText} bg={e.type==="1099"?T.greenBg:T.blueBg}/></td>
+                      <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><Badge text={e.status||"active"} color={e.status==="active"?T.greenText:T.textDim} bg={e.status==="active"?T.greenBg:T.borderLight}/></td>
+                      <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`,fontSize:10,color:T.textMuted,maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(e.aliases||[]).join(", ")||"—"}</td>
+                      <td style={{padding:"8px",borderBottom:`1px solid ${T.borderLight}`}}><button onClick={()=>setEditing(e)} style={{padding:"3px 10px",border:`1px solid ${T.brand}`,borderRadius:6,background:"transparent",color:T.brand,fontSize:10,fontWeight:600,cursor:"pointer"}}>Edit</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {filtered.length===0&&<div style={{textAlign:"center",padding:20,color:T.textMuted,fontSize:12}}>No employees match the filter</div>}
+          </div>
+        </>
+      )}
+
+      {(editing||adding)&&<EmployeeEditor employee={editing} isNew={adding} onClose={()=>{setEditing(null);setAdding(false);}} onSaved={async()=>{await reload();setEditing(null);setAdding(false);}}/>}
+    </div>
+  );
+}
+
+function EmployeeEditor({employee,isNew,onClose,onSaved}){
+  const [data,setData]=useState(employee||{display_id:"",first_name:"",last_name:"",middle_name:"",aliases:[],status:"active",type:"W2",pay_rate:0,department:"",notes:""});
+  const [aliasInput,setAliasInput]=useState("");
+  const [saving,setSaving]=useState(false);
+  const upd=(k,v)=>setData(p=>({...p,[k]:v}));
+
+  const save=async()=>{
+    setSaving(true);
+    if(isNew) await Roster.add(data);
+    else await Roster.save({...data,full_name:data.middle_name?`${data.first_name} ${data.middle_name} ${data.last_name}`:`${data.first_name} ${data.last_name}`});
+    setSaving(false);onSaved();
+  };
+  const addAlias=()=>{if(aliasInput.trim()){upd("aliases",[...(data.aliases||[]),aliasInput.trim()]);setAliasInput("");}};
+  const removeAlias=(i)=>{upd("aliases",(data.aliases||[]).filter((_,idx)=>idx!==i));};
+
+  return(
+    <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20}} onClick={onClose}>
+      <div style={{background:T.bgWhite,borderRadius:12,padding:24,maxWidth:520,width:"100%",maxHeight:"90vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+          <div style={{fontSize:16,fontWeight:700}}>{isNew?"Add Employee":"Edit Employee"}</div>
+          <button onClick={onClose} style={{border:"none",background:"transparent",fontSize:20,cursor:"pointer",color:T.textMuted}}>✕</button>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+          <div><label style={{fontSize:11,color:T.textMuted}}>First Name</label><input value={data.first_name||""} onChange={e=>upd("first_name",e.target.value)} style={inputStyle}/></div>
+          <div><label style={{fontSize:11,color:T.textMuted}}>Last Name</label><input value={data.last_name||""} onChange={e=>upd("last_name",e.target.value)} style={inputStyle}/></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+          <div><label style={{fontSize:11,color:T.textMuted}}>Middle Name</label><input value={data.middle_name||""} onChange={e=>upd("middle_name",e.target.value)} style={inputStyle}/></div>
+          <div><label style={{fontSize:11,color:T.textMuted}}>Display ID (B600)</label><input value={data.display_id||""} onChange={e=>upd("display_id",e.target.value)} style={{...inputStyle,fontFamily:"monospace"}} disabled={!isNew}/></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:10}}>
+          <div><label style={{fontSize:11,color:T.textMuted}}>Status</label><select value={data.status||"active"} onChange={e=>upd("status",e.target.value)} style={inputStyle}><option value="active">Active</option><option value="inactive">Inactive</option><option value="terminated">Terminated</option></select></div>
+          <div><label style={{fontSize:11,color:T.textMuted}}>Type</label><select value={data.type||"W2"} onChange={e=>upd("type",e.target.value)} style={inputStyle}><option value="W2">W2</option><option value="1099">1099</option></select></div>
+          <div><label style={{fontSize:11,color:T.textMuted}}>Pay Rate ($/hr)</label><input type="number" step="0.01" value={data.pay_rate||0} onChange={e=>upd("pay_rate",parseFloat(e.target.value)||0)} style={inputStyle}/></div>
+        </div>
+        <div style={{marginBottom:10}}><label style={{fontSize:11,color:T.textMuted}}>Department</label><input value={data.department||""} onChange={e=>upd("department",e.target.value)} placeholder="Dept 01" style={inputStyle}/></div>
+        <div style={{marginBottom:10}}>
+          <label style={{fontSize:11,color:T.textMuted}}>Name Aliases <span style={{fontSize:10,color:T.textDim}}>(for CyberPay / NuVizz matching)</span></label>
+          <div style={{display:"flex",gap:6,marginTop:4}}>
+            <input value={aliasInput} onChange={e=>setAliasInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addAlias();}}} placeholder="Add alias (press Enter)" style={{...inputStyle,flex:1}}/>
+            <button onClick={addAlias} style={{padding:"8px 14px",border:`1px solid ${T.brand}`,borderRadius:8,background:T.brand,color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer"}}>+</button>
+          </div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6}}>
+            {(data.aliases||[]).map((a,i)=>(
+              <span key={i} style={{fontSize:11,background:T.brandPale,color:T.brand,padding:"3px 8px",borderRadius:12,display:"inline-flex",alignItems:"center",gap:4}}>
+                {a}<button onClick={()=>removeAlias(i)} style={{border:"none",background:"transparent",color:T.brand,cursor:"pointer",fontSize:12,padding:0,lineHeight:1}}>×</button>
+              </span>
+            ))}
+          </div>
+        </div>
+        <div style={{marginBottom:16}}><label style={{fontSize:11,color:T.textMuted}}>Notes</label><textarea value={data.notes||""} onChange={e=>upd("notes",e.target.value)} style={{...inputStyle,minHeight:60}}/></div>
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+          <button onClick={onClose} style={{padding:"10px 20px",border:`1px solid ${T.border}`,borderRadius:10,background:"transparent",color:T.textMuted,fontSize:13,fontWeight:600,cursor:"pointer"}}>Cancel</button>
+          <PrimaryBtn text={isNew?"Add Employee":"Save Changes"} onClick={save} loading={saving}/>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
 // MAIN APP v4.0
 // ═══════════════════════════════════════════════════════════════
 function MarginIQ(){
@@ -2891,7 +3332,7 @@ function MarginIQApp({user,onLogout}){
     return m;
   },[costs,ulineWeeks,qboData,qbFinancials]);
   const onUline=w=>{setUlineWeeks(p=>[w,...p.filter(x=>x.week_id!==w.week_id)]);};
-  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"pricing",i:"💎",l:"Pricing"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"import",i:"📥",l:"Data Import"},{id:"settings",i:"🔧",l:"Settings"}];
+  const tabs=[{id:"command",i:"🎯",l:"Command"},{id:"pricing",i:"💎",l:"Pricing"},{id:"ai",i:"🤖",l:"AI"},{id:"reconcile",i:"🔗",l:"Reconcile"},{id:"uline",i:"📦",l:"Uline"},{id:"routes",i:"🛣️",l:"Routes"},{id:"trends",i:"📈",l:"Trends"},{id:"payroll",i:"💵",l:"Payroll"},{id:"mileage",i:"⛽",l:"Mileage"},{id:"customers",i:"🏢",l:"Customers"},{id:"fleet",i:"🚛",l:"Fleet"},{id:"roster",i:"👥",l:"Roster"},{id:"integrity",i:"🛡️",l:"Integrity"},{id:"costs",i:"⚙️",l:"Costs"},{id:"import",i:"📥",l:"Data Import"},{id:"settings",i:"🔧",l:"Settings"}];
   return(
     <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'DM Sans',sans-serif"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",borderBottom:`1px solid ${T.border}`,background:"rgba(255,255,255,0.95)",backdropFilter:"blur(12px)",position:"sticky",top:0,zIndex:100}}>
@@ -2923,6 +3364,7 @@ function MarginIQApp({user,onLogout}){
       {!loading&&tab==="routes"&&<RouteTab margins={margins}/>}
       {!loading&&tab==="customers"&&<CustomerTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="fleet"&&<FleetTab margins={margins}/>}
+      {!loading&&tab==="roster"&&<RosterTab/>}
       {!loading&&tab==="payroll"&&<PayrollTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
       {!loading&&tab==="mileage"&&<MileageTab margins={margins} costs={costs}/>}
       {!loading&&tab==="trends"&&<TrendsTab ulineWeeks={ulineWeeks} margins={margins} qbFinancials={qbFinancials}/>}
