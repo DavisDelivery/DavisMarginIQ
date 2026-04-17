@@ -13,9 +13,6 @@
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-    .hide-scrollbar::-webkit-scrollbar { display: none; }
-    .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-    @media (max-width: 640px) { .fade-in { animation: none; } }
     input[type="number"]::-webkit-inner-spin-button { opacity: 1; }
     input[type="date"] { color-scheme: light; }
     @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
@@ -26,7 +23,6 @@
 
   <!-- Firebase via CDN -->
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
   <script>
@@ -39,15 +35,11 @@
       appId: "1:131773007635:web:be408aab03d843333afce6",
     });
     window.db = firebase.firestore();
-    window.fbAuth = firebase.auth();
     window.fbStorage = firebase.storage();
   </script>
 
   <!-- SheetJS for xlsx parsing -->
   <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
-
-  <!-- ZIP3 centroid database for distance calculations -->
-  <script src="./zip3.js"></script>
 </head>
 <body>
   <div id="root"></div>
