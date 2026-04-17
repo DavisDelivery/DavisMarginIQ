@@ -47,6 +47,42 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // ─── v2.3 Multi-source collections ───
+    // NuVizz stop-level cross-reference (pro → driver + 1099 pay base)
+    match /nuvizz_stops/{proKey} {
+      allow read, write: if true;
+    }
+
+    // NuVizz weekly driver rollups
+    match /nuvizz_weekly/{weekId} {
+      allow read, write: if true;
+    }
+
+    // Time clock (SENTINEL / B600) daily entries
+    match /timeclock_daily/{entryId} {
+      allow read, write: if true;
+    }
+
+    // Time clock weekly rollups by employee
+    match /timeclock_weekly/{weekId} {
+      allow read, write: if true;
+    }
+
+    // Payroll (CyberPay) weekly register by employee
+    match /payroll_weekly/{weekId} {
+      allow read, write: if true;
+    }
+
+    // QuickBooks historical exports (P&L, TB, GL)
+    match /qbo_history/{periodId} {
+      allow read, write: if true;
+    }
+
+    // Unified source file archive (every upload across all sources)
+    match /source_files/{fileId} {
+      allow read, write: if true;
+    }
+
     match /nuvizz_manifests/{date} {
       allow read: if true;
       allow write: if false;

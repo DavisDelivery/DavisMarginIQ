@@ -1,9 +1,10 @@
-// Davis MarginIQ v2.2 — Cost Intelligence Platform
+// Davis MarginIQ v2.3 — Cost Intelligence Platform
 // Revenue (billed) drives margins. Reconciliation (paid) is separate monitoring.
 // Data completeness scanner flags missing weeks.
+// v2.3: Multi-source ingest (Uline + NuVizz + Time Clock + Payroll + QBO)
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.2.0";
+const APP_VERSION = "2.3.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -45,6 +46,54 @@ const puToMonth = pu => { if (!pu) return null; const s = String(Math.floor(pu))
 const parseDateMDY = s => { if (!s) return null; const m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); if (!m) return null; return `${m[3]}-${m[1].padStart(2,"0")}-${m[2].padStart(2,"0")}`; };
 const dateToMonth = d => d ? d.slice(0,7) : null;
 
+// NuVizz format: "3/30/26 01:18 PM" or "3/30/2026 1:18 PM" — extract date portion only
+function parseDateMDYFlexible(s) {
+  if (!s) return null;
+  const str = String(s).trim();
+  // Match M/D/YY or M/D/YYYY, optional time after
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (!m) return null;
+  let [, mo, d, y] = m;
+  if (y.length === 2) y = (parseInt(y) >= 70 ? "19" : "20") + y;
+  return `${y}-${mo.padStart(2,"0")}-${d.padStart(2,"0")}`;
+}
+
+// Parse "$150.00" or "150.00" or "$1,250.50" to number; returns 0 if not a money string
+function parseMoney(v) {
+  if (v == null) return 0;
+  if (typeof v === "number") return v;
+  const s = String(v).replace(/[$,\s]/g,"").trim();
+  if (!s) return 0;
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+// Normalize employee/driver name: "LAST, FIRST" or "First Last" → "First Last"
+function normalizeName(v) {
+  if (!v) return null;
+  let s = String(v).trim();
+  if (!s) return null;
+  if (s.includes(",")) {
+    const [last, first] = s.split(",").map(x=>x.trim());
+    if (first && last) s = `${first} ${last}`;
+  }
+  return s.replace(/\s+/g," ").split(" ").map(w => w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(" ");
+}
+
+// Parse duration strings like "8:30" (H:MM) or "8.5" to decimal hours
+function parseHours(v) {
+  if (v == null) return 0;
+  if (typeof v === "number") return v;
+  const s = String(v).trim();
+  if (!s) return 0;
+  if (s.includes(":")) {
+    const [h, m] = s.split(":").map(x => parseInt(x) || 0);
+    return h + (m/60);
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
 // Compute the Friday week-ending for a YYYY-MM-DD date
 function weekEndingFriday(dateStr) {
   if (!dateStr) return null;
@@ -80,22 +129,76 @@ const FS = {
   async getDDISFiles() { if (!hasFirebase) return []; try { const s=await window.db.collection("ddis_files").orderBy("latest_bill_date","desc").get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveFileLog(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("file_log").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getFileLog(limit=500) { if (!hasFirebase) return []; try { const s=await window.db.collection("file_log").orderBy("uploaded_at","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+
+  // ─── v2.3 Multi-source helpers ───────────────────────────────
+  async saveNuVizzStop(proKey, data) { if (!hasFirebase) return false; try { await window.db.collection("nuvizz_stops").doc(String(proKey)).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async saveNuVizzWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("nuvizz_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getNuVizzWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("nuvizz_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveTimeClockDaily(id, data) { if (!hasFirebase) return false; try { await window.db.collection("timeclock_daily").doc(id).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async saveTimeClockWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("timeclock_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getTimeClockWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("timeclock_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async savePayrollWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("payroll_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getPayrollWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("payroll_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveQBOHistory(periodId, data) { if (!hasFirebase) return false; try { await window.db.collection("qbo_history").doc(periodId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getQBOHistory() { if (!hasFirebase) return []; try { const s=await window.db.collection("qbo_history").orderBy("period","desc").limit(120).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveSourceFile(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("source_files").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
 };
 
 // ─── File Type Detection ────────────────────────────────────
 function detectFileType(filename, firstRow) {
   const fn = filename.toLowerCase();
+  // Uline family (existing)
   if (fn.startsWith("ddis820") || fn.includes("ddis")) return "ddis";
   if (fn.startsWith("master")) return "master";
   if (fn.includes("accessorial") || fn.includes("acesorial") || fn.includes("acessorial") || fn.includes("accesorial") || fn.includes("acceessorial")) return "accessorials";
   if (fn.startsWith("das") || fn.startsWith("das ")) return "original";
+  // NuVizz family
+  if (fn.includes("driver_stops") || fn.includes("driver stops") || fn.includes("nuvizz")) return "nuvizz";
+  // Time clock / SENTINEL
+  if (fn.includes("sentinel") || fn.includes("timeclock") || fn.includes("time_clock") || fn.includes("b600") || fn.includes("punch")) return "timeclock";
+  // Payroll (CyberPay)
+  if (fn.includes("cyberpay") || fn.includes("payroll") || fn.includes("paydetail") || fn.includes("pay_detail") || fn.includes("pay_register") || fn.includes("payregister")) return "payroll";
+  // QBO
+  if (fn.includes("profit") && fn.includes("loss")) return "qbo_pl";
+  if (fn.includes("p&l") || fn.includes("p_l")) return "qbo_pl";
+  if (fn.includes("trial_balance") || fn.includes("trial balance") || fn.includes("tb_")) return "qbo_tb";
+  if (fn.includes("general_ledger") || fn.includes("general ledger") || fn.includes("_gl_") || fn.includes(" gl ")) return "qbo_gl";
+  if (fn.includes("quickbooks") || fn.includes("qbo_")) return "qbo_pl"; // default QBO export → P&L
+
   if (firstRow) {
     const keys = Object.keys(firstRow).map(k => k.toLowerCase().trim());
-    if (keys.includes("voucher#") || keys.includes("check#")) return "ddis";
-    if (keys.some(k => k === "pro" || k === "pro#") && keys.includes("new cost")) {
+    const keySet = new Set(keys);
+    // Uline DDIS
+    if (keySet.has("voucher#") || keySet.has("check#")) return "ddis";
+    // NuVizz: has Stop Number + Driver Name + Ship To
+    if (keySet.has("stop number") && keySet.has("driver name")) return "nuvizz";
+    // Time clock: employee + punch in/out or clock in/out
+    if ((keySet.has("employee") || keySet.has("employee name") || keySet.has("driver") || keySet.has("driver name")) &&
+        (keySet.has("punch in") || keySet.has("clock in") || keySet.has("time in") || keySet.has("in") || keySet.has("start time"))) return "timeclock";
+    // Payroll: employee + hours + gross
+    if ((keySet.has("employee") || keySet.has("employee name") || keySet.has("name")) &&
+        (keySet.has("gross") || keySet.has("gross pay") || keySet.has("total pay")) &&
+        (keySet.has("hours") || keySet.has("reg hours") || keySet.has("regular hours") || keySet.has("total hours"))) return "payroll";
+    // QBO P&L: "account" + "total" or "amount"
+    if (keySet.has("account") && (keySet.has("total") || keySet.has("amount") || keySet.has("balance"))) {
+      if (keySet.has("debit") || keySet.has("credit")) return "qbo_tb";
+      return "qbo_pl";
+    }
+    // Uline original/accessorial
+    if (keys.some(k => k === "pro" || k === "pro#") && keySet.has("new cost")) {
       return firstRow.code ? "accessorials" : "original";
     }
   }
+  return "unknown";
+}
+
+// Normalize file type to source group for UI grouping
+function sourceGroup(kind) {
+  if (["master","original","accessorials","ddis"].includes(kind)) return "uline";
+  if (kind === "nuvizz") return "nuvizz";
+  if (kind === "timeclock") return "timeclock";
+  if (kind === "payroll") return "payroll";
+  if (["qbo_pl","qbo_tb","qbo_gl"].includes(kind)) return "qbo";
   return "unknown";
 }
 
@@ -196,6 +299,226 @@ function parseDDIS(rows) {
     });
   }
   return payments;
+}
+
+// ─── NuVizz Parser ──────────────────────────────────────────
+// Columns: Delivery End, Stop Number, Stop Status, Driver Name,
+//          Ship To Name, Ship To, Ship To - City, Ship To - Zip Code, Stop SealNbr
+// "Stop SealNbr" is the base dollar amount used to calculate contractor pay.
+// 1099 contractors get 40% of SealNbr per stop. W2 drivers are paid hourly (CyberPay).
+// Driver W2/1099 classification lives in Fleet Management.
+const CONTRACTOR_PAY_PCT = 0.40;
+
+function parseNuVizz(rows) {
+  const stops = [];
+  for (const r of rows) {
+    const stopNum = r["stop number"];
+    const driver = r["driver name"];
+    if (!stopNum && !driver) continue; // skip blank rows
+    const deliveryDate = parseDateMDYFlexible(r["delivery end"]);
+    const status = r["stop status"] ? String(r["stop status"]).trim() : null;
+    const shipTo = r["ship to name"] ? String(r["ship to name"]).trim() : null;
+    const city = r["ship to - city"] ? String(r["ship to - city"]).trim() : null;
+    const zip = r["ship to - zip code"] ? String(r["ship to - zip code"]).trim() : null;
+    const payBase = parseMoney(r["stop sealnbr"]);
+    const contractorPay = payBase * CONTRACTOR_PAY_PCT; // applied only if driver is 1099
+    const pro = normalizePro(stopNum); // cross-reference to Uline PRO
+    stops.push({
+      stop_number: stopNum ? String(stopNum).trim() : null,
+      pro,
+      driver_name: normalizeName(driver),
+      delivery_date: deliveryDate,
+      week_ending: deliveryDate ? weekEndingFriday(deliveryDate) : null,
+      month: deliveryDate ? dateToMonth(deliveryDate) : null,
+      status,
+      ship_to: shipTo,
+      city, zip,
+      contractor_pay_base: payBase,         // raw $ from SealNbr column
+      contractor_pay_at_40: contractorPay,  // 40% — actual cost IF driver is 1099
+    });
+  }
+  return stops;
+}
+
+// Build NuVizz weekly rollups
+// Note: contractor_pay_total assumes ALL drivers are 1099. Actual cost depends on
+// Fleet Management's W2/1099 classification applied downstream.
+function buildNuVizzWeekly(stops) {
+  const byWeek = {};
+  for (const s of stops) {
+    if (!s.week_ending) continue;
+    const w = s.week_ending;
+    if (!byWeek[w]) {
+      byWeek[w] = {
+        week_ending: w, month: s.month,
+        stops_total: 0, stops_completed: 0,
+        pay_base_total: 0,             // sum of all SealNbr values
+        contractor_pay_if_all_1099: 0, // upper bound cost if every driver were 1099
+        unique_drivers: new Set(),
+        unique_customers: new Set(),
+        drivers: {},
+      };
+    }
+    const bw = byWeek[w];
+    bw.stops_total++;
+    if (s.status && s.status.toLowerCase() === "completed") bw.stops_completed++;
+    bw.pay_base_total += s.contractor_pay_base || 0;
+    bw.contractor_pay_if_all_1099 += s.contractor_pay_at_40 || 0;
+    if (s.driver_name) {
+      bw.unique_drivers.add(s.driver_name);
+      if (!bw.drivers[s.driver_name]) bw.drivers[s.driver_name] = { stops:0, pay_base:0, pay_at_40:0 };
+      bw.drivers[s.driver_name].stops++;
+      bw.drivers[s.driver_name].pay_base += s.contractor_pay_base || 0;
+      bw.drivers[s.driver_name].pay_at_40 += s.contractor_pay_at_40 || 0;
+    }
+    if (s.ship_to) bw.unique_customers.add(s.ship_to);
+  }
+  return Object.values(byWeek).map(w => ({
+    ...w,
+    unique_drivers: w.unique_drivers.size,
+    unique_customers: w.unique_customers.size,
+    top_drivers: Object.entries(w.drivers).sort((a,b) => b[1].stops - a[1].stops).slice(0,60).map(([name, v]) => ({name, ...v})),
+    drivers: undefined,
+  }));
+}
+
+// ─── Time Clock Parser ──────────────────────────────────────
+// Flexible column mapping: employee/driver, date, clock in, clock out, hours
+function parseTimeClock(rows) {
+  const entries = [];
+  for (const r of rows) {
+    const name = r["employee"] || r["employee name"] || r["driver"] || r["driver name"] || r["name"];
+    if (!name) continue;
+    const dateRaw = r["date"] || r["punch date"] || r["work date"] || r["day"];
+    const date = parseDateMDYFlexible(dateRaw) || (dateRaw ? parseDateMDY(dateRaw) : null);
+    const clockIn = r["clock in"] || r["punch in"] || r["time in"] || r["in"] || r["start time"];
+    const clockOut = r["clock out"] || r["punch out"] || r["time out"] || r["out"] || r["end time"];
+    const hoursRaw = r["hours"] || r["total hours"] || r["worked"] || r["duration"];
+    const hours = parseHours(hoursRaw);
+    entries.push({
+      employee: normalizeName(name),
+      date,
+      week_ending: date ? weekEndingFriday(date) : null,
+      month: date ? dateToMonth(date) : null,
+      clock_in: clockIn ? String(clockIn).trim() : null,
+      clock_out: clockOut ? String(clockOut).trim() : null,
+      hours,
+    });
+  }
+  return entries;
+}
+
+function buildTimeClockWeekly(entries) {
+  const byWeek = {};
+  for (const e of entries) {
+    if (!e.week_ending || !e.employee) continue;
+    const w = e.week_ending;
+    if (!byWeek[w]) {
+      byWeek[w] = {
+        week_ending: w, month: e.month,
+        total_hours: 0, days_worked: 0,
+        unique_employees: new Set(),
+        employees: {},
+      };
+    }
+    const bw = byWeek[w];
+    bw.total_hours += e.hours || 0;
+    bw.days_worked++;
+    bw.unique_employees.add(e.employee);
+    if (!bw.employees[e.employee]) bw.employees[e.employee] = { hours:0, days:0 };
+    bw.employees[e.employee].hours += e.hours || 0;
+    bw.employees[e.employee].days++;
+  }
+  return Object.values(byWeek).map(w => ({
+    ...w,
+    unique_employees: w.unique_employees.size,
+    top_employees: Object.entries(w.employees).sort((a,b) => b[1].hours - a[1].hours).slice(0,60).map(([name, v]) => ({name, ...v})),
+    employees: undefined,
+  }));
+}
+
+// ─── Payroll (CyberPay) Parser ──────────────────────────────
+// Columns: employee, pay period end, reg hours, OT hours, gross pay
+function parsePayroll(rows) {
+  const entries = [];
+  for (const r of rows) {
+    const name = r["employee"] || r["employee name"] || r["name"];
+    if (!name) continue;
+    const periodRaw = r["pay period end"] || r["period end"] || r["pay date"] || r["check date"] || r["week ending"];
+    const periodEnd = parseDateMDYFlexible(periodRaw) || (periodRaw ? parseDateMDY(periodRaw) : null);
+    const regHours = parseHours(r["reg hours"] || r["regular hours"] || r["hours"] || 0);
+    const otHours = parseHours(r["ot hours"] || r["overtime hours"] || r["overtime"] || 0);
+    const gross = parseMoney(r["gross"] || r["gross pay"] || r["total pay"] || r["pay"] || 0);
+    const net = parseMoney(r["net"] || r["net pay"] || 0);
+    const type = r["type"] || r["class"] || r["driver type"] || null; // W2/1099 if present
+    entries.push({
+      employee: normalizeName(name),
+      period_end: periodEnd,
+      week_ending: periodEnd ? weekEndingFriday(periodEnd) : null,
+      month: periodEnd ? dateToMonth(periodEnd) : null,
+      reg_hours: regHours,
+      ot_hours: otHours,
+      total_hours: regHours + otHours,
+      gross, net,
+      classification: type ? String(type).trim() : null,
+    });
+  }
+  return entries;
+}
+
+function buildPayrollWeekly(entries) {
+  const byWeek = {};
+  for (const e of entries) {
+    if (!e.week_ending || !e.employee) continue;
+    const w = e.week_ending;
+    if (!byWeek[w]) {
+      byWeek[w] = {
+        week_ending: w, month: e.month,
+        gross_total: 0, net_total: 0,
+        hours_total: 0, ot_hours_total: 0,
+        employee_count: 0,
+        employees: [],
+      };
+    }
+    const bw = byWeek[w];
+    bw.gross_total += e.gross || 0;
+    bw.net_total += e.net || 0;
+    bw.hours_total += e.total_hours || 0;
+    bw.ot_hours_total += e.ot_hours || 0;
+    bw.employee_count++;
+    bw.employees.push({
+      name: e.employee, gross: e.gross, hours: e.total_hours, ot: e.ot_hours,
+      classification: e.classification,
+    });
+  }
+  // Keep top 60 employees per week to stay within Firebase doc limits
+  return Object.values(byWeek).map(w => ({
+    ...w,
+    employees: w.employees.sort((a,b) => b.gross - a.gross).slice(0, 60),
+  }));
+}
+
+// ─── QBO Parser ─────────────────────────────────────────────
+// P&L and Trial Balance exports have similar structure: account + amounts
+function parseQBO(rows, kind) {
+  const entries = [];
+  // Try to detect period from filename or from a header row
+  for (const r of rows) {
+    const account = r["account"] || r["account name"] || r["name"];
+    if (!account) continue;
+    const amt = parseMoney(r["total"] || r["amount"] || r["balance"]);
+    const debit = parseMoney(r["debit"]);
+    const credit = parseMoney(r["credit"]);
+    const period = r["period"] || r["month"] || r["date"] || null;
+    entries.push({
+      account: String(account).trim(),
+      amount: amt || (debit - credit),
+      debit, credit,
+      period: period ? (parseDateMDYFlexible(period) || String(period).trim()) : null,
+      report_type: kind, // qbo_pl, qbo_tb, qbo_gl
+    });
+  }
+  return entries;
 }
 
 // ─── Build Weekly Rollups ──────────────────────────────────
@@ -917,7 +1240,31 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
   const [status, setStatus] = useState("");
   const [progress, setProgress] = useState({ current:0, total:0 });
   const [lastResult, setLastResult] = useState(null);
+  const [sourceStats, setSourceStats] = useState(null);
   const fileRef = useRef(null);
+
+  // Load source counts for all 5 sources on mount so cards show meaningful status
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) return;
+      try {
+        const [nvW, tcW, payW, qboH] = await Promise.all([
+          FS.getNuVizzWeekly(), FS.getTimeClockWeekly(),
+          FS.getPayrollWeekly(), FS.getQBOHistory(),
+        ]);
+        setSourceStats({
+          nuvizz_weeks: nvW.length,
+          nuvizz_stops: nvW.reduce((s,w)=>s+(w.stops_total||0),0),
+          nuvizz_pay_if_1099: nvW.reduce((s,w)=>s+(w.contractor_pay_if_all_1099||0),0),
+          timeclock_weeks: tcW.length,
+          timeclock_hours: tcW.reduce((s,w)=>s+(w.total_hours||0),0),
+          payroll_weeks: payW.length,
+          payroll_gross: payW.reduce((s,w)=>s+(w.gross_total||0),0),
+          qbo_periods: qboH.length,
+        });
+      } catch(e) {}
+    })();
+  }, []);
 
   const handleFiles = async (files) => {
     if (!files || files.length === 0) return;
@@ -925,12 +1272,18 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
     setStatus(`Processing ${files.length} file${files.length>1?"s":""}...`);
     setProgress({ current:0, total:files.length });
 
-    const results = { master:[], original:[], accessorials:[], ddis:[], unknown:[] };
-    const stopsByPro = {}; // pro -> merged stop (for dedup when both orig and acc files exist)
-    const paymentByPro = {};
-    const paymentsByWeek = {};
+    // Per-group accumulators
+    const stopsByPro = {};         // Uline: pro -> merged stop
+    const paymentByPro = {};       // DDIS
     const ddisFileRecords = [];
+    const nuvizzStops = [];
+    const timeClockEntries = [];
+    const payrollEntries = [];
+    const qboEntries = [];
     const fileLogs = [];
+    const sourceFiles = [];
+    const countsByKind = { master:0, original:0, accessorials:0, ddis:0, nuvizz:0, timeclock:0, payroll:0, qbo_pl:0, qbo_tb:0, qbo_gl:0, unknown:0 };
+    const unknownFiles = [];
 
     for (let i=0; i<files.length; i++) {
       const file = files[i];
@@ -943,22 +1296,23 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
         const isCSV = file.name.toLowerCase().endsWith(".csv");
         if (isCSV) rows = await readCSV(file);
         else rows = await readWorkbook(file);
-        if (!rows || rows.length === 0) { results.unknown.push(file.name); continue; }
+        if (!rows || rows.length === 0) { unknownFiles.push(file.name + " (empty)"); countsByKind.unknown++; continue; }
 
         const kind = detectFileType(file.name, rows[0]);
-        fileLogs.push({ file_id: fileId, filename: file.name, kind, row_count: rows.length, uploaded_at: new Date().toISOString() });
+        const group = sourceGroup(kind);
+        countsByKind[kind] = (countsByKind[kind]||0) + 1;
 
+        fileLogs.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
+        sourceFiles.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
+
+        // ─── Uline family ───
         if (kind === "master" || kind === "original" || kind === "accessorials") {
           const stops = parseOriginalOrAccessorial(rows);
           for (const s of stops) {
             if (!s.pro || !s.week_ending) continue;
-            // Dedup: if we already have this PRO, keep the row with the higher new_cost (usually accessorial version)
             const existing = stopsByPro[s.pro];
-            if (!existing || (s.new_cost > existing.new_cost)) {
-              stopsByPro[s.pro] = s;
-            }
+            if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[s.pro] = s;
           }
-          results[kind].push({ name:file.name, stops:stops.length });
         } else if (kind === "ddis") {
           const payments = parseDDIS(rows);
           const billDates = payments.map(p => p.bill_date).filter(Boolean).sort();
@@ -971,34 +1325,39 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
             checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
             uploaded_at: new Date().toISOString(),
           });
-          for (const p of payments) {
-            paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
-            if (p.bill_date) {
-              const we = weekEndingFriday(p.bill_date);
-              if (we) {
-                if (!paymentsByWeek[we]) paymentsByWeek[we] = { total:0, count:0 };
-                paymentsByWeek[we].total += p.paid;
-                paymentsByWeek[we].count++;
-              }
-            }
-          }
-          results.ddis.push({ name:file.name, records:payments.length, paid:totalPaid });
-        } else {
-          results.unknown.push(file.name);
+          for (const p of payments) paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
+        }
+        // ─── NuVizz ───
+        else if (kind === "nuvizz") {
+          nuvizzStops.push(...parseNuVizz(rows));
+        }
+        // ─── Time Clock ───
+        else if (kind === "timeclock") {
+          timeClockEntries.push(...parseTimeClock(rows));
+        }
+        // ─── Payroll ───
+        else if (kind === "payroll") {
+          payrollEntries.push(...parsePayroll(rows));
+        }
+        // ─── QBO ───
+        else if (kind === "qbo_pl" || kind === "qbo_tb" || kind === "qbo_gl") {
+          qboEntries.push(...parseQBO(rows, kind).map(e => ({...e, source_file: file.name})));
+        }
+        else {
+          unknownFiles.push(file.name);
         }
       } catch(e) {
         console.error("File error:", file.name, e);
-        results.unknown.push(file.name + " (err: " + e.message + ")");
+        unknownFiles.push(file.name + " (err: " + e.message + ")");
+        countsByKind.unknown++;
       }
     }
 
-    // Build weekly rollups
-    setStatus("Building weekly rollups...");
+    // ─── Uline: Build weekly rollups + recon ───
+    setStatus("Building Uline weekly rollups...");
     const allStops = Object.values(stopsByPro);
     const rollups = buildWeeklyRollups(allStops);
 
-    // Build reconciliation: for each week, sum billed vs paid-matched-against-those-PROs
-    setStatus("Matching payments to billings...");
     const reconByWeek = {};
     const unpaidStops = [];
     for (const s of allStops) {
@@ -1022,31 +1381,88 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
       r.collection_rate = r.billed > 0 ? (r.paid_matched / r.billed * 100) : null;
     }
 
-    // Save weekly rollups
-    setStatus("Saving weekly rollups to Firebase...");
+    // ─── Save Uline ───
+    setStatus("Saving Uline weekly rollups...");
     let savedWeeks = 0;
     for (const r of rollups) {
-      const weekId = r.week_ending;
-      const ok = await FS.saveWeeklyRollup(weekId, {...r, updated_at:new Date().toISOString()});
+      const ok = await FS.saveWeeklyRollup(r.week_ending, {...r, updated_at:new Date().toISOString()});
       if (ok) savedWeeks++;
     }
-
-    setStatus("Saving reconciliation data...");
     let savedRecon = 0;
     for (const r of Object.values(reconByWeek)) {
       const ok = await FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()});
       if (ok) savedRecon++;
     }
-
-    setStatus("Saving DDIS metadata...");
     for (const f of ddisFileRecords) await FS.saveDDISFile(f.file_id, f);
-
-    setStatus("Saving unpaid queue...");
     const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, 500);
     for (const s of topUnpaid) await FS.saveUnpaidStop(s.pro, s);
 
+    // ─── NuVizz: rollups + cross-ref stops ───
+    let nvWeeksSaved = 0, nvStopsSaved = 0;
+    if (nuvizzStops.length > 0) {
+      setStatus(`Building NuVizz weekly rollups (${nuvizzStops.length} stops)...`);
+      const nvWeekly = buildNuVizzWeekly(nuvizzStops);
+      for (const w of nvWeekly) {
+        const ok = await FS.saveNuVizzWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()});
+        if (ok) nvWeeksSaved++;
+      }
+      // Save up to 2000 most recent stops for cross-reference (avoid bloating Firebase)
+      setStatus("Saving NuVizz stop cross-references...");
+      const recent = nuvizzStops
+        .filter(s => s.pro && s.delivery_date)
+        .sort((a,b) => (b.delivery_date||"").localeCompare(a.delivery_date||""))
+        .slice(0, 2000);
+      for (const s of recent) {
+        const key = s.pro || s.stop_number;
+        if (!key) continue;
+        const ok = await FS.saveNuVizzStop(key, s);
+        if (ok) nvStopsSaved++;
+      }
+    }
+
+    // ─── Time Clock: weekly rollups ───
+    let tcWeeksSaved = 0;
+    if (timeClockEntries.length > 0) {
+      setStatus(`Building time clock weekly rollups (${timeClockEntries.length} entries)...`);
+      const tcWeekly = buildTimeClockWeekly(timeClockEntries);
+      for (const w of tcWeekly) {
+        const ok = await FS.saveTimeClockWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()});
+        if (ok) tcWeeksSaved++;
+      }
+    }
+
+    // ─── Payroll: weekly rollups ───
+    let payWeeksSaved = 0;
+    if (payrollEntries.length > 0) {
+      setStatus(`Building payroll weekly rollups (${payrollEntries.length} entries)...`);
+      const payWeekly = buildPayrollWeekly(payrollEntries);
+      for (const w of payWeekly) {
+        const ok = await FS.savePayrollWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()});
+        if (ok) payWeeksSaved++;
+      }
+    }
+
+    // ─── QBO: store per-period aggregates ───
+    let qboPeriodsSaved = 0;
+    if (qboEntries.length > 0) {
+      setStatus(`Saving QBO entries (${qboEntries.length} line items)...`);
+      // Group by period+report_type+source_file
+      const byPeriod = {};
+      for (const e of qboEntries) {
+        const pid = `${e.report_type}_${e.source_file || "unknown"}`.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
+        if (!byPeriod[pid]) byPeriod[pid] = { period: e.period || null, report_type: e.report_type, source_file: e.source_file, accounts: [] };
+        byPeriod[pid].accounts.push({ account: e.account, amount: e.amount, debit: e.debit, credit: e.credit });
+      }
+      for (const [pid, data] of Object.entries(byPeriod)) {
+        const ok = await FS.saveQBOHistory(pid, {...data, uploaded_at: new Date().toISOString()});
+        if (ok) qboPeriodsSaved++;
+      }
+    }
+
+    // ─── Log all files ───
     setStatus("Logging files...");
     for (const l of fileLogs) await FS.saveFileLog(l.file_id, l);
+    for (const sf of sourceFiles) await FS.saveSourceFile(sf.file_id, sf);
 
     const existingMeta = await FS.getReconMeta() || {};
     await FS.saveReconMeta({
@@ -1057,22 +1473,52 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
 
     setLastResult({
       files_processed: files.length,
-      master_count: results.master.length,
-      originals_count: results.original.length,
-      accessorials_count: results.accessorials.length,
-      ddis_count: results.ddis.length,
-      unknown: results.unknown,
-      stops_parsed: allStops.length,
-      payments_parsed: Object.keys(paymentByPro).length,
-      weeks_saved: savedWeeks,
-      recon_saved: savedRecon,
-      unpaid_saved: topUnpaid.length,
+      counts: countsByKind,
+      uline: { stops: allStops.length, weeks_saved: savedWeeks, recon_saved: savedRecon, unpaid_saved: topUnpaid.length, payments: Object.keys(paymentByPro).length },
+      nuvizz: { stops: nuvizzStops.length, weeks_saved: nvWeeksSaved, stops_saved: nvStopsSaved },
+      timeclock: { entries: timeClockEntries.length, weeks_saved: tcWeeksSaved },
+      payroll: { entries: payrollEntries.length, weeks_saved: payWeeksSaved },
+      qbo: { lines: qboEntries.length, periods_saved: qboPeriodsSaved },
+      unknown: unknownFiles,
     });
-    setStatus(`✓ Processed ${files.length} files → ${allStops.length.toLocaleString()} stops → ${savedWeeks} weeks saved`);
+    setStatus(`✓ Processed ${files.length} files across ${Object.values(countsByKind).filter(c=>c>0).length} source types`);
     setUploading(false);
     if (fileRef.current) fileRef.current.value = "";
     onRefresh();
+
+    // Refresh source stats
+    if (hasFirebase) {
+      try {
+        const [nvW, tcW, payW, qboH] = await Promise.all([
+          FS.getNuVizzWeekly(), FS.getTimeClockWeekly(),
+          FS.getPayrollWeekly(), FS.getQBOHistory(),
+        ]);
+        setSourceStats({
+          nuvizz_weeks: nvW.length,
+          nuvizz_stops: nvW.reduce((s,w)=>s+(w.stops_total||0),0),
+          nuvizz_pay_if_1099: nvW.reduce((s,w)=>s+(w.contractor_pay_if_all_1099||0),0),
+          timeclock_weeks: tcW.length,
+          timeclock_hours: tcW.reduce((s,w)=>s+(w.total_hours||0),0),
+          payroll_weeks: payW.length,
+          payroll_gross: payW.reduce((s,w)=>s+(w.gross_total||0),0),
+          qbo_periods: qboH.length,
+        });
+      } catch(e) {}
+    }
   };
+
+  // Render a source card
+  const SourceCard = ({ icon, title, sub, primary, secondary, color }) => (
+    <div style={{...cardStyle, borderLeft:`3px solid ${color}`, padding:"12px 14px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+        <span style={{fontSize:18}}>{icon}</span>
+        <span style={{fontSize:12,fontWeight:700,color:T.text}}>{title}</span>
+      </div>
+      <div style={{fontSize:16,fontWeight:700,color}}>{primary}</div>
+      <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>{secondary}</div>
+      <div style={{fontSize:10,color:T.textDim,marginTop:4,fontStyle:"italic"}}>{sub}</div>
+    </div>
+  );
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="📤" text="Data Ingest" right={
@@ -1083,16 +1529,44 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
     } />
 
     <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
-      <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand}}>📤 Bulk Upload Everything</div>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand}}>📤 Bulk Upload — Any Data Source</div>
       <div style={{fontSize:12,color:T.text,lineHeight:1.6}}>
-        Select all your Uline files at once — master, originals, accessorials, DDIS. The app auto-detects each type and:
+        Select any combination of files. MarginIQ auto-detects each type and routes to the right parser:
         <ul style={{marginTop:8,marginLeft:20,fontSize:12}}>
-          <li><strong>Master / original / accessorial</strong> → parsed into weekly revenue rollups</li>
-          <li><strong>DDIS payment files</strong> → matched to PROs and stored separately for the Reconciliation tab</li>
-          <li>Dedupe handled automatically — accessorial versions of a PRO override original billing</li>
-          <li>Every file logged with timestamp so you can track what's been processed</li>
+          <li><strong>Uline</strong> (master / originals / accessorials / DDIS) → weekly revenue + reconciliation</li>
+          <li><strong>NuVizz</strong> (driver stops export) → weekly driver rollups + 1099 contractor pay (40% of SealNbr)</li>
+          <li><strong>Time Clock</strong> (SENTINEL / B600 punches) → weekly hours by employee</li>
+          <li><strong>Payroll</strong> (CyberPay register) → weekly gross, hours, OT by employee</li>
+          <li><strong>QuickBooks</strong> (P&L, Trial Balance, GL exports) → financial history</li>
         </ul>
+        <div style={{fontSize:11,color:T.textMuted,marginTop:8}}>
+          Upload all at once — no need to separate. Files auto-detected by filename and column headers.
+        </div>
       </div>
+    </div>
+
+    {/* 5 source status cards */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:"10px",marginTop:12}}>
+      <SourceCard icon="📦" title="Uline Revenue" color={T.brand}
+        primary={`${weeklyRollups.length} weeks`}
+        secondary={weeklyRollups.length > 0 ? fmtK(weeklyRollups.reduce((s,r)=>s+(r.revenue||0),0)) + " billed" : "—"}
+        sub="Master / weekly / accessorials" />
+      <SourceCard icon="🚚" title="NuVizz" color={T.blue}
+        primary={sourceStats ? `${sourceStats.nuvizz_weeks} weeks` : "—"}
+        secondary={sourceStats ? `${fmtNum(sourceStats.nuvizz_stops)} stops` : "—"}
+        sub="Driver attribution + 1099 pay base" />
+      <SourceCard icon="⏰" title="Time Clock" color={T.purple}
+        primary={sourceStats ? `${sourceStats.timeclock_weeks} weeks` : "—"}
+        secondary={sourceStats ? `${fmtNum(Math.round(sourceStats.timeclock_hours))} hrs` : "—"}
+        sub="SENTINEL / B600 punches" />
+      <SourceCard icon="💵" title="Payroll" color={T.green}
+        primary={sourceStats ? `${sourceStats.payroll_weeks} weeks` : "—"}
+        secondary={sourceStats ? fmtK(sourceStats.payroll_gross) + " gross" : "—"}
+        sub="CyberPay register" />
+      <SourceCard icon="📊" title="QuickBooks" color={T.yellow}
+        primary={sourceStats ? `${sourceStats.qbo_periods} periods` : "—"}
+        secondary="P&L / TB / GL"
+        sub="Financial reports" />
     </div>
 
     {uploading && (
@@ -1107,23 +1581,27 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
       <div style={{...cardStyle, background:T.greenBg, borderColor:T.green}}>
         <div style={{fontSize:13,fontWeight:700,color:T.greenText,marginBottom:8}}>✓ Import Complete</div>
         <div style={{fontSize:12,color:T.text,lineHeight:1.8}}>
-          <div>Files processed: <strong>{lastResult.files_processed}</strong> ({lastResult.master_count} master, {lastResult.originals_count} orig, {lastResult.accessorials_count} acc, {lastResult.ddis_count} ddis)</div>
-          <div>Stops parsed: <strong>{fmtNum(lastResult.stops_parsed)}</strong></div>
-          <div>Payments parsed: <strong>{fmtNum(lastResult.payments_parsed)}</strong></div>
-          <div>Weekly rollups saved: <strong>{lastResult.weeks_saved}</strong></div>
-          <div>Reconciliation weeks saved: <strong>{lastResult.recon_saved}</strong></div>
-          <div>Unpaid stops queued: <strong>{fmtNum(lastResult.unpaid_saved)}</strong></div>
+          <div><strong>Total files:</strong> {lastResult.files_processed}</div>
+          {lastResult.uline.stops > 0 && (
+            <div style={{marginTop:6}}>
+              <strong>📦 Uline:</strong> {fmtNum(lastResult.uline.stops)} stops → {lastResult.uline.weeks_saved} weeks, {lastResult.uline.recon_saved} recon, {fmtNum(lastResult.uline.unpaid_saved)} unpaid
+              {" "}({lastResult.counts.master||0} master, {lastResult.counts.original||0} orig, {lastResult.counts.accessorials||0} acc, {lastResult.counts.ddis||0} ddis)
+            </div>
+          )}
+          {lastResult.nuvizz.stops > 0 && (
+            <div><strong>🚚 NuVizz:</strong> {fmtNum(lastResult.nuvizz.stops)} stops → {lastResult.nuvizz.weeks_saved} weeks, {fmtNum(lastResult.nuvizz.stops_saved)} cross-refs saved ({lastResult.counts.nuvizz} files)</div>
+          )}
+          {lastResult.timeclock.entries > 0 && (
+            <div><strong>⏰ Time Clock:</strong> {fmtNum(lastResult.timeclock.entries)} entries → {lastResult.timeclock.weeks_saved} weeks ({lastResult.counts.timeclock} files)</div>
+          )}
+          {lastResult.payroll.entries > 0 && (
+            <div><strong>💵 Payroll:</strong> {fmtNum(lastResult.payroll.entries)} entries → {lastResult.payroll.weeks_saved} weeks ({lastResult.counts.payroll} files)</div>
+          )}
+          {lastResult.qbo.lines > 0 && (
+            <div><strong>📊 QBO:</strong> {fmtNum(lastResult.qbo.lines)} line items → {lastResult.qbo.periods_saved} periods ({(lastResult.counts.qbo_pl||0)+(lastResult.counts.qbo_tb||0)+(lastResult.counts.qbo_gl||0)} files)</div>
+          )}
           {lastResult.unknown.length > 0 && <div style={{color:T.yellowText,marginTop:6}}>⚠️ Unrecognized: {lastResult.unknown.join(", ")}</div>}
         </div>
-      </div>
-    )}
-
-    {weeklyRollups.length > 0 && (
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:"10px",marginTop:16}}>
-        <KPI label="Weeks Loaded" value={weeklyRollups.length} subColor={T.green} />
-        <KPI label="Total Stops" value={fmtNum(weeklyRollups.reduce((s,r)=>s+(r.stops||0),0))} />
-        <KPI label="Total Revenue" value={fmtK(weeklyRollups.reduce((s,r)=>s+(r.revenue||0),0))} subColor={T.green} />
-        <KPI label="DDIS Files" value={reconMeta?reconMeta.files_count:0} sub="reconciliation files" />
       </div>
     )}
   </div>;
