@@ -4,13 +4,13 @@
 // v2.3.1: Drivers tab for W2/1099 classification
 // v2.4: Gmail Sync — auto-import NuVizz + Uline reports from inbox via OAuth
 // v2.4.1: Labor Reality Check on Command Center (actual vs estimated)
-// v2.5: AuditIQ — Revenue recovery module. Renamed Reconciliation → Audit.
-//       Categorizes every billed-vs-paid discrepancy (short_paid, zero_pay,
-//       accessorial_ignored, overpaid, orphan). Aging buckets. Customer AP
-//       contacts. One-click dispute PDF generator. Dispute tracker.
+// v2.5: AuditIQ — Revenue recovery module
+// v2.6: Fuel tab — FuelFox PDF pair parser with true $/gal (fuel+tax+delivery
+//       baked in). Weekly per-vendor comparison (FuelFox vs Quick Fuel).
+//       Per-truck fuel history. Quick Fuel parser scaffolded but pending sample.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.5.0";
+const APP_VERSION = "2.6.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -375,6 +375,510 @@ async function ingestFiles(files, onStatus = () => {}) {
 }
 
 // ═══ GMAIL SYNC — Auto-import weekly reports from inbox ═════
+// ═══ FUEL — Per-Vendor Spend & Rate Tracking (v2.6) ════════
+// Two sources: FuelFox + Quick Fuel. Weekly rollups by vendor so you can
+// compare which vendor is actually cheaper per gallon when you include
+// all fees/taxes/delivery. True rate = (fuel + taxes + delivery) / gallons.
+const FUEL_VENDORS = [
+  { key: "fuelfox", label: "FuelFox", color: "#dc2626", supported: true },
+  { key: "quickfuel", label: "Quick Fuel", color: "#2563eb", supported: false },
+];
+
+function Fuel() {
+  const [view, setView] = useState("weekly"); // weekly | invoices | upload | trucks
+  const [loading, setLoading] = useState(true);
+  const [invoices, setInvoices] = useState([]);
+  const [weekly, setWeekly] = useState([]);
+  const [byTruck, setByTruck] = useState([]);
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  // Upload state (FuelFox pair)
+  const [summaryPdf, setSummaryPdf] = useState(null);
+  const [logPdf, setLogPdf] = useState(null);
+  const [parsing, setParsing] = useState(false);
+  const [parseResult, setParseResult] = useState(null);
+  const [uploadStatus, setUploadStatus] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const [inv, wk, tr] = await Promise.all([
+        FS.getFuelInvoices(), FS.getFuelWeekly(), FS.getFuelByTruck(3000),
+      ]);
+      setInvoices(inv);
+      setWeekly(wk);
+      setByTruck(tr);
+      setLoading(false);
+    })();
+  }, [refreshTick]);
+
+  // ─── Weekly rollups by vendor ───
+  const weeklyByVendor = useMemo(() => {
+    // Group by week_ending → { vendor: {gallons, spend, true_rate} }
+    const byWeek = {};
+    for (const w of weekly) {
+      if (!byWeek[w.week_ending]) byWeek[w.week_ending] = { week_ending: w.week_ending, vendors: {} };
+      byWeek[w.week_ending].vendors[w.vendor] = w;
+    }
+    return Object.values(byWeek).sort((a, b) => b.week_ending.localeCompare(a.week_ending));
+  }, [weekly]);
+
+  const vendorTotals = useMemo(() => {
+    const t = {};
+    for (const v of FUEL_VENDORS) t[v.key] = { gallons: 0, spend: 0, invoices: 0 };
+    for (const inv of invoices) {
+      const v = inv.vendor || "fuelfox";
+      if (!t[v]) t[v] = { gallons: 0, spend: 0, invoices: 0 };
+      t[v].gallons += inv.total_gallons || 0;
+      t[v].spend += inv.grand_total || 0;
+      t[v].invoices++;
+    }
+    // Overall true rate per vendor
+    for (const k of Object.keys(t)) {
+      t[k].true_rate = t[k].gallons > 0 ? t[k].spend / t[k].gallons : null;
+    }
+    return t;
+  }, [invoices]);
+
+  // ─── Upload: FuelFox PDF pair ───
+  const fileToBase64 = (file) => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(",")[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+
+  const parseFuelFoxPair = async () => {
+    if (!summaryPdf || !logPdf) {
+      setUploadStatus("✗ Both PDFs required");
+      return;
+    }
+    setParsing(true);
+    setUploadStatus("Reading PDFs...");
+    setParseResult(null);
+    try {
+      const [summaryB64, logB64] = await Promise.all([fileToBase64(summaryPdf), fileToBase64(logPdf)]);
+      setUploadStatus("Parsing with FuelFox engine...");
+      const resp = await fetch("/.netlify/functions/marginiq-fuelfox-parse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pdfs: [
+            { filename: summaryPdf.name, data_base64: summaryB64 },
+            { filename: logPdf.name, data_base64: logB64 },
+          ],
+        }),
+      });
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+      setParseResult(data);
+      setUploadStatus(`✓ Parsed — ${data.trucks.length} trucks, ${data.totals.total_gallons} gal, $${data.totals.grand_total.toFixed(2)} true cost @ $${data.totals.true_rate.toFixed(4)}/gal`);
+    } catch (e) {
+      setUploadStatus(`✗ Parse failed: ${e.message}`);
+    }
+    setParsing(false);
+  };
+
+  const saveParsedInvoice = async () => {
+    if (!parseResult) return;
+    setUploadStatus("Saving to Firebase...");
+    try {
+      const pr = parseResult;
+      const invId = `fuelfox_${pr.summary.invoice_number}`;
+      const weekKey = weekEndingFriday(pr.summary.invoice_date ? isoDate(pr.summary.invoice_date) : null);
+
+      // 1) Save invoice summary
+      await FS.saveFuelInvoice(invId, {
+        invoice_id: invId,
+        vendor: "fuelfox",
+        invoice_number: pr.summary.invoice_number,
+        invoice_date: pr.summary.invoice_date ? isoDate(pr.summary.invoice_date) : null,
+        service_date: pr.log.service_date ? isoDate(pr.log.service_date) : null,
+        week_ending: weekKey,
+        total_gallons: pr.summary.total_gallons,
+        posted_rate: pr.summary.posted_rate,
+        fuel_cost: pr.summary.diesel_cost,
+        tax: pr.summary.diesel_tax,
+        delivery_fee: pr.summary.delivery_fee,
+        grand_total: pr.totals.grand_total,
+        true_rate: pr.totals.true_rate,
+        fuel_only_rate: pr.totals.fuel_only_rate,
+        truck_count: pr.totals.truck_count,
+        ambassador: pr.log.ambassador,
+        service_vehicle: pr.log.service_vehicle,
+      });
+
+      // 2) Save per-truck line items
+      for (const t of pr.trucks) {
+        const lineId = `fuelfox_${pr.summary.invoice_number}_${t.unit}`;
+        await FS.saveFuelByTruck(lineId, {
+          line_id: lineId,
+          vendor: "fuelfox",
+          invoice_number: pr.summary.invoice_number,
+          invoice_id: invId,
+          unit: t.unit,
+          gallons: t.gallons,
+          posted_rate: t.posted_rate,
+          posted_charge: t.posted_charge,
+          true_rate: t.true_rate,
+          true_cost: t.true_cost,
+          uplift: t.uplift,
+          service_date: pr.log.service_date ? isoDate(pr.log.service_date) : null,
+          week_ending: weekKey,
+        });
+      }
+
+      // 3) Update weekly rollup for this vendor/week
+      if (weekKey) {
+        const weekRollupId = `fuelfox_${weekKey}`;
+        // Load existing, merge additively
+        const existing = weekly.find(w => w.id === weekRollupId);
+        const newGallons = (existing?.gallons || 0) + pr.summary.total_gallons;
+        const newSpend = (existing?.spend || 0) + pr.totals.grand_total;
+        await FS.saveFuelWeekly(weekRollupId, {
+          week_id: weekRollupId,
+          vendor: "fuelfox",
+          week_ending: weekKey,
+          gallons: newGallons,
+          spend: newSpend,
+          true_rate: newGallons > 0 ? newSpend / newGallons : null,
+          invoice_count: (existing?.invoice_count || 0) + 1,
+        });
+      }
+
+      setUploadStatus(`✓ Saved — ${pr.trucks.length} trucks, invoice ${pr.summary.invoice_number}`);
+      setSummaryPdf(null);
+      setLogPdf(null);
+      setParseResult(null);
+      setRefreshTick(t => t + 1);
+      setTimeout(() => setView("weekly"), 1200);
+    } catch (e) {
+      setUploadStatus(`✗ Save failed: ${e.message}`);
+    }
+  };
+
+  // Helper: MM/DD/YYYY → YYYY-MM-DD
+  function isoDate(mdy) {
+    if (!mdy) return null;
+    const m = String(mdy).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (!m) return null;
+    return `${m[3]}-${m[1].padStart(2,"0")}-${m[2].padStart(2,"0")}`;
+  }
+
+  if (loading) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading fuel data...</div>;
+
+  const hasData = invoices.length > 0;
+
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="⛽" text="Fuel — Per-Vendor Tracking" right={
+      <span style={{fontSize:10,color:T.textDim}}>{invoices.length} invoices • {byTruck.length} truck-fills</span>
+    } />
+
+    {/* Vendor totals summary */}
+    {hasData && (
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",gap:10,marginBottom:16}}>
+        {FUEL_VENDORS.map(v => {
+          const t = vendorTotals[v.key] || {};
+          return (
+            <div key={v.key} style={{...cardStyle, borderLeft:`3px solid ${v.color}`, padding:"12px 14px"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                <div style={{fontSize:13,fontWeight:700}}>{v.label}</div>
+                {!v.supported && <Badge text="soon" color={T.textDim} bg={T.bgSurface} />}
+              </div>
+              <div style={{fontSize:18,fontWeight:700,color:v.color}}>
+                {t.true_rate ? `$${t.true_rate.toFixed(4)}/gal` : "—"}
+              </div>
+              <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>all-in true rate</div>
+              <div style={{fontSize:11,color:T.textMuted,marginTop:8,lineHeight:1.6}}>
+                <div>{fmtNum(Math.round(t.gallons||0))} gallons total</div>
+                <div>{fmtK(t.spend||0)} spend • {t.invoices||0} invoices</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    )}
+
+    {/* View tabs */}
+    <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+      {[
+        ["weekly","📅 Weekly Comparison"],
+        ["invoices","📄 Invoices"],
+        ["trucks","🚛 By Truck"],
+        ["upload","📤 Upload FuelFox"],
+      ].map(([id,l]) =>
+        <TabButton key={id} active={view===id} label={l} onClick={()=>setView(id)} />
+      )}
+    </div>
+
+    {/* ─── WEEKLY VENDOR COMPARISON ─── */}
+    {view === "weekly" && (
+      !hasData ? (
+        <div style={cardStyle}>
+          <EmptyState icon="⛽" title="No Fuel Data Yet" sub="Upload a FuelFox invoice pair to begin tracking weekly spend and true price per gallon." />
+        </div>
+      ) : (
+        <div style={{...cardStyle, padding:0, overflow:"hidden"}}>
+          <div style={{padding:"12px 14px",background:T.bgSurface,borderBottom:`1px solid ${T.border}`}}>
+            <div style={{fontSize:13,fontWeight:700}}>Weekly Spend & $/Gal — Side by Side</div>
+            <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>Each row is one week. Lower $/gal wins that week.</div>
+          </div>
+          <div style={{overflowX:"auto",maxHeight:600}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead style={{position:"sticky",top:0,background:T.bgWhite,zIndex:1}}>
+                <tr style={{borderBottom:`1px solid ${T.border}`}}>
+                  <th rowSpan={2} style={{padding:"6px 10px",textAlign:"left",fontSize:10,color:T.textDim,fontWeight:700,textTransform:"uppercase"}}>Week Ending</th>
+                  {FUEL_VENDORS.map(v => (
+                    <th key={v.key} colSpan={3} style={{padding:"6px 10px",textAlign:"center",fontSize:10,color:v.color,fontWeight:700,textTransform:"uppercase",borderBottom:`2px solid ${v.color}`}}>{v.label}</th>
+                  ))}
+                  <th rowSpan={2} style={{padding:"6px 10px",textAlign:"center",fontSize:10,color:T.textDim,fontWeight:700,textTransform:"uppercase"}}>Winner</th>
+                </tr>
+                <tr style={{borderBottom:`1px solid ${T.border}`}}>
+                  {FUEL_VENDORS.flatMap(v => [
+                    <th key={`${v.key}-gal`} style={{padding:"4px 8px",textAlign:"right",fontSize:9,color:T.textMuted,fontWeight:600}}>Gal</th>,
+                    <th key={`${v.key}-spend`} style={{padding:"4px 8px",textAlign:"right",fontSize:9,color:T.textMuted,fontWeight:600}}>Spend</th>,
+                    <th key={`${v.key}-rate`} style={{padding:"4px 8px",textAlign:"right",fontSize:9,color:T.textMuted,fontWeight:600}}>$/Gal</th>,
+                  ])}
+                </tr>
+              </thead>
+              <tbody>
+                {weeklyByVendor.slice(0, 60).map(row => {
+                  // Determine winner by lowest true_rate among vendors with data
+                  const ratesByVendor = {};
+                  for (const v of FUEL_VENDORS) {
+                    const vd = row.vendors[v.key];
+                    if (vd && vd.true_rate) ratesByVendor[v.key] = vd.true_rate;
+                  }
+                  const winnerKey = Object.keys(ratesByVendor).length > 1
+                    ? Object.entries(ratesByVendor).sort((a,b) => a[1]-b[1])[0][0]
+                    : null;
+                  const winner = winnerKey ? FUEL_VENDORS.find(v => v.key === winnerKey) : null;
+                  return (
+                    <tr key={row.week_ending} style={{borderBottom:`1px solid ${T.borderLight}`}}>
+                      <td style={{padding:"8px 10px",fontWeight:600}}>WE {weekLabel(row.week_ending)}</td>
+                      {FUEL_VENDORS.flatMap(v => {
+                        const vd = row.vendors[v.key];
+                        return [
+                          <td key={`${v.key}-g`} style={{padding:"8px",textAlign:"right",color:T.textMuted}}>{vd ? fmtNum(Math.round(vd.gallons)) : "—"}</td>,
+                          <td key={`${v.key}-s`} style={{padding:"8px",textAlign:"right",fontWeight:600}}>{vd ? fmt(vd.spend) : "—"}</td>,
+                          <td key={`${v.key}-r`} style={{padding:"8px",textAlign:"right",color:v.color,fontWeight:700}}>{vd ? `$${vd.true_rate.toFixed(4)}` : "—"}</td>,
+                        ];
+                      })}
+                      <td style={{padding:"8px 10px",textAlign:"center"}}>
+                        {winner ? <Badge text={winner.label} color={winner.color} bg={winner.color+"22"} /> : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )
+    )}
+
+    {/* ─── INVOICES ─── */}
+    {view === "invoices" && (
+      !hasData ? (
+        <div style={cardStyle}><EmptyState icon="📄" title="No Invoices Yet" sub="Upload a FuelFox invoice pair to populate this list." /></div>
+      ) : (
+        <div style={{...cardStyle, padding:0}}>
+          <div style={{overflowX:"auto",maxHeight:500}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{background:T.bgSurface,position:"sticky",top:0}}>
+                  {["Date","Vendor","Invoice #","Gallons","Fuel","Tax","Delivery","Grand Total","True $/Gal","Trucks"].map(h =>
+                    <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {invoices.map(inv => {
+                  const v = FUEL_VENDORS.find(x => x.key === inv.vendor) || FUEL_VENDORS[0];
+                  return (
+                    <tr key={inv.id} style={{borderBottom:`1px solid ${T.borderLight}`}}>
+                      <td style={{padding:"8px 10px"}}>{inv.invoice_date || "—"}</td>
+                      <td style={{padding:"8px 10px"}}><Badge text={v.label} color={v.color} bg={v.color+"22"} /></td>
+                      <td style={{padding:"8px 10px",fontFamily:"monospace",fontWeight:600}}>{inv.invoice_number}</td>
+                      <td style={{padding:"8px 10px"}}>{fmtNum(inv.total_gallons)}</td>
+                      <td style={{padding:"8px 10px"}}>{fmt(inv.fuel_cost)}</td>
+                      <td style={{padding:"8px 10px",color:T.textMuted}}>{fmt(inv.tax)}</td>
+                      <td style={{padding:"8px 10px",color:T.textMuted}}>{fmt(inv.delivery_fee)}</td>
+                      <td style={{padding:"8px 10px",color:T.red,fontWeight:700}}>{fmt(inv.grand_total)}</td>
+                      <td style={{padding:"8px 10px",color:v.color,fontWeight:700}}>${inv.true_rate ? inv.true_rate.toFixed(4) : "—"}</td>
+                      <td style={{padding:"8px 10px"}}>{inv.truck_count}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )
+    )}
+
+    {/* ─── BY TRUCK ─── */}
+    {view === "trucks" && (
+      !hasData ? (
+        <div style={cardStyle}><EmptyState icon="🚛" title="No Truck Data" sub="Upload a FuelFox invoice pair to see per-truck fuel cost." /></div>
+      ) : (
+        <div style={{...cardStyle, padding:0}}>
+          <div style={{padding:"10px 14px",background:T.bgSurface,borderBottom:`1px solid ${T.border}`,fontSize:12,fontWeight:700}}>
+            Per-Truck Fuel History — Last {Math.min(byTruck.length, 500)} fill-ups
+          </div>
+          <div style={{overflowX:"auto",maxHeight:500}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead>
+                <tr style={{background:T.bgSurface,position:"sticky",top:0}}>
+                  {["Service Date","Unit","Gallons","Posted $","True $","Uplift","Vendor","Invoice"].map(h =>
+                    <th key={h} style={{textAlign:"left",padding:"6px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:9,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {byTruck.slice(0, 500).map(t => {
+                  const v = FUEL_VENDORS.find(x => x.key === t.vendor) || FUEL_VENDORS[0];
+                  return (
+                    <tr key={t.id} style={{borderBottom:`1px solid ${T.borderLight}`}}>
+                      <td style={{padding:"6px 10px"}}>{t.service_date || "—"}</td>
+                      <td style={{padding:"6px 10px",fontFamily:"monospace",fontWeight:700}}>{t.unit}</td>
+                      <td style={{padding:"6px 10px"}}>{t.gallons?.toFixed(1)}</td>
+                      <td style={{padding:"6px 10px",color:T.textMuted}}>{fmt(t.posted_charge)}</td>
+                      <td style={{padding:"6px 10px",color:T.red,fontWeight:700}}>{fmt(t.true_cost)}</td>
+                      <td style={{padding:"6px 10px",color:T.yellowText,fontSize:10}}>+{fmt(t.uplift)}</td>
+                      <td style={{padding:"6px 10px",fontSize:10}}>{v.label}</td>
+                      <td style={{padding:"6px 10px",fontSize:10,color:T.textMuted,fontFamily:"monospace"}}>{t.invoice_number}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )
+    )}
+
+    {/* ─── UPLOAD ─── */}
+    {view === "upload" && (
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>Upload FuelFox Invoice Pair</div>
+        <div style={{fontSize:11,color:T.textMuted,lineHeight:1.5,marginBottom:16}}>
+          FuelFox sends <strong>both PDFs in the same email</strong>. Drop the summary invoice and the service log below. MarginIQ will parse both, compute the true $/gallon (fuel + taxes + delivery fee baked in), and save per-truck breakdown.
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",gap:12,marginBottom:16}}>
+          <FileDropZone
+            label="1. Summary Invoice"
+            hint="Invoice_DDxxx_from_FuelFox_*.pdf"
+            file={summaryPdf}
+            onFile={setSummaryPdf}
+            color={T.brand}
+          />
+          <FileDropZone
+            label="2. Service Log"
+            hint="FuelFox-ServiceLog-*.pdf"
+            file={logPdf}
+            onFile={setLogPdf}
+            color={T.brandLight}
+          />
+        </div>
+
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <PrimaryBtn text={parsing ? "Parsing..." : "🔍 Parse Invoice Pair"} onClick={parseFuelFoxPair} loading={parsing} disabled={!summaryPdf || !logPdf} />
+          {parseResult && !parsing && (
+            <button onClick={saveParsedInvoice} style={{padding:"8px 16px",fontSize:12,fontWeight:700,borderRadius:8,border:`1px solid ${T.green}`,background:T.green,color:"#fff",cursor:"pointer"}}>
+              💾 Save to Firebase
+            </button>
+          )}
+        </div>
+
+        {uploadStatus && (
+          <div style={{marginTop:12,padding:"10px 12px",borderRadius:8,
+            background: uploadStatus.startsWith("✓") ? T.greenBg : uploadStatus.startsWith("✗") ? T.redBg : T.yellowBg,
+            color: uploadStatus.startsWith("✓") ? T.greenText : uploadStatus.startsWith("✗") ? T.redText : T.yellowText,
+            fontSize:12,fontWeight:600}}>
+            {uploadStatus}
+          </div>
+        )}
+
+        {/* Preview parsed result */}
+        {parseResult && (
+          <div style={{marginTop:16,padding:"12px",background:T.bgSurface,borderRadius:8,border:`1px solid ${T.border}`}}>
+            <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>📊 Parse Preview — Review before saving</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:12}}>
+              <KPI label="Invoice #" value={parseResult.summary.invoice_number} sub={parseResult.summary.invoice_date} />
+              <KPI label="Total Gallons" value={fmtNum(parseResult.totals.total_gallons)} sub={`${parseResult.totals.truck_count} trucks`} />
+              <KPI label="Grand Total" value={fmt(parseResult.totals.grand_total)} sub="fuel+tax+delivery" subColor={T.red} />
+              <KPI label="True $/Gal" value={`$${parseResult.totals.true_rate.toFixed(4)}`} sub={`posted $${parseResult.totals.posted_rate}`} subColor={T.brand} />
+            </div>
+            <div style={{fontSize:10,color:T.textMuted,marginBottom:6}}>Breakdown: ${parseResult.totals.posted_fuel_cost.toFixed(2)} fuel + ${parseResult.totals.tax.toFixed(2)} tax + ${parseResult.totals.delivery_fee.toFixed(2)} delivery</div>
+            <div style={{maxHeight:240,overflowY:"auto",border:`1px solid ${T.border}`,borderRadius:6}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+                <thead><tr style={{background:T.bgWhite}}>
+                  {["Unit","Gal","Posted","True","Uplift"].map(h =>
+                    <th key={h} style={{padding:"4px 8px",textAlign:"left",borderBottom:`1px solid ${T.border}`,fontSize:9,color:T.textMuted,fontWeight:600}}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {parseResult.trucks.map(t => (
+                    <tr key={t.unit} style={{borderBottom:`1px solid ${T.borderLight}`}}>
+                      <td style={{padding:"3px 8px",fontFamily:"monospace",fontWeight:600}}>{t.unit}</td>
+                      <td style={{padding:"3px 8px"}}>{t.gallons}</td>
+                      <td style={{padding:"3px 8px",color:T.textMuted}}>{fmt(t.posted_charge)}</td>
+                      <td style={{padding:"3px 8px",color:T.red,fontWeight:600}}>{fmt(t.true_cost)}</td>
+                      <td style={{padding:"3px 8px",color:T.yellowText}}>+{fmt(t.uplift)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Quick Fuel placeholder */}
+        <div style={{marginTop:20,padding:"12px",background:T.bgSurface,borderRadius:8,border:`1px dashed ${T.border}`}}>
+          <div style={{fontSize:12,fontWeight:700,color:T.textMuted,marginBottom:4}}>🚧 Quick Fuel (coming next)</div>
+          <div style={{fontSize:11,color:T.textMuted,lineHeight:1.5}}>
+            Quick Fuel / 4flyers.com parser isn't built yet. When you have a sample Quick Fuel invoice, send it over and I'll add the parser with the same logic — true $/gal including all fees — so the weekly comparison is apples-to-apples.
+          </div>
+        </div>
+      </div>
+    )}
+  </div>;
+}
+
+function FileDropZone({ label, hint, file, onFile, color }) {
+  const ref = useRef(null);
+  return (
+    <div
+      onClick={() => ref.current?.click()}
+      onDragOver={e => { e.preventDefault(); }}
+      onDrop={e => {
+        e.preventDefault();
+        const f = e.dataTransfer.files[0];
+        if (f) onFile(f);
+      }}
+      style={{
+        border: `2px dashed ${file ? color : T.border}`,
+        borderRadius: 10,
+        padding: 14,
+        cursor: "pointer",
+        background: file ? color+"11" : T.bgWhite,
+        transition: "all 0.15s",
+      }}
+    >
+      <input ref={ref} type="file" accept=".pdf" style={{display:"none"}} onChange={e => onFile(e.target.files[0])} />
+      <div style={{fontSize:12,fontWeight:700,color:file?color:T.text,marginBottom:4}}>{label}</div>
+      <div style={{fontSize:10,color:T.textMuted,marginBottom:6}}>{hint}</div>
+      {file ? (
+        <div style={{fontSize:11,fontWeight:600,color,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+          ✓ {file.name} <span style={{color:T.textDim,fontWeight:400}}>({Math.round(file.size/1024)} KB)</span>
+        </div>
+      ) : (
+        <div style={{fontSize:10,color:T.textDim}}>Drop PDF or click to browse</div>
+      )}
+    </div>
+  );
+}
+
+
 function GmailSync({ onRefresh }) {
   const [gmailConn, setGmailConn] = useState(null);
   const [loadingConn, setLoadingConn] = useState(true);
@@ -662,6 +1166,14 @@ const FS = {
 
   async getDisputes() { if (!hasFirebase) return []; try { const s=await window.db.collection("disputes").orderBy("updated_at","desc").limit(500).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveDispute(id, data) { if (!hasFirebase) return false; try { await window.db.collection("disputes").doc(String(id)).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
+
+  // ─── Fuel (v2.6) ─────────────────────────────────────────────
+  async getFuelInvoices() { if (!hasFirebase) return []; try { const s=await window.db.collection("fuel_invoices").orderBy("invoice_date","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveFuelInvoice(id, data) { if (!hasFirebase) return false; try { await window.db.collection("fuel_invoices").doc(String(id)).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
+  async getFuelByTruck(limit=3000) { if (!hasFirebase) return []; try { const s=await window.db.collection("fuel_by_truck").orderBy("service_date","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveFuelByTruck(id, data) { if (!hasFirebase) return false; try { await window.db.collection("fuel_by_truck").doc(String(id)).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getFuelWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("fuel_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveFuelWeekly(id, data) { if (!hasFirebase) return false; try { await window.db.collection("fuel_weekly").doc(String(id)).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
 };
 
 // ─── File Type Detection ────────────────────────────────────
@@ -3342,6 +3854,7 @@ function MarginIQ() {
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
     { id:"drivers", icon:"👥", label:"Drivers" },
+    { id:"fuel", icon:"⛽", label:"Fuel" },
     { id:"completeness", icon:"✅", label:"Data Health" },
     { id:"ingest", icon:"📤", label:"Data Ingest" },
     { id:"gmail", icon:"📧", label:"Gmail Sync" },
@@ -3375,6 +3888,7 @@ function MarginIQ() {
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
     {!loading && tab==="recon" && <Audit reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
     {!loading && tab==="drivers" && <Drivers />}
+    {!loading && tab==="fuel" && <Fuel />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}

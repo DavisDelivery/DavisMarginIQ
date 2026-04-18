@@ -104,6 +104,22 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // ─── Fuel tracking (v2.6) ───
+    // Invoice-level summary: one doc per invoice (vendor + period + totals + true rate)
+    match /fuel_invoices/{invoiceId} {
+      allow read, write: if true;
+    }
+
+    // Per-truck-per-invoice fuel line items
+    match /fuel_by_truck/{lineId} {
+      allow read, write: if true;
+    }
+
+    // Weekly vendor rollups (auto-computed on ingest)
+    match /fuel_weekly/{weekId} {
+      allow read, write: if true;
+    }
+
     match /nuvizz_manifests/{date} {
       allow read: if true;
       allow write: if false;
