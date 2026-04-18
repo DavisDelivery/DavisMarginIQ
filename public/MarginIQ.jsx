@@ -4,9 +4,12 @@
 // v2.3.1: Drivers tab for W2/1099 classification
 // v2.4: Gmail Sync — auto-import NuVizz + Uline reports from inbox via OAuth.
 //       Shared ingestFiles() pipeline used by both manual upload and Gmail.
+// v2.4.1: Labor Reality Check on Command Center — actual W2 payroll + 1099
+//         contractor pay compared to cost-structure estimate, using Drivers
+//         classifications. Flags unclassified labor as risk.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.4.0";
+const APP_VERSION = "2.4.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1208,6 +1211,131 @@ function LineTrend({ data, xKey, yKey, y2Key, label, y2Label, color, color2, hei
 }
 
 // ═══ COMMAND CENTER ════════════════════════════════════════════
+// ═══ LABOR REALITY — actual vs estimated labor cost ══════════
+// Pulls real data from nuvizz_weekly + payroll_weekly + driver_classifications
+// and compares to the cost-structure estimate. This is the payoff for the
+// v2.3+ data plumbing — actual labor cost based on who's 1099 vs W2.
+function LaborReality({ margins }) {
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) { setLoading(false); return; }
+      try {
+        const [nvW, payW, clsList] = await Promise.all([
+          FS.getNuVizzWeekly(), FS.getPayrollWeekly(), FS.getDriverClassifications(),
+        ]);
+        // Build classification map
+        const cls = {};
+        for (const c of clsList) cls[c.id] = c.classification || "unknown";
+
+        // Walk each NuVizz week, compute actual 1099 cost
+        // (= sum of 40% SealNbr ONLY for drivers classified 1099)
+        const weeks = {};
+        for (const w of nvW) {
+          if (!w.top_drivers) continue;
+          let actual1099 = 0, unclassifiedPay = 0;
+          for (const d of w.top_drivers) {
+            const k = driverKey(d.name);
+            const c = k ? cls[k] : "unknown";
+            if (c === "1099") actual1099 += d.pay_at_40 || 0;
+            else if (c !== "w2") unclassifiedPay += d.pay_at_40 || 0;
+          }
+          if (!weeks[w.week_ending]) weeks[w.week_ending] = { week_ending: w.week_ending, month: w.month };
+          weeks[w.week_ending].nv_1099_actual = actual1099;
+          weeks[w.week_ending].nv_unclassified = unclassifiedPay;
+        }
+
+        // Walk payroll weeks — sum W2 gross for drivers classified W2
+        for (const w of payW) {
+          if (!w.employees) continue;
+          let w2Gross = 0, unclassifiedGross = 0;
+          for (const e of w.employees) {
+            const k = driverKey(e.name);
+            const c = k ? cls[k] : "unknown";
+            if (c === "w2") w2Gross += e.gross || 0;
+            else if (c !== "1099") unclassifiedGross += e.gross || 0;
+          }
+          if (!weeks[w.week_ending]) weeks[w.week_ending] = { week_ending: w.week_ending, month: w.month };
+          weeks[w.week_ending].pay_w2_actual = w2Gross;
+          weeks[w.week_ending].pay_unclassified = unclassifiedGross;
+          weeks[w.week_ending].pay_gross_total = w.gross_total || 0;
+        }
+
+        // Totals for last 4 weeks (most recent)
+        const sorted = Object.values(weeks).sort((a,b) => b.week_ending.localeCompare(a.week_ending));
+        const recent = sorted.slice(0, 4);
+        const weeksCovered = recent.length;
+        const avg1099 = weeksCovered ? recent.reduce((s,w) => s + (w.nv_1099_actual||0), 0) / weeksCovered : 0;
+        const avgW2 = weeksCovered ? recent.reduce((s,w) => s + (w.pay_w2_actual||0), 0) / weeksCovered : 0;
+        const avgUnclNv = weeksCovered ? recent.reduce((s,w) => s + (w.nv_unclassified||0), 0) / weeksCovered : 0;
+        const avgUnclPay = weeksCovered ? recent.reduce((s,w) => s + (w.pay_unclassified||0), 0) / weeksCovered : 0;
+        const actualTotalWeekly = avg1099 + avgW2;
+
+        // Estimated weekly labor from cost structure (annual / 52)
+        const estimatedWeekly = (margins?.totalAnnualLabor || 0) / 52;
+        const varWeekly = actualTotalWeekly - estimatedWeekly;
+        const varPct = estimatedWeekly > 0 ? (varWeekly / estimatedWeekly * 100) : null;
+
+        setData({
+          hasNv: nvW.length > 0,
+          hasPay: payW.length > 0,
+          classifiedCount: Object.values(cls).filter(v => v === "w2" || v === "1099").length,
+          unclassifiedCount: Object.values(cls).filter(v => v === "unknown").length + (Object.keys(cls).length === 0 ? 0 : 0),
+          weeksCovered, avg1099, avgW2, avgUnclNv, avgUnclPay,
+          actualTotalWeekly, estimatedWeekly, varWeekly, varPct,
+          recent,
+        });
+      } catch(e) { console.error("LaborReality load err:", e); }
+      setLoading(false);
+    })();
+  }, [margins]);
+
+  if (loading) return null; // silent while loading — Command Center has other content
+  if (!data || (!data.hasNv && !data.hasPay)) {
+    return (
+      <div style={{...cardStyle, background:T.bgSurface, borderLeft:`3px solid ${T.textDim}`, marginBottom:12}}>
+        <div style={{fontSize:12,fontWeight:700,marginBottom:4}}>💡 Labor Reality Check</div>
+        <div style={{fontSize:11,color:T.textMuted}}>Upload NuVizz + Payroll files (or connect Gmail) to see actual labor cost vs your cost-structure estimate. Then classify drivers in the Drivers tab to unlock accurate margins.</div>
+      </div>
+    );
+  }
+
+  const varColor = data.varPct == null ? T.textMuted
+                 : Math.abs(data.varPct) < 5 ? T.green
+                 : Math.abs(data.varPct) < 15 ? T.yellow
+                 : T.red;
+  const varSign = data.varWeekly > 0 ? "+" : "";
+
+  return (
+    <div style={{...cardStyle, borderLeft:`3px solid ${T.purple}`, marginBottom:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:10}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:700}}>💡 Labor Reality Check</div>
+          <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>Last {data.weeksCovered} week{data.weeksCovered!==1?"s":""} avg — actual payroll + contractor pay vs cost-structure estimate</div>
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10}}>
+        <KPI label="Actual Weekly" value={fmtK(data.actualTotalWeekly)} sub={`${fmtK(data.avgW2)} W2 + ${fmtK(data.avg1099)} 1099`} subColor={T.green} />
+        <KPI label="Estimated Weekly" value={fmtK(data.estimatedWeekly)} sub="from cost structure" subColor={T.blue} />
+        <KPI label="Variance" value={data.varPct == null ? "—" : `${varSign}${fmtPct(data.varPct)}`} sub={`${varSign}${fmtK(data.varWeekly)}/wk`} subColor={varColor} />
+      </div>
+
+      {(data.avgUnclNv > 0 || data.avgUnclPay > 0) && (
+        <div style={{marginTop:10,padding:"8px 10px",background:T.yellowBg,borderRadius:8,fontSize:11,color:T.yellowText,lineHeight:1.5}}>
+          ⚠️ <strong>{fmtK(data.avgUnclNv + data.avgUnclPay)}/wk is unclassified</strong> —
+          {data.avgUnclNv > 0 && ` ${fmtK(data.avgUnclNv)} NuVizz pay`}
+          {data.avgUnclNv > 0 && data.avgUnclPay > 0 && " +"}
+          {data.avgUnclPay > 0 && ` ${fmtK(data.avgUnclPay)} payroll`}
+          {" "}from drivers/employees not yet tagged W2 or 1099. Classify them in the Drivers tab for accurate actual-cost math.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, reconMeta, connections, setTab }) {
   const m = margins;
   const marginColor = m.dailyMarginPct >= 30 ? T.green : m.dailyMarginPct >= 20 ? T.yellow : T.red;
@@ -1257,6 +1385,8 @@ function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, rec
       <KPI icon="🎯" label="Rev/Stop" value={fmt(m.revenuePerStop)} sub={`${fmt(m.costPerStop)} cost`} subColor={T.blue} />
       <KPI icon="👤" label="Rev/Driver" value={fmt(m.revenuePerDriver)} sub={`${fmtNum(m.stopsPerDriver)} stops/day`} />
     </div>
+
+    <LaborReality margins={m} />
 
     <div style={{...cardStyle, borderLeft:`4px solid ${marginColor}`, marginBottom:16}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
