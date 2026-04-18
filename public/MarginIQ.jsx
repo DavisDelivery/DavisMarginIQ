@@ -8,9 +8,11 @@
 // v2.6: Fuel tab — FuelFox PDF pair parser with true $/gal (fuel+tax+delivery
 //       baked in). Weekly per-vendor comparison (FuelFox vs Quick Fuel).
 //       Per-truck fuel history. Quick Fuel parser scaffolded but pending sample.
+// v2.6.1: Rewrote FuelFox parser for new pdf-parse PDFParse class API.
+//         Delivery fee baked into true $/gal (all-in rate = $4.67/gal for DD404).
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.6.0";
+const APP_VERSION = "2.6.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
