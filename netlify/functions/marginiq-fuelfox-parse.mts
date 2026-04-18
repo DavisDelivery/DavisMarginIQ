@@ -1,5 +1,6 @@
 import type { Context, Config } from "@netlify/functions";
-import { PDFParse } from "pdf-parse";
+import pdfParsePkg from "pdf-parse";
+const { PDFParse } = pdfParsePkg as any;
 
 // Davis MarginIQ — FuelFox invoice pair parser.
 // POST body: { pdfs: [{ filename, data_base64 }, { filename, data_base64 }] }

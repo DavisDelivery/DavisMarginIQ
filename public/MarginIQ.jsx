@@ -10,9 +10,10 @@
 //       Per-truck fuel history. Quick Fuel parser scaffolded but pending sample.
 // v2.6.1: Rewrote FuelFox parser for new pdf-parse PDFParse class API.
 //         Delivery fee baked into true $/gal (all-in rate = $4.67/gal for DD404).
+// v2.6.2: Fix CJS import for pdf-parse on Netlify.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.6.1";
+const APP_VERSION = "2.6.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
