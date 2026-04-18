@@ -88,6 +88,22 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // ─── AuditIQ (v2.5) ───
+    // Per-stop audit records: billed vs paid, category, dispute status
+    match /audit_items/{proKey} {
+      allow read, write: if true;
+    }
+
+    // Customer AP contacts (billing email, contact name, SLA, portal URL)
+    match /customer_ap_contacts/{customerKey} {
+      allow read, write: if true;
+    }
+
+    // Dispute submissions and outcomes
+    match /disputes/{disputeId} {
+      allow read, write: if true;
+    }
+
     match /nuvizz_manifests/{date} {
       allow read: if true;
       allow write: if false;

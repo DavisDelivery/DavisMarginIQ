@@ -1,15 +1,16 @@
-// Davis MarginIQ v2.4 — Cost Intelligence Platform
+// Davis MarginIQ v2.5 — Cost Intelligence Platform
 // Revenue (billed) drives margins. Reconciliation (paid) is separate monitoring.
 // v2.3: Multi-source ingest (Uline + NuVizz + Time Clock + Payroll + QBO)
 // v2.3.1: Drivers tab for W2/1099 classification
-// v2.4: Gmail Sync — auto-import NuVizz + Uline reports from inbox via OAuth.
-//       Shared ingestFiles() pipeline used by both manual upload and Gmail.
-// v2.4.1: Labor Reality Check on Command Center — actual W2 payroll + 1099
-//         contractor pay compared to cost-structure estimate, using Drivers
-//         classifications. Flags unclassified labor as risk.
+// v2.4: Gmail Sync — auto-import NuVizz + Uline reports from inbox via OAuth
+// v2.4.1: Labor Reality Check on Command Center (actual vs estimated)
+// v2.5: AuditIQ — Revenue recovery module. Renamed Reconciliation → Audit.
+//       Categorizes every billed-vs-paid discrepancy (short_paid, zero_pay,
+//       accessorial_ignored, overpaid, orphan). Aging buckets. Customer AP
+//       contacts. One-click dispute PDF generator. Dispute tracker.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.4.1";
+const APP_VERSION = "2.5.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -91,6 +92,64 @@ function driverKey(name) {
   return String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g,"_").replace(/^_+|_+$/g,"").slice(0, 140) || null;
 }
 
+// Customer name → Firestore-safe key (same slug style)
+function customerKey(name) {
+  return driverKey(name);
+}
+
+// ─── Audit Categorization ───────────────────────────────────
+// Categorize a billed-vs-paid comparison into one of the spec's buckets.
+function categorize(billed, paid, hasAccessorial, accessorialPaid, ageDays) {
+  if (billed <= 0) return "orphan";
+  const ratio = paid / billed;
+  if (ratio >= 0.99) return "paid_in_full";
+  if (ratio >= 0.5 && ratio < 0.98) return "short_paid";
+  if (paid <= 0 && ageDays >= 45) return "zero_pay";
+  if (paid <= 0) return "short_paid"; // too new to call zero-pay yet
+  if (ratio > 1.01) return "overpaid";
+  // Special case: base paid but accessorial ignored
+  if (hasAccessorial && accessorialPaid <= 0 && ratio >= 0.5) return "accessorial_ignored";
+  return "short_paid";
+}
+
+function ageBucket(ageDays) {
+  if (ageDays == null || ageDays < 0) return "unknown";
+  if (ageDays <= 30) return "0-30";
+  if (ageDays <= 60) return "31-60";
+  if (ageDays <= 90) return "61-90";
+  if (ageDays <= 180) return "91-180";
+  if (ageDays <= 365) return "181-365";
+  return "365+";
+}
+
+const AGE_BUCKETS = ["0-30","31-60","61-90","91-180","181-365","365+"];
+const CATEGORIES = ["paid_in_full","short_paid","accessorial_ignored","zero_pay","overpaid","orphan"];
+const CATEGORY_COLORS = {
+  paid_in_full: "#10b981",
+  short_paid: "#f59e0b",
+  accessorial_ignored: "#f97316",
+  zero_pay: "#ef4444",
+  overpaid: "#3b82f6",
+  orphan: "#94a3b8",
+  written_off: "#64748b",
+};
+const CATEGORY_LABELS = {
+  paid_in_full: "Paid in Full",
+  short_paid: "Short-paid",
+  accessorial_ignored: "Accessorial Ignored",
+  zero_pay: "Zero-pay",
+  overpaid: "Overpaid",
+  orphan: "Orphan",
+};
+
+function daysBetween(fromISO, toISO) {
+  if (!fromISO) return null;
+  const a = new Date(fromISO + "T00:00:00");
+  const b = new Date((toISO || new Date().toISOString().slice(0,10)) + "T00:00:00");
+  if (isNaN(a) || isNaN(b)) return null;
+  return Math.floor((b - a) / (1000*60*60*24));
+}
+
 // ─── Shared Ingest Pipeline ─────────────────────────────────
 // Takes an array of File objects + a status callback, returns a summary.
 // Used by both the manual upload flow and the Gmail auto-import flow.
@@ -166,19 +225,50 @@ async function ingestFiles(files, onStatus = () => {}) {
   const rollups = buildWeeklyRollups(allStops);
   const reconByWeek = {};
   const unpaidStops = [];
+  const auditItems = [];  // v2.5 AuditIQ: all stops with any variance, categorized
+  const today = new Date().toISOString().slice(0,10);
   for (const s of allStops) {
     const paid = paymentByPro[s.pro] || 0;
     if (!reconByWeek[s.week_ending]) reconByWeek[s.week_ending] = { week_ending: s.week_ending, month: s.month, billed:0, paid_matched:0, unpaid_count:0, unpaid_amount:0 };
     reconByWeek[s.week_ending].billed += s.new_cost || 0;
     reconByWeek[s.week_ending].paid_matched += paid;
-    if (paid === 0 && (s.new_cost||0) > 0) {
+    const billed = s.new_cost || 0;
+    const variance = billed - paid;
+    const variancePct = billed > 0 ? (variance / billed * 100) : null;
+    if (paid === 0 && billed > 0) {
       reconByWeek[s.week_ending].unpaid_count++;
-      reconByWeek[s.week_ending].unpaid_amount += s.new_cost;
+      reconByWeek[s.week_ending].unpaid_amount += billed;
       if (unpaidStops.length < 2000) {
         unpaidStops.push({
           pro: s.pro, customer: s.customer, city: s.city, state: s.state, zip: s.zip,
-          pu_date: s.pu_date, week_ending: s.week_ending, month: s.month, billed: s.new_cost,
+          pu_date: s.pu_date, week_ending: s.week_ending, month: s.month, billed: billed,
           code: s.code, weight: s.weight, order: s.order
+        });
+      }
+    }
+    // v2.5 AuditIQ — track any stop with variance > $1 (both unpaid AND short-paid)
+    if (billed > 0 && variance > 1) {
+      const ageDays = daysBetween(s.pu_date, today);
+      const hasAcc = !!s.extra_cost && s.extra_cost > 0;
+      const category = categorize(billed, paid, hasAcc, 0 /* unknown acc-paid split */, ageDays);
+      if (auditItems.length < 3000) {
+        auditItems.push({
+          pro: s.pro,
+          customer: s.customer || "Unknown",
+          customer_key: customerKey(s.customer),
+          city: s.city, state: s.state, zip: s.zip,
+          pu_date: s.pu_date, week_ending: s.week_ending, month: s.month,
+          billed, paid, variance,
+          variance_pct: variancePct,
+          accessorial_amount: s.extra_cost || 0,
+          base_cost: s.cost || 0,
+          code: s.code, weight: s.weight, order: s.order,
+          age_days: ageDays,
+          age_bucket: ageBucket(ageDays),
+          category,
+          dispute_status: "new", // new | queued | sent | won | lost | partial | written_off
+          notes: [],
+          updated_at: new Date().toISOString(),
         });
       }
     }
@@ -186,12 +276,40 @@ async function ingestFiles(files, onStatus = () => {}) {
   for (const r of Object.values(reconByWeek)) r.collection_rate = r.billed > 0 ? (r.paid_matched / r.billed * 100) : null;
 
   onStatus({ phase:"save", message:"Saving to Firebase..." });
-  let savedWeeks = 0, savedRecon = 0;
+  let savedWeeks = 0, savedRecon = 0, savedAudit = 0;
   for (const r of rollups) { if (await FS.saveWeeklyRollup(r.week_ending, {...r, updated_at:new Date().toISOString()})) savedWeeks++; }
   for (const r of Object.values(reconByWeek)) { if (await FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()})) savedRecon++; }
   for (const f of ddisFileRecords) await FS.saveDDISFile(f.file_id, f);
   const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, 500);
   for (const s of topUnpaid) await FS.saveUnpaidStop(s.pro, s);
+  // v2.5 save audit_items, top 1500 by variance
+  const topAudit = auditItems.sort((a,b) => b.variance - a.variance).slice(0, 1500);
+  for (const a of topAudit) { if (await FS.saveAuditItem(a.pro, a)) savedAudit++; }
+  // v2.5 auto-seed customer_ap_contacts stubs for customers in audit
+  const uniqueCustomers = new Map();
+  for (const a of topAudit) {
+    if (a.customer_key && !uniqueCustomers.has(a.customer_key)) {
+      uniqueCustomers.set(a.customer_key, { customer: a.customer, total_owed: 0, item_count: 0 });
+    }
+    if (a.customer_key) {
+      const c = uniqueCustomers.get(a.customer_key);
+      c.total_owed += a.variance;
+      c.item_count++;
+    }
+  }
+  for (const [key, stats] of uniqueCustomers) {
+    await FS.saveAPContact(key, {
+      customer: stats.customer,
+      customer_key: key,
+      total_owed_cached: stats.total_owed,
+      item_count_cached: stats.item_count,
+      // Only set these if doc is new (merge preserves existing values)
+      billing_email: "",
+      ap_contact_name: "",
+      ap_contact_phone: "",
+      dispute_portal_url: "",
+    });
+  }
 
   // NuVizz
   let nvWeeksSaved = 0, nvStopsSaved = 0;
@@ -247,7 +365,7 @@ async function ingestFiles(files, onStatus = () => {}) {
   return {
     files_processed: files.length,
     counts: countsByKind,
-    uline: { stops: allStops.length, weeks_saved: savedWeeks, recon_saved: savedRecon, unpaid_saved: topUnpaid.length, payments: Object.keys(paymentByPro).length },
+    uline: { stops: allStops.length, weeks_saved: savedWeeks, recon_saved: savedRecon, unpaid_saved: topUnpaid.length, audit_saved: savedAudit, payments: Object.keys(paymentByPro).length },
     nuvizz: { stops: nuvizzStops.length, weeks_saved: nvWeeksSaved, stops_saved: nvStopsSaved },
     timeclock: { entries: timeClockEntries.length, weeks_saved: tcWeeksSaved },
     payroll: { entries: payrollEntries.length, weeks_saved: payWeeksSaved },
@@ -533,6 +651,17 @@ const FS = {
   // who aren't in the current Fleet Management roster.
   async getDriverClassifications() { if (!hasFirebase) return []; try { const s=await window.db.collection("driver_classifications").get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveDriverClassification(key, data) { if (!hasFirebase) return false; try { await window.db.collection("driver_classifications").doc(key).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
+
+  // ─── AuditIQ: audit_items, customer_ap_contacts, disputes ───
+  async saveAuditItem(id, data) { if (!hasFirebase) return false; try { await window.db.collection("audit_items").doc(String(id)).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async getAuditItems(limit=2000) { if (!hasFirebase) return []; try { const s=await window.db.collection("audit_items").orderBy("variance","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async deleteAuditItem(id) { if (!hasFirebase) return false; try { await window.db.collection("audit_items").doc(String(id)).delete(); return true; } catch(e) { return false; } },
+
+  async getAPContacts() { if (!hasFirebase) return []; try { const s=await window.db.collection("customer_ap_contacts").get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveAPContact(key, data) { if (!hasFirebase) return false; try { await window.db.collection("customer_ap_contacts").doc(key).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
+
+  async getDisputes() { if (!hasFirebase) return []; try { const s=await window.db.collection("disputes").orderBy("updated_at","desc").limit(500).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveDispute(id, data) { if (!hasFirebase) return false; try { await window.db.collection("disputes").doc(String(id)).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
 };
 
 // ─── File Type Detection ────────────────────────────────────
@@ -2125,169 +2254,734 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
   </div>;
 }
 
-// ═══ RECONCILIATION (separate from revenue) ═══════════════════
-function Reconciliation({ reconWeekly, weeklyRollups }) {
-  const [unpaid, setUnpaid] = useState([]);
+// ═══ AUDIT — Revenue Recovery (AuditIQ) ════════════════════
+// Consolidated billed-vs-paid tracking + discrepancy workflow.
+// Replaces the old simple Reconciliation tab with:
+//   - Hero dashboard (Outstanding, Recovered, Win Rate, Avg Days)
+//   - Aging buckets
+//   - Top customers by discrepancy
+//   - Full audit item list with category/age/dispute-status filters
+//   - Detail view with one-click Dispute PDF generation
+//   - Customer AP contacts editor
+//   - Dispute tracker
+function Audit({ reconWeekly, weeklyRollups }) {
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState("weekly");
-  const [searchFilter, setSearchFilter] = useState("");
+  const [auditItems, setAuditItems] = useState([]);
+  const [apContacts, setApContacts] = useState({}); // key -> contact doc
+  const [disputes, setDisputes] = useState([]);
+  const [view, setView] = useState("dashboard"); // dashboard | items | contacts | disputes | weekly
+  const [detailItem, setDetailItem] = useState(null);
+  const [editingContact, setEditingContact] = useState(null);
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true);
-      const u = await FS.getUnpaidStops(500);
-      setUnpaid(u);
-      setLoading(false);
-    })();
+  // Filters for items view
+  const [filterCategory, setFilterCategory] = useState("all");
+  const [filterAge, setFilterAge] = useState("all");
+  const [filterStatus, setFilterStatus] = useState("all");
+  const [filterCustomer, setFilterCustomer] = useState("");
+  const [filterMinVar, setFilterMinVar] = useState(10);
+  const [sortBy, setSortBy] = useState("variance");
+  const [selectedIds, setSelectedIds] = useState({}); // pro -> true
+
+  // PDF generation state
+  const [generatingPdf, setGeneratingPdf] = useState(false);
+  const [pdfStatus, setPdfStatus] = useState("");
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    const [items, contacts, disp] = await Promise.all([
+      FS.getAuditItems(2000), FS.getAPContacts(), FS.getDisputes(),
+    ]);
+    setAuditItems(items);
+    const cMap = {};
+    for (const c of contacts) cMap[c.id] = c;
+    setApContacts(cMap);
+    setDisputes(disp);
+    setLoading(false);
   }, []);
 
-  // Only show reconciliation for weeks that HAVE any paid data
-  // This avoids false alarms on weeks with no DDIS yet
-  const reconWithPayments = reconWeekly.filter(r => r.paid_matched > 0);
-  const reconWeeks = reconWithPayments.sort((a,b) => a.week_ending.localeCompare(b.week_ending));
+  useEffect(() => { loadData(); }, [loadData]);
 
-  const totalBilled = reconWithPayments.reduce((s,r) => s + (r.billed||0), 0);
-  const totalPaid = reconWithPayments.reduce((s,r) => s + (r.paid_matched||0), 0);
-  const overallCollectionRate = totalBilled > 0 ? (totalPaid / totalBilled * 100) : 0;
-  const totalUnpaidAmount = reconWithPayments.reduce((s,r) => s + (r.unpaid_amount||0), 0);
-  const totalUnpaidCount = reconWithPayments.reduce((s,r) => s + (r.unpaid_count||0), 0);
+  // Recompute age_days on load (they were stored at ingest time and may be stale)
+  const itemsWithFreshAge = useMemo(() => {
+    const today = new Date().toISOString().slice(0,10);
+    return auditItems.map(i => {
+      const age = daysBetween(i.pu_date, today);
+      return { ...i, age_days: age, age_bucket: ageBucket(age) };
+    });
+  }, [auditItems]);
 
-  const reconStart = reconWeeks[0]?.week_ending;
-  const reconEnd = reconWeeks[reconWeeks.length-1]?.week_ending;
+  // Dashboard stats
+  const stats = useMemo(() => {
+    const active = itemsWithFreshAge.filter(i => i.dispute_status !== "written_off" && i.dispute_status !== "won");
+    const outstanding = active.reduce((s,i) => s + (i.variance||0), 0);
+    const outstandingCount = active.length;
+    const thisMonth = new Date().toISOString().slice(0,7);
+    const wonThisMonth = disputes.filter(d => d.outcome === "won" && (d.response_date||"").startsWith(thisMonth));
+    const recovered = wonThisMonth.reduce((s,d) => s + (d.amount_recovered||0), 0);
+    const allDisputed = disputes.filter(d => d.submitted_date);
+    const won = allDisputed.filter(d => d.outcome === "won" || d.outcome === "partial");
+    const winRate = allDisputed.length > 0 ? (won.length / allDisputed.length * 100) : null;
+    // Avg days to recover
+    const turnarounds = allDisputed
+      .filter(d => d.submitted_date && d.response_date && (d.outcome === "won" || d.outcome === "partial"))
+      .map(d => daysBetween(d.submitted_date.slice(0,10), d.response_date.slice(0,10)) || 0);
+    const avgTurnaround = turnarounds.length > 0 ? Math.round(turnarounds.reduce((s,t)=>s+t,0)/turnarounds.length) : null;
+    return { outstanding, outstandingCount, recovered, wonThisMonthCount: wonThisMonth.length, winRate, avgTurnaround };
+  }, [itemsWithFreshAge, disputes]);
 
-  // By customer
-  const byCustomer = {};
-  for (const u of unpaid) {
-    const c = u.customer || "Unknown";
-    if (!byCustomer[c]) byCustomer[c] = { customer:c, count:0, amount:0 };
-    byCustomer[c].count++;
-    byCustomer[c].amount += u.billed || 0;
-  }
-  const topUnpaidCustomers = Object.values(byCustomer).sort((a,b) => b.amount-a.amount).slice(0,15);
+  // Aging bucket breakdown (active only)
+  const agingBuckets = useMemo(() => {
+    const buckets = {};
+    for (const b of AGE_BUCKETS) buckets[b] = { bucket: b, count: 0, amount: 0 };
+    for (const i of itemsWithFreshAge) {
+      if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
+      const b = i.age_bucket || "unknown";
+      if (!buckets[b]) buckets[b] = { bucket: b, count: 0, amount: 0 };
+      buckets[b].count++;
+      buckets[b].amount += i.variance || 0;
+    }
+    return AGE_BUCKETS.map(b => buckets[b]).filter(b => b.count > 0);
+  }, [itemsWithFreshAge]);
 
-  const filteredUnpaid = unpaid.filter(u => {
-    if (!searchFilter) return true;
-    const q = searchFilter.toLowerCase();
-    return (u.customer||"").toLowerCase().includes(q) || (u.city||"").toLowerCase().includes(q) || (u.pro||"").toLowerCase().includes(q);
-  });
+  // Top customers by outstanding
+  const topCustomers = useMemo(() => {
+    const byC = {};
+    for (const i of itemsWithFreshAge) {
+      if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
+      const c = i.customer || "Unknown";
+      if (!byC[c]) byC[c] = { customer: c, customer_key: i.customer_key, count: 0, amount: 0, oldest_age: 0 };
+      byC[c].count++;
+      byC[c].amount += i.variance || 0;
+      if ((i.age_days||0) > byC[c].oldest_age) byC[c].oldest_age = i.age_days || 0;
+    }
+    return Object.values(byC).sort((a,b) => b.amount - a.amount).slice(0, 15);
+  }, [itemsWithFreshAge]);
+
+  // Category breakdown
+  const byCategory = useMemo(() => {
+    const out = {};
+    for (const c of CATEGORIES) out[c] = { category: c, count: 0, amount: 0 };
+    for (const i of itemsWithFreshAge) {
+      if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
+      const c = i.category || "short_paid";
+      if (!out[c]) out[c] = { category: c, count: 0, amount: 0 };
+      out[c].count++;
+      out[c].amount += i.variance || 0;
+    }
+    return CATEGORIES.map(c => out[c]).filter(x => x.count > 0);
+  }, [itemsWithFreshAge]);
+
+  // Filtered item list
+  const filteredItems = useMemo(() => {
+    let arr = itemsWithFreshAge;
+    if (filterCategory !== "all") arr = arr.filter(i => i.category === filterCategory);
+    if (filterAge !== "all") arr = arr.filter(i => i.age_bucket === filterAge);
+    if (filterStatus !== "all") arr = arr.filter(i => (i.dispute_status || "new") === filterStatus);
+    if (filterCustomer.trim()) {
+      const q = filterCustomer.toLowerCase();
+      arr = arr.filter(i => (i.customer||"").toLowerCase().includes(q) || (i.pro||"").toLowerCase().includes(q));
+    }
+    arr = arr.filter(i => (i.variance||0) >= filterMinVar);
+    arr = arr.slice().sort((a,b) => {
+      if (sortBy === "variance") return (b.variance||0) - (a.variance||0);
+      if (sortBy === "age") return (b.age_days||0) - (a.age_days||0);
+      if (sortBy === "date") return (b.pu_date||"").localeCompare(a.pu_date||"");
+      if (sortBy === "customer") return (a.customer||"").localeCompare(b.customer||"");
+      return 0;
+    });
+    return arr;
+  }, [itemsWithFreshAge, filterCategory, filterAge, filterStatus, filterCustomer, filterMinVar, sortBy]);
+
+  // Selected items for bulk actions
+  const selectedItems = useMemo(() =>
+    filteredItems.filter(i => selectedIds[i.pro]),
+  [filteredItems, selectedIds]);
+
+  const toggleSelect = (pro) => setSelectedIds(prev => ({...prev, [pro]: !prev[pro]}));
+  const selectAll = () => {
+    const map = {};
+    for (const i of filteredItems) map[i.pro] = true;
+    setSelectedIds(map);
+  };
+  const clearSelect = () => setSelectedIds({});
+
+  const updateItemStatus = async (pro, newStatus, extras = {}) => {
+    const item = auditItems.find(i => i.pro === pro);
+    if (!item) return;
+    const updated = { ...item, dispute_status: newStatus, ...extras, updated_at: new Date().toISOString() };
+    await FS.saveAuditItem(pro, updated);
+    setAuditItems(prev => prev.map(i => i.pro === pro ? updated : i));
+  };
+
+  // Generate dispute PDF for selected or single item
+  const generateDisputePdf = async (itemsArr, customerName) => {
+    if (itemsArr.length === 0) return;
+    setGeneratingPdf(true);
+    setPdfStatus("Generating PDF...");
+    try {
+      const firstKey = itemsArr[0].customer_key || customerKey(itemsArr[0].customer);
+      const contact = apContacts[firstKey] || {};
+      const resp = await fetch("/.netlify/functions/marginiq-dispute-pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: itemsArr,
+          customer: customerName || itemsArr[0].customer,
+          ap_contact: contact,
+        }),
+      });
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+
+      // Download the PDF
+      const link = document.createElement("a");
+      link.href = "data:application/pdf;base64," + data.data;
+      link.download = data.filename;
+      link.click();
+
+      setPdfStatus(`✓ Generated ${data.filename} (${itemsArr.length} items, $${data.total_claim.toFixed(2)} claim)`);
+
+      // Create a dispute record and update item statuses
+      const disputeId = `D_${Date.now()}`;
+      await FS.saveDispute(disputeId, {
+        dispute_id: disputeId,
+        customer: customerName || itemsArr[0].customer,
+        customer_key: firstKey,
+        item_count: itemsArr.length,
+        item_pros: itemsArr.map(i => i.pro),
+        amount_claimed: data.total_claim,
+        amount_recovered: 0,
+        submitted_date: null, // set when user confirms sent
+        submitted_to: contact.billing_email || null,
+        outcome: null,
+        response_date: null,
+        package_generated_at: new Date().toISOString(),
+        notes: [],
+      });
+      // Mark items as queued
+      for (const item of itemsArr) {
+        await updateItemStatus(item.pro, "queued", { dispute_id: disputeId });
+      }
+      setDisputes(prev => [{
+        id: disputeId, dispute_id: disputeId, customer: customerName || itemsArr[0].customer,
+        item_count: itemsArr.length, amount_claimed: data.total_claim, outcome: null,
+        package_generated_at: new Date().toISOString(),
+      }, ...prev]);
+
+      clearSelect();
+    } catch(e) {
+      setPdfStatus(`✗ Failed: ${e.message}`);
+    }
+    setGeneratingPdf(false);
+  };
+
+  const saveContact = async (key, data) => {
+    await FS.saveAPContact(key, data);
+    setApContacts(prev => ({...prev, [key]: {...prev[key], ...data, id: key}}));
+    setEditingContact(null);
+  };
+
+  if (loading) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading audit data...</div>;
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-    <SectionTitle icon="🧾" text="Reconciliation (Going Forward)" right={reconStart?<span style={{fontSize:10,color:T.textDim}}>Window: {weekLabel(reconStart)} → {weekLabel(reconEnd)}</span>:null} />
+    <SectionTitle icon="🧾" text="Audit — Revenue Recovery" right={
+      <div style={{fontSize:10,color:T.textDim}}>{itemsWithFreshAge.length} items tracked</div>
+    } />
 
-    {reconWithPayments.length === 0 ? (
-      <div style={cardStyle}>
-        <EmptyState icon="🧾" title="No Reconciliation Data Yet" sub="Upload DDIS payment files (CSV) in Data Ingest to begin monitoring collections going forward." />
-        <div style={{fontSize:12,color:T.textMuted,textAlign:"center",marginTop:12,padding:"0 20px"}}>
-          Reconciliation tracks which Uline bills actually got paid. This data only exists for the window where you have DDIS files — it's NOT used for total revenue calculations.
-        </div>
-      </div>
-    ) : (
+    {pdfStatus && (
+      <div style={{...cardStyle, background: pdfStatus.startsWith("✓") ? T.greenBg : pdfStatus.startsWith("✗") ? T.redBg : T.yellowBg,
+        borderColor: pdfStatus.startsWith("✓") ? T.green : pdfStatus.startsWith("✗") ? T.red : T.yellow,
+        fontSize:12, fontWeight:600}}>{pdfStatus}</div>
+    )}
+
+    {/* View tabs */}
+    <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+      {[
+        ["dashboard","📊 Dashboard"],
+        ["items","📋 Items"],
+        ["contacts","📇 AP Contacts"],
+        ["disputes","📨 Disputes"],
+        ["weekly","📅 By Week"],
+      ].map(([id,l])=>
+        <TabButton key={id} active={view===id} label={l} onClick={()=>setView(id)} />
+      )}
+    </div>
+
+    {/* ─── DASHBOARD ─── */}
+    {view === "dashboard" && (
       <>
-        <div style={{...cardStyle, background:T.blueBg, borderColor:T.blue, marginBottom:12}}>
-          <div style={{fontSize:12,color:T.blueText,lineHeight:1.5}}>
-            <strong>ℹ️ About this tab:</strong> Reconciliation only covers weeks where DDIS payment files have been uploaded. It's a monitoring tool for going forward — total revenue and margins in the other tabs use the full billed amount (source of truth), not paid amount.
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:"10px",marginBottom:"16px"}}>
+          <KPI icon="💰" label="Outstanding Recovery" value={fmtK(stats.outstanding)} sub={`${stats.outstandingCount} items`} subColor={T.red} />
+          <KPI icon="🏆" label="Recovered This Month" value={fmtK(stats.recovered)} sub={`${stats.wonThisMonthCount} disputes won`} subColor={T.green} />
+          <KPI icon="📈" label="Win Rate" value={stats.winRate==null?"—":fmtPct(stats.winRate)} sub="of submitted disputes" subColor={T.blue} />
+          <KPI icon="⏱" label="Avg Days to Recover" value={stats.avgTurnaround==null?"—":`${stats.avgTurnaround} days`} sub="submission → payment" />
+        </div>
+
+        {itemsWithFreshAge.length === 0 ? (
+          <div style={cardStyle}>
+            <EmptyState icon="🧾" title="No Audit Data Yet" sub="Upload Uline DDIS payment files in Data Ingest. Every billed-vs-paid discrepancy will appear here for you to chase." />
+          </div>
+        ) : (
+          <>
+            {/* Aging buckets */}
+            <div style={{...cardStyle, marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Aging — Outstanding by Age</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {agingBuckets.map(b => {
+                  const color = b.bucket === "0-30" ? T.green : b.bucket === "31-60" ? T.blue : b.bucket === "61-90" ? T.yellow : T.red;
+                  return (
+                    <button key={b.bucket} onClick={()=>{setFilterAge(b.bucket); setView("items");}}
+                      style={{flex:"1 1 140px",padding:"10px 12px",borderRadius:10,border:`1px solid ${color}`,background:T.bgWhite,cursor:"pointer",textAlign:"left"}}>
+                      <div style={{fontSize:10,color:T.textMuted,fontWeight:600}}>{b.bucket} days</div>
+                      <div style={{fontSize:16,fontWeight:700,color,marginTop:2}}>{fmtK(b.amount)}</div>
+                      <div style={{fontSize:10,color:T.textDim}}>{b.count} items</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Category breakdown */}
+            <div style={{...cardStyle, marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>By Category</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {byCategory.map(c => (
+                  <button key={c.category} onClick={()=>{setFilterCategory(c.category); setView("items");}}
+                    style={{flex:"1 1 140px",padding:"10px 12px",borderRadius:10,border:`1px solid ${CATEGORY_COLORS[c.category]}`,background:T.bgWhite,cursor:"pointer",textAlign:"left"}}>
+                    <div style={{fontSize:10,color:T.textMuted,fontWeight:600}}>{CATEGORY_LABELS[c.category]}</div>
+                    <div style={{fontSize:16,fontWeight:700,color:CATEGORY_COLORS[c.category],marginTop:2}}>{fmtK(c.amount)}</div>
+                    <div style={{fontSize:10,color:T.textDim}}>{c.count} items</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Top customers */}
+            <div style={cardStyle}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Top Customers by Outstanding $</div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                  <thead>
+                    <tr>{["Customer","Items","Outstanding","Oldest Age",""].map(h =>
+                      <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topCustomers.map(c => (
+                      <tr key={c.customer}>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{c.count}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:700}}>{fmt(c.amount)}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:c.oldest_age>180?T.red:T.textMuted}}>{c.oldest_age} days</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>
+                          <button onClick={()=>{setFilterCustomer(c.customer); setView("items");}}
+                            style={{padding:"4px 10px",fontSize:10,fontWeight:600,borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,cursor:"pointer"}}>View →</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
+        )}
+      </>
+    )}
+
+    {/* ─── ITEMS ─── */}
+    {view === "items" && (
+      <>
+        {/* Filters */}
+        <div style={{...cardStyle, padding:"10px 12px", marginBottom:8}}>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+            <input type="text" value={filterCustomer} onChange={e=>setFilterCustomer(e.target.value)}
+              placeholder="Search PRO or customer..." style={{...inputStyle,flex:"1 1 160px",fontSize:12}} />
+            <select value={filterCategory} onChange={e=>setFilterCategory(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
+              <option value="all">All categories</option>
+              {CATEGORIES.map(c => <option key={c} value={c}>{CATEGORY_LABELS[c]}</option>)}
+            </select>
+            <select value={filterAge} onChange={e=>setFilterAge(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
+              <option value="all">All ages</option>
+              {AGE_BUCKETS.map(a => <option key={a} value={a}>{a} days</option>)}
+            </select>
+            <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
+              <option value="all">All statuses</option>
+              {["new","queued","sent","won","lost","partial","written_off"].map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+            <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
+              <option value="variance">Sort: $ owed</option>
+              <option value="age">Sort: age</option>
+              <option value="date">Sort: date</option>
+              <option value="customer">Sort: customer</option>
+            </select>
+          </div>
+          <div style={{fontSize:10,color:T.textMuted,marginTop:6}}>
+            Showing {filteredItems.length} items • Min variance ${filterMinVar}
+            {Object.keys(selectedIds).filter(k=>selectedIds[k]).length > 0 && ` • ${selectedItems.length} selected`}
           </div>
         </div>
 
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
-          <KPI label="Collection Rate" value={fmtPct(overallCollectionRate)} subColor={overallCollectionRate>=95?T.green:overallCollectionRate>=85?T.yellow:T.red} sub={`${fmtK(totalPaid)} / ${fmtK(totalBilled)}`} />
-          <KPI label="Total Leakage" value={fmt(totalBilled-totalPaid)} subColor={T.red} sub={`${reconWeeks.length} weeks tracked`} />
-          <KPI label="Unpaid Stops" value={fmtNum(totalUnpaidCount)} subColor={T.red} sub={`${fmt(totalUnpaidAmount)} outstanding`} />
-          <KPI label="Avg Weekly Leak" value={fmt(reconWeeks.length>0?(totalBilled-totalPaid)/reconWeeks.length:0)} subColor={T.red} />
-        </div>
+        {/* Bulk actions */}
+        {selectedItems.length > 0 && (
+          <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand, padding:"10px 12px", marginBottom:8}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+              <div style={{fontSize:12,fontWeight:600,color:T.brand}}>
+                {selectedItems.length} selected • {fmtK(selectedItems.reduce((s,i)=>s+i.variance,0))} total
+              </div>
+              <div style={{display:"flex",gap:6}}>
+                <button onClick={() => {
+                  // Group by customer, one PDF per customer
+                  const byCust = {};
+                  for (const i of selectedItems) {
+                    const k = i.customer || "Unknown";
+                    if (!byCust[k]) byCust[k] = [];
+                    byCust[k].push(i);
+                  }
+                  const customers = Object.entries(byCust);
+                  if (customers.length > 1 && !confirm(`Generate ${customers.length} separate PDFs (one per customer)?`)) return;
+                  (async () => {
+                    for (const [cust, arr] of customers) await generateDisputePdf(arr, cust);
+                  })();
+                }} disabled={generatingPdf}
+                  style={{padding:"6px 12px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${T.brand}`,background:generatingPdf?T.bgSurface:T.brand,color:generatingPdf?T.text:"#fff",cursor:generatingPdf?"wait":"pointer"}}>
+                  {generatingPdf ? "Generating..." : "📄 Generate Dispute PDF"}
+                </button>
+                <button onClick={clearSelect} style={{padding:"6px 10px",fontSize:11,borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,cursor:"pointer"}}>Clear</button>
+              </div>
+            </div>
+          </div>
+        )}
 
-        <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
-          {[["weekly","📅 By Week"],["customers","🏢 By Customer"],["unpaid","📋 Unpaid Queue"]].map(([id,l])=>
-            <TabButton key={id} active={view===id} label={l} onClick={()=>setView(id)} />
+        {/* Items table */}
+        <div style={{...cardStyle, padding:0, overflow:"hidden"}}>
+          <div style={{maxHeight:600,overflowY:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead>
+                <tr style={{background:T.bgSurface,position:"sticky",top:0,zIndex:1}}>
+                  <th style={{padding:"6px 8px",borderBottom:`1px solid ${T.border}`,textAlign:"center",width:30}}>
+                    <input type="checkbox" checked={filteredItems.length > 0 && filteredItems.every(i => selectedIds[i.pro])}
+                      onChange={e => e.target.checked ? selectAll() : clearSelect()} />
+                  </th>
+                  {["PRO","Customer","Billed","Paid","Variance","Age","Category","Status"].map(h =>
+                    <th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:9,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredItems.slice(0, 500).map(i => {
+                  const catColor = CATEGORY_COLORS[i.category] || T.textMuted;
+                  const statusColor = i.dispute_status === "won" ? T.green :
+                                      i.dispute_status === "sent" ? T.blue :
+                                      i.dispute_status === "queued" ? T.purple :
+                                      i.dispute_status === "written_off" ? T.textDim : T.textMuted;
+                  return (
+                    <tr key={i.pro} onClick={() => setDetailItem(i)} style={{cursor:"pointer"}}>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,textAlign:"center"}} onClick={e=>e.stopPropagation()}>
+                        <input type="checkbox" checked={!!selectedIds[i.pro]} onChange={() => toggleSelect(i.pro)} />
+                      </td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontWeight:600}}>{i.pro}</td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:500}}>{i.customer || "—"}</td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(i.billed)}</td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted}}>{fmt(i.paid||0)}</td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:700}}>{fmt(i.variance)}</td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:(i.age_days||0)>180?T.red:T.textMuted}}>{i.age_days==null?"—":i.age_days+"d"}</td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>
+                        <span style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:catColor+"22",color:catColor}}>{CATEGORY_LABELS[i.category]||i.category}</span>
+                      </td>
+                      <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontSize:10,color:statusColor,fontWeight:600,textTransform:"uppercase"}}>{i.dispute_status || "new"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {filteredItems.length === 0 && (
+            <div style={{padding:"24px",textAlign:"center",color:T.textMuted,fontSize:12}}>No items match these filters.</div>
+          )}
+          {filteredItems.length > 500 && (
+            <div style={{padding:"10px",textAlign:"center",fontSize:10,color:T.textMuted,background:T.bgSurface}}>Showing top 500 of {filteredItems.length} — narrow filters to see more.</div>
           )}
         </div>
+      </>
+    )}
 
-        {view === "weekly" && (
+    {/* ─── AP CONTACTS ─── */}
+    {view === "contacts" && (
+      <>
+        <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand, marginBottom:12}}>
+          <div style={{fontSize:12,color:T.text,lineHeight:1.5}}>
+            Stub contacts are auto-created for every customer with outstanding items. Fill in the billing email + AP contact name so dispute PDFs have a proper "To:" address.
+          </div>
+        </div>
+        {Object.values(apContacts).length === 0 ? (
           <div style={cardStyle}>
-            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Billed vs Paid by Week</div>
-            <LineTrend data={reconWeeks} xKey="week_ending" yKey="billed" y2Key="paid_matched" label="Billed" y2Label="Paid" height={240} />
-            <div style={{marginTop:16,overflowX:"auto",maxHeight:500}}>
+            <EmptyState icon="📇" title="No Customer Contacts Yet" sub="Upload Uline DDIS files to auto-seed customer contacts from the outstanding queue." />
+          </div>
+        ) : (
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:10}}>
+            {Object.values(apContacts).sort((a,b) => (b.total_owed_cached||0) - (a.total_owed_cached||0)).slice(0, 100).map(c => (
+              <div key={c.id} style={cardStyle}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:13,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis"}}>{c.customer}</div>
+                    <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>
+                      {c.item_count_cached||0} items • {fmtK(c.total_owed_cached||0)} owed
+                    </div>
+                  </div>
+                  <button onClick={()=>setEditingContact(c.id)}
+                    style={{padding:"4px 10px",fontSize:10,borderRadius:6,border:`1px solid ${T.brand}`,background:T.bgWhite,color:T.brand,cursor:"pointer",fontWeight:600}}>
+                    Edit
+                  </button>
+                </div>
+                <div style={{marginTop:10,fontSize:11,color:T.textMuted,lineHeight:1.6}}>
+                  <div><strong>Email:</strong> {c.billing_email || <em style={{color:T.redText}}>not set</em>}</div>
+                  <div><strong>AP Contact:</strong> {c.ap_contact_name || <em style={{color:T.textDim}}>—</em>}</div>
+                  <div><strong>Phone:</strong> {c.ap_contact_phone || <em style={{color:T.textDim}}>—</em>}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {editingContact && apContacts[editingContact] && (
+          <ContactEditor contact={apContacts[editingContact]} onSave={(data) => saveContact(editingContact, data)} onCancel={() => setEditingContact(null)} />
+        )}
+      </>
+    )}
+
+    {/* ─── DISPUTES ─── */}
+    {view === "disputes" && (
+      <>
+        {disputes.length === 0 ? (
+          <div style={cardStyle}>
+            <EmptyState icon="📨" title="No Disputes Yet" sub="Select items in the Items tab and click 'Generate Dispute PDF' to create your first dispute package." />
+          </div>
+        ) : (
+          <div style={{...cardStyle, padding:0}}>
+            <div style={{overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr>{["Week Ending","Billed","Paid","Gap","Collect %","Unpaid #","Unpaid $"].map(h=>
-                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>
-                )}</tr></thead>
+                <thead>
+                  <tr style={{background:T.bgSurface}}>
+                    {["Customer","Items","Claimed","Recovered","Submitted","Outcome","Actions"].map(h =>
+                      <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                  </tr>
+                </thead>
                 <tbody>
-                  {reconWeeks.slice().reverse().map((r,i) => {
-                    const cr = r.collection_rate;
-                    const crColor = cr==null?T.textDim : cr>=95?T.green : cr>=85?T.yellow : T.red;
-                    const gap = (r.paid_matched||0) - (r.billed||0);
-                    return <tr key={i}>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(r.week_ending)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.green}}>{fmt(r.billed)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(r.paid_matched)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:gap<0?T.red:T.green}}>{fmt(gap)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{cr!=null?<Badge text={fmtPct(cr)} color={crColor} bg={crColor===T.green?T.greenBg:crColor===T.yellow?T.yellowBg:T.redBg} />:"—"}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{r.unpaid_count||0}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{r.unpaid_amount?fmt(r.unpaid_amount):"—"}</td>
-                    </tr>;
+                  {disputes.map(d => {
+                    const outcomeColor = d.outcome === "won" ? T.green : d.outcome === "lost" ? T.red : d.outcome === "partial" ? T.yellow : T.textMuted;
+                    return (
+                      <tr key={d.id}>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{d.customer}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{d.item_count}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.brand,fontWeight:700}}>{fmt(d.amount_claimed||0)}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.green,fontWeight:600}}>{d.amount_recovered?fmt(d.amount_recovered):"—"}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:10}}>{d.submitted_date ? new Date(d.submitted_date).toLocaleDateString() : <em style={{color:T.textDim}}>not sent</em>}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:10,fontWeight:700,color:outcomeColor,textTransform:"uppercase"}}>{d.outcome || "pending"}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>
+                          <DisputeActions dispute={d} onUpdate={async (updates) => {
+                            const merged = {...d, ...updates};
+                            await FS.saveDispute(d.id, merged);
+                            setDisputes(prev => prev.map(x => x.id === d.id ? merged : x));
+                            // If marked won/lost/partial, update the items too
+                            if (updates.outcome && d.item_pros) {
+                              for (const pro of d.item_pros) {
+                                await updateItemStatus(pro, updates.outcome);
+                              }
+                            }
+                          }} />
+                        </td>
+                      </tr>
+                    );
                   })}
                 </tbody>
               </table>
             </div>
           </div>
         )}
-
-        {view === "customers" && (
-          <div style={cardStyle}>
-            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Top Customers With Unpaid Stops</div>
-            <BarChart data={topUnpaidCustomers} labelKey="customer" valueKey="amount" color={T.red} maxBars={15} />
-            <div style={{marginTop:16,overflowX:"auto"}}>
-              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr>{["Customer","Unpaid Stops","Total Unpaid","Avg/Stop"].map(h=>
-                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
-                )}</tr></thead>
-                <tbody>
-                  {topUnpaidCustomers.map((c,i) => (
-                    <tr key={i}>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{c.count}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:700}}>{fmt(c.amount)}</td>
-                      <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(c.amount/c.count)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {view === "unpaid" && (
-          <div style={cardStyle}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
-              <div style={{fontSize:13,fontWeight:700}}>Unpaid Queue ({filteredUnpaid.length})</div>
-              <input type="text" placeholder="Search PRO, customer, city..." value={searchFilter} onChange={e=>setSearchFilter(e.target.value)} style={{...inputStyle,maxWidth:260,fontSize:12}} />
-            </div>
-            {loading ? <EmptyState icon="⏳" title="Loading..." sub="" /> : (
-              <div style={{maxHeight:500,overflowY:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-                  <thead><tr>{["PRO","Customer","City","Pickup","Billed","Code"].map(h=>
-                    <th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite,zIndex:1}}>{h}</th>
-                  )}</tr></thead>
-                  <tbody>
-                    {filteredUnpaid.slice(0,500).map((u,i) => (
-                      <tr key={i}>
-                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontWeight:600}}>{u.pro}</td>
-                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:500}}>{u.customer||"—"}</td>
-                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{u.city||"—"}</td>
-                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`}}>{u.pu_date||"—"}</td>
-                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:700}}>{fmt(u.billed)}</td>
-                        <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted,fontSize:10}}>{u.code||"—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        )}
       </>
     )}
+
+    {/* ─── WEEKLY (legacy reconciliation by-week view) ─── */}
+    {view === "weekly" && (
+      <WeeklyReconView reconWeekly={reconWeekly} />
+    )}
+
+    {/* Item detail modal */}
+    {detailItem && (
+      <AuditItemDetail item={detailItem} contact={apContacts[detailItem.customer_key]} onClose={()=>setDetailItem(null)}
+        onGeneratePdf={() => { generateDisputePdf([detailItem], detailItem.customer); setDetailItem(null); }}
+        onUpdateStatus={(s) => { updateItemStatus(detailItem.pro, s); setDetailItem({...detailItem, dispute_status: s}); }}
+      />
+    )}
   </div>;
+}
+
+// ─── Sub-components ─────────────────────────────────────────
+
+function WeeklyReconView({ reconWeekly }) {
+  const reconWithPayments = reconWeekly.filter(r => r.paid_matched > 0);
+  const reconWeeks = reconWithPayments.sort((a,b) => a.week_ending.localeCompare(b.week_ending));
+  const totalBilled = reconWithPayments.reduce((s,r) => s + (r.billed||0), 0);
+  const totalPaid = reconWithPayments.reduce((s,r) => s + (r.paid_matched||0), 0);
+  const overallCollectionRate = totalBilled > 0 ? (totalPaid / totalBilled * 100) : 0;
+
+  if (reconWithPayments.length === 0) {
+    return <div style={cardStyle}><EmptyState icon="📅" title="No Weekly Data Yet" sub="Upload DDIS files to see billed vs paid by week." /></div>;
+  }
+
+  return <div style={cardStyle}>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:12}}>
+      <KPI label="Collection Rate" value={fmtPct(overallCollectionRate)} subColor={overallCollectionRate>=95?T.green:overallCollectionRate>=85?T.yellow:T.red} />
+      <KPI label="Total Billed" value={fmtK(totalBilled)} subColor={T.green} />
+      <KPI label="Total Paid" value={fmtK(totalPaid)} subColor={T.blue} />
+      <KPI label="Gap" value={fmtK(totalBilled-totalPaid)} subColor={T.red} />
+    </div>
+    <LineTrend data={reconWeeks} xKey="week_ending" yKey="billed" y2Key="paid_matched" label="Billed" y2Label="Paid" height={200} />
+    <div style={{marginTop:16,overflowX:"auto",maxHeight:400}}>
+      <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+        <thead><tr>{["Week","Billed","Paid","Gap","Collect %","Unpaid $"].map(h=>
+          <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>
+        )}</tr></thead>
+        <tbody>
+          {reconWeeks.slice().reverse().map((r,i) => {
+            const cr = r.collection_rate;
+            const crColor = cr==null?T.textDim : cr>=95?T.green : cr>=85?T.yellow : T.red;
+            const gap = (r.paid_matched||0) - (r.billed||0);
+            return <tr key={i}>
+              <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(r.week_ending)}</td>
+              <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.green}}>{fmt(r.billed)}</td>
+              <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(r.paid_matched)}</td>
+              <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:gap<0?T.red:T.green}}>{fmt(gap)}</td>
+              <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{cr!=null?<Badge text={fmtPct(cr)} color={crColor} bg={crColor===T.green?T.greenBg:crColor===T.yellow?T.yellowBg:T.redBg} />:"—"}</td>
+              <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{r.unpaid_amount?fmt(r.unpaid_amount):"—"}</td>
+            </tr>;
+          })}
+        </tbody>
+      </table>
+    </div>
+  </div>;
+}
+
+function ContactEditor({ contact, onSave, onCancel }) {
+  const [form, setForm] = useState({
+    billing_email: contact.billing_email || "",
+    ap_contact_name: contact.ap_contact_name || "",
+    ap_contact_phone: contact.ap_contact_phone || "",
+    dispute_portal_url: contact.dispute_portal_url || "",
+    expected_response_sla_days: contact.expected_response_sla_days || 30,
+  });
+  const upd = (k, v) => setForm(p => ({...p, [k]: v}));
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}} onClick={onCancel}>
+      <div style={{background:T.bgWhite,borderRadius:12,padding:20,maxWidth:500,width:"100%",maxHeight:"90vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{fontSize:15,fontWeight:700,marginBottom:4}}>{contact.customer}</div>
+        <div style={{fontSize:11,color:T.textMuted,marginBottom:16}}>AP Contact Information</div>
+        {[
+          ["billing_email","Billing Email","email"],
+          ["ap_contact_name","AP Contact Name","text"],
+          ["ap_contact_phone","Phone","tel"],
+          ["dispute_portal_url","Dispute Portal URL","url"],
+          ["expected_response_sla_days","Expected Response SLA (days)","number"],
+        ].map(([k,l,type]) => (
+          <div key={k} style={{marginBottom:10}}>
+            <label style={{fontSize:11,color:T.textMuted,display:"block",marginBottom:3}}>{l}</label>
+            <input type={type} value={form[k]} onChange={e=>upd(k, type==="number"?parseInt(e.target.value)||0:e.target.value)} style={{...inputStyle,width:"100%"}} />
+          </div>
+        ))}
+        <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"flex-end"}}>
+          <button onClick={onCancel} style={{padding:"8px 16px",borderRadius:8,border:`1px solid ${T.border}`,background:T.bgWhite,cursor:"pointer",fontSize:12}}>Cancel</button>
+          <PrimaryBtn text="Save" onClick={()=>onSave(form)} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DisputeActions({ dispute, onUpdate }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!expanded) {
+    return <button onClick={()=>setExpanded(true)} style={{padding:"4px 10px",fontSize:10,borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,cursor:"pointer"}}>Update</button>;
+  }
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:4}}>
+      {!dispute.submitted_date && (
+        <button onClick={() => { onUpdate({ submitted_date: new Date().toISOString() }); setExpanded(false); }}
+          style={{padding:"3px 8px",fontSize:9,borderRadius:4,border:`1px solid ${T.blue}`,background:T.bgWhite,color:T.blue,cursor:"pointer",fontWeight:600}}>Mark Sent</button>
+      )}
+      <button onClick={() => {
+        const amt = parseFloat(prompt("Amount recovered ($):", dispute.amount_claimed) || "0");
+        if (amt > 0) onUpdate({ outcome: amt >= dispute.amount_claimed*0.99 ? "won" : "partial", amount_recovered: amt, response_date: new Date().toISOString() });
+        setExpanded(false);
+      }}
+        style={{padding:"3px 8px",fontSize:9,borderRadius:4,border:`1px solid ${T.green}`,background:T.bgWhite,color:T.green,cursor:"pointer",fontWeight:600}}>Won/Partial</button>
+      <button onClick={() => { onUpdate({ outcome: "lost", response_date: new Date().toISOString() }); setExpanded(false); }}
+        style={{padding:"3px 8px",fontSize:9,borderRadius:4,border:`1px solid ${T.red}`,background:T.bgWhite,color:T.red,cursor:"pointer",fontWeight:600}}>Lost</button>
+      <button onClick={()=>setExpanded(false)} style={{padding:"3px 8px",fontSize:9,borderRadius:4,border:`1px solid ${T.border}`,background:T.bgWhite,cursor:"pointer"}}>Cancel</button>
+    </div>
+  );
+}
+
+function AuditItemDetail({ item, contact, onClose, onGeneratePdf, onUpdateStatus }) {
+  const catColor = CATEGORY_COLORS[item.category] || T.textMuted;
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}} onClick={onClose}>
+      <div style={{background:T.bgWhite,borderRadius:12,padding:20,maxWidth:600,width:"100%",maxHeight:"90vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12,gap:8}}>
+          <div>
+            <div style={{fontSize:10,color:T.textMuted,fontFamily:"monospace"}}>PRO {item.pro}</div>
+            <div style={{fontSize:16,fontWeight:700,marginTop:2}}>{item.customer}</div>
+            <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>{item.city}{item.state?`, ${item.state}`:""}{item.zip?` ${item.zip}`:""}</div>
+          </div>
+          <span style={{fontSize:10,fontWeight:700,padding:"4px 10px",borderRadius:6,background:catColor+"22",color:catColor}}>{CATEGORY_LABELS[item.category]}</span>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          <div style={{padding:"10px",background:T.bgSurface,borderRadius:8}}>
+            <div style={{fontSize:10,color:T.textMuted}}>Billed</div>
+            <div style={{fontSize:18,fontWeight:700,color:T.brand}}>{fmt(item.billed)}</div>
+          </div>
+          <div style={{padding:"10px",background:T.bgSurface,borderRadius:8}}>
+            <div style={{fontSize:10,color:T.textMuted}}>Paid</div>
+            <div style={{fontSize:18,fontWeight:700}}>{fmt(item.paid||0)}</div>
+          </div>
+        </div>
+        <div style={{padding:"10px",background:T.redBg,borderRadius:8,marginBottom:12}}>
+          <div style={{fontSize:10,color:T.redText}}>Variance — Outstanding</div>
+          <div style={{fontSize:22,fontWeight:800,color:T.red}}>{fmt(item.variance)}</div>
+          <div style={{fontSize:10,color:T.redText,marginTop:2}}>{item.age_days!=null?`${item.age_days} days old`:""} • {item.variance_pct!=null?`${fmtPct(item.variance_pct)} variance`:""}</div>
+        </div>
+
+        <div style={{fontSize:11,color:T.textMuted,lineHeight:1.7,marginBottom:12}}>
+          <div><strong>Pickup:</strong> {item.pu_date || "—"}</div>
+          <div><strong>Week Ending:</strong> {item.week_ending || "—"}</div>
+          {item.weight > 0 && <div><strong>Weight:</strong> {fmtNum(item.weight)} lbs</div>}
+          {item.code && <div><strong>Accessorial Code:</strong> {item.code}</div>}
+          {item.order && <div><strong>Order #:</strong> {item.order}</div>}
+          {item.accessorial_amount > 0 && <div><strong>Accessorial Amount:</strong> {fmt(item.accessorial_amount)}</div>}
+          <div><strong>Current Status:</strong> <span style={{textTransform:"uppercase",fontWeight:600}}>{item.dispute_status||"new"}</span></div>
+        </div>
+
+        {contact && (
+          <div style={{padding:"10px",background:T.brandPale,borderRadius:8,marginBottom:12,fontSize:11,color:T.text}}>
+            <div style={{fontWeight:700,marginBottom:4}}>AP Contact on File</div>
+            <div>📧 {contact.billing_email || <em style={{color:T.redText}}>not set — set in AP Contacts tab before generating PDF</em>}</div>
+            {contact.ap_contact_name && <div>👤 {contact.ap_contact_name}</div>}
+            {contact.ap_contact_phone && <div>📞 {contact.ap_contact_phone}</div>}
+          </div>
+        )}
+
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:16}}>
+          <PrimaryBtn text="📄 Generate Dispute PDF" onClick={onGeneratePdf} />
+          {["new","queued","sent","written_off"].map(s => (
+            <button key={s} onClick={()=>onUpdateStatus(s)}
+              style={{padding:"6px 10px",fontSize:11,borderRadius:6,border:`1px solid ${item.dispute_status===s?T.brand:T.border}`,background:item.dispute_status===s?T.brand:T.bgWhite,color:item.dispute_status===s?"#fff":T.text,cursor:"pointer",fontWeight:600}}>
+              Mark {s}
+            </button>
+          ))}
+          <button onClick={onClose} style={{padding:"6px 10px",fontSize:11,borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,cursor:"pointer"}}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ═══ COSTS ═══════════════════════════════════════════════════
@@ -2646,7 +3340,7 @@ function MarginIQ() {
   const tabs = [
     { id:"command", icon:"🎯", label:"Command" },
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
-    { id:"recon", icon:"🧾", label:"Reconciliation" },
+    { id:"recon", icon:"🧾", label:"Audit" },
     { id:"drivers", icon:"👥", label:"Drivers" },
     { id:"completeness", icon:"✅", label:"Data Health" },
     { id:"ingest", icon:"📤", label:"Data Ingest" },
@@ -2679,7 +3373,7 @@ function MarginIQ() {
     </div>}
     {!loading && tab==="command" && <CommandCenter margins={margins} weeklyRollups={weeklyRollups} completeness={completeness} qboConnected={qboConnected} reconMeta={reconMeta} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
-    {!loading && tab==="recon" && <Reconciliation reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
+    {!loading && tab==="recon" && <Audit reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
     {!loading && tab==="drivers" && <Drivers />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} onRefresh={refreshData} />}
