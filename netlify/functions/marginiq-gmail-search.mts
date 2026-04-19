@@ -3,14 +3,17 @@ import type { Context, Config } from "@netlify/functions";
 // Vendor-specific Gmail search queries for MarginIQ data sources.
 // Each query returns emails likely to contain importable weekly reports.
 const VENDOR_QUERIES: Record<string, string> = {
-  // NuVizz: daily/weekly driver stops export
-  // Sender: nuvizzapps@nuvizzapps.com
-  // Attachment: Driver_stops_for_past_week_M_DD_YY_*.csv
+  // NuVizz: daily/weekly driver stops CSV export
   nuvizz: 'from:nuvizzapps@nuvizzapps.com has:attachment',
 
   // Uline: weekly billing files from various @uline.com senders
-  // Attachments: das*.xlsx (originals), *accessorial*.xlsx, master*.xlsx, ddis820*.csv/.xlsx
   uline: 'from:@uline.com has:attachment',
+
+  // FuelFox: fuel delivery invoices — summary PDF + service log PDF in one email
+  fuelfox: 'from:accounting@fuelfox.net has:attachment',
+
+  // Quick Fuel: fuel card statements from 4flyers.com
+  quickfuel: '(from:4flyers.com OR from:ebilling@4flyers.com OR "quick fuel" OR "4flyers") has:attachment',
 };
 
 export default async (req: Request, context: Context) => {
@@ -114,10 +117,10 @@ export default async (req: Request, context: Context) => {
         };
         if (full.payload) walkParts(full.payload);
 
-        // Filter to data attachments (xlsx, xls, csv)
+        // Filter to data attachments (xlsx, xls, csv, pdf)
         const dataAttachments = attachments.filter(a => {
           const fn = a.filename.toLowerCase();
-          return fn.endsWith(".xlsx") || fn.endsWith(".xls") || fn.endsWith(".csv");
+          return fn.endsWith(".xlsx") || fn.endsWith(".xls") || fn.endsWith(".csv") || fn.endsWith(".pdf");
         });
 
         const dateStr = getHeader("Date");

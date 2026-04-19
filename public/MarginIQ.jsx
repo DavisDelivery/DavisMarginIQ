@@ -10,11 +10,14 @@
 //       Per-truck fuel history. Quick Fuel parser scaffolded but pending sample.
 // v2.6.1: Rewrote FuelFox parser for new pdf-parse PDFParse class API.
 //         Delivery fee baked into true $/gal (all-in rate = $4.67/gal for DD404).
-// v2.6.2: Fix CJS import for pdf-parse on Netlify.
 // v2.6.3: Use createRequire for pdf-parse (ESM/CJS interop fix).
+// v2.7.0: Gmail Sync now supports FuelFox (pair-PDF auto-parse) and Quick Fuel
+//         (stub until sample invoice provided). Static import for pdf-parse so
+//         Netlify bundler traces dependencies correctly. One-click FuelFox
+//         "Import Pair" downloads both PDFs, parses, saves to Firestore.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.6.3";
+const APP_VERSION = "2.7.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -982,6 +985,112 @@ function GmailSync({ onRefresh }) {
     setImporting(prev => ({...prev, [refKey]: false}));
   };
 
+  // FuelFox emails contain a PAIR of PDFs (summary + service log). Import both
+  // together, send to marginiq-fuelfox-parse, save results to Firestore.
+  const importFuelFoxPair = async (email) => {
+    const pdfs = (email.attachments || []).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
+    if (pdfs.length < 2) {
+      setImportStatus(`✗ FuelFox email needs 2 PDFs (found ${pdfs.length})`);
+      return;
+    }
+    const refKey = `${email.emailId}:fuelfox_pair`;
+    setImporting(prev => ({...prev, [refKey]: true}));
+    setImportStatus(`Downloading ${pdfs.length} FuelFox PDFs...`);
+    try {
+      // Download both PDFs in parallel, keep as base64
+      const downloads = await Promise.all(pdfs.map(async (a) => {
+        const dlResp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messageId: email.emailId, attachmentId: a.attachmentId }),
+        });
+        const dlData = await dlResp.json();
+        if (dlData.error) throw new Error(dlData.error);
+        return { filename: a.filename, data_base64: dlData.data };
+      }));
+
+      setImportStatus(`Parsing with FuelFox engine (true $/gal = fuel+tax+delivery ÷ gallons)...`);
+      const parseResp = await fetch("/.netlify/functions/marginiq-fuelfox-parse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pdfs: downloads }),
+      });
+      const pr = await parseResp.json();
+      if (pr.error) throw new Error(pr.error);
+
+      // Save to Firestore (same shape as Fuel tab upload)
+      setImportStatus(`Saving ${pr.trucks.length} trucks to Firebase...`);
+      const mdy = pr.summary.invoice_date;
+      const isoInv = mdy ? (() => {
+        const m = String(mdy).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+        return m ? `${m[3]}-${m[1].padStart(2,"0")}-${m[2].padStart(2,"0")}` : null;
+      })() : null;
+      const weekKey = weekEndingFriday(isoInv);
+      const invId = `fuelfox_${pr.summary.invoice_number}`;
+
+      await FS.saveFuelInvoice(invId, {
+        invoice_id: invId,
+        vendor: "fuelfox",
+        invoice_number: pr.summary.invoice_number,
+        invoice_date: isoInv,
+        service_date: pr.log.service_date,
+        week_ending: weekKey,
+        total_gallons: pr.summary.total_gallons,
+        posted_rate: pr.summary.posted_rate,
+        fuel_cost: pr.summary.diesel_cost,
+        tax: pr.summary.diesel_tax,
+        delivery_fee: pr.summary.delivery_fee,
+        grand_total: pr.totals.grand_total,
+        true_rate: pr.totals.true_rate,
+        fuel_only_rate: pr.totals.fuel_only_rate,
+        truck_count: pr.totals.truck_count,
+        ambassador: pr.log.ambassador,
+        service_vehicle: pr.log.service_vehicle,
+        gmail_email_id: email.emailId,
+      });
+
+      for (const t of pr.trucks) {
+        const lineId = `fuelfox_${pr.summary.invoice_number}_${t.unit}`;
+        await FS.saveFuelByTruck(lineId, {
+          line_id: lineId,
+          vendor: "fuelfox",
+          invoice_number: pr.summary.invoice_number,
+          invoice_id: invId,
+          unit: t.unit,
+          gallons: t.gallons,
+          posted_rate: t.posted_rate,
+          posted_charge: t.posted_charge,
+          true_rate: t.true_rate,
+          true_cost: t.true_cost,
+          uplift: t.uplift,
+          service_date: pr.log.service_date,
+          week_ending: weekKey,
+        });
+      }
+
+      if (weekKey) {
+        const weekRollupId = `fuelfox_${weekKey}`;
+        await FS.saveFuelWeekly(weekRollupId, {
+          week_id: weekRollupId,
+          vendor: "fuelfox",
+          week_ending: weekKey,
+          gallons: pr.summary.total_gallons,
+          spend: pr.totals.grand_total,
+          true_rate: pr.totals.true_rate,
+          invoice_count: 1,
+        });
+      }
+
+      setImported(prev => ({...prev, [refKey]: { ok: true, trucks: pr.trucks.length, total: pr.totals.grand_total, rate: pr.totals.true_rate }}));
+      setImportStatus(`✓ FuelFox ${pr.summary.invoice_number}: ${pr.trucks.length} trucks, $${pr.totals.grand_total.toFixed(2)} @ $${pr.totals.true_rate.toFixed(4)}/gal`);
+      if (onRefresh) onRefresh();
+    } catch(e) {
+      setImported(prev => ({...prev, [refKey]: { error: e.message }}));
+      setImportStatus(`✗ FuelFox import failed: ${e.message}`);
+    }
+    setImporting(prev => ({...prev, [refKey]: false}));
+  };
+
   if (loadingConn) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading Gmail...</div>;
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
@@ -1024,8 +1133,10 @@ function GmailSync({ onRefresh }) {
 
         {/* Vendor Panels */}
         {[
-          { key:"nuvizz", icon:"🚚", label:"NuVizz", desc:"Weekly driver stops from nuvizzapps@nuvizzapps.com", color:T.blue },
-          { key:"uline", icon:"📦", label:"Uline", desc:"Weekly billing + DDIS from @uline.com senders", color:T.brand },
+          { key:"nuvizz", icon:"🚚", label:"NuVizz", desc:"Weekly driver stops from nuvizzapps@nuvizzapps.com", color:T.blue, mode:"per-attachment" },
+          { key:"uline", icon:"📦", label:"Uline", desc:"Weekly billing + DDIS from @uline.com senders", color:T.brand, mode:"per-attachment" },
+          { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
+          { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from 4flyers.com (parser pending sample)", color:"#2563eb", mode:"per-attachment", comingSoon:true },
         ].map(v => {
           const r = results[v.key];
           const isLoading = loading[v.key];
@@ -1033,7 +1144,10 @@ function GmailSync({ onRefresh }) {
             <div key={v.key} style={{...cardStyle, borderLeft:`3px solid ${v.color}`}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:8}}>
                 <div>
-                  <div style={{fontSize:14,fontWeight:700}}>{v.icon} {v.label}</div>
+                  <div style={{fontSize:14,fontWeight:700}}>
+                    {v.icon} {v.label}
+                    {v.comingSoon && <span style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:T.bgSurface,color:T.textDim,marginLeft:8}}>parser pending</span>}
+                  </div>
                   <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>{v.desc}</div>
                 </div>
                 <PrimaryBtn text={isLoading ? "Searching..." : "Search Last 60 Days"} onClick={() => searchVendor(v.key)} loading={isLoading} />
@@ -1047,39 +1161,81 @@ function GmailSync({ onRefresh }) {
 
               {r?.list && r.list.length > 0 && (
                 <div style={{marginTop:8}}>
-                  <div style={{fontSize:10,color:T.textDim,marginBottom:6}}>Found {r.list.length} email{r.list.length>1?"s":""}. Click Import on any attachment to download + parse.</div>
-                  {r.list.map((em, idx) => (
-                    <div key={em.emailId} style={{padding:"8px 10px",borderTop:idx>0?`1px solid ${T.borderLight}`:"none"}}>
-                      <div style={{fontSize:12,fontWeight:600}}>{em.emailSubject || "(no subject)"}</div>
-                      <div style={{fontSize:10,color:T.textMuted}}>{em.from} • {em.emailDate ? new Date(em.emailDate).toLocaleString() : "—"}</div>
-                      {em.attachments?.length > 0 ? (
-                        <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
-                          {em.attachments.map(a => {
-                            const refKey = `${em.emailId}:${a.attachmentId}`;
-                            const isImp = importing[refKey];
-                            const imp = imported[refKey];
-                            return (
-                              <div key={a.attachmentId} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"4px 8px",background:T.bgSurface,borderRadius:6}}>
-                                <div style={{flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>📎 {a.filename} <span style={{color:T.textDim}}>({Math.round(a.size/1024)} KB)</span></div>
-                                {imp?.error ? (
-                                  <span style={{fontSize:10,color:T.redText}}>✗ {imp.error.substring(0,40)}</span>
-                                ) : imp ? (
-                                  <span style={{fontSize:10,color:T.greenText,fontWeight:600}}>✓ Imported</span>
-                                ) : (
-                                  <button onClick={() => importAttachment(em, a)} disabled={isImp}
-                                    style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${v.color}`,background:isImp?T.bgSurface:v.color,color:isImp?T.text:"#fff",cursor:isImp?"wait":"pointer",opacity:isImp?0.6:1}}>
-                                    {isImp ? "..." : "→ Import"}
-                                  </button>
-                                )}
+                  <div style={{fontSize:10,color:T.textDim,marginBottom:6}}>
+                    Found {r.list.length} email{r.list.length>1?"s":""}.
+                    {v.mode === "pair" && " FuelFox sends a summary + log together — click Import Pair to process both at once."}
+                  </div>
+                  {r.list.map((em, idx) => {
+                    // For FuelFox: single "Import Pair" button per email
+                    if (v.mode === "pair") {
+                      const pdfs = (em.attachments || []).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
+                      const refKey = `${em.emailId}:fuelfox_pair`;
+                      const isImp = importing[refKey];
+                      const imp = imported[refKey];
+                      return (
+                        <div key={em.emailId} style={{padding:"8px 10px",borderTop:idx>0?`1px solid ${T.borderLight}`:"none"}}>
+                          <div style={{fontSize:12,fontWeight:600}}>{em.emailSubject || "(no subject)"}</div>
+                          <div style={{fontSize:10,color:T.textMuted}}>{em.from} • {em.emailDate ? new Date(em.emailDate).toLocaleString() : "—"}</div>
+                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:8,padding:"6px 10px",background:T.bgSurface,borderRadius:6}}>
+                            <div style={{flex:1,fontSize:11}}>
+                              📎 {pdfs.length} PDF{pdfs.length!==1?"s":""}{pdfs.length === 2 ? " (summary + log)" : pdfs.length < 2 ? " ⚠️ expected 2" : ""}
+                              <div style={{fontSize:9,color:T.textDim,marginTop:2}}>{pdfs.map(p => p.filename).join(" · ")}</div>
+                            </div>
+                            {imp?.error ? (
+                              <span style={{fontSize:10,color:T.redText,maxWidth:150}}>✗ {imp.error.substring(0,60)}</span>
+                            ) : imp?.ok ? (
+                              <div style={{textAlign:"right"}}>
+                                <div style={{fontSize:10,color:T.greenText,fontWeight:700}}>✓ {imp.trucks} trucks</div>
+                                <div style={{fontSize:9,color:T.textMuted}}>${imp.total.toFixed(2)} @ ${imp.rate.toFixed(4)}/gal</div>
                               </div>
-                            );
-                          })}
+                            ) : (
+                              <button onClick={() => importFuelFoxPair(em)} disabled={isImp || pdfs.length < 2}
+                                style={{padding:"6px 12px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${v.color}`,background:(isImp || pdfs.length < 2)?T.bgSurface:v.color,color:(isImp || pdfs.length < 2)?T.text:"#fff",cursor:isImp?"wait":(pdfs.length < 2 ? "not-allowed":"pointer"),opacity:(isImp || pdfs.length < 2)?0.6:1}}>
+                                {isImp ? "Processing..." : "⛽ Import Pair"}
+                              </button>
+                            )}
+                          </div>
                         </div>
-                      ) : (
-                        <div style={{fontSize:10,color:T.textDim,marginTop:4}}>No data attachments (.xlsx/.csv)</div>
-                      )}
-                    </div>
-                  ))}
+                      );
+                    }
+
+                    // Default: per-attachment buttons (NuVizz, Uline, Quick Fuel)
+                    return (
+                      <div key={em.emailId} style={{padding:"8px 10px",borderTop:idx>0?`1px solid ${T.borderLight}`:"none"}}>
+                        <div style={{fontSize:12,fontWeight:600}}>{em.emailSubject || "(no subject)"}</div>
+                        <div style={{fontSize:10,color:T.textMuted}}>{em.from} • {em.emailDate ? new Date(em.emailDate).toLocaleString() : "—"}</div>
+                        {em.attachments?.length > 0 ? (
+                          <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
+                            {em.attachments.map(a => {
+                              const refKey = `${em.emailId}:${a.attachmentId}`;
+                              const isImp = importing[refKey];
+                              const imp = imported[refKey];
+                              const disabled = v.comingSoon;
+                              return (
+                                <div key={a.attachmentId} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"4px 8px",background:T.bgSurface,borderRadius:6}}>
+                                  <div style={{flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>📎 {a.filename} <span style={{color:T.textDim}}>({Math.round(a.size/1024)} KB)</span></div>
+                                  {imp?.error ? (
+                                    <span style={{fontSize:10,color:T.redText}}>✗ {imp.error.substring(0,40)}</span>
+                                  ) : imp ? (
+                                    <span style={{fontSize:10,color:T.greenText,fontWeight:600}}>✓ Imported</span>
+                                  ) : disabled ? (
+                                    <span style={{fontSize:9,color:T.textDim,fontStyle:"italic"}}>parser pending</span>
+                                  ) : (
+                                    <button onClick={() => importAttachment(em, a)} disabled={isImp}
+                                      style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${v.color}`,background:isImp?T.bgSurface:v.color,color:isImp?T.text:"#fff",cursor:isImp?"wait":"pointer",opacity:isImp?0.6:1}}>
+                                      {isImp ? "..." : "→ Import"}
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div style={{fontSize:10,color:T.textDim,marginTop:4}}>No data attachments</div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

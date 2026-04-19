@@ -1,7 +1,8 @@
 import type { Context, Config } from "@netlify/functions";
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const { PDFParse } = require("pdf-parse");
+// Use static import so Netlify's bundler traces and includes pdf-parse.
+// pdf-parse is CJS — we cast through any to access the PDFParse export.
+import pdfParseModule from "pdf-parse";
+const { PDFParse } = pdfParseModule as any;
 
 // Davis MarginIQ — FuelFox invoice pair parser.
 // POST body: { pdfs: [{ filename, data_base64 }, { filename, data_base64 }] }
