@@ -11,9 +11,10 @@
 // v2.6.1: Rewrote FuelFox parser for new pdf-parse PDFParse class API.
 //         Delivery fee baked into true $/gal (all-in rate = $4.67/gal for DD404).
 // v2.6.2: Fix CJS import for pdf-parse on Netlify.
+// v2.6.3: Use createRequire for pdf-parse (ESM/CJS interop fix).
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.6.2";
+const APP_VERSION = "2.6.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
