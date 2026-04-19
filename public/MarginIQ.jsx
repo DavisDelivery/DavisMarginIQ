@@ -11,13 +11,20 @@
 // v2.6.1: Rewrote FuelFox parser for new pdf-parse PDFParse class API.
 //         Delivery fee baked into true $/gal (all-in rate = $4.67/gal for DD404).
 // v2.6.3: Use createRequire for pdf-parse (ESM/CJS interop fix).
-// v2.7.0: Gmail Sync now supports FuelFox (pair-PDF auto-parse) and Quick Fuel
-//         (stub until sample invoice provided). Static import for pdf-parse so
-//         Netlify bundler traces dependencies correctly. One-click FuelFox
-//         "Import Pair" downloads both PDFs, parses, saves to Firestore.
+// v2.7.0: Gmail Sync FuelFox pair + Quick Fuel stub.
+// v2.8.0: ARCHITECTURAL PIVOT — fuel parsing now uses Claude vision API
+//         (per FUEL_PARSER_SPEC.pdf from Davis Fleet Management v2.10.0).
+//         Removed broken pdf-parse-based function. New marginiq-scan-invoice
+//         proxy calls Anthropic messages API with claude-sonnet-4-6.
+//         Client-side pdf.js converts PDF pages to PNGs before scanning.
+//         FuelFox: Service Log + Invoice scanned separately, redistributeFuelFox
+//         Overhead() spreads tax+delivery proportionally by gallons.
+//         Quick Fuel: "Recap by Additional Info 2" table parsed row-per-truck.
+//         Gmail queries corrected: FuelFox is from quickbooks@notification.intuit.com
+//         with subject "FuelFox Atlanta"; Quick Fuel is from ebilling@4flyers.com.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.7.0";
+const APP_VERSION = "2.8.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -461,25 +468,85 @@ function Fuel() {
       return;
     }
     setParsing(true);
-    setUploadStatus("Reading PDFs...");
+    setUploadStatus("Converting PDFs to images...");
     setParseResult(null);
     try {
-      const [summaryB64, logB64] = await Promise.all([fileToBase64(summaryPdf), fileToBase64(logPdf)]);
-      setUploadStatus("Parsing with FuelFox engine...");
-      const resp = await fetch("/.netlify/functions/marginiq-fuelfox-parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          pdfs: [
-            { filename: summaryPdf.name, data_base64: summaryB64 },
-            { filename: logPdf.name, data_base64: logB64 },
-          ],
-        }),
-      });
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error);
-      setParseResult(data);
-      setUploadStatus(`✓ Parsed — ${data.trucks.length} trucks, ${data.totals.total_gallons} gal, $${data.totals.grand_total.toFixed(2)} true cost @ $${data.totals.true_rate.toFixed(4)}/gal`);
+      // Identify which PDF is which by filename
+      const isLogFile = (f) => /service.?log|servicelog/i.test(f.name);
+      let serviceLogPdf, invoicePdf;
+      if (isLogFile(logPdf) && !isLogFile(summaryPdf)) {
+        serviceLogPdf = logPdf; invoicePdf = summaryPdf;
+      } else if (isLogFile(summaryPdf) && !isLogFile(logPdf)) {
+        serviceLogPdf = summaryPdf; invoicePdf = logPdf;
+      } else {
+        // Fall back to the user's zones as named
+        serviceLogPdf = logPdf; invoicePdf = summaryPdf;
+      }
+
+      setUploadStatus("Rendering Service Log pages...");
+      const logPages = await pdfToPngPages(serviceLogPdf, 2);
+      setUploadStatus("Rendering Invoice page...");
+      const invoicePages = await pdfToPngPages(invoicePdf, 2);
+
+      setUploadStatus(`Scanning Service Log with Claude vision (${logPages.length} pages)...`);
+      const slData = await scanPdfWithVision(logPages, FUELFOX_SERVICE_LOG_PROMPT);
+
+      setUploadStatus(`Scanning Invoice with Claude vision (${invoicePages.length} pages)...`);
+      const invData = await scanPdfWithVision(invoicePages, FUELFOX_INVOICE_PROMPT);
+
+      // Validate shape
+      if (!slData || !Array.isArray(slData.rows)) throw new Error("Service Log scan: no rows returned");
+      if (!invData || invData.overhead_total == null) throw new Error("Invoice scan: overhead_total missing");
+
+      // Redistribute overhead
+      const redist = redistributeFuelFoxOverhead(slData.rows, invData.overhead_total);
+
+      // Build combined result shape (compatible with old save logic)
+      const grandTotal = (invData.diesel_sales || 0) + (invData.diesel_taxes || 0) + (invData.delivery_fee || 0);
+      const combined = {
+        vendor: "fuelfox",
+        summary: {
+          invoice_number: invData.invoice_number,
+          invoice_date: invData.invoice_date,
+          total_gallons: redist.total_gallons,
+          posted_rate: slData.rows[0]?.posted_rate || null,
+          diesel_cost: invData.diesel_sales,
+          diesel_tax: invData.diesel_taxes,
+          delivery_fee: invData.delivery_fee,
+          grand_total: grandTotal,
+          fuel_only_rate: redist.total_gallons > 0 ? ((invData.diesel_sales + invData.diesel_taxes) / redist.total_gallons) : null,
+          true_rate: redist.total_gallons > 0 ? (grandTotal / redist.total_gallons) : null,
+        },
+        log: {
+          service_date: slData.service_date,
+          ambassador: slData.ambassador,
+          service_vehicle: slData.service_vehicle,
+        },
+        trucks: redist.rows.map(r => ({
+          unit: r.truckId,
+          gallons: r.gallons,
+          posted_rate: r.posted_rate,
+          posted_charge: r.posted_charge,
+          true_rate: r.true_rate,
+          true_cost: r.true_cost,
+          uplift: r.overhead_share,
+          invoice_number: invData.invoice_number,
+          service_date: slData.service_date,
+        })),
+        totals: {
+          total_gallons: redist.total_gallons,
+          posted_fuel_cost: invData.diesel_sales,
+          tax: invData.diesel_taxes,
+          delivery_fee: invData.delivery_fee,
+          grand_total: grandTotal,
+          true_rate: redist.total_gallons > 0 ? (grandTotal / redist.total_gallons) : null,
+          posted_rate: slData.rows[0]?.posted_rate || null,
+          truck_count: redist.rows.length,
+        },
+        notes: [redist.report],
+      };
+      setParseResult(combined);
+      setUploadStatus(`✓ Parsed — ${combined.trucks.length} trucks, ${combined.totals.total_gallons.toFixed(1)} gal, $${grandTotal.toFixed(2)} true cost @ $${combined.totals.true_rate.toFixed(4)}/gal`);
     } catch (e) {
       setUploadStatus(`✗ Parse failed: ${e.message}`);
     }
@@ -886,6 +953,184 @@ function FileDropZone({ label, hint, file, onFile, color }) {
 }
 
 
+// ═══ CLAUDE VISION INVOICE SCANNING (v2.8) ══════════════════
+// Converts PDF pages to PNG via pdf.js, sends to Claude messages API
+// via /.netlify/functions/marginiq-scan-invoice. Per-vendor prompt rules
+// (Quick Fuel, FuelFox) produce structured JSON.
+//
+// Architecture matches Davis Fleet Management v2.10.0 production:
+//   1. Service Log → per-truck rows with BASE cost
+//   2. Invoice     → 1 "INVENTORY" overhead row (tax + delivery fee)
+//   3. redistributeFuelFoxOverhead() spreads overhead by gallons share
+
+async function loadPdfJs() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  await new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  return window.pdfjsLib;
+}
+
+// Convert a PDF File or base64 string to an array of PNG dataURLs (one per page).
+async function pdfToPngPages(source, scale = 2) {
+  const pdfjs = await loadPdfJs();
+  let bytes;
+  if (source instanceof File || source instanceof Blob) {
+    bytes = new Uint8Array(await source.arrayBuffer());
+  } else if (typeof source === "string") {
+    // Base64 string
+    const binary = atob(source);
+    bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  } else {
+    throw new Error("pdfToPngPages: unsupported source type");
+  }
+  const pdf = await pdfjs.getDocument({ data: bytes }).promise;
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const vp = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = vp.width;
+    canvas.height = vp.height;
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+    pages.push(canvas.toDataURL("image/png"));
+  }
+  return pages;
+}
+
+// Call Claude vision with PNG pages + prompt. Returns parsed JSON.
+async function scanPdfWithVision(pngPages, prompt) {
+  const content = [];
+  for (const dataUrl of pngPages) {
+    const mediaType = dataUrl.split(";")[0].split(":")[1];
+    const base64Data = dataUrl.split(",")[1];
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: mediaType, data: base64Data },
+    });
+  }
+  content.push({ type: "text", text: prompt });
+
+  const resp = await fetch("/.netlify/functions/marginiq-scan-invoice", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messages: [{ role: "user", content }],
+      max_tokens: 4096,
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Scan API ${resp.status}: ${errText.substring(0, 300)}`);
+  }
+  const data = await resp.json();
+  const text = (data.content || []).find(c => c.type === "text")?.text || "";
+  const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    throw new Error(`JSON parse failed. Raw: ${cleaned.substring(0, 400)}`);
+  }
+}
+
+// ─── Vendor-specific prompt rules (verbatim from production spec) ───
+
+const QUICK_FUEL_PROMPT = `Parse this Quick Fuel (Flyers Energy) weekly fuel-card invoice and return JSON.
+
+RULES FOR QUICK FUEL / FLYERS ENERGY:
+- Vendor should be "Quick Fuel". Invoice number starts with "CFS-" (e.g. "CFS-4582698").
+- Find the section titled "Recap by Additional Info 2" — this is your CRITICAL data. Do NOT confuse with "Recap by Card" which lists per-driver totals (wrong data).
+- In the "Recap by Additional Info 2" table, each row has: [Truck#] [Units/gallons] [Amount pre-tax] [Taxes] [Total]. Truck numbers can be 3-5 digits (preserve as-is, keep leading zeros). A row with truck "0" means unassigned fuel — use truckId "INVENTORY".
+- EVERY row in that Recap table becomes ONE object in output array. If table has 11 rows, return 11 objects. DO NOT merge, summarize, or skip.
+- For each row:
+  - truckId: the truck # (or "INVENTORY" for "0" bucket)
+  - gallons: Units column (REQUIRED)
+  - total: Total column — THIS INCLUDES TAX (REQUIRED)
+  - pricePerGallon: total / gallons, rounded to 4 decimals
+  - invoiceNum: "<base invoice>-<truckId>" e.g. "CFS-4582698-0294"
+  - date: invoice date YYYY-MM-DD
+  - notes: "Weekly fuel card - Truck X" or "Unassigned fuel" for INVENTORY
+- FINAL SANITY CHECK: sum of all row totals must equal "Invoice Amount" at bottom. If off, re-parse.
+- Return ONLY a JSON object: {"vendor":"Quick Fuel","invoice_number":"CFS-xxx","invoice_date":"YYYY-MM-DD","invoice_total":N,"rows":[...]}
+- NO markdown fences, NO explanation, JUST the JSON.`;
+
+const FUELFOX_SERVICE_LOG_PROMPT = `Parse this FuelFox Atlanta SERVICE LOG PDF and return JSON.
+
+RULES FOR FUELFOX SERVICE LOG:
+- Header shows "Service Log", "Customer:", "Service Date: MM/DD/YYYY", "Service Vehicle: N" (FuelFox's own truck — IGNORE this number, it's NOT a Davis truck).
+- Body has "Diesel" heading, then columns: [Unit Number] [Gallons] [Price Per Gallon] [Total Charge].
+- Return ONE OBJECT PER TRUCK ROW (NOT the Total row). Each row has:
+  - truckId: Unit Number (preserve leading zeros: "0424", "1478")
+  - gallons: Gallons column
+  - posted_rate: Price Per Gallon column (base price only, NO tax, NO delivery)
+  - total: Total Charge column (gallons × posted_rate — base only)
+- SKIP any row where Unit Number matches the "Service Vehicle" in the header.
+- SANITY: sum of row totals must equal "Total: $X,XXX.XX" at bottom.
+- Return ONLY JSON: {"kind":"service_log","vendor":"FuelFox Atlanta","service_date":"YYYY-MM-DD","service_vehicle":"N","ambassador":"Name","rows":[...]}
+- NO markdown, NO explanation, JUST JSON.`;
+
+const FUELFOX_INVOICE_PROMPT = `Parse this FuelFox Atlanta INVOICE PDF and return JSON.
+
+RULES FOR FUELFOX INVOICE:
+- Header shows "FuelFox Atlanta", "INVOICE", "INVOICE DDxxx", "DATE: MM/DD/YYYY".
+- Body has: "Diesel Sales" (base charge — already captured per-truck in Service Log), "Diesel Taxes", "Delivery Fee", "BALANCE DUE".
+- Return EXACTLY ONE object (not per-truck):
+  - kind: "invoice"
+  - vendor: "FuelFox Atlanta"
+  - invoice_number: e.g. "DD404"
+  - invoice_date: YYYY-MM-DD from invoice date
+  - diesel_sales: value of Diesel Sales line
+  - diesel_taxes: value of Diesel Taxes line
+  - delivery_fee: value of Delivery Fee line
+  - balance_due: value of BALANCE DUE
+  - overhead_total: diesel_taxes + delivery_fee (the portion to redistribute across trucks)
+- Return ONLY JSON, NO markdown, NO explanation.`;
+
+// ─── FuelFox overhead redistribution ────────────────────────
+// Takes freshly-scanned service_log rows + invoice overhead, spreads the
+// tax+delivery proportionally by gallons across the trucks. Returns the
+// truck rows with true per-gallon cost baked in.
+function redistributeFuelFoxOverhead(serviceRows, overhead) {
+  if (!serviceRows || serviceRows.length === 0) {
+    return { rows: [], report: "No service log rows — nothing to redistribute" };
+  }
+  const totalGallons = serviceRows.reduce((s, r) => s + (Number(r.gallons) || 0), 0);
+  if (totalGallons <= 0) {
+    return { rows: serviceRows, report: "Zero gallons total — cannot redistribute" };
+  }
+  const overheadAmount = Number(overhead) || 0;
+  const overheadPerGal = overheadAmount / totalGallons;
+  const out = serviceRows.map(r => {
+    const baseTotal = Number(r.total) || 0;
+    const share = (Number(r.gallons) || 0) * overheadPerGal;
+    const newTotal = Math.round((baseTotal + share) * 100) / 100;
+    const newPpg = (Number(r.gallons) > 0) ? Math.round((newTotal / Number(r.gallons)) * 10000) / 10000 : 0;
+    return {
+      ...r,
+      posted_charge: baseTotal,  // keep original for audit
+      overhead_share: Math.round(share * 100) / 100,
+      true_cost: newTotal,
+      true_rate: newPpg,
+    };
+  });
+  return {
+    rows: out,
+    total_gallons: totalGallons,
+    overhead_amount: overheadAmount,
+    overhead_per_gallon: Math.round(overheadPerGal * 10000) / 10000,
+    report: `Distributed $${overheadAmount.toFixed(2)} across ${serviceRows.length} trucks (${totalGallons.toFixed(1)} gal @ $${overheadPerGal.toFixed(4)}/gal)`,
+  };
+}
+
+
 function GmailSync({ onRefresh }) {
   const [gmailConn, setGmailConn] = useState(null);
   const [loadingConn, setLoadingConn] = useState(true);
@@ -985,8 +1230,9 @@ function GmailSync({ onRefresh }) {
     setImporting(prev => ({...prev, [refKey]: false}));
   };
 
-  // FuelFox emails contain a PAIR of PDFs (summary + service log). Import both
-  // together, send to marginiq-fuelfox-parse, save results to Firestore.
+  // FuelFox emails contain a PAIR of PDFs (Service Log + Invoice_DDxxx).
+  // Uses Claude vision API (via marginiq-scan-invoice proxy) to parse each,
+  // then redistributes overhead proportionally across trucks.
   const importFuelFoxPair = async (email) => {
     const pdfs = (email.attachments || []).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
     if (pdfs.length < 2) {
@@ -995,98 +1241,170 @@ function GmailSync({ onRefresh }) {
     }
     const refKey = `${email.emailId}:fuelfox_pair`;
     setImporting(prev => ({...prev, [refKey]: true}));
-    setImportStatus(`Downloading ${pdfs.length} FuelFox PDFs...`);
     try {
-      // Download both PDFs in parallel, keep as base64
-      const downloads = await Promise.all(pdfs.map(async (a) => {
-        const dlResp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+      // Classify: Service Log vs Invoice by filename
+      let serviceLogAtt = pdfs.find(a => /service.?log|servicelog/i.test(a.filename));
+      let invoiceAtt = pdfs.find(a => /invoice[_\s-]*dd/i.test(a.filename)) || pdfs.find(a => a !== serviceLogAtt);
+      if (!serviceLogAtt) { serviceLogAtt = pdfs[0]; invoiceAtt = pdfs[1]; }
+      if (!invoiceAtt) invoiceAtt = pdfs.find(a => a !== serviceLogAtt);
+
+      // Download both
+      setImportStatus(`Downloading FuelFox PDFs...`);
+      const dl = async (a) => {
+        const r = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
+          method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ messageId: email.emailId, attachmentId: a.attachmentId }),
         });
-        const dlData = await dlResp.json();
-        if (dlData.error) throw new Error(dlData.error);
-        return { filename: a.filename, data_base64: dlData.data };
-      }));
+        const d = await r.json();
+        if (d.error) throw new Error(d.error);
+        return d.data; // base64
+      };
+      const [slB64, invB64] = await Promise.all([dl(serviceLogAtt), dl(invoiceAtt)]);
 
-      setImportStatus(`Parsing with FuelFox engine (true $/gal = fuel+tax+delivery ÷ gallons)...`);
-      const parseResp = await fetch("/.netlify/functions/marginiq-fuelfox-parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pdfs: downloads }),
-      });
-      const pr = await parseResp.json();
-      if (pr.error) throw new Error(pr.error);
+      // Convert PDFs to PNG pages (client-side via pdf.js)
+      setImportStatus(`Rendering PDF pages...`);
+      const [slPages, invPages] = await Promise.all([
+        pdfToPngPages(slB64, 2),
+        pdfToPngPages(invB64, 2),
+      ]);
 
-      // Save to Firestore (same shape as Fuel tab upload)
-      setImportStatus(`Saving ${pr.trucks.length} trucks to Firebase...`);
-      const mdy = pr.summary.invoice_date;
-      const isoInv = mdy ? (() => {
-        const m = String(mdy).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-        return m ? `${m[3]}-${m[1].padStart(2,"0")}-${m[2].padStart(2,"0")}` : null;
-      })() : null;
+      // Scan each with Claude vision
+      setImportStatus(`Scanning Service Log (${slPages.length} pg) with Claude vision...`);
+      const slData = await scanPdfWithVision(slPages, FUELFOX_SERVICE_LOG_PROMPT);
+      if (!slData?.rows?.length) throw new Error("Service Log scan: no truck rows");
+
+      setImportStatus(`Scanning Invoice (${invPages.length} pg) with Claude vision...`);
+      const invData = await scanPdfWithVision(invPages, FUELFOX_INVOICE_PROMPT);
+      if (invData?.overhead_total == null) throw new Error("Invoice scan: overhead_total missing");
+
+      // Redistribute overhead across service log trucks
+      const redist = redistributeFuelFoxOverhead(slData.rows, invData.overhead_total);
+      const grandTotal = (invData.diesel_sales || 0) + (invData.diesel_taxes || 0) + (invData.delivery_fee || 0);
+      const trueRate = redist.total_gallons > 0 ? (grandTotal / redist.total_gallons) : null;
+
+      // Save to Firestore — same schema as Fuel tab upload
+      setImportStatus(`Saving ${redist.rows.length} trucks to Firebase...`);
+      const isoInv = invData.invoice_date; // Claude returns YYYY-MM-DD per prompt
       const weekKey = weekEndingFriday(isoInv);
-      const invId = `fuelfox_${pr.summary.invoice_number}`;
+      const invId = `fuelfox_${invData.invoice_number}`;
 
       await FS.saveFuelInvoice(invId, {
-        invoice_id: invId,
-        vendor: "fuelfox",
-        invoice_number: pr.summary.invoice_number,
-        invoice_date: isoInv,
-        service_date: pr.log.service_date,
-        week_ending: weekKey,
-        total_gallons: pr.summary.total_gallons,
-        posted_rate: pr.summary.posted_rate,
-        fuel_cost: pr.summary.diesel_cost,
-        tax: pr.summary.diesel_tax,
-        delivery_fee: pr.summary.delivery_fee,
-        grand_total: pr.totals.grand_total,
-        true_rate: pr.totals.true_rate,
-        fuel_only_rate: pr.totals.fuel_only_rate,
-        truck_count: pr.totals.truck_count,
-        ambassador: pr.log.ambassador,
-        service_vehicle: pr.log.service_vehicle,
+        invoice_id: invId, vendor: "fuelfox",
+        invoice_number: invData.invoice_number,
+        invoice_date: isoInv, service_date: slData.service_date, week_ending: weekKey,
+        total_gallons: redist.total_gallons,
+        posted_rate: slData.rows[0]?.posted_rate || null,
+        fuel_cost: invData.diesel_sales,
+        tax: invData.diesel_taxes,
+        delivery_fee: invData.delivery_fee,
+        grand_total: grandTotal, true_rate: trueRate,
+        fuel_only_rate: redist.total_gallons > 0 ? ((invData.diesel_sales + invData.diesel_taxes) / redist.total_gallons) : null,
+        truck_count: redist.rows.length,
+        ambassador: slData.ambassador,
+        service_vehicle: slData.service_vehicle,
         gmail_email_id: email.emailId,
       });
 
-      for (const t of pr.trucks) {
-        const lineId = `fuelfox_${pr.summary.invoice_number}_${t.unit}`;
+      for (const r of redist.rows) {
+        const lineId = `fuelfox_${invData.invoice_number}_${r.truckId}`;
         await FS.saveFuelByTruck(lineId, {
-          line_id: lineId,
-          vendor: "fuelfox",
-          invoice_number: pr.summary.invoice_number,
-          invoice_id: invId,
-          unit: t.unit,
-          gallons: t.gallons,
-          posted_rate: t.posted_rate,
-          posted_charge: t.posted_charge,
-          true_rate: t.true_rate,
-          true_cost: t.true_cost,
-          uplift: t.uplift,
-          service_date: pr.log.service_date,
-          week_ending: weekKey,
+          line_id: lineId, vendor: "fuelfox",
+          invoice_number: invData.invoice_number, invoice_id: invId,
+          unit: r.truckId, gallons: r.gallons,
+          posted_rate: r.posted_rate, posted_charge: r.posted_charge,
+          true_rate: r.true_rate, true_cost: r.true_cost, uplift: r.overhead_share,
+          service_date: slData.service_date, week_ending: weekKey,
         });
       }
 
       if (weekKey) {
         const weekRollupId = `fuelfox_${weekKey}`;
         await FS.saveFuelWeekly(weekRollupId, {
-          week_id: weekRollupId,
-          vendor: "fuelfox",
-          week_ending: weekKey,
-          gallons: pr.summary.total_gallons,
-          spend: pr.totals.grand_total,
-          true_rate: pr.totals.true_rate,
-          invoice_count: 1,
+          week_id: weekRollupId, vendor: "fuelfox", week_ending: weekKey,
+          gallons: redist.total_gallons, spend: grandTotal, true_rate: trueRate, invoice_count: 1,
         });
       }
 
-      setImported(prev => ({...prev, [refKey]: { ok: true, trucks: pr.trucks.length, total: pr.totals.grand_total, rate: pr.totals.true_rate }}));
-      setImportStatus(`✓ FuelFox ${pr.summary.invoice_number}: ${pr.trucks.length} trucks, $${pr.totals.grand_total.toFixed(2)} @ $${pr.totals.true_rate.toFixed(4)}/gal`);
+      setImported(prev => ({...prev, [refKey]: { ok: true, trucks: redist.rows.length, total: grandTotal, rate: trueRate }}));
+      setImportStatus(`✓ FuelFox ${invData.invoice_number}: ${redist.rows.length} trucks, $${grandTotal.toFixed(2)} @ $${trueRate.toFixed(4)}/gal`);
       if (onRefresh) onRefresh();
     } catch(e) {
       setImported(prev => ({...prev, [refKey]: { error: e.message }}));
       setImportStatus(`✗ FuelFox import failed: ${e.message}`);
+    }
+    setImporting(prev => ({...prev, [refKey]: false}));
+  };
+
+  // Quick Fuel — single PDF, Recap table, pricePerGallon = total/gallons.
+  // Uses Claude vision via marginiq-scan-invoice.
+  const importQuickFuel = async (email, attachment) => {
+    const refKey = `${email.emailId}:${attachment.attachmentId}`;
+    setImporting(prev => ({...prev, [refKey]: true}));
+    setImportStatus(`Downloading ${attachment.filename}...`);
+    try {
+      const dlResp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messageId: email.emailId, attachmentId: attachment.attachmentId }),
+      });
+      const dlData = await dlResp.json();
+      if (dlData.error) throw new Error(dlData.error);
+
+      setImportStatus(`Rendering PDF pages...`);
+      const pages = await pdfToPngPages(dlData.data, 2);
+
+      setImportStatus(`Scanning (${pages.length} pg) with Claude vision...`);
+      const data = await scanPdfWithVision(pages, QUICK_FUEL_PROMPT);
+      if (!data?.rows?.length) throw new Error("No rows found in Recap table");
+
+      // Save: per-truck rows as fuel_by_truck, one aggregated invoice doc
+      setImportStatus(`Saving ${data.rows.length} trucks to Firebase...`);
+      const isoDate = data.invoice_date;
+      const weekKey = weekEndingFriday(isoDate);
+      const invBase = data.invoice_number;
+      const totalGal = data.rows.reduce((s, r) => s + (Number(r.gallons) || 0), 0);
+      const totalSpend = data.rows.reduce((s, r) => s + (Number(r.total) || 0), 0);
+      const avgRate = totalGal > 0 ? totalSpend / totalGal : null;
+
+      await FS.saveFuelInvoice(`quickfuel_${invBase}`, {
+        invoice_id: `quickfuel_${invBase}`, vendor: "quickfuel",
+        invoice_number: invBase, invoice_date: isoDate, week_ending: weekKey,
+        total_gallons: totalGal,
+        fuel_cost: totalSpend,  // already all-in with tax
+        tax: null, delivery_fee: 0,
+        grand_total: totalSpend,
+        true_rate: avgRate,
+        fuel_only_rate: avgRate,
+        truck_count: data.rows.length,
+        gmail_email_id: email.emailId,
+      });
+
+      for (const r of data.rows) {
+        const lineId = `quickfuel_${invBase}_${r.truckId}`;
+        await FS.saveFuelByTruck(lineId, {
+          line_id: lineId, vendor: "quickfuel",
+          invoice_number: invBase, invoice_id: `quickfuel_${invBase}`,
+          unit: r.truckId, gallons: r.gallons,
+          posted_rate: r.pricePerGallon, posted_charge: r.total,
+          true_rate: r.pricePerGallon, true_cost: r.total, uplift: 0,  // no overhead for QF
+          service_date: isoDate, week_ending: weekKey,
+          notes: r.notes,
+        });
+      }
+
+      if (weekKey) {
+        const weekRollupId = `quickfuel_${weekKey}`;
+        await FS.saveFuelWeekly(weekRollupId, {
+          week_id: weekRollupId, vendor: "quickfuel", week_ending: weekKey,
+          gallons: totalGal, spend: totalSpend, true_rate: avgRate, invoice_count: 1,
+        });
+      }
+
+      setImported(prev => ({...prev, [refKey]: { ok: true, trucks: data.rows.length, total: totalSpend, rate: avgRate }}));
+      setImportStatus(`✓ Quick Fuel ${invBase}: ${data.rows.length} trucks, $${totalSpend.toFixed(2)} @ $${avgRate?.toFixed(4)}/gal`);
+      if (onRefresh) onRefresh();
+    } catch(e) {
+      setImported(prev => ({...prev, [refKey]: { error: e.message }}));
+      setImportStatus(`✗ Quick Fuel failed: ${e.message}`);
     }
     setImporting(prev => ({...prev, [refKey]: false}));
   };
@@ -1136,7 +1454,7 @@ function GmailSync({ onRefresh }) {
           { key:"nuvizz", icon:"🚚", label:"NuVizz", desc:"Weekly driver stops from nuvizzapps@nuvizzapps.com", color:T.blue, mode:"per-attachment" },
           { key:"uline", icon:"📦", label:"Uline", desc:"Weekly billing + DDIS from @uline.com senders", color:T.brand, mode:"per-attachment" },
           { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
-          { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from 4flyers.com (parser pending sample)", color:"#2563eb", mode:"per-attachment", comingSoon:true },
+          { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from ebilling@4flyers.com", color:"#2563eb", mode:"quickfuel" },
         ].map(v => {
           const r = results[v.key];
           const isLoading = loading[v.key];
@@ -1211,19 +1529,27 @@ function GmailSync({ onRefresh }) {
                               const isImp = importing[refKey];
                               const imp = imported[refKey];
                               const disabled = v.comingSoon;
+                              const isQuickFuelPdf = v.mode === "quickfuel" && a.filename.toLowerCase().endsWith(".pdf");
                               return (
                                 <div key={a.attachmentId} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"4px 8px",background:T.bgSurface,borderRadius:6}}>
                                   <div style={{flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>📎 {a.filename} <span style={{color:T.textDim}}>({Math.round(a.size/1024)} KB)</span></div>
                                   {imp?.error ? (
-                                    <span style={{fontSize:10,color:T.redText}}>✗ {imp.error.substring(0,40)}</span>
+                                    <span style={{fontSize:10,color:T.redText,maxWidth:180,whiteSpace:"normal"}}>✗ {imp.error.substring(0,80)}</span>
+                                  ) : imp?.ok && v.mode === "quickfuel" ? (
+                                    <div style={{textAlign:"right"}}>
+                                      <div style={{fontSize:10,color:T.greenText,fontWeight:700}}>✓ {imp.trucks} trucks</div>
+                                      <div style={{fontSize:9,color:T.textMuted}}>${imp.total.toFixed(2)} @ ${imp.rate?.toFixed(4)}/gal</div>
+                                    </div>
                                   ) : imp ? (
                                     <span style={{fontSize:10,color:T.greenText,fontWeight:600}}>✓ Imported</span>
                                   ) : disabled ? (
                                     <span style={{fontSize:9,color:T.textDim,fontStyle:"italic"}}>parser pending</span>
                                   ) : (
-                                    <button onClick={() => importAttachment(em, a)} disabled={isImp}
+                                    <button
+                                      onClick={() => isQuickFuelPdf ? importQuickFuel(em, a) : importAttachment(em, a)}
+                                      disabled={isImp}
                                       style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${v.color}`,background:isImp?T.bgSurface:v.color,color:isImp?T.text:"#fff",cursor:isImp?"wait":"pointer",opacity:isImp?0.6:1}}>
-                                      {isImp ? "..." : "→ Import"}
+                                      {isImp ? "..." : isQuickFuelPdf ? "⛽ Scan" : "→ Import"}
                                     </button>
                                   )}
                                 </div>

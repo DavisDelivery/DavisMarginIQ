@@ -9,11 +9,14 @@ const VENDOR_QUERIES: Record<string, string> = {
   // Uline: weekly billing files from various @uline.com senders
   uline: 'from:@uline.com has:attachment',
 
-  // FuelFox: fuel delivery invoices — summary PDF + service log PDF in one email
-  fuelfox: 'from:accounting@fuelfox.net has:attachment',
+  // FuelFox: invoices sent VIA QuickBooks on FuelFox's behalf.
+  // Subject always contains "FuelFox Atlanta". Each email has 2 PDFs
+  // (Service Log + Invoice_DDxxx) that must be processed as a pair.
+  fuelfox: '(from:quickbooks@notification.intuit.com subject:"FuelFox Atlanta") has:attachment',
 
-  // Quick Fuel: fuel card statements from 4flyers.com
-  quickfuel: '(from:4flyers.com OR from:ebilling@4flyers.com OR "quick fuel" OR "4flyers") has:attachment',
+  // Quick Fuel: weekly fuel card invoice from Flyers Energy
+  // Locked to sender only — loose text matching pulls unrelated docs
+  quickfuel: 'from:ebilling@4flyers.com has:attachment',
 };
 
 export default async (req: Request, context: Context) => {
