@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.22.0";
+const APP_VERSION = "2.23.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -4884,15 +4884,21 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
                   <tbody>
                     {sparseWeeks.map((w,i) => {
                       const isOpen = inspectingWeek === w.week_ending;
+                      const handleInspect = (e) => {
+                        e?.stopPropagation?.();
+                        if (isOpen) setInspectingWeek(null);
+                        else inspectWeek(w.week_ending);
+                      };
                       return (
-                      <tr key={i} onClick={() => isOpen ? setInspectingWeek(null) : inspectWeek(w.week_ending)}
-                        style={{cursor:"pointer",background: isOpen ? T.yellowBg : "transparent"}}>
-                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(w.week_ending)}</td>
-                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.stops)}</td>
-                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600,color:T.green}}>{fmt(w.revenue||0)}</td>
-                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(avgStops)}</td>
-                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmtNum(avgStops-w.stops)}</td>
-                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim,fontSize:10}}>{isOpen?"▼":"▶"} inspect</td>
+                      <tr key={i} style={{background: isOpen ? T.yellowBg : "transparent"}}>
+                        <td onClick={handleInspect} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600,cursor:"pointer"}}>WE {weekLabel(w.week_ending)}</td>
+                        <td onClick={handleInspect} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,cursor:"pointer"}}>{fmtNum(w.stops)}</td>
+                        <td onClick={handleInspect} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600,color:T.green,cursor:"pointer"}}>{fmt(w.revenue||0)}</td>
+                        <td onClick={handleInspect} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,cursor:"pointer"}}>{fmtNum(avgStops)}</td>
+                        <td onClick={handleInspect} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600,cursor:"pointer"}}>{fmtNum(avgStops-w.stops)}</td>
+                        <td style={{padding:"4px 6px",borderBottom:`1px solid ${T.borderLight}`}}>
+                          <button type="button" onClick={handleInspect} style={{background:isOpen?T.yellow:T.brand,color:"#fff",border:"none",padding:"6px 10px",borderRadius:6,fontSize:10,fontWeight:700,cursor:"pointer"}}>{isOpen?"▼ Close":"🔬 Inspect"}</button>
+                        </td>
                       </tr>
                     );})}
                   </tbody>
@@ -6852,7 +6858,37 @@ function Drivers() {
   </div>;
 }
 
-function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups }) {
+function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onRefresh }) {
+  const [purgeConfirmText, setPurgeConfirmText] = useState("");
+  const [purgeToken, setPurgeToken] = useState("");
+  const [purging, setPurging] = useState(false);
+  const [purgeResult, setPurgeResult] = useState(null);
+
+  const handlePurge = async () => {
+    if (purgeConfirmText !== "PURGE ULINE") {
+      setPurgeResult({ error: "Confirmation text must be exactly: PURGE ULINE" });
+      return;
+    }
+    if (!purgeToken.trim()) {
+      setPurgeResult({ error: "Admin token required" });
+      return;
+    }
+    setPurging(true);
+    setPurgeResult(null);
+    try {
+      const resp = await fetch(`/.netlify/functions/marginiq-purge-uline?token=${encodeURIComponent(purgeToken.trim())}`);
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+      setPurgeResult(data);
+      setPurgeConfirmText("");
+      setPurgeToken("");
+      if (onRefresh) await onRefresh();
+    } catch(e) {
+      setPurgeResult({ error: e.message });
+    }
+    setPurging(false);
+  };
+
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="⚙️" text="Settings & Connections" />
     <div style={cardStyle}>
@@ -6876,6 +6912,56 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups }) {
       {[["Firebase","davismarginiq"],["Netlify","davis-marginiq.netlify.app"],["Version",APP_VERSION],["Weekly Rollups",weeklyRollups.length],["DDIS Files Loaded",reconMeta?reconMeta.files_count:0],["Last Upload",reconMeta?.last_upload?new Date(reconMeta.last_upload).toLocaleString():"Never"]].map(([l,v])=>
         <DataRow key={l} label={l} value={String(v)} />
       )}
+    </div>
+
+    {/* DANGER ZONE: Purge Uline data */}
+    <div style={{...cardStyle, borderColor: T.red, borderWidth: 2, background: "#fef2f2"}}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.redText}}>⚠️ Danger Zone — Purge Uline Data</div>
+      <div style={{fontSize:12,color:T.text,marginBottom:12,lineHeight:1.5}}>
+        Wipes <strong>uline_weekly</strong>, <strong>recon_weekly</strong>, <strong>unpaid_stops</strong>, <strong>audit_items</strong>, <strong>source_conflicts</strong>, and all Uline-kind entries in <strong>file_log</strong> + <strong>source_files</strong>.
+        <br/><br/>
+        <strong style={{color:T.greenText}}>Preserved:</strong> DDIS payments, NuVizz, Time Clock, Payroll, QBO, Fuel, Driver Classifications, AP Contacts, Disputes, Gmail connection.
+        <br/><br/>
+        Use this when Uline rollup data is corrupted (e.g. accessorial-only weeks merged into real weeks) and you want to re-ingest clean. You'll need to re-run ingestion from Gmail Sync or the Data Ingest tab after.
+      </div>
+
+      {purgeResult?.ok && (
+        <div style={{padding:"10px 12px",background:"#ecfdf5",border:`1px solid ${T.green}`,borderRadius:6,marginBottom:10,fontSize:12,color:"#065f46"}}>
+          <div style={{fontWeight:700,marginBottom:6}}>✓ Purge complete</div>
+          {Object.entries(purgeResult.results||{}).map(([coll, r]) => (
+            <div key={coll} style={{fontFamily:"monospace",fontSize:11}}>{coll}: {r.deleted}/{r.found} deleted</div>
+          ))}
+        </div>
+      )}
+      {purgeResult?.error && (
+        <div style={{padding:"10px 12px",background:T.redBg,border:`1px solid ${T.red}`,borderRadius:6,marginBottom:10,fontSize:12,color:T.redText}}>
+          ✗ {purgeResult.error}
+        </div>
+      )}
+
+      <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:12}}>
+        <label style={{fontSize:11,fontWeight:600,color:T.text}}>
+          Admin token (MARGINIQ_ADMIN_TOKEN)
+          <input type="password" value={purgeToken} onChange={e=>setPurgeToken(e.target.value)} placeholder="enter admin token"
+            style={{display:"block",marginTop:4,padding:"8px 10px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:12,width:"100%",maxWidth:300}} />
+        </label>
+        <label style={{fontSize:11,fontWeight:600,color:T.text}}>
+          Type <code style={{background:"#fff",padding:"2px 6px",borderRadius:3,color:T.redText,fontWeight:700}}>PURGE ULINE</code> to confirm:
+          <input type="text" value={purgeConfirmText} onChange={e=>setPurgeConfirmText(e.target.value)} placeholder="PURGE ULINE"
+            style={{display:"block",marginTop:4,padding:"8px 10px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:12,width:"100%",maxWidth:300}} />
+        </label>
+        <button onClick={handlePurge}
+          disabled={purging || purgeConfirmText !== "PURGE ULINE" || !purgeToken.trim()}
+          style={{
+            padding:"10px 16px",borderRadius:8,border:"none",fontSize:13,fontWeight:700,
+            background: (purging || purgeConfirmText !== "PURGE ULINE" || !purgeToken.trim()) ? T.bgSurface : T.red,
+            color: (purging || purgeConfirmText !== "PURGE ULINE" || !purgeToken.trim()) ? T.textDim : "#fff",
+            cursor: purging ? "wait" : (purgeConfirmText === "PURGE ULINE" && purgeToken.trim() ? "pointer" : "not-allowed"),
+            maxWidth:300,
+          }}>
+          {purging ? "Purging..." : "🗑️ Purge Uline Data"}
+        </button>
+      </div>
     </div>
   </div>;
 }
@@ -7000,7 +7086,7 @@ function MarginIQ() {
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
-    {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} />}
+    {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} onRefresh={refreshData} />}
   </div>;
 }
 
