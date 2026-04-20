@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.20.0";
+const APP_VERSION = "2.20.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -276,6 +276,12 @@ async function ingestFiles(files, onStatus = () => {}) {
   const unpaidStops = [];
   const auditItems = [];  // v2.5 AuditIQ: all stops with any variance, categorized
   const today = new Date().toISOString().slice(0,10);
+  // If we have no DDIS payment data yet for the weeks in this batch, audit
+  // generation produces meaningless output (every stop looks unpaid). Skip
+  // the heavy per-stop audit work when paymentByPro is empty — it massively
+  // speeds up first-time ingest of a single weekly file. AuditIQ will
+  // populate correctly the next time DDIS files are added via the normal flow.
+  const hasPaymentData = Object.keys(paymentByPro).length > 0;
   for (const s of allStops) {
     const paid = paymentByPro[s.pro] || 0;
     if (!reconByWeek[s.week_ending]) reconByWeek[s.week_ending] = { week_ending: s.week_ending, month: s.month, billed:0, paid_matched:0, unpaid_count:0, unpaid_amount:0 };
@@ -295,8 +301,10 @@ async function ingestFiles(files, onStatus = () => {}) {
         });
       }
     }
-    // v2.5 AuditIQ — track any stop with variance > $1 (both unpaid AND short-paid)
-    if (billed > 0 && variance > 1) {
+    // v2.5 AuditIQ — only generate audit items when we have payment data to
+    // compare against. Without DDIS, every stop's variance == billed amount
+    // (all "unpaid") which is noise, not a real audit signal.
+    if (hasPaymentData && billed > 0 && variance > 1) {
       const ageDays = daysBetween(s.pu_date, today);
       const hasAcc = !!s.extra_cost && s.extra_cost > 0;
       const category = categorize(billed, paid, hasAcc, 0 /* unknown acc-paid split */, ageDays);
@@ -347,7 +355,9 @@ async function ingestFiles(files, onStatus = () => {}) {
     r => FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()}),
     25, "Saving reconciliation");
   await batchWrite(ddisFileRecords, f => FS.saveDDISFile(f.file_id, f), 25);
-  const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, 500);
+  // Without DDIS payment data, every stop looks unpaid — cap hard to avoid
+  // writing 500 meaningless rows. With payment data, keep full 500 for audit.
+  const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, hasPaymentData ? 500 : 100);
   if (topUnpaid.length > 0) {
     onStatus({ phase:"save", message:`Saving unpaid stops...` });
     await batchWrite(topUnpaid, s => FS.saveUnpaidStop(s.pro, s), 25, "Saving unpaid stops");
@@ -1407,19 +1417,55 @@ function GmailSync({ onRefresh }) {
     setLoading(prev => ({...prev, [vendor]: false}));
   };
 
+  // Shared helper — download a Gmail attachment with retry + clearer error surfacing.
+  // Common failure modes on mobile: Netlify cold-start timeout, 5G flakiness,
+  // brief Gmail API hiccup. A single retry with a short backoff clears most.
+  const downloadGmailAttachment = async (emailId, attachmentId, filenameForLogs) => {
+    const MAX_ATTEMPTS = 3;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        // AbortController with 45s timeout — long enough for Netlify function
+        // cold-start + Gmail fetch, short enough that user sees a real error
+        // rather than waiting 3+ minutes on a hung request.
+        const ctrl = new AbortController();
+        const timeoutId = setTimeout(() => ctrl.abort(), 45000);
+        const resp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messageId: emailId, attachmentId }),
+          signal: ctrl.signal,
+        });
+        clearTimeout(timeoutId);
+        if (!resp.ok) {
+          // Got HTTP error — try to read body for useful message
+          let bodyTxt = "";
+          try { bodyTxt = await resp.text(); } catch {}
+          throw new Error(`HTTP ${resp.status}${bodyTxt ? ": " + bodyTxt.substring(0,120) : ""}`);
+        }
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        if (!data.data) throw new Error("Empty response");
+        return data;
+      } catch (e) {
+        lastErr = e;
+        const isAbort = e.name === "AbortError";
+        console.warn(`Attachment DL attempt ${attempt}/${MAX_ATTEMPTS} failed for ${filenameForLogs}:`, isAbort ? "timeout" : e.message);
+        if (attempt < MAX_ATTEMPTS) {
+          await new Promise(r => setTimeout(r, 1500 * attempt)); // 1.5s, 3s backoff
+        }
+      }
+    }
+    throw new Error(`Download failed after ${MAX_ATTEMPTS} tries: ${lastErr?.message || "unknown"}`);
+  };
+
   const importAttachment = async (email, attachment) => {
     const refKey = `${email.emailId}:${attachment.attachmentId}`;
     setImporting(prev => ({...prev, [refKey]: true}));
     setImportStatus(`Downloading ${attachment.filename}...`);
     try {
-      // 1. Download attachment bytes
-      const dlResp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageId: email.emailId, attachmentId: attachment.attachmentId }),
-      });
-      const dlData = await dlResp.json();
-      if (dlData.error) throw new Error(dlData.error);
+      // 1. Download attachment bytes (with retry)
+      const dlData = await downloadGmailAttachment(email.emailId, attachment.attachmentId, attachment.filename);
 
       // 2. Base64 → File
       const binary = atob(dlData.data);
