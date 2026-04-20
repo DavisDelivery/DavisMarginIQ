@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.21.0";
+const APP_VERSION = "2.22.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -4713,6 +4713,51 @@ function CoverageTimeline() {
 function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
   const hasUline = weeklyRollups && weeklyRollups.length > 0 && completeness;
   const [streamCoverage, setStreamCoverage] = useState(null);
+  const [inspectingWeek, setInspectingWeek] = useState(null); // week_ending string
+  const [inspectorData, setInspectorData] = useState(null);
+  const [inspectorLoading, setInspectorLoading] = useState(false);
+
+  // When a week is selected for inspection, pull everything we know about it:
+  // the rollup doc, any matching file_log entries, and any audit/unpaid records.
+  const inspectWeek = async (weekEnding) => {
+    setInspectingWeek(weekEnding);
+    setInspectorData(null);
+    setInspectorLoading(true);
+    try {
+      // The rollup doc
+      const rollup = weeklyRollups.find(w => w.week_ending === weekEnding);
+
+      // Files whose filename date-range overlaps this week_ending.
+      // Uline filename convention: das YYYYMMDD-YYYYMMDD.xlsx (Sat→Fri).
+      // Week ending = the YYYYMMDD after the dash.
+      const targetYMD = weekEnding.replace(/-/g, "");
+      const matchingFiles = (fileLog || []).filter(f => {
+        const fn = (f.filename || "").toLowerCase();
+        // Match either exact YYYYMMDD match in filename, or a small date window
+        return fn.includes(targetYMD) || fn.includes(weekEnding);
+      });
+
+      // Pull any recon doc for this week
+      let reconDoc = null;
+      try {
+        if (hasFirebase) {
+          const d = await window.db.collection("recon_weekly").doc(weekEnding).get();
+          if (d.exists) reconDoc = d.data();
+        }
+      } catch (e) { /* ignore */ }
+
+      setInspectorData({
+        weekEnding,
+        rollup: rollup || null,
+        matchingFiles,
+        reconDoc,
+      });
+    } catch(e) {
+      console.error("inspectWeek error:", e);
+      setInspectorData({ weekEnding, error: e.message });
+    }
+    setInspectorLoading(false);
+  };
 
   // Load per-stream coverage counts in parallel so AIInsight gets a full picture.
   // Same data sources CoverageTimeline uses, but summarized to counts (not cells).
@@ -4830,25 +4875,135 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
           {sparseWeeks.length > 0 && (
             <div style={cardStyle}>
               <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.yellowText}}>⚠️ Suspiciously Low-Volume Weeks ({sparseWeeks.length})</div>
-              <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have far fewer stops than your average of <strong>{fmtNum(avgStops)}</strong>. Data may be partial or a holiday week.</div>
+              <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have far fewer stops than your average of <strong>{fmtNum(avgStops)}</strong>. Tap a row to see what files are loaded for that week.</div>
               <div style={{overflowX:"auto"}}>
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead><tr>{["Week Ending","Stops","Revenue","Expected Stops","Gap"].map(h=>
+                  <thead><tr>{["Week Ending","Stops","Revenue","Expected Stops","Gap",""].map(h=>
                     <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
                   )}</tr></thead>
                   <tbody>
-                    {sparseWeeks.map((w,i) => (
-                      <tr key={i}>
+                    {sparseWeeks.map((w,i) => {
+                      const isOpen = inspectingWeek === w.week_ending;
+                      return (
+                      <tr key={i} onClick={() => isOpen ? setInspectingWeek(null) : inspectWeek(w.week_ending)}
+                        style={{cursor:"pointer",background: isOpen ? T.yellowBg : "transparent"}}>
                         <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(w.week_ending)}</td>
                         <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.stops)}</td>
                         <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600,color:T.green}}>{fmt(w.revenue||0)}</td>
                         <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(avgStops)}</td>
                         <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmtNum(avgStops-w.stops)}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.textDim,fontSize:10}}>{isOpen?"▼":"▶"} inspect</td>
                       </tr>
-                    ))}
+                    );})}
                   </tbody>
                 </table>
               </div>
+
+              {inspectingWeek && (
+                <div style={{marginTop:12,padding:"12px 14px",background:T.bgSurface,borderRadius:8,border:`2px solid ${T.yellow}50`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                    <div style={{fontSize:13,fontWeight:700}}>🔬 Week Inspector — WE {weekLabel(inspectingWeek)}</div>
+                    <button onClick={()=>setInspectingWeek(null)} style={{background:"none",border:"none",color:T.textMuted,fontSize:14,cursor:"pointer"}}>✕</button>
+                  </div>
+
+                  {inspectorLoading && <div style={{fontSize:12,color:T.textMuted}}>Loading data for this week…</div>}
+
+                  {inspectorData && !inspectorLoading && (() => {
+                    const d = inspectorData;
+                    const r = d.rollup;
+                    const hasDel = r && ((r.delivery_stops||0) > 0);
+                    const hasTk = r && ((r.truckload_stops||0) > 0);
+                    const hasAcc = r && ((r.accessorial_stops||0) > 0 || (r.accessorial_revenue||0) > 0);
+
+                    // Diagnose what's missing
+                    const diagnosis = [];
+                    if (!r) {
+                      diagnosis.push({ severity: "alarm", text: "❌ No rollup document at all for this week" });
+                    } else {
+                      if (!hasDel) diagnosis.push({ severity: "alarm", text: "❌ Missing delivery data — main das xlsx was never ingested" });
+                      if (hasAcc && !hasDel) diagnosis.push({ severity: "alarm", text: "⚠️ Only accessorials are loaded — this is your bug: accessorials ingested but main delivery file was not" });
+                      if (!hasTk && !hasDel) diagnosis.push({ severity: "info", text: "No truckload data either (may not run TK this week)" });
+                      if (hasDel && r.delivery_stops < 500) diagnosis.push({ severity: "warn", text: `Delivery stops (${r.delivery_stops}) are well below average — could be a holiday or partial ingest` });
+                    }
+
+                    return (
+                      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                        {/* Diagnosis */}
+                        {diagnosis.length > 0 && (
+                          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                            {diagnosis.map((dx, i) => (
+                              <div key={i} style={{
+                                padding:"8px 10px",borderRadius:6,fontSize:12,
+                                background: dx.severity === "alarm" ? T.redBg : dx.severity === "warn" ? T.yellowBg : T.bgSurface,
+                                color: dx.severity === "alarm" ? T.redText : dx.severity === "warn" ? T.yellowText : T.text,
+                                border: `1px solid ${dx.severity === "alarm" ? T.red : dx.severity === "warn" ? T.yellow : T.borderLight}40`,
+                              }}>{dx.text}</div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Rollup breakdown */}
+                        <div>
+                          <div style={{fontSize:10,fontWeight:700,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>What's in the Rollup</div>
+                          {!r ? (
+                            <div style={{fontSize:12,color:T.textMuted,fontStyle:"italic"}}>No rollup doc exists for this week.</div>
+                          ) : (
+                            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8}}>
+                              <div style={{padding:"8px 10px",background:"white",borderRadius:6,border:`1px solid ${hasDel?T.green+"40":T.red+"40"}`}}>
+                                <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase"}}>Delivery</div>
+                                <div style={{fontSize:14,fontWeight:700,color:hasDel?T.green:T.red}}>{fmtNum(r.delivery_stops||0)} stops</div>
+                                <div style={{fontSize:10,color:T.textMuted}}>{fmt(r.delivery_revenue||0)}</div>
+                              </div>
+                              <div style={{padding:"8px 10px",background:"white",borderRadius:6,border:`1px solid ${hasTk?T.green+"40":T.borderLight}`}}>
+                                <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase"}}>Truckload</div>
+                                <div style={{fontSize:14,fontWeight:700,color:hasTk?T.green:T.textDim}}>{fmtNum(r.truckload_stops||0)} stops</div>
+                                <div style={{fontSize:10,color:T.textMuted}}>{fmt(r.truckload_revenue||0)}</div>
+                              </div>
+                              <div style={{padding:"8px 10px",background:"white",borderRadius:6,border:`1px solid ${hasAcc?T.green+"40":T.yellow+"40"}`}}>
+                                <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase"}}>Accessorials</div>
+                                <div style={{fontSize:14,fontWeight:700,color:hasAcc?T.green:T.yellowText}}>{fmtNum(r.accessorial_stops||0)} items</div>
+                                <div style={{fontSize:10,color:T.textMuted}}>{fmt(r.accessorial_revenue||0)}</div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Files matching this week */}
+                        <div>
+                          <div style={{fontSize:10,fontWeight:700,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Files in file_log matching this week ({d.matchingFiles.length})</div>
+                          {d.matchingFiles.length === 0 ? (
+                            <div style={{fontSize:12,color:T.redText,fontStyle:"italic"}}>⚠️ No file_log entries match this week. The rollup was built from files that are no longer logged, OR from files whose filenames don't include this date.</div>
+                          ) : (
+                            <div style={{fontSize:11,fontFamily:"monospace",display:"flex",flexDirection:"column",gap:3}}>
+                              {d.matchingFiles.map((f,i) => (
+                                <div key={i} style={{padding:"4px 8px",background:"white",borderRadius:4,display:"flex",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+                                  <span>📎 {f.filename}</span>
+                                  <span style={{color:T.textMuted,fontSize:10}}>{f.kind}{f.service_type?`/${f.service_type}`:""} • {f.row_count||0} rows</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Expected filename for re-upload */}
+                        <div style={{padding:"8px 10px",background:"#eff6ff",borderRadius:6,fontSize:11,border:`1px solid #3b82f640`}}>
+                          <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",marginBottom:4}}>To fix — find this file in Gmail or backups</div>
+                          <div style={{fontFamily:"monospace",fontWeight:600}}>
+                            {(() => {
+                              // Compute the WE-6days → WE filename: das YYYYMMDD-YYYYMMDD.xlsx (Sat→Fri)
+                              const fri = new Date(inspectingWeek + "T00:00:00");
+                              const sat = new Date(fri);
+                              sat.setDate(fri.getDate() - 6);
+                              const ymd = (x) => x.toISOString().slice(0,10).replace(/-/g,"");
+                              return `das ${ymd(sat)}-${ymd(fri)}.xlsx`;
+                            })()}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
             </div>
           )}
           {missingAccessorials.length > 0 && (
