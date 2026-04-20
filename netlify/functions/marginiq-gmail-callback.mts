@@ -85,3 +85,4 @@ export default async (req: Request, context: Context) => {
   }
 };
 // env: GOOGLE_CLIENT_SECRET set 2026-04-20T18:01:38Z
+// env vars updated 2026-04-20T18:03:27Z — force fresh function build
