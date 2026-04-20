@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.16.0";
+const APP_VERSION = "2.16.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1633,13 +1633,13 @@ function GmailSync({ onRefresh }) {
                   </div>
                   <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>{v.desc}</div>
                 </div>
-                <PrimaryBtn text={isLoading ? "Searching..." : "Search Last 60 Days"} onClick={() => searchVendor(v.key)} loading={isLoading} />
+                <PrimaryBtn text={isLoading ? "Searching..." : `Search · ${rangeLabel()}`} onClick={() => searchVendor(v.key)} loading={isLoading} />
               </div>
 
               {r?.error && <div style={{fontSize:12,color:T.redText,background:T.redBg,padding:"8px 10px",borderRadius:6,marginTop:8}}>✗ {r.error}</div>}
 
               {r?.list && r.list.length === 0 && (
-                <div style={{fontSize:12,color:T.textMuted,padding:8}}>No matching emails in the last 60 days.</div>
+                <div style={{fontSize:12,color:T.textMuted,padding:8}}>No matching emails in this range ({rangeLabel()}).</div>
               )}
 
               {r?.list && r.list.length > 0 && (
