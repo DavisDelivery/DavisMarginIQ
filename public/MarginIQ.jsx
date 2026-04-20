@@ -12,19 +12,14 @@
 //         Delivery fee baked into true $/gal (all-in rate = $4.67/gal for DD404).
 // v2.6.3: Use createRequire for pdf-parse (ESM/CJS interop fix).
 // v2.7.0: Gmail Sync FuelFox pair + Quick Fuel stub.
-// v2.8.0: ARCHITECTURAL PIVOT — fuel parsing now uses Claude vision API
-//         (per FUEL_PARSER_SPEC.pdf from Davis Fleet Management v2.10.0).
-//         Removed broken pdf-parse-based function. New marginiq-scan-invoice
-//         proxy calls Anthropic messages API with claude-sonnet-4-6.
-//         Client-side pdf.js converts PDF pages to PNGs before scanning.
-//         FuelFox: Service Log + Invoice scanned separately, redistributeFuelFox
-//         Overhead() spreads tax+delivery proportionally by gallons.
-//         Quick Fuel: "Recap by Additional Info 2" table parsed row-per-truck.
-//         Gmail queries corrected: FuelFox is from quickbooks@notification.intuit.com
-//         with subject "FuelFox Atlanta"; Quick Fuel is from ebilling@4flyers.com.
+// v2.8.0: ARCHITECTURAL PIVOT — fuel parsing now uses Claude vision API.
+// v2.8.1: Quick Fuel — extract invoice-level fees (Regulatory Compliance Fee
+//         $4.99 on CFS-4582698) and redistribute proportionally by gallons
+//         across all trucks, matching the FuelFox overhead pattern. Per-truck
+//         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.8.0";
+const APP_VERSION = "2.8.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1058,8 +1053,9 @@ RULES FOR QUICK FUEL / FLYERS ENERGY:
   - invoiceNum: "<base invoice>-<truckId>" e.g. "CFS-4582698-0294"
   - date: invoice date YYYY-MM-DD
   - notes: "Weekly fuel card - Truck X" or "Unassigned fuel" for INVENTORY
-- FINAL SANITY CHECK: sum of all row totals must equal "Invoice Amount" at bottom. If off, re-parse.
-- Return ONLY a JSON object: {"vendor":"Quick Fuel","invoice_number":"CFS-xxx","invoice_date":"YYYY-MM-DD","invoice_total":N,"rows":[...]}
+- ALSO CAPTURE INVOICE-LEVEL FEES: Look for a section titled "Invoice Fees Total" or similar. Fees like "Regulatory Compliance Fee" are NOT per-truck — they appear as an invoice-level total. Extract as invoice_fees (number, 0 if none).
+- INVOICE_TOTAL: the grand total shown at the bottom of the invoice (e.g. "15,736.44"). This should equal (sum of row totals) + invoice_fees.
+- Return ONLY JSON: {"vendor":"Quick Fuel","invoice_number":"CFS-xxx","invoice_date":"YYYY-MM-DD","invoice_total":N,"invoice_fees":N,"rows":[...]}
 - NO markdown fences, NO explanation, JUST the JSON.`;
 
 const FUELFOX_SERVICE_LOG_PROMPT = `Parse this FuelFox Atlanta SERVICE LOG PDF and return JSON.
@@ -1362,30 +1358,41 @@ function GmailSync({ onRefresh }) {
       const weekKey = weekEndingFriday(isoDate);
       const invBase = data.invoice_number;
       const totalGal = data.rows.reduce((s, r) => s + (Number(r.gallons) || 0), 0);
-      const totalSpend = data.rows.reduce((s, r) => s + (Number(r.total) || 0), 0);
-      const avgRate = totalGal > 0 ? totalSpend / totalGal : null;
+      const rowSum = data.rows.reduce((s, r) => s + (Number(r.total) || 0), 0);
+      const invoiceFees = Number(data.invoice_fees) || 0;
+      const grandTotal = rowSum + invoiceFees;  // matches invoice_total
+      // Redistribute invoice-level fees (e.g. Regulatory Compliance Fee) proportionally by gallons
+      const feePerGal = totalGal > 0 ? invoiceFees / totalGal : 0;
+      const avgRate = totalGal > 0 ? grandTotal / totalGal : null;
 
       await FS.saveFuelInvoice(`quickfuel_${invBase}`, {
         invoice_id: `quickfuel_${invBase}`, vendor: "quickfuel",
         invoice_number: invBase, invoice_date: isoDate, week_ending: weekKey,
         total_gallons: totalGal,
-        fuel_cost: totalSpend,  // already all-in with tax
-        tax: null, delivery_fee: 0,
-        grand_total: totalSpend,
+        fuel_cost: rowSum,  // sum of recap rows (includes per-gallon tax)
+        tax: null,
+        delivery_fee: invoiceFees,  // invoice-level fees (regulatory compliance, etc.)
+        grand_total: grandTotal,
         true_rate: avgRate,
-        fuel_only_rate: avgRate,
+        fuel_only_rate: totalGal > 0 ? rowSum / totalGal : null,
         truck_count: data.rows.length,
         gmail_email_id: email.emailId,
       });
 
       for (const r of data.rows) {
         const lineId = `quickfuel_${invBase}_${r.truckId}`;
+        const gal = Number(r.gallons) || 0;
+        const baseTotal = Number(r.total) || 0;
+        const share = gal * feePerGal;
+        const trueTotal = Math.round((baseTotal + share) * 100) / 100;
+        const trueRate = gal > 0 ? Math.round((trueTotal / gal) * 10000) / 10000 : null;
         await FS.saveFuelByTruck(lineId, {
           line_id: lineId, vendor: "quickfuel",
           invoice_number: invBase, invoice_id: `quickfuel_${invBase}`,
-          unit: r.truckId, gallons: r.gallons,
-          posted_rate: r.pricePerGallon, posted_charge: r.total,
-          true_rate: r.pricePerGallon, true_cost: r.total, uplift: 0,  // no overhead for QF
+          unit: r.truckId, gallons: gal,
+          posted_rate: r.pricePerGallon, posted_charge: baseTotal,
+          true_rate: trueRate, true_cost: trueTotal,
+          uplift: Math.round(share * 10000) / 10000,  // per-truck share of invoice fees
           service_date: isoDate, week_ending: weekKey,
           notes: r.notes,
         });
@@ -1395,12 +1402,12 @@ function GmailSync({ onRefresh }) {
         const weekRollupId = `quickfuel_${weekKey}`;
         await FS.saveFuelWeekly(weekRollupId, {
           week_id: weekRollupId, vendor: "quickfuel", week_ending: weekKey,
-          gallons: totalGal, spend: totalSpend, true_rate: avgRate, invoice_count: 1,
+          gallons: totalGal, spend: grandTotal, true_rate: avgRate, invoice_count: 1,
         });
       }
 
-      setImported(prev => ({...prev, [refKey]: { ok: true, trucks: data.rows.length, total: totalSpend, rate: avgRate }}));
-      setImportStatus(`✓ Quick Fuel ${invBase}: ${data.rows.length} trucks, $${totalSpend.toFixed(2)} @ $${avgRate?.toFixed(4)}/gal`);
+      setImported(prev => ({...prev, [refKey]: { ok: true, trucks: data.rows.length, total: grandTotal, rate: avgRate }}));
+      setImportStatus(`✓ Quick Fuel ${invBase}: ${data.rows.length} trucks, $${grandTotal.toFixed(2)} @ $${avgRate?.toFixed(4)}/gal${invoiceFees > 0 ? ` (includes $${invoiceFees.toFixed(2)} redistributed fees)` : ""}`);
       if (onRefresh) onRefresh();
     } catch(e) {
       setImported(prev => ({...prev, [refKey]: { error: e.message }}));
