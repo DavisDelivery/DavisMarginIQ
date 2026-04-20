@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.10.3";
+const APP_VERSION = "2.11.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1764,7 +1764,21 @@ async function readWorkbook(file) {
       try {
         const wb = XLSX.read(e.target.result, { type: "array" });
         const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+        // Check for Uline-style meta row on row 0 (cells contain patterns like
+        // "Num,0 (No Blanks)", "CAPS (COD,$$$)", etc). If detected, skip one row
+        // so the REAL headers (pro, order, customer, cost, new cost, code, ...)
+        // become the sheet_to_json keys.
+        const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+        let skipRows = 0;
+        if (raw.length >= 2) {
+          const r0 = (raw[0] || []).filter(v => v != null).map(v => String(v).toLowerCase());
+          const metaHints = r0.filter(v =>
+            /^num\s*,/.test(v) || /no blanks/.test(v) || /^caps\s/.test(v) || v.startsWith("not blank")
+          ).length;
+          // If most of row 0 looks like meta-descriptors, skip it
+          if (metaHints >= 3 && r0.length >= 5) skipRows = 1;
+        }
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: null, range: skipRows });
         const norm = rows.map(r => { const o = {}; Object.keys(r).forEach(k => o[String(k).toLowerCase().trim()] = r[k]); return o; });
         resolve(norm);
       } catch(err) { reject(err); }
@@ -1851,6 +1865,245 @@ function parseCSVStream(text) {
     rows.push(cur);
   }
   return rows;
+}
+
+// ─── Zip unpacking ──────────────────────────────────────────
+// If the user drops a .zip into Data Ingest, we unpack it in the browser and
+// return an array of File-shaped blobs — same interface readCSV/readWorkbook
+// already accept, so nothing downstream has to change.
+async function unzipIfNeeded(files) {
+  const out = [];
+  for (const f of files) {
+    const name = (f.name || "").toLowerCase();
+    if (!name.endsWith(".zip")) { out.push(f); continue; }
+    if (typeof JSZip === "undefined") {
+      throw new Error("JSZip not loaded — cannot unpack .zip file");
+    }
+    const zip = await JSZip.loadAsync(f);
+    const entries = Object.values(zip.files);
+    for (const entry of entries) {
+      if (entry.dir) continue;
+      const entryName = entry.name;
+      // Skip macOS resource fork files and hidden files
+      if (entryName.includes("__MACOSX/")) continue;
+      const base = entryName.split("/").pop();
+      if (!base || base.startsWith(".") || base.startsWith("._")) continue;
+      // Only keep files the ingest knows how to handle
+      const lower = base.toLowerCase();
+      const isData = lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.endsWith(".csv");
+      const isPdf = lower.endsWith(".pdf");
+      if (!isData && !isPdf) continue;
+      const blob = await entry.async("blob");
+      // Wrap in a File so the existing FileReader code paths work unchanged
+      const fakeFile = new File([blob], base, { type: blob.type || "application/octet-stream" });
+      // Tag with source info for the audit UI
+      fakeFile._zipSource = f.name;
+      fakeFile._isPdf = isPdf;
+      out.push(fakeFile);
+    }
+  }
+  return out;
+}
+
+// ─── Filename audit ─────────────────────────────────────────
+// Runs BEFORE ingestion. Classifies every file by parseable date range,
+// flags typos/duplicates/gaps, so the user can review before anything hits
+// Firestore. Returns a structured audit report.
+function auditFilenames(files) {
+  // Parse: "DAS 20250104-20250110" or "DAS 20250104 - 20250110" variants.
+  // Use (?<!\d) / (?!\d) instead of \b so boundaries between letters and digits
+  // still match (e.g. "das2025012-20250718" where no space separates prefix from date).
+  const patternGood = /(?<!\d)(\d{8})\s*-\s*(\d{8})(?!\d)/;
+  // Typo patterns we want to explicitly surface:
+  const patternBad7To8 = /(?<!\d)(\d{7})\s*-\s*(\d{8})(?!\d)/;              // "0240608-20240614" or "das2025012-20250718"
+  const patternBad8To9 = /(?<!\d)(\d{8})\s*-\s*(\d{9})(?!\d)/;              // "20250315 - 220250321"
+  const patternDoubleDash = /(?<!\d)(\d{8})\s*-\s*-\s*(\d{8})(?!\d)/;       // "20250324- -20250328"
+  const patternSlashDate = /(?<!\d)(\d{2})(\d{2})(\d{4})\s*-\s*(\d{2})(\d{2})(\d{4})(?!\d)/; // "03012025 - 03072025"
+
+  const parseYMD = (s) => {
+    try {
+      const y = parseInt(s.slice(0, 4), 10), m = parseInt(s.slice(4, 6), 10), d = parseInt(s.slice(6, 8), 10);
+      if (y < 2000 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return null;
+      return `${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    } catch { return null; }
+  };
+
+  const classified = [];
+  for (const f of files) {
+    const name = f.name;
+    const lower = name.toLowerCase();
+    const ext = lower.split(".").pop();
+    const isPdf = ext === "pdf";
+    const isBackup = /backup/i.test(name);
+    const isAccessorial = /accessorial|acessorial|accesorial|acesorial|acceessorial/i.test(name);
+    const isDispute = /dispute/i.test(name);
+    const isInvoicePdf = /^ra#|_invoice|backup accessorials|back accessorials/i.test(name);
+
+    let startDate = null, endDate = null, weekEnding = null;
+    let parseStatus = "ok"; // ok | typo-7digit | typo-9digit | typo-doubledash | typo-slashdate | unparsed | pdf-no-date
+    let suggestedRename = null;
+
+    // Try good pattern first
+    let m = name.match(patternGood);
+    if (m) {
+      startDate = parseYMD(m[1]);
+      endDate = parseYMD(m[2]);
+    } else if ((m = name.match(patternBad7To8))) {
+      parseStatus = "typo-7digit";
+      // Heuristic 1: leading-zero typo. "0240608" → "20240608"
+      let fixedStart = null;
+      if (m[1].length === 7 && m[1].startsWith("0")) fixedStart = "2" + m[1];
+      // Heuristic 2: try parsing end date, subtract 6 days, see if that matches 7 digits of truth
+      if (!fixedStart) {
+        const endParsed = parseYMD(m[2]);
+        if (endParsed) {
+          const startFromEnd = addDays(endParsed, -6).replace(/-/g, ""); // YYYYMMDD
+          // Does startFromEnd look similar to m[1]? e.g. m[1]="2025012", startFromEnd="20250712"
+          // Count matching characters
+          let matches = 0;
+          for (let i = 0; i < Math.min(m[1].length, startFromEnd.length); i++) {
+            if (m[1][i] === startFromEnd[i]) matches++;
+          }
+          if (matches >= 5) fixedStart = startFromEnd;
+        }
+      }
+      if (fixedStart) {
+        startDate = parseYMD(fixedStart);
+        endDate = parseYMD(m[2]);
+        // Build a sensible suggested rename
+        const before = name.indexOf(m[1]);
+        if (before >= 0) {
+          suggestedRename = name.slice(0, before) + fixedStart + name.slice(before + m[1].length);
+          // Also normalize "das2025012" style (no space between das and date)
+          suggestedRename = suggestedRename.replace(/^das(\d)/i, "das $1");
+        }
+      }
+    } else if ((m = name.match(patternBad8To9))) {
+      parseStatus = "typo-9digit";
+      // 9-digit end date likely has duplicated digit. e.g. "220250321" → "20250321"
+      const maybeFix = m[2].length === 9 && m[2].startsWith("2") && m[2][1] === "2" ? m[2].slice(1) : null;
+      if (maybeFix) {
+        startDate = parseYMD(m[1]);
+        endDate = parseYMD(maybeFix);
+        suggestedRename = name.replace("- " + m[2], "- " + maybeFix).replace("-" + m[2], "-" + maybeFix);
+      }
+    } else if ((m = name.match(patternDoubleDash))) {
+      parseStatus = "typo-doubledash";
+      startDate = parseYMD(m[1]);
+      endDate = parseYMD(m[2]);
+      suggestedRename = name.replace(/(\d{8})-\s*-\s*(\d{8})/, "$1-$2");
+    } else if ((m = name.match(patternSlashDate))) {
+      parseStatus = "typo-slashdate";
+      // "03012025" MM/DD/YYYY → rebuild as YYYYMMDD
+      const s = `${m[3]}${m[1]}${m[2]}`;
+      const e = `${m[6]}${m[4]}${m[5]}`;
+      startDate = parseYMD(s);
+      endDate = parseYMD(e);
+      suggestedRename = name.replace(m[0], `${s}-${e}`);
+    } else {
+      parseStatus = isPdf ? "pdf-no-date" : "unparsed";
+    }
+
+    // Compute Friday week-ending if we have an end date
+    if (endDate) {
+      weekEnding = weekEndingFriday(endDate);
+    }
+
+    // Classify kind
+    let kind;
+    if (isDispute) kind = "uline-dispute";
+    else if (isBackup || isInvoicePdf) kind = "pdf-backup";
+    else if (isPdf) kind = "pdf-other";
+    else if (isAccessorial) kind = "accessorial";
+    else kind = "original";
+
+    classified.push({
+      file: f, name,
+      kind, isPdf,
+      startDate, endDate, weekEnding,
+      parseStatus, suggestedRename,
+      size: f.size || 0,
+    });
+  }
+
+  // Group data files by week-ending (originals & accessorials only)
+  const byWeek = {};
+  for (const c of classified) {
+    if (c.isPdf) continue;
+    if (c.kind !== "original" && c.kind !== "accessorial") continue;
+    if (!c.weekEnding) continue;
+    if (!byWeek[c.weekEnding]) byWeek[c.weekEnding] = { originals: [], accessorials: [] };
+    if (c.kind === "original") byWeek[c.weekEnding].originals.push(c);
+    else byWeek[c.weekEnding].accessorials.push(c);
+  }
+
+  // Find duplicates (multiple files for same week+kind)
+  const duplicates = [];
+  for (const [we, g] of Object.entries(byWeek)) {
+    if (g.originals.length > 1) duplicates.push({ weekEnding: we, kind: "original", files: g.originals });
+    if (g.accessorials.length > 1) duplicates.push({ weekEnding: we, kind: "accessorial", files: g.accessorials });
+  }
+
+  // Find missing accessorials (weeks with original but no accessorial)
+  const missingAccessorials = Object.entries(byWeek)
+    .filter(([, g]) => g.originals.length > 0 && g.accessorials.length === 0)
+    .map(([we]) => we)
+    .sort();
+
+  // Find week gaps using contiguous-run detection. Ignores isolated stray files
+  // (e.g., a lone 2023 file when the main data is 2025), which otherwise would
+  // make every week between them look "missing".
+  const weeksCovered = Object.keys(byWeek).sort();
+  const missingWeeks = [];
+  if (weeksCovered.length >= 4) {
+    // Split sorted weeks into runs — consecutive = no gap > 28 days
+    const runs = [];
+    let cur = [weeksCovered[0]];
+    for (let i = 1; i < weeksCovered.length; i++) {
+      const prev = weeksCovered[i-1];
+      const w = weeksCovered[i];
+      const gapDays = (new Date(w+"T00:00:00") - new Date(prev+"T00:00:00")) / 86400000;
+      if (gapDays <= 28) cur.push(w);
+      else { runs.push(cur); cur = [w]; }
+    }
+    runs.push(cur);
+    // Only look for gaps inside substantial runs (4+ weeks) — single stray
+    // files or short runs don't generate noisy "missing week" alerts.
+    for (const run of runs) {
+      if (run.length < 4) continue;
+      let x = run[0];
+      const end = run[run.length - 1];
+      while (x <= end) {
+        if (!byWeek[x]) missingWeeks.push(x);
+        x = addDays(x, 7);
+      }
+    }
+  }
+
+  const typos = classified.filter(c => c.parseStatus.startsWith("typo"));
+  const unparsed = classified.filter(c => c.parseStatus === "unparsed");
+
+  return {
+    classified,
+    byWeek,
+    summary: {
+      total: classified.length,
+      originals: classified.filter(c => c.kind === "original" && c.weekEnding).length,
+      accessorials: classified.filter(c => c.kind === "accessorial" && c.weekEnding).length,
+      pdfs: classified.filter(c => c.isPdf).length,
+      typos: typos.length,
+      unparsed: unparsed.length,
+      duplicates: duplicates.length,
+      missingAccessorials: missingAccessorials.length,
+      missingWeeks: missingWeeks.length,
+      weeksCovered: weeksCovered.length,
+    },
+    typos,
+    unparsed,
+    duplicates,
+    missingAccessorials,
+    missingWeeks,
+  };
 }
 
 function normalizePro(v) {
@@ -3024,6 +3277,7 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   const [progress, setProgress] = useState({ current:0, total:0 });
   const [lastResult, setLastResult] = useState(null);
   const [sourceStats, setSourceStats] = useState(null);
+  const [pendingReview, setPendingReview] = useState(null); // {audit, expandedFiles} while awaiting user confirmation
   const fileRef = useRef(null);
 
   // Load source counts for all 5 sources on mount so cards show meaningful status
@@ -3052,6 +3306,53 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   const handleFiles = async (files) => {
     if (!files || files.length === 0) return;
     setUploading(true);
+    setStatus(`Preparing ${files.length} file${files.length>1?"s":""}...`);
+    setProgress({ current:0, total:0 });
+
+    let expanded;
+    try {
+      expanded = await unzipIfNeeded(Array.from(files));
+    } catch(e) {
+      setStatus("");
+      setUploading(false);
+      alert("Could not unpack zip: " + e.message);
+      return;
+    }
+    // Audit the expanded file list
+    const audit = auditFilenames(expanded);
+
+    // Decide whether to show the pre-upload review
+    const anyZip = Array.from(files).some(f => (f.name || "").toLowerCase().endsWith(".zip"));
+    const needsReview = anyZip || audit.summary.typos > 0 || audit.summary.unparsed > 0 ||
+                        audit.summary.duplicates > 0 || audit.summary.missingWeeks > 0 ||
+                        audit.summary.missingAccessorials > 0;
+
+    if (needsReview) {
+      setPendingReview({ audit, expandedFiles: expanded });
+      setUploading(false);
+      setStatus("");
+      return;
+    }
+    // No issues — straight to ingest
+    await doIngest(expanded);
+  };
+
+  const proceedWithPending = async () => {
+    if (!pendingReview) return;
+    const { expandedFiles } = pendingReview;
+    setPendingReview(null);
+    setUploading(true);
+    await doIngest(expandedFiles);
+  };
+
+  const cancelPending = () => {
+    setPendingReview(null);
+    setStatus("");
+  };
+
+  const doIngest = async (files) => {
+    if (!files || files.length === 0) { setUploading(false); return; }
+    setUploading(true);
     setStatus(`Processing ${files.length} file${files.length>1?"s":""}...`);
     setProgress({ current:0, total:files.length });
 
@@ -3073,6 +3374,13 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       setProgress({ current: i+1, total: files.length });
       setStatus(`[${i+1}/${files.length}] ${file.name}...`);
       const fileId = file.name.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
+
+      // PDFs are backup/evidence docs — log for audit trail, don't parse
+      if (file._isPdf || file.name.toLowerCase().endsWith(".pdf")) {
+        const pdfKind = /backup/i.test(file.name) ? "pdf-backup" : "pdf-other";
+        fileLogs.push({ file_id: fileId, filename: file.name, kind: pdfKind, group: "evidence", row_count: 0, uploaded_at: new Date().toISOString() });
+        continue;
+      }
 
       try {
         let rows;
@@ -3306,15 +3614,137 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="📤" text="Data Ingest" right={
       <div>
-        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" multiple onChange={e=>handleFiles(e.target.files)} style={{display:"none"}} />
+        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.zip,.pdf" multiple onChange={e=>handleFiles(e.target.files)} style={{display:"none"}} />
         <PrimaryBtn text={uploading?"Processing...":"Upload Files"} onClick={()=>fileRef.current?.click()} loading={uploading} />
       </div>
     } />
 
+    {pendingReview && (() => {
+      const a = pendingReview.audit;
+      const weekLabels = (ws) => ws.map(w => {
+        try { const d = new Date(w+"T00:00:00"); return `WE ${d.getMonth()+1}/${d.getDate()}/${String(d.getFullYear()).slice(-2)}`; }
+        catch { return w; }
+      });
+      const canProceed = a.summary.unparsed === 0 && a.summary.typos === 0 && a.summary.duplicates === 0;
+      return (
+        <div style={{...cardStyle, borderColor:T.yellow, borderWidth:2, background:"#fffbeb"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <div style={{fontSize:14,fontWeight:700,color:T.yellowText}}>🔍 Pre-Upload Review</div>
+            <div style={{fontSize:11,color:T.textMuted}}>{a.summary.total} files detected</div>
+          </div>
+
+          {/* Summary grid */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10,marginBottom:16}}>
+            <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Originals</div>
+              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.originals}</div>
+            </div>
+            <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Accessorials</div>
+              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.accessorials}</div>
+            </div>
+            <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>PDF Backups</div>
+              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.pdfs}</div>
+            </div>
+            <div style={{background:a.summary.weeksCovered>0?T.bgSurface:"#fef2f2",padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Weeks Covered</div>
+              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.weeksCovered}</div>
+            </div>
+            <div style={{background:a.summary.typos>0?"#fef2f2":T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${a.summary.typos>0?T.red:T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Filename Typos</div>
+              <div style={{fontSize:18,fontWeight:700,color:a.summary.typos>0?T.redText:T.text}}>{a.summary.typos}</div>
+            </div>
+            <div style={{background:a.summary.duplicates>0?"#fffbeb":T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${a.summary.duplicates>0?T.yellow:T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Duplicates</div>
+              <div style={{fontSize:18,fontWeight:700,color:a.summary.duplicates>0?T.yellowText:T.text}}>{a.summary.duplicates}</div>
+            </div>
+          </div>
+
+          {a.typos.length > 0 && (
+            <div style={{background:"#fef2f2",border:`1px solid ${T.red}40`,borderRadius:8,padding:12,marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.redText,marginBottom:8}}>🔴 Filename Typos ({a.typos.length}) — rename these in Finder and re-upload</div>
+              <div style={{maxHeight:200,overflowY:"auto"}}>
+                {a.typos.map((t,i) => (
+                  <div key={i} style={{padding:"6px 0",borderBottom:i<a.typos.length-1?`1px solid ${T.borderLight}`:"none",fontSize:11}}>
+                    <div style={{fontFamily:"monospace",color:T.redText}}>❌ {t.name}</div>
+                    {t.suggestedRename && <div style={{fontFamily:"monospace",color:T.green,marginTop:2}}>✅ {t.suggestedRename}</div>}
+                    <div style={{color:T.textDim,fontSize:10,marginTop:2}}>Issue: {t.parseStatus.replace("typo-","")}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {a.duplicates.length > 0 && (
+            <div style={{background:"#fffbeb",border:`1px solid ${T.yellow}60`,borderRadius:8,padding:12,marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.yellowText,marginBottom:8}}>🟡 Duplicates ({a.duplicates.length}) — one {"{"}kind{"}"} per week expected</div>
+              <div style={{maxHeight:200,overflowY:"auto"}}>
+                {a.duplicates.map((d,i) => (
+                  <div key={i} style={{padding:"6px 0",borderBottom:i<a.duplicates.length-1?`1px solid ${T.borderLight}`:"none",fontSize:11}}>
+                    <div style={{fontWeight:600,color:T.text}}>{weekLabels([d.weekEnding])[0]} — {d.kind}</div>
+                    {d.files.map((f,j) => (
+                      <div key={j} style={{fontFamily:"monospace",color:T.textMuted,fontSize:10,marginLeft:12,marginTop:2}}>• {f.name}</div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {a.missingWeeks.length > 0 && (
+            <div style={{background:"#fef2f2",border:`1px solid ${T.red}40`,borderRadius:8,padding:12,marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.redText,marginBottom:8}}>🔴 Missing Weeks ({a.missingWeeks.length}) — no files found for these dates</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                {weekLabels(a.missingWeeks).map((w,i) => (
+                  <div key={i} style={{padding:"4px 10px",background:"white",borderRadius:4,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText,fontWeight:600}}>{w}</div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {a.missingAccessorials.length > 0 && (
+            <div style={{background:"#fffbeb",border:`1px solid ${T.yellow}60`,borderRadius:8,padding:12,marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.yellowText,marginBottom:8}}>🟡 Weeks Missing Accessorials ({a.missingAccessorials.length})</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                {weekLabels(a.missingAccessorials).map((w,i) => (
+                  <div key={i} style={{padding:"4px 10px",background:"white",borderRadius:4,border:`1px solid ${T.yellow}60`,fontSize:11,color:T.yellowText,fontWeight:600}}>{w}</div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {a.unparsed.length > 0 && (
+            <div style={{background:"#f9fafb",border:`1px solid ${T.border}`,borderRadius:8,padding:12,marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.textMuted,marginBottom:8}}>⚪ Unrecognized ({a.unparsed.length}) — will be skipped</div>
+              <div style={{maxHeight:140,overflowY:"auto"}}>
+                {a.unparsed.map((u,i) => (
+                  <div key={i} style={{fontFamily:"monospace",fontSize:10,color:T.textMuted,padding:"3px 0"}}>{u.name}</div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Action buttons */}
+          <div style={{display:"flex",gap:10,alignItems:"center",marginTop:16,paddingTop:12,borderTop:`1px solid ${T.borderLight}`}}>
+            <button onClick={cancelPending} style={{padding:"10px 20px",borderRadius:8,background:"white",border:`1px solid ${T.border}`,color:T.text,fontSize:13,fontWeight:600,cursor:"pointer"}}>Cancel</button>
+            <button onClick={proceedWithPending} style={{padding:"10px 20px",borderRadius:8,background:canProceed?T.brand:T.yellow,border:"none",color:"white",fontSize:13,fontWeight:600,cursor:"pointer"}}>
+              {canProceed ? "Proceed with Ingest →" : `Ingest Anyway (${a.summary.typos + a.summary.duplicates} issues) →`}
+            </button>
+            {!canProceed && (
+              <div style={{fontSize:11,color:T.textMuted,fontStyle:"italic"}}>
+                Recommended: fix typos and dedupe, then re-upload
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    })()}
+
     <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
       <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand}}>📤 Bulk Upload — Any Data Source</div>
       <div style={{fontSize:12,color:T.text,lineHeight:1.6}}>
-        Select any combination of files. MarginIQ auto-detects each type and routes to the right parser:
+        Select any combination of files — individual <code>.xlsx</code>/<code>.csv</code> or a <code>.zip</code> archive (e.g., a year's worth of Uline weeklies). MarginIQ unpacks zips, audits for typos/duplicates/gaps, shows you a review before ingesting, and auto-detects each type:
         <ul style={{marginTop:8,marginLeft:20,fontSize:12}}>
           <li><strong>Uline</strong> (master / originals / accessorials / DDIS) → weekly revenue (source of truth) + reconciliation</li>
           <li><strong>NuVizz</strong> (driver stops export) → weekly driver rollups + 1099 contractor pay base (40% per stop). <em>Not revenue.</em></li>
