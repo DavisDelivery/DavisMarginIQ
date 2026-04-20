@@ -38,15 +38,20 @@ _None detected in the 4-CSV backfill — continuous weekly coverage Jan 2025 thr
 - Env vars required: `B600_BASE_URL`, `B600_USERNAME`, `B600_PASSWORD`, `B600_EXPORT_PATH`, `FIREBASE_API_KEY`
 - Last run status logged in `marginiq_config/b600_last_pull`
 
-### Auto-pull: B600 protocol details (discovered 2026-04-20)
+### Auto-pull: B600 protocol (fully characterized 2026-04-20)
 
-The B600 is an **Icon Time TotalPass B600** hardware clock (serial `B005-109-637`, sw v4.0.10103) at `b600.atlantafreightquotes.com`. Flow for weekly CSV export:
+The B600 is an **Icon Time TotalPass B600** hardware clock (serial `B005-109-637`, sw v4.0.10103) at `b600.atlantafreightquotes.com`. The **Reports → Timecards → Export → CSV Extended** workflow produces the same 25-column CSV format as the manual backfill files. Flow:
 
-1. `POST /login.html` with `username`, `password`, `buttonClicked=Submit` (form-encoded) → session cookie
-2. `POST /payroll.html` — primes server-side export context (browser does this on Submit; exact body not yet characterized)
-3. `GET /export.html?type=4&timeFrame=4&provider=Paycom` — returns the CSV
-   - `timeFrame=4` = "Last Week" (prior Mon–Sun)
-   - `provider=Paycom` = the CSV format MarginIQ already parses (Display Name, Date, In Time, Out Time, REG, OT1, OT2, Total)
+1. `GET /login.html` → seed session cookie
+2. `POST /login.html` body `username=X&password=Y&buttonClicked=Submit` (form-encoded) → authenticated session, 302 → `/index.html`
+3. `GET /report.html?rt=2&from=MM/DD/YY&to=MM/DD/YY&eid=ss&export=1` → returns the CSV directly
+
+Parameters:
+- `rt=2` — Timecards report
+- `eid=ss` — all employees
+- `export=1` — CSV Extended (25 cols with header; `export=0`/no param would be CSV basic)
+
+The `/payroll.html` POST preamble and the `/export.html` endpoint that the earlier "Paycom" investigation turned up are **not used** — they return a different, unheadered format that the MarginIQ parser doesn't speak. The Timecard Report export is the clean path.
 
 ### Known issues
 - The direct `GET /export.html` returns **503** if hit without the preceding POST to `/payroll.html`. The browser's Submit button works because it POSTs first. The Netlify function replicates this, but the exact POST body the browser sends is still not fully characterized. If the first real run 503s, capture the browser's POST body via Dev Tools → Network → payroll.html → Payload.
