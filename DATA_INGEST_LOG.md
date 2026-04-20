@@ -2,7 +2,7 @@
 
 Living record of what data has been fed into Davis MarginIQ. Updated after every ingestion.
 
-Last updated: **2026-04-20**
+Last updated: **2026-04-20** (v2.9.0 — Time Clock tab + AI analyst)
 
 ---
 
@@ -41,6 +41,10 @@ _None detected in the 4-CSV backfill — continuous weekly coverage Jan 2025 thr
 ### Known issues
 - Auto-pull endpoint (`B600_EXPORT_PATH`) assumed to be `/reports/timeclock/export` with `?from=MM/DD/YY&to=MM/DD/YY&format=csv` — **needs verification against actual B600 Reports → Export CSV URL**.
 - Auth method assumed Basic; may need session-cookie flow depending on how CyberPay login works.
+
+### Fixes / history
+- **2026-04-20 (commit `77eca82`)** — Fixed: SheetJS auto-converts CSV date columns (`01/17/25`) to Excel serial numbers (`45674`), causing every timeclock row to have `date=null` and the weekly rollup to produce 0 weeks. `parseDateMDYFlexible()` now handles numeric Excel serial input transparently.
+- **2026-04-20 (v2.9.0)** — New Time Clock tab with overview stats, weekly drill-in (top 20 employees per week), anomaly detection (spike/drop vs trailing-8-week avg, OT >20%, staff drops), and AI chat (ask-anything via `marginiq-analyze-timeclock` Netlify function).
 
 ---
 

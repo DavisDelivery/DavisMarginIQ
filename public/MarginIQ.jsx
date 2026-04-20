@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.8.1";
+const APP_VERSION = "2.9.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -4375,6 +4375,7 @@ function MarginIQ() {
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
     { id:"drivers", icon:"👥", label:"Drivers" },
+    { id:"timeclock", icon:"⏰", label:"Time Clock" },
     { id:"fuel", icon:"⛽", label:"Fuel" },
     { id:"completeness", icon:"✅", label:"Data Health" },
     { id:"ingest", icon:"📤", label:"Data Ingest" },
@@ -4409,6 +4410,7 @@ function MarginIQ() {
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
     {!loading && tab==="recon" && <Audit reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
     {!loading && tab==="drivers" && <Drivers />}
+    {!loading && tab==="timeclock" && (typeof window !== "undefined" && window.TimeClockTab ? React.createElement(window.TimeClockTab) : <EmptyState icon="⏰" title="Time Clock module not loaded" sub="TimeClockTab.jsx did not load. Check console." />)}
     {!loading && tab==="fuel" && <Fuel />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} onRefresh={refreshData} />}
