@@ -7,9 +7,13 @@ const VENDOR_QUERIES: Record<string, string> = {
   nuvizz: 'from:nuvizzapps@nuvizzapps.com has:attachment',
 
   // Uline weekly billing (DAS files — the delivery/truckload/accessorial
-  // xlsx files). Excludes the AP-Freight DDIS remittance emails which have
-  // their own vendor entry below.
-  uline: 'from:@uline.com -from:APFreight@uline.com has:attachment',
+  // xlsx files). Filename-based filter because billing emails arrive from
+  // various @uline.com senders but the attachments always start with 'das '
+  // (e.g. 'das 20250301-20250307.xlsx'). The attachment-name filter cuts
+  // out all the noise from outbound.logistics/EC Traces/Ben Monroe etc.
+  // who send PDFs, customer-comment xlsx, freight reports, pickup requests,
+  // etc. none of which we want to ingest.
+  uline: 'from:@uline.com filename:das filename:xlsx -from:APFreight@uline.com',
 
   // Uline DDIS payment remittance — CSV files listing paid PROs. From the
   // APFreight@uline.com sender with subject = filename (DDIS820_*.csv).
