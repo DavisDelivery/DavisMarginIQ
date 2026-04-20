@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.11.0";
+const APP_VERSION = "2.11.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1867,6 +1867,37 @@ function parseCSVStream(text) {
   return rows;
 }
 
+// ─── Auto-rename typo'd files in memory ─────────────────────
+// For each file whose audit result has a suggestedRename, wrap it in a fresh
+// File object with the corrected name. The file on disk is unchanged — only
+// the in-memory copy used for this ingest has the clean name. This means the
+// detection logic downstream sees clean filenames and duplicates/gaps analysis
+// produces accurate results.
+function applyTypoFixes(files, audit) {
+  const renameMap = new Map(); // originalName -> suggestedRename
+  const fixed = [];
+  for (const c of audit.classified) {
+    if (c.parseStatus.startsWith("typo") && c.suggestedRename && c.suggestedRename !== c.name) {
+      renameMap.set(c.name, c.suggestedRename);
+    }
+  }
+  for (const f of files) {
+    const newName = renameMap.get(f.name);
+    if (newName) {
+      // File constructor requires the fetch as Blob. Copy the underlying bytes.
+      const rewrapped = new File([f], newName, { type: f.type || "application/octet-stream" });
+      // Preserve our custom tags
+      if (f._zipSource) rewrapped._zipSource = f._zipSource;
+      if (f._isPdf) rewrapped._isPdf = f._isPdf;
+      rewrapped._originalName = f.name; // for audit history so we can show the fix
+      fixed.push(rewrapped);
+    } else {
+      fixed.push(f);
+    }
+  }
+  return { files: fixed, renameMap };
+}
+
 // ─── Zip unpacking ──────────────────────────────────────────
 // If the user drops a .zip into Data Ingest, we unpack it in the browser and
 // return an array of File-shaped blobs — same interface readCSV/readWorkbook
@@ -3318,23 +3349,32 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       alert("Could not unpack zip: " + e.message);
       return;
     }
-    // Audit the expanded file list
-    const audit = auditFilenames(expanded);
+
+    // PASS 1: initial audit to find typos
+    const firstPass = auditFilenames(expanded);
+
+    // Auto-rename any files with suggestedRename (in memory only — disk untouched)
+    const { files: correctedFiles, renameMap } = applyTypoFixes(expanded, firstPass);
+
+    // PASS 2: re-audit with the corrected names so duplicates/gaps reflect reality
+    const audit = auditFilenames(correctedFiles);
+    // Attach rename info so the review UI can show what was auto-fixed
+    audit.autoRenamed = Array.from(renameMap.entries()).map(([from, to]) => ({ from, to }));
 
     // Decide whether to show the pre-upload review
     const anyZip = Array.from(files).some(f => (f.name || "").toLowerCase().endsWith(".zip"));
     const needsReview = anyZip || audit.summary.typos > 0 || audit.summary.unparsed > 0 ||
                         audit.summary.duplicates > 0 || audit.summary.missingWeeks > 0 ||
-                        audit.summary.missingAccessorials > 0;
+                        audit.summary.missingAccessorials > 0 || audit.autoRenamed.length > 0;
 
     if (needsReview) {
-      setPendingReview({ audit, expandedFiles: expanded });
+      setPendingReview({ audit, expandedFiles: correctedFiles });
       setUploading(false);
       setStatus("");
       return;
     }
     // No issues — straight to ingest
-    await doIngest(expanded);
+    await doIngest(correctedFiles);
   };
 
   const proceedWithPending = async () => {
@@ -3651,9 +3691,9 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
               <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Weeks Covered</div>
               <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.weeksCovered}</div>
             </div>
-            <div style={{background:a.summary.typos>0?"#fef2f2":T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${a.summary.typos>0?T.red:T.borderLight}`}}>
-              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Filename Typos</div>
-              <div style={{fontSize:18,fontWeight:700,color:a.summary.typos>0?T.redText:T.text}}>{a.summary.typos}</div>
+            <div style={{background:a.autoRenamed && a.autoRenamed.length>0 ? "#ecfdf5" : T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${a.autoRenamed && a.autoRenamed.length>0 ? T.green : T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Auto-Fixed</div>
+              <div style={{fontSize:18,fontWeight:700,color:a.autoRenamed && a.autoRenamed.length>0 ? T.green : T.text}}>{a.autoRenamed ? a.autoRenamed.length : 0}</div>
             </div>
             <div style={{background:a.summary.duplicates>0?"#fffbeb":T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${a.summary.duplicates>0?T.yellow:T.borderLight}`}}>
               <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Duplicates</div>
@@ -3661,14 +3701,29 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
             </div>
           </div>
 
+          {a.autoRenamed && a.autoRenamed.length > 0 && (
+            <div style={{background:"#ecfdf5",border:`1px solid ${T.green}50`,borderRadius:8,padding:12,marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.green,marginBottom:8}}>✅ Auto-Corrected Filenames ({a.autoRenamed.length}) — will be ingested with clean names</div>
+              <div style={{fontSize:11,color:T.textMuted,marginBottom:8}}>These files had parseable date typos. The files on disk weren't modified — the corrections apply only to this ingest.</div>
+              <div style={{maxHeight:200,overflowY:"auto"}}>
+                {a.autoRenamed.map((r,i) => (
+                  <div key={i} style={{padding:"6px 0",borderBottom:i<a.autoRenamed.length-1?`1px solid ${T.borderLight}`:"none",fontSize:11}}>
+                    <div style={{fontFamily:"monospace",color:T.textMuted,textDecoration:"line-through"}}>{r.from}</div>
+                    <div style={{fontFamily:"monospace",color:T.green,marginTop:2}}>→ {r.to}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {a.typos.length > 0 && (
             <div style={{background:"#fef2f2",border:`1px solid ${T.red}40`,borderRadius:8,padding:12,marginBottom:12}}>
-              <div style={{fontSize:12,fontWeight:700,color:T.redText,marginBottom:8}}>🔴 Filename Typos ({a.typos.length}) — rename these in Finder and re-upload</div>
+              <div style={{fontSize:12,fontWeight:700,color:T.redText,marginBottom:8}}>🔴 Unfixable Filenames ({a.typos.length})</div>
+              <div style={{fontSize:11,color:T.textMuted,marginBottom:8}}>Could not auto-correct these. Rename in Finder and re-upload.</div>
               <div style={{maxHeight:200,overflowY:"auto"}}>
                 {a.typos.map((t,i) => (
                   <div key={i} style={{padding:"6px 0",borderBottom:i<a.typos.length-1?`1px solid ${T.borderLight}`:"none",fontSize:11}}>
                     <div style={{fontFamily:"monospace",color:T.redText}}>❌ {t.name}</div>
-                    {t.suggestedRename && <div style={{fontFamily:"monospace",color:T.green,marginTop:2}}>✅ {t.suggestedRename}</div>}
                     <div style={{color:T.textDim,fontSize:10,marginTop:2}}>Issue: {t.parseStatus.replace("typo-","")}</div>
                   </div>
                 ))}
