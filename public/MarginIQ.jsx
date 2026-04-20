@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.16.1";
+const APP_VERSION = "2.16.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -48,6 +48,10 @@ const DEFAULT_COSTS = {
 
 // Earliest date we consider "business started" — before this, sparse data is expected
 const BUSINESS_START = "2023-03-01";
+
+// Earliest week we actively track for gaps and alerts. Data before this is
+// historical / spotty (pre-MarginIQ era) and shouldn't raise flags.
+const TRACKING_START = "2025-01-01";
 
 // ─── Formatters ──────────────────────────────────────────────
 const fmt = n => n==null||isNaN(n)?"$0":"$"+Number(n).toLocaleString("en-US",{maximumFractionDigits:0});
@@ -5786,10 +5790,11 @@ function MarginIQ() {
     return calculateMargins(costs, weeklyWindow);
   }, [costs, weeklyRollups]);
 
-  // Data completeness scan
+  // Data completeness scan. Starts from TRACKING_START (2025-01-01) so old
+  // pre-MarginIQ data doesn't raise flags.
   const completeness = useMemo(() => {
     if (weeklyRollups.length === 0) return null;
-    return scanCompleteness(weeklyRollups, null, BUSINESS_START);
+    return scanCompleteness(weeklyRollups, null, TRACKING_START);
   }, [weeklyRollups]);
 
   const tabs = [
