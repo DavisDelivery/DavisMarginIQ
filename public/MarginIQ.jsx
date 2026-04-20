@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.14.1";
+const APP_VERSION = "2.14.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3671,21 +3671,38 @@ function CoverageTimeline() {
         </div>
         {deliveryGaps.length > 0 && (
           <div style={{marginTop:12,paddingTop:10,borderTop:`1px solid ${deliveryStats.pct >= 85 ? T.yellow+"50" : T.red+"40"}`}}>
-            <div style={{fontSize:11,fontWeight:700,color:T.redText,marginBottom:6}}>🚨 Missing Delivery Weeks — find and upload these</div>
-            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
-              {deliveryGaps.slice(0, 30).map(w => (
-                <div key={w} style={{
-                  padding: "3px 8px",
-                  borderRadius: 4,
-                  background: "white",
-                  color: T.redText,
-                  fontSize: 10,
-                  fontWeight: 600,
-                  border: `1px solid ${T.red}30`,
-                  fontFamily: "monospace",
-                }}>WE {w.slice(5)}</div>
-              ))}
-              {deliveryGaps.length > 30 && <div style={{padding:"3px 8px",fontSize:10,color:T.textMuted}}>+{deliveryGaps.length - 30} more</div>}
+            <div style={{fontSize:11,fontWeight:700,color:T.redText,marginBottom:4}}>🚨 Missing Delivery Weeks — find and upload these files</div>
+            <div style={{fontSize:10,color:T.textMuted,marginBottom:8}}>Uline filenames encode the date range (Sat start → Fri end). Search your inbox / drive for the exact filename below.</div>
+            <div style={{maxHeight:240,overflowY:"auto",background:"white",borderRadius:6,border:`1px solid ${T.red}20`}}>
+              {deliveryGaps.slice(0, 50).map(we => {
+                // Compute Sat start = Friday WE - 6 days
+                const friDate = new Date(we + "T00:00:00");
+                const satDate = new Date(friDate);
+                satDate.setDate(satDate.getDate() - 6);
+                const fmt = (d) => d.toISOString().slice(0,10).replace(/-/g,"");
+                const expectedFilename = `das ${fmt(satDate)}-${fmt(friDate)}.xlsx`;
+                const accFilename = `das ${fmt(satDate)}-${fmt(friDate)} accessorials.xlsx`;
+                const humanRange = `${satDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})} – ${friDate.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}`;
+                return (
+                  <div key={we} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8,flexWrap:"wrap"}}>
+                      <div style={{fontWeight:700,color:T.redText}}>WE {we}</div>
+                      <div style={{fontSize:10,color:T.textMuted}}>{humanRange}</div>
+                    </div>
+                    <div style={{fontFamily:"monospace",fontSize:11,color:T.text,marginTop:4,wordBreak:"break-all"}}>
+                      <span style={{color:T.textDim}}>Delivery:</span> <strong>{expectedFilename}</strong>
+                    </div>
+                    <div style={{fontFamily:"monospace",fontSize:10,color:T.textMuted,marginTop:2,wordBreak:"break-all"}}>
+                      <span>Accessorial:</span> {accFilename}
+                    </div>
+                  </div>
+                );
+              })}
+              {deliveryGaps.length > 50 && (
+                <div style={{padding:"8px 10px",fontSize:10,color:T.textMuted,textAlign:"center",fontStyle:"italic"}}>
+                  +{deliveryGaps.length - 50} more missing weeks not shown
+                </div>
+              )}
             </div>
           </div>
         )}
