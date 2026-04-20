@@ -84,3 +84,4 @@ export default async (req: Request, context: Context) => {
     return Response.redirect(`${SITE_URL}?tab=gmail&gmail=error&reason=crash_${encodeURIComponent(e.message || "unknown")}`, 302);
   }
 };
+// env: GOOGLE_CLIENT_SECRET set 2026-04-20T18:01:38Z
