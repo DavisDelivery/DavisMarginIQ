@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.19.1";
+const APP_VERSION = "2.20.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1282,11 +1282,30 @@ function GmailSync({ onRefresh }) {
   const [importStatus, setImportStatus] = useState("");
   const [oauthMsg, setOauthMsg] = useState(null); // { kind: 'success'|'error', text }
 
+  // Import All state — tracks when a bulk import is running per vendor
+  const [bulkImporting, setBulkImporting] = useState({});     // vendor -> { current, total, skipped, failed, running }
+  const [alreadyImportedFilenames, setAlreadyImportedFilenames] = useState(new Set());
+
   // Date range controls — shared across all vendor searches.
   // rangePreset values: "30d" | "60d" | "90d" | "6mo" | "12mo" | "ytd" | "all" | "custom"
   const [rangePreset, setRangePreset] = useState("60d");
   const [customFrom, setCustomFrom] = useState(""); // YYYY-MM-DD
   const [customTo, setCustomTo] = useState("");     // YYYY-MM-DD
+
+  // Load the filenames we've already ingested so Import All can skip them.
+  // Loaded once on mount + refreshed after each bulk import.
+  const loadImportedFilenames = async () => {
+    if (!hasFirebase) return;
+    try {
+      const log = await FS.getFileLog(2000);
+      const set = new Set();
+      for (const l of log) {
+        if (l.filename) set.add(l.filename.toLowerCase());
+      }
+      setAlreadyImportedFilenames(set);
+    } catch(e) { console.error("loadImportedFilenames err:", e); }
+  };
+  useEffect(() => { loadImportedFilenames(); }, []);
 
   // Load Gmail connection state
   useEffect(() => {
@@ -1625,6 +1644,76 @@ function GmailSync({ onRefresh }) {
     setImporting(prev => ({...prev, [refKey]: false}));
   };
 
+  // Import All — bulk-import every email in the current vendor's search results.
+  // Skips anything whose filename is already in file_log (idempotent on re-runs).
+  // Honors vendor-specific handlers: FuelFox uses pair import, Quick Fuel PDFs
+  // use importQuickFuel, everything else uses per-attachment importAttachment.
+  const importAllForVendor = async (vendor) => {
+    const r = results[vendor];
+    if (!r?.list || r.list.length === 0) return;
+
+    const emails = r.list;
+    let current = 0;
+    let imported = 0;
+    let skipped = 0;
+    let failed = 0;
+    const total = emails.length;
+    setBulkImporting(prev => ({...prev, [vendor]: { current: 0, total, skipped: 0, failed: 0, imported: 0, running: true }}));
+
+    for (const em of emails) {
+      current++;
+      setBulkImporting(prev => ({...prev, [vendor]: { current, total, skipped, failed, imported, running: true }}));
+
+      try {
+        // FuelFox is pair-mode — one email = 2 PDFs processed together
+        if (vendor === "fuelfox") {
+          const pdfs = (em.attachments || []).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
+          if (pdfs.length < 2) { skipped++; continue; }
+          // Check if ALL attachments already imported
+          const allDone = pdfs.every(p => alreadyImportedFilenames.has(p.filename.toLowerCase()));
+          if (allDone) { skipped++; continue; }
+          setImportStatus(`[${current}/${total}] ${em.emailSubject || "FuelFox"}...`);
+          await importFuelFoxPair(em);
+          imported++;
+        } else {
+          // Per-attachment vendors (NuVizz, Uline, DDIS, Quick Fuel)
+          const atts = (em.attachments || []);
+          if (atts.length === 0) { skipped++; continue; }
+          for (const a of atts) {
+            const lcName = a.filename.toLowerCase();
+            // Skip if already imported
+            if (alreadyImportedFilenames.has(lcName)) { skipped++; continue; }
+            // Only handle data file types the vendor parses
+            const isData = lcName.endsWith(".xlsx") || lcName.endsWith(".xls") || lcName.endsWith(".csv") || lcName.endsWith(".pdf");
+            if (!isData) { skipped++; continue; }
+            setImportStatus(`[${current}/${total}] ${a.filename}...`);
+            try {
+              // Quick Fuel PDFs need special handler
+              const isQuickFuelPdf = vendor === "quickfuel" && lcName.endsWith(".pdf");
+              if (isQuickFuelPdf) await importQuickFuel(em, a);
+              else await importAttachment(em, a);
+              imported++;
+              // Remember for subsequent iterations in this run
+              setAlreadyImportedFilenames(prev => new Set([...prev, lcName]));
+            } catch(e) {
+              console.error("Import All: attachment failed", a.filename, e);
+              failed++;
+            }
+          }
+        }
+      } catch(e) {
+        console.error("Import All: email failed", em.emailSubject, e);
+        failed++;
+      }
+      setBulkImporting(prev => ({...prev, [vendor]: { current, total, skipped, failed, imported, running: true }}));
+    }
+
+    setBulkImporting(prev => ({...prev, [vendor]: { current, total, skipped, failed, imported, running: false }}));
+    setImportStatus(`✓ Import All done — ${imported} imported, ${skipped} skipped (already loaded), ${failed} failed`);
+    await loadImportedFilenames(); // Refresh the already-imported Set
+    if (onRefresh) onRefresh();
+  };
+
   if (loadingConn) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading Gmail...</div>;
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
@@ -1782,13 +1871,71 @@ function GmailSync({ onRefresh }) {
                 <div style={{fontSize:12,color:T.textMuted,padding:8}}>No matching emails in this range ({rangeLabel()}).</div>
               )}
 
-              {r?.list && r.list.length > 0 && (
-                <div style={{marginTop:8}}>
-                  <div style={{fontSize:10,color:T.textDim,marginBottom:6}}>
-                    Found {r.list.length} email{r.list.length>1?"s":""}.
-                    {v.mode === "pair" && " FuelFox sends a summary + log together — click Import Pair to process both at once."}
-                  </div>
-                  {r.list.map((em, idx) => {
+              {r?.list && r.list.length > 0 && (() => {
+                // Count how many attachments would be skipped (already imported)
+                let totalData = 0, alreadyDone = 0;
+                for (const em of r.list) {
+                  if (v.mode === "pair") {
+                    const pdfs = (em.attachments||[]).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
+                    if (pdfs.length > 0) {
+                      totalData++;
+                      if (pdfs.every(p => alreadyImportedFilenames.has(p.filename.toLowerCase()))) alreadyDone++;
+                    }
+                  } else {
+                    for (const a of (em.attachments||[])) {
+                      const lc = a.filename.toLowerCase();
+                      if (!(lc.endsWith(".xlsx") || lc.endsWith(".xls") || lc.endsWith(".csv") || lc.endsWith(".pdf"))) continue;
+                      totalData++;
+                      if (alreadyImportedFilenames.has(lc)) alreadyDone++;
+                    }
+                  }
+                }
+                const pending = totalData - alreadyDone;
+                const bulk = bulkImporting[v.key];
+                const bulkRunning = bulk?.running;
+
+                return (
+                  <div style={{marginTop:8}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8,padding:"8px 10px",background:T.bgSurface,borderRadius:6}}>
+                      <div style={{fontSize:11,color:T.textDim}}>
+                        <strong style={{color:T.text}}>{r.list.length} email{r.list.length>1?"s":""}</strong>
+                        {" · "}
+                        <span>{totalData} {v.mode === "pair" ? "pair(s)" : "file(s)"}</span>
+                        {alreadyDone > 0 && <span style={{color:T.greenText}}> · {alreadyDone} already imported</span>}
+                        {pending > 0 && <span style={{color:T.brand,fontWeight:600}}> · {pending} pending</span>}
+                      </div>
+                      {pending > 0 && !bulkRunning && (
+                        <button
+                          onClick={() => {
+                            if (!confirm(`Import ${pending} ${v.mode==="pair"?"email pair(s)":"file(s)"} from ${v.label}?\n\nAlready-imported files will be skipped automatically.`)) return;
+                            importAllForVendor(v.key);
+                          }}
+                          style={{
+                            padding: "6px 14px",
+                            borderRadius: 6,
+                            border: "none",
+                            background: `linear-gradient(135deg,${v.color},${v.color})`,
+                            color: "#fff",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: "pointer",
+                          }}
+                        >🚀 Import All ({pending})</button>
+                      )}
+                      {bulkRunning && (
+                        <div style={{fontSize:11,color:v.color,fontWeight:700}}>
+                          ⏳ {bulk.current}/{bulk.total} · ✓{bulk.imported} ⏭{bulk.skipped} ✗{bulk.failed}
+                        </div>
+                      )}
+                      {!bulkRunning && bulk && bulk.current > 0 && (
+                        <div style={{fontSize:11,color:T.greenText,fontWeight:700}}>
+                          ✓ Done — imported {bulk.imported}, skipped {bulk.skipped}, failed {bulk.failed}
+                        </div>
+                      )}
+                    </div>
+                    {v.mode === "pair" && <div style={{fontSize:10,color:T.textMuted,marginBottom:6,fontStyle:"italic"}}>FuelFox sends summary + service log PDFs together — each pair imports as one unit.</div>}
+
+                    {r.list.map((em, idx) => {
                     // For FuelFox: single "Import Pair" button per email
                     if (v.mode === "pair") {
                       const pdfs = (em.attachments || []).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
@@ -1885,7 +2032,8 @@ function GmailSync({ onRefresh }) {
                     );
                   })}
                 </div>
-              )}
+                );
+              })()}
             </div>
           );
         })}
