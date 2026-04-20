@@ -10,7 +10,7 @@ Last updated: **2026-04-20** (v2.9.0 — Time Clock tab + AI analyst)
 
 | Stream | Source | Cadence | Collection(s) | Status |
 |---|---|---|---|---|
-| Time Clock | B600 CyberPay web UI (`b600.atlantafreightquotes.com`) | Weekly, Mondays 9AM ET | `timeclock_weekly` | 🟢 Backfill pending (4 CSVs ready) · auto-pull deployed |
+| Time Clock | B600 CyberPay web UI (`b600.atlantafreightquotes.com`) | Weekly, Mondays 9AM ET | `timeclock_weekly` | 🟢 Backfilled Jan 2025–Apr 2026 (67 weeks) · auto-pull pending endpoint config |
 | QuickBooks | QBO OAuth connector | Continuous (OAuth-refreshed) | `qbo_*` / `marginiq_config/qbo_tokens` | 🟡 Infrastructure built, no data feed yet |
 | NuVizz | NuVizz stop exports | Weekly | `nuvizz_stops`, `nuvizz_weekly` | 🟡 Function exists, no data feed yet |
 | Uline | Weekly `.xlsx` from `@uline.com` senders via Gmail | Weekly (Friday week-ending) | `uline_weekly` | 🟡 Gmail search wired, no data feed yet |
@@ -26,7 +26,7 @@ Last updated: **2026-04-20** (v2.9.0 — Time Clock tab + AI analyst)
 
 | Batch date | Window | Files / method | Rows | Weeks | Hours | Saved by |
 |---|---|---|---|---|---|---|
-| _pending_ | 2025-01-01 → 2026-04-10 | 4 CSV backfill (Data Ingest tab upload) | 14,773 | 67 | 126,893.57 | Chad (manual upload) |
+| **2026-04-20** | 2025-01-01 → 2026-04-10 | 4 CSV backfill (Data Ingest tab upload) | 14,773 | 67 | 126,893.57 | Chad (manual upload, v2.9.1) |
 
 ### Coverage gaps
 _None detected in the 4-CSV backfill — continuous weekly coverage Jan 2025 through Apr 10 2026._
