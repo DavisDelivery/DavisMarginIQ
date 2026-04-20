@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.16.3";
+const APP_VERSION = "2.17.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3045,6 +3045,248 @@ function TabButton({ active, label, onClick }) {
 function PrimaryBtn({ text, onClick, loading, disabled, style:sx }) {
   return <button onClick={onClick} disabled={loading||disabled} style={{padding:"10px 20px",borderRadius:"10px",border:"none",background:(loading||disabled)?"#94a3b8":`linear-gradient(135deg,${T.brand},${T.brandLight})`,color:"#fff",fontSize:"13px",fontWeight:700,cursor:(loading||disabled)?"not-allowed":"pointer",...sx}}>{loading?"Loading...":text}</button>;
 }
+
+// ═══ AI INSIGHT PANEL ═════════════════════════════════════════════════
+// Shared analyzer component. Any tab can drop <AIInsight context="X" data={{...}} />
+// and get two passes: (1) instant deterministic sanity checks computed from the
+// data provided, (2) Claude-powered interpretation via /marginiq-ai-analyze
+// that adds pattern recognition and recommendations on top.
+//
+// Current contexts supported:
+//   - "uline-revenue"  → checks accessorial %, rev/stop stability, week coverage
+//   - "command-center" → overall business-health signals
+//   - "data-health"    → missing weeks, gap severity, suggested next uploads
+//   - "audit"          → reconciliation gaps, unmatched PROs
+// Add new contexts by extending runSanityChecks() below.
+
+// --- Sanity check engine (deterministic, no AI, instant) ---
+// Returns { signal: 'ok'|'warn'|'alarm', findings: [{severity, title, detail, metric?}] }
+function runSanityChecks(context, data) {
+  const findings = [];
+  const push = (severity, title, detail, metric) => findings.push({ severity, title, detail, metric });
+
+  if (context === "uline-revenue" && data?.weeklyRollups) {
+    const weeks = data.weeklyRollups.filter(w => w.week_ending >= "2025-01-01");
+    if (weeks.length === 0) {
+      push("info", "No 2025+ data loaded yet", "Upload your Uline weekly files in Data Ingest to start analysis.");
+      return { signal: "info", findings };
+    }
+
+    // Check 1: accessorial ratio. LTL accessorials typically 5-15% of revenue.
+    // If it's < 3%, almost certainly missing accessorial files.
+    const totalRev = weeks.reduce((s,w) => s + (w.revenue||0), 0);
+    const totalAcc = weeks.reduce((s,w) => s + (w.accessorial_revenue||0), 0);
+    const accPct = totalRev > 0 ? (totalAcc / totalRev * 100) : 0;
+    if (accPct < 3 && totalRev > 100000) {
+      const weeksWithAcc = weeks.filter(w => (w.accessorial_revenue||0) > 0).length;
+      const weeksMissingAcc = weeks.length - weeksWithAcc;
+      push("alarm",
+        `Accessorial revenue is only ${accPct.toFixed(1)}% of total — too low`,
+        `LTL accessorials typically run 5–15% of revenue. Yours is ${accPct.toFixed(1)}%, suggesting missing accessorial files. ${weeksMissingAcc} of ${weeks.length} weeks have zero accessorial revenue.`,
+        { actual: `${accPct.toFixed(1)}%`, expected: "5–15%", missing_weeks: weeksMissingAcc });
+    } else if (accPct >= 3 && accPct < 5) {
+      push("warn",
+        `Accessorial revenue is ${accPct.toFixed(1)}% of total — on the low end`,
+        `Below the typical LTL range of 5-15%. Worth spot-checking a few weeks to confirm accessorial files are complete.`,
+        { actual: `${accPct.toFixed(1)}%`, expected: "5–15%" });
+    }
+
+    // Check 2: week coverage — expected weeks vs actual
+    const sorted = [...weeks].sort((a,b) => a.week_ending.localeCompare(b.week_ending));
+    const firstWE = sorted[0].week_ending;
+    const lastWE = sorted[sorted.length-1].week_ending;
+    const msPerWeek = 7*86400000;
+    const expectedWeekCount = Math.round((new Date(lastWE) - new Date(firstWE)) / msPerWeek) + 1;
+    const actualWeekCount = weeks.length;
+    if (actualWeekCount < expectedWeekCount) {
+      push("alarm",
+        `${expectedWeekCount - actualWeekCount} week(s) missing between ${firstWE} and ${lastWE}`,
+        `Expected ${expectedWeekCount} weeks of data based on date range; have ${actualWeekCount}. Check Data Health tab for the exact missing Fridays.`,
+        { expected: expectedWeekCount, actual: actualWeekCount });
+    }
+
+    // Check 3: rev/stop stability — outliers suggest partial weeks
+    const revPerStop = weeks.filter(w => (w.stops||0) > 100).map(w => (w.revenue||0) / (w.stops||1));
+    if (revPerStop.length >= 5) {
+      const sortedRPS = [...revPerStop].sort((a,b) => a-b);
+      const median = sortedRPS[Math.floor(sortedRPS.length/2)];
+      const outlierLow = weeks.filter(w => (w.stops||0) > 100 && ((w.revenue||0)/(w.stops||1)) < median * 0.5);
+      if (outlierLow.length > 0) {
+        push("warn",
+          `${outlierLow.length} week(s) have rev/stop < 50% of median (\$${median.toFixed(0)})`,
+          `Weeks: ${outlierLow.slice(0,5).map(w=>w.week_ending).join(", ")}${outlierLow.length>5?"…":""}. These weeks may be partial uploads (delivery file without accessorials).`,
+          { median_rps: `$${median.toFixed(0)}`, outliers: outlierLow.length });
+      }
+    }
+
+    // Check 4: truckload presence
+    const withTK = weeks.filter(w => (w.truckload_stops||0) > 0).length;
+    if (withTK === 0 && weeks.length > 20) {
+      push("info",
+        "No truckload (TK) weeks detected",
+        "If you run truckload alongside delivery, the TK files may not be ingested. Filenames contain 'TK' (e.g. das 20251201-20251205 TK.xlsx).");
+    }
+  }
+
+  if (context === "command-center" && data?.completeness) {
+    const c = data.completeness;
+    if (c.gaps?.length > 0) {
+      push("alarm",
+        `${c.gaps.length} missing week(s) of Uline data`,
+        `These weeks have zero data in the system from 2025 onward. Your revenue, margin, and rev/stop metrics are understated.`,
+        { gaps: c.gaps.length });
+    }
+    if (c.sparseWeeks?.length > 5) {
+      push("warn",
+        `${c.sparseWeeks.length} suspiciously low-volume weeks`,
+        `These weeks have far fewer stops than average. Could be partial uploads or legitimate slow weeks (holidays).`,
+        { sparse: c.sparseWeeks.length });
+    }
+    if (c.missingAccessorials?.length > 3) {
+      push("warn",
+        `${c.missingAccessorials.length} weeks have delivery data but no accessorial file`,
+        `Accessorial charges from these weeks are missing from revenue totals.`,
+        { missing: c.missingAccessorials.length });
+    }
+  }
+
+  if (context === "data-health" && data?.streamCoverage) {
+    const delivery = data.streamCoverage.delivery;
+    if (delivery && delivery.pct < 100) {
+      push("alarm",
+        `Delivery coverage is ${delivery.pct}% (${delivery.total - delivery.covered} missing)`,
+        `Delivery is your primary revenue stream. Missing weeks here directly understate revenue.`,
+        { coverage: `${delivery.pct}%` });
+    }
+  }
+
+  // Overall signal: max severity seen
+  let signal = "ok";
+  if (findings.some(f => f.severity === "alarm")) signal = "alarm";
+  else if (findings.some(f => f.severity === "warn")) signal = "warn";
+  else if (findings.some(f => f.severity === "info")) signal = "info";
+  return { signal, findings };
+}
+
+function AIInsight({ context, data, title, compact }) {
+  const [expanded, setExpanded] = useState(!compact);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiResponse, setAiResponse] = useState(null);
+  const [aiError, setAiError] = useState(null);
+
+  const { signal, findings } = useMemo(() => runSanityChecks(context, data), [context, data]);
+
+  const runAI = async () => {
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const resp = await fetch("/.netlify/functions/marginiq-ai-analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ context, data, sanityFindings: findings }),
+      });
+      const result = await resp.json();
+      if (result.error) throw new Error(result.error);
+      setAiResponse(result);
+    } catch(e) {
+      setAiError(e.message);
+    }
+    setAiLoading(false);
+  };
+
+  // Color theming by severity
+  const sigColors = {
+    alarm: { border: T.red,    bg: "#fef2f2", accent: T.redText,    icon: "🚨", label: "Needs attention" },
+    warn:  { border: T.yellow, bg: "#fffbeb", accent: T.yellowText, icon: "⚠️",  label: "Review" },
+    info:  { border: T.blue,   bg: "#eff6ff", accent: "#1d4ed8",    icon: "ℹ️",  label: "Note" },
+    ok:    { border: T.green,  bg: "#ecfdf5", accent: "#065f46",    icon: "✓",  label: "Looks good" },
+  };
+  const sc = sigColors[signal];
+
+  return (
+    <div style={{
+      borderRadius: 10,
+      border: `1px solid ${sc.border}`,
+      background: sc.bg,
+      padding: "12px 14px",
+      marginBottom: 12,
+    }}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:16}}>{sc.icon}</span>
+          <div>
+            <div style={{fontSize:12,fontWeight:700,color:sc.accent,textTransform:"uppercase",letterSpacing:"0.06em"}}>
+              🤖 AI Insight · {sc.label}
+            </div>
+            <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>
+              {title || "Automated analysis of the data shown above."} {findings.length > 0 && `${findings.length} finding${findings.length>1?"s":""}.`}
+            </div>
+          </div>
+        </div>
+        <button onClick={() => setExpanded(!expanded)} style={{
+          border: "none", background: "transparent", color: sc.accent, cursor: "pointer",
+          fontSize: 11, fontWeight: 700,
+        }}>{expanded ? "Hide ▲" : "Show ▼"}</button>
+      </div>
+
+      {expanded && (
+        <>
+          {findings.length === 0 ? (
+            <div style={{marginTop:10,fontSize:12,color:T.textMuted,fontStyle:"italic"}}>
+              No anomalies detected in the current data.
+            </div>
+          ) : (
+            <div style={{marginTop:10,display:"flex",flexDirection:"column",gap:8}}>
+              {findings.map((f, i) => (
+                <div key={i} style={{
+                  padding: "8px 10px",
+                  borderRadius: 6,
+                  background: "white",
+                  borderLeft: `3px solid ${sigColors[f.severity].border}`,
+                  fontSize: 12,
+                }}>
+                  <div style={{fontWeight:700,color:sigColors[f.severity].accent,marginBottom:2}}>
+                    {f.title}
+                  </div>
+                  <div style={{color:T.text,lineHeight:1.4}}>{f.detail}</div>
+                  {f.metric && (
+                    <div style={{marginTop:4,display:"flex",gap:8,flexWrap:"wrap"}}>
+                      {Object.entries(f.metric).map(([k,v]) => (
+                        <span key={k} style={{
+                          fontSize: 10, padding: "1px 6px", borderRadius: 4,
+                          background: T.bgSurface, color: T.textMuted, fontFamily: "monospace",
+                        }}>{k.replace(/_/g," ")}: <strong style={{color:T.text}}>{v}</strong></span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* AI Deep Analysis button — available once sanity pass is done */}
+          <div style={{marginTop:12,paddingTop:10,borderTop:`1px dashed ${sc.border}50`}}>
+            {!aiResponse && !aiLoading && (
+              <button onClick={runAI} style={{
+                padding: "6px 12px", borderRadius: 6,
+                border: `1px solid ${sc.border}`,
+                background: "white", color: sc.accent,
+                fontSize: 11, fontWeight: 700, cursor: "pointer",
+              }}>🧠 Ask Claude for deeper analysis</button>
+            )}
+            {aiLoading && <div style={{fontSize:11,color:T.textMuted}}>Running deep analysis…</div>}
+            {aiError && <div style={{fontSize:11,color:T.redText}}>AI error: {aiError}</div>}
+            {aiResponse && (
+              <div style={{fontSize:12,color:T.text,lineHeight:1.5,whiteSpace:"pre-wrap"}}>
+                {aiResponse.analysis || JSON.stringify(aiResponse)}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 function BarChart({ data, labelKey, valueKey, color, maxBars=15, formatValue }) {
   const items = data.slice(0, maxBars);
   const max = Math.max(...items.map(d => d[valueKey] || 0), 1);
@@ -3295,6 +3537,13 @@ function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, rec
       </div>
     )}
 
+    <AIInsight
+      context="command-center"
+      data={{ completeness, margins: m }}
+      title="Scanning KPIs + data completeness for anomalies."
+      compact
+    />
+
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
       <KPI icon="💰" label="Daily Revenue" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.annualRevenue)}/yr projected`} subColor={T.green} />
       <KPI icon="📉" label="Daily Cost" value={fmt(m.dailyCost)} sub={`${fmtK(m.totalAnnualCost)}/yr`} subColor={T.red} />
@@ -3447,6 +3696,12 @@ function UlineRevenue({ weeklyRollups }) {
           <KPI label="Accessorials" value={fmtK(totalAccessorials)} sub={totalRevenue>0?fmtPct(totalAccessorials/totalRevenue*100)+" of revenue":"—"} subColor={T.purple} />
           <KPI label="Total Weight" value={fmtNum(totalWeight)+" lbs"} />
         </div>
+
+        <AIInsight
+          context="uline-revenue"
+          data={{ weeklyRollups: filtered }}
+          title={`Analyzing ${filtered.length} week(s) of Uline revenue data.`}
+        />
 
         <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
           {[["weekly","📅 Weekly"],["monthly","📊 Monthly"],["customers","🏢 Customers"],["cities","📍 Cities"]].map(([id,l])=>
