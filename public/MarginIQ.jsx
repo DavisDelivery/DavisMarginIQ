@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.10.2";
+const APP_VERSION = "2.10.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3018,7 +3018,7 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
 }
 
 // ═══ DATA INGEST ═══════════════════════════════════════════
-function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
+function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   const [uploading, setUploading] = useState(false);
   const [status, setStatus] = useState("");
   const [progress, setProgress] = useState({ current:0, total:0 });
@@ -3384,6 +3384,37 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
             <div><strong>📊 QBO:</strong> {fmtNum(lastResult.qbo.lines)} line items → {lastResult.qbo.periods_saved} periods ({(lastResult.counts.qbo_pl||0)+(lastResult.counts.qbo_tb||0)+(lastResult.counts.qbo_gl||0)} files)</div>
           )}
           {lastResult.unknown.length > 0 && <div style={{color:T.yellowText,marginTop:6}}>⚠️ Unrecognized: {lastResult.unknown.join(", ")}</div>}
+        </div>
+      </div>
+    )}
+
+    {fileLog && fileLog.length > 0 && (
+      <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,padding:"16px 20px",marginTop:16,boxShadow:T.shadow}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div style={{fontSize:13,fontWeight:700,color:T.text}}>📋 Upload History</div>
+          <div style={{fontSize:11,color:T.textDim}}>Showing {Math.min(fileLog.length,100)} most recent {fileLog.length > 100 ? `of ${fmtNum(fileLog.length)}` : ""}</div>
+        </div>
+        <div style={{overflowX:"auto",maxHeight:500,borderRadius:T.radiusSm,border:`1px solid ${T.borderLight}`}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <thead>
+              <tr>
+                {["Filename","Type","Source","Rows","When"].map(h =>
+                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textMuted,fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",position:"sticky",top:0,background:T.bgSurface,zIndex:1}}>{h}</th>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {fileLog.slice(0,100).map((f,i) => (
+                <tr key={i} style={{transition:"background 0.15s"}} onMouseEnter={e => e.currentTarget.style.background=T.bgSurface} onMouseLeave={e => e.currentTarget.style.background="transparent"}>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontSize:11,color:T.text,maxWidth:340,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={f.filename}>{f.filename}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{f.kind ? <Badge text={f.kind} color={T.brand} bg={T.brandPale} /> : <span style={{color:T.textDim,fontSize:11}}>—</span>}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11,color:T.textMuted}}>{f.group || "—"}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:12,fontWeight:600,color:T.text,textAlign:"right"}}>{fmtNum(f.row_count || 0)}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11,color:T.textMuted,whiteSpace:"nowrap"}}>{f.uploaded_at ? new Date(f.uploaded_at).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit"}) : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     )}
@@ -4422,7 +4453,7 @@ function MarginIQ() {
 
   const refreshData = async () => {
     const [weekly, recon, meta, log] = await Promise.all([
-      FS.getWeeklyRollups(), FS.getReconWeekly(), FS.getReconMeta(), FS.getFileLog(100),
+      FS.getWeeklyRollups(), FS.getReconWeekly(), FS.getReconMeta(), FS.getFileLog(500),
     ]);
     setWeeklyRollups(weekly.sort((a,b) => a.week_ending.localeCompare(b.week_ending)));
     setReconWeekly(recon);
@@ -4516,7 +4547,7 @@ function MarginIQ() {
     {!loading && tab==="timeclock" && (typeof window !== "undefined" && window.TimeClockTab ? React.createElement(window.TimeClockTab) : <EmptyState icon="⏰" title="Time Clock module not loaded" sub="TimeClockTab.jsx did not load. Check console." />)}
     {!loading && tab==="fuel" && <Fuel />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
-    {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} onRefresh={refreshData} />}
+    {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
     {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} />}
