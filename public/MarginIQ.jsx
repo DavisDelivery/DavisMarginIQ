@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.17.0";
+const APP_VERSION = "2.17.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -4092,10 +4092,26 @@ function CoverageTimeline() {
         </div>
         {deliveryGaps.length > 0 && (
           <div style={{marginTop:12,paddingTop:10,borderTop:`1px solid ${deliveryStats.pct >= 85 ? T.yellow+"50" : T.red+"40"}`}}>
-            <div style={{fontSize:11,fontWeight:700,color:T.redText,marginBottom:4}}>🚨 Missing Delivery Weeks — find and upload these files</div>
-            <div style={{fontSize:10,color:T.textMuted,marginBottom:8}}>Uline filenames encode the date range (Sat start → Fri end). Search your inbox / drive for the exact filename below.</div>
-            <div style={{maxHeight:240,overflowY:"auto",background:"white",borderRadius:6,border:`1px solid ${T.red}20`}}>
-              {deliveryGaps.slice(0, 50).map(we => {
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6}}>
+              <div style={{fontSize:11,fontWeight:700,color:T.redText}}>🚨 {deliveryGaps.length} Missing Delivery Week{deliveryGaps.length===1?"":"s"} — find and upload these</div>
+              <button
+                onClick={() => {
+                  const allNames = deliveryGaps.map(we => {
+                    const fri = new Date(we + "T00:00:00");
+                    const sat = new Date(fri); sat.setDate(sat.getDate() - 6);
+                    const fmt = (d) => d.toISOString().slice(0,10).replace(/-/g,"");
+                    return `das ${fmt(sat)}-${fmt(fri)}.xlsx`;
+                  }).join("\n");
+                  navigator.clipboard?.writeText(allNames).then(() => {
+                    alert(`Copied ${deliveryGaps.length} filenames to clipboard.`);
+                  }).catch(() => alert("Copy failed — your browser may block clipboard access."));
+                }}
+                style={{padding:"4px 10px",borderRadius:6,border:`1px solid ${T.red}`,background:"white",color:T.redText,fontSize:10,fontWeight:700,cursor:"pointer"}}
+              >📋 Copy all {deliveryGaps.length}</button>
+            </div>
+            <div style={{fontSize:10,color:T.textMuted,marginBottom:8}}>Tap any filename to copy it. Filenames encode Sat start → Fri end (Uline naming convention).</div>
+            <div style={{maxHeight:400,overflowY:"auto",background:"white",borderRadius:6,border:`1px solid ${T.red}20`}}>
+              {deliveryGaps.map(we => {
                 // Compute Sat start = Friday WE - 6 days
                 const friDate = new Date(we + "T00:00:00");
                 const satDate = new Date(friDate);
@@ -4104,7 +4120,14 @@ function CoverageTimeline() {
                 const expectedFilename = `das ${fmt(satDate)}-${fmt(friDate)}.xlsx`;
                 const humanRange = `${satDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})} – ${friDate.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}`;
                 return (
-                  <div key={we} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11}}>
+                  <div
+                    key={we}
+                    onClick={() => {
+                      navigator.clipboard?.writeText(expectedFilename).catch(()=>{});
+                    }}
+                    style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11,cursor:"pointer"}}
+                    title="Click to copy filename"
+                  >
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8,flexWrap:"wrap"}}>
                       <div style={{fontWeight:700,color:T.redText}}>WE {we}</div>
                       <div style={{fontSize:10,color:T.textMuted}}>{humanRange}</div>
@@ -4115,11 +4138,6 @@ function CoverageTimeline() {
                   </div>
                 );
               })}
-              {deliveryGaps.length > 50 && (
-                <div style={{padding:"8px 10px",fontSize:10,color:T.textMuted,textAlign:"center",fontStyle:"italic"}}>
-                  +{deliveryGaps.length - 50} more missing weeks not shown
-                </div>
-              )}
             </div>
           </div>
         )}
