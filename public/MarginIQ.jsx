@@ -62,8 +62,20 @@ const parseDateMDY = s => { if (!s) return null; const m = String(s).match(/^(\d
 const dateToMonth = d => d ? d.slice(0,7) : null;
 
 // NuVizz format: "3/30/26 01:18 PM" or "3/30/2026 1:18 PM" — extract date portion only
+// Also handles Excel serial dates (numbers) that SheetJS produces when reading CSV date columns.
 function parseDateMDYFlexible(s) {
-  if (!s) return null;
+  if (s == null || s === "") return null;
+  // Excel serial date: integer or float days since 1899-12-30 (SheetJS convention)
+  if (typeof s === "number" && isFinite(s)) {
+    // Excel epoch is 1899-12-30 in JS land (accounts for the 1900 leap-year bug)
+    const ms = Math.round((s - 25569) * 86400 * 1000); // 25569 = days from 1970-01-01 to 1899-12-30 epoch
+    const d = new Date(ms);
+    if (isNaN(d)) return null;
+    const y = d.getUTCFullYear();
+    const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    return `${y}-${mo}-${dd}`;
+  }
   const str = String(s).trim();
   // Match M/D/YY or M/D/YYYY, optional time after
   const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
