@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.19.0";
+const APP_VERSION = "2.19.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -324,16 +324,40 @@ async function ingestFiles(files, onStatus = () => {}) {
   }
   for (const r of Object.values(reconByWeek)) r.collection_rate = r.billed > 0 ? (r.paid_matched / r.billed * 100) : null;
 
-  onStatus({ phase:"save", message:"Saving to Firebase..." });
+  onStatus({ phase:"save", message:"Saving weekly rollups..." });
   let savedWeeks = 0, savedRecon = 0, savedAudit = 0;
-  for (const r of rollups) { if (await FS.saveWeeklyRollup(r.week_ending, {...r, updated_at:new Date().toISOString()})) savedWeeks++; }
-  for (const r of Object.values(reconByWeek)) { if (await FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()})) savedRecon++; }
-  for (const f of ddisFileRecords) await FS.saveDDISFile(f.file_id, f);
+
+  // Helper to run Firestore writes in parallel batches (cuts multi-minute
+  // mobile hangs down to seconds). 25 concurrent writes works reliably.
+  const batchWrite = async (items, writer, batchSize = 25, statusMsg) => {
+    let saved = 0;
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batch = items.slice(i, i + batchSize);
+      const results = await Promise.all(batch.map(writer));
+      saved += results.filter(r => r).length;
+      if (statusMsg) onStatus({ phase:"save", message: `${statusMsg} (${Math.min(i+batchSize, items.length)}/${items.length})` });
+    }
+    return saved;
+  };
+
+  savedWeeks = await batchWrite(rollups,
+    r => FS.saveWeeklyRollup(r.week_ending, {...r, updated_at:new Date().toISOString()}),
+    25, "Saving weekly rollups");
+  savedRecon = await batchWrite(Object.values(reconByWeek),
+    r => FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()}),
+    25, "Saving reconciliation");
+  await batchWrite(ddisFileRecords, f => FS.saveDDISFile(f.file_id, f), 25);
   const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, 500);
-  for (const s of topUnpaid) await FS.saveUnpaidStop(s.pro, s);
+  if (topUnpaid.length > 0) {
+    onStatus({ phase:"save", message:`Saving unpaid stops...` });
+    await batchWrite(topUnpaid, s => FS.saveUnpaidStop(s.pro, s), 25, "Saving unpaid stops");
+  }
   // v2.5 save audit_items, top 1500 by variance
   const topAudit = auditItems.sort((a,b) => b.variance - a.variance).slice(0, 1500);
-  for (const a of topAudit) { if (await FS.saveAuditItem(a.pro, a)) savedAudit++; }
+  if (topAudit.length > 0) {
+    onStatus({ phase:"save", message:`Saving audit items...` });
+    savedAudit = await batchWrite(topAudit, a => FS.saveAuditItem(a.pro, a), 25, "Saving audit items");
+  }
   // v2.5 auto-seed customer_ap_contacts stubs for customers in audit
   const uniqueCustomers = new Map();
   for (const a of topAudit) {
@@ -346,18 +370,20 @@ async function ingestFiles(files, onStatus = () => {}) {
       c.item_count++;
     }
   }
-  for (const [key, stats] of uniqueCustomers) {
-    await FS.saveAPContact(key, {
-      customer: stats.customer,
-      customer_key: key,
-      total_owed_cached: stats.total_owed,
-      item_count_cached: stats.item_count,
-      // Only set these if doc is new (merge preserves existing values)
-      billing_email: "",
-      ap_contact_name: "",
-      ap_contact_phone: "",
-      dispute_portal_url: "",
-    });
+  const customerContactEntries = Array.from(uniqueCustomers.entries());
+  if (customerContactEntries.length > 0) {
+    await batchWrite(customerContactEntries,
+      ([key, stats]) => FS.saveAPContact(key, {
+        customer: stats.customer,
+        customer_key: key,
+        total_owed_cached: stats.total_owed,
+        item_count_cached: stats.item_count,
+        billing_email: "",
+        ap_contact_name: "",
+        ap_contact_phone: "",
+        dispute_portal_url: "",
+      }),
+      25);
   }
 
   // NuVizz
@@ -365,27 +391,35 @@ async function ingestFiles(files, onStatus = () => {}) {
   if (nuvizzStops.length > 0) {
     onStatus({ phase:"save", message:`Saving NuVizz (${nuvizzStops.length} stops)...` });
     const nvWeekly = buildNuVizzWeekly(nuvizzStops);
-    for (const w of nvWeekly) { if (await FS.saveNuVizzWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()})) nvWeeksSaved++; }
-    const recent = nuvizzStops.filter(s => s.pro && s.delivery_date).sort((a,b) => (b.delivery_date||"").localeCompare(a.delivery_date||"")).slice(0, 2000);
-    for (const s of recent) {
-      const key = s.pro || s.stop_number;
-      if (!key) continue;
-      if (await FS.saveNuVizzStop(key, s)) nvStopsSaved++;
-    }
+    nvWeeksSaved = await batchWrite(nvWeekly,
+      w => FS.saveNuVizzWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()}),
+      25, "Saving NuVizz weekly");
+    const recent = nuvizzStops
+      .filter(s => s.pro && s.delivery_date)
+      .sort((a,b) => (b.delivery_date||"").localeCompare(a.delivery_date||""))
+      .slice(0, 2000);
+    const toSave = recent.filter(s => (s.pro || s.stop_number));
+    nvStopsSaved = await batchWrite(toSave,
+      s => FS.saveNuVizzStop(s.pro || s.stop_number, s),
+      25, "Saving NuVizz stops");
   }
 
   // Time Clock
   let tcWeeksSaved = 0;
   if (timeClockEntries.length > 0) {
     const tcWeekly = buildTimeClockWeekly(timeClockEntries);
-    for (const w of tcWeekly) { if (await FS.saveTimeClockWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()})) tcWeeksSaved++; }
+    tcWeeksSaved = await batchWrite(tcWeekly,
+      w => FS.saveTimeClockWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()}),
+      25);
   }
 
   // Payroll
   let payWeeksSaved = 0;
   if (payrollEntries.length > 0) {
     const payWeekly = buildPayrollWeekly(payrollEntries);
-    for (const w of payWeekly) { if (await FS.savePayrollWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()})) payWeeksSaved++; }
+    payWeeksSaved = await batchWrite(payWeekly,
+      w => FS.savePayrollWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()}),
+      25);
   }
 
   // QBO
@@ -397,12 +431,19 @@ async function ingestFiles(files, onStatus = () => {}) {
       if (!byPeriod[pid]) byPeriod[pid] = { period: e.period || null, report_type: e.report_type, source_file: e.source_file, accounts: [] };
       byPeriod[pid].accounts.push({ account: e.account, amount: e.amount, debit: e.debit, credit: e.credit });
     }
-    for (const [pid, data] of Object.entries(byPeriod)) { if (await FS.saveQBOHistory(pid, {...data, uploaded_at: new Date().toISOString()})) qboPeriodsSaved++; }
+    const periodEntries = Object.entries(byPeriod);
+    qboPeriodsSaved = await batchWrite(periodEntries,
+      ([pid, data]) => FS.saveQBOHistory(pid, {...data, uploaded_at: new Date().toISOString()}),
+      25);
   }
 
   // File logs
-  for (const l of fileLogs) await FS.saveFileLog(l.file_id, l);
-  for (const sf of sourceFilesLog) await FS.saveSourceFile(sf.file_id, sf);
+  if (fileLogs.length > 0) {
+    await batchWrite(fileLogs, l => FS.saveFileLog(l.file_id, l), 25);
+  }
+  if (sourceFilesLog.length > 0) {
+    await batchWrite(sourceFilesLog, sf => FS.saveSourceFile(sf.file_id, sf), 25);
+  }
 
   const existingMeta = await FS.getReconMeta() || {};
   await FS.saveReconMeta({
