@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.18.0";
+const APP_VERSION = "2.19.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -413,21 +413,66 @@ async function ingestFiles(files, onStatus = () => {}) {
 
   // Compute source conflicts: any week where files from more than one source
   // contributed data during this ingest batch. Gives Chad a review list.
+  // For each conflict we compute per-source aggregates (stops, revenue, acc)
+  // so the resolver UI can show a side-by-side comparison.
   const sourceConflicts = [];
+
+  // Index stops by (week, source) to compute per-source aggregates
+  const byWeekSource = {};  // `${we}|${src}` → { stops: [], delivery_stops, truckload_stops, accessorial_stops, revenue, acc_revenue, delivery_revenue, truckload_revenue }
+  for (const s of allStops) {
+    const src = s._source || "manual";
+    const key = `${s.week_ending}|${src}`;
+    if (!byWeekSource[key]) byWeekSource[key] = {
+      stop_count: 0, delivery_stops: 0, truckload_stops: 0, accessorial_stops: 0,
+      revenue: 0, delivery_revenue: 0, truckload_revenue: 0, accessorial_revenue: 0,
+    };
+    const b = byWeekSource[key];
+    const nc = s.new_cost || 0;
+    b.stop_count++;
+    b.revenue += nc;
+    if (s.service_type === "truckload") { b.truckload_stops++; b.truckload_revenue += nc; }
+    else if (s.service_type === "accessorial") { b.accessorial_stops++; b.accessorial_revenue += nc; }
+    else { b.delivery_stops++; b.delivery_revenue += nc; }
+  }
+
   for (const [we, sources] of Object.entries(weekSources)) {
     if (sources.size > 1) {
-      // Look up which files from this batch touched this week
       const filesForWeek = fileWeekImpact
         .filter(f => f.weeks.includes(we))
         .map(f => ({ filename: f.filename, source: f.source, kind: f.kind, service_type: f.service_type, stop_count: f.stop_count }));
+      // Per-source aggregates for this week
+      const summaries = {};
+      for (const src of sources) {
+        summaries[src] = byWeekSource[`${we}|${src}`] || {
+          stop_count: 0, delivery_stops: 0, truckload_stops: 0, accessorial_stops: 0,
+          revenue: 0, delivery_revenue: 0, truckload_revenue: 0, accessorial_revenue: 0,
+        };
+      }
       sourceConflicts.push({
         week_ending: we,
         sources: Array.from(sources),
         files: filesForWeek,
+        summaries,
       });
     }
   }
   sourceConflicts.sort((a, b) => a.week_ending.localeCompare(b.week_ending));
+
+  // Persist unresolved conflicts to Firestore so they survive page refresh
+  // and the user can review them on the Data Ingest tab even after closing
+  // the result modal.
+  for (const c of sourceConflicts) {
+    await FS.saveSourceConflict(c.week_ending, {
+      week_ending: c.week_ending,
+      sources: c.sources,
+      files: c.files,
+      summaries: c.summaries,
+      detected_at: new Date().toISOString(),
+      resolved: null,         // null | "davis" | "uline" | "merge"
+      resolved_at: null,
+      resolved_by: null,
+    });
+  }
 
   return {
     files_processed: files.length,
@@ -1885,6 +1930,14 @@ const FS = {
   async saveQBOHistory(periodId, data) { if (!hasFirebase) return false; try { await window.db.collection("qbo_history").doc(periodId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getQBOHistory() { if (!hasFirebase) return []; try { const s=await window.db.collection("qbo_history").orderBy("period","desc").limit(120).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveSourceFile(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("source_files").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+
+  // ─── Source Conflict Resolution (Uline vs Davis corrections) ───────────
+  // When the same week has files from both @uline.com AND billing@davisdelivery.com,
+  // the ingest pipeline writes a conflict doc. User reviews + picks winner in the
+  // Data Ingest tab. Resolved conflicts stay in the collection for audit history.
+  async saveSourceConflict(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("source_conflicts").doc(weekId).set(data, {merge:true}); return true; } catch(e) { console.error("saveSourceConflict failed:", weekId, e); return false; } },
+  async getSourceConflicts() { if (!hasFirebase) return []; try { const s=await window.db.collection("source_conflicts").orderBy("week_ending","desc").limit(200).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async updateSourceConflict(weekId, patch) { if (!hasFirebase) return false; try { await window.db.collection("source_conflicts").doc(weekId).update(patch); return true; } catch(e) { console.error("updateSourceConflict failed:", weekId, e); return false; } },
 
   // ─── Driver Classifications (W2 / 1099 / Unknown) ───────────
   // Key is normalized_name (e.g. "chris head"). Lets us tag historical drivers
@@ -4435,7 +4488,20 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   const [lastResult, setLastResult] = useState(null);
   const [sourceStats, setSourceStats] = useState(null);
   const [pendingReview, setPendingReview] = useState(null); // {audit, expandedFiles} while awaiting user confirmation
+  const [sourceConflicts, setSourceConflicts] = useState([]); // Uline vs Davis conflicts pending review
+  const [resolvingWeek, setResolvingWeek] = useState(null); // week_ending currently being resolved
   const fileRef = useRef(null);
+
+  // Load source conflicts from Firestore — survive across page loads
+  const loadSourceConflicts = async () => {
+    if (!hasFirebase) return;
+    try {
+      const all = await FS.getSourceConflicts();
+      // Only show unresolved (resolved === null)
+      setSourceConflicts(all.filter(c => !c.resolved));
+    } catch(e) { console.error("loadSourceConflicts err:", e); }
+  };
+  useEffect(() => { loadSourceConflicts(); }, []);
 
   // Load source counts for all 5 sources on mount so cards show meaningful status
   useEffect(() => {
@@ -4534,17 +4600,22 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
     const sourceFiles = [];
     const countsByKind = { master:0, original:0, accessorials:0, ddis:0, nuvizz:0, timeclock:0, payroll:0, qbo_pl:0, qbo_tb:0, qbo_gl:0, unknown:0 };
     const unknownFiles = [];
+    // Source conflict tracking — mirrors the logic in ingestFiles
+    const weekSources = {};        // weekKey → Set of sources
+    const fileWeekImpact = [];     // [{filename, source, kind, weeks, stop_count}]
 
     for (let i=0; i<files.length; i++) {
       const file = files[i];
       setProgress({ current: i+1, total: files.length });
       setStatus(`[${i+1}/${files.length}] ${file.name}...`);
       const fileId = file.name.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
+      const source = file._source || "manual";
+      const emailFrom = file._emailFrom || null;
 
       // PDFs are backup/evidence docs — log for audit trail, don't parse
       if (file._isPdf || file.name.toLowerCase().endsWith(".pdf")) {
         const pdfKind = /backup/i.test(file.name) ? "pdf-backup" : "pdf-other";
-        fileLogs.push({ file_id: fileId, filename: file.name, kind: pdfKind, group: "evidence", row_count: 0, uploaded_at: new Date().toISOString() });
+        fileLogs.push({ file_id: fileId, filename: file.name, kind: pdfKind, group: "evidence", row_count: 0, source, email_from: emailFrom, uploaded_at: new Date().toISOString() });
         continue;
       }
 
@@ -4560,18 +4631,31 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
         const serviceType = detectServiceType(file.name, kind);
         countsByKind[kind] = (countsByKind[kind]||0) + 1;
 
-        fileLogs.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
-        sourceFiles.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
+        const logEntry = { file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, source, email_from: emailFrom, uploaded_at: new Date().toISOString() };
+        fileLogs.push(logEntry);
+        sourceFiles.push(logEntry);
 
         // ─── Uline family ───
         if (kind === "master" || kind === "original" || kind === "accessorials") {
           const stops = parseOriginalOrAccessorial(rows, serviceType);
+          const weeksTouched = new Set();
           for (const s of stops) {
             if (!s.pro || !s.week_ending) continue;
+            weeksTouched.add(s.week_ending);
+            if (!s._source) s._source = source;
             const key = `${s.pro}|${s.service_type}`; // key by PRO + service_type
             const existing = stopsByPro[key];
             if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[key] = s;
           }
+          for (const we of weeksTouched) {
+            if (!weekSources[we]) weekSources[we] = new Set();
+            weekSources[we].add(source);
+          }
+          fileWeekImpact.push({
+            filename: file.name, source, kind, service_type: serviceType,
+            weeks: Array.from(weeksTouched).sort(),
+            stop_count: stops.length,
+          });
         } else if (kind === "ddis") {
           const payments = parseDDIS(rows);
           const billDates = payments.map(p => p.bill_date).filter(Boolean).sort();
@@ -4616,6 +4700,44 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
     setStatus("Building Uline weekly rollups...");
     const allStops = Object.values(stopsByPro);
     const rollups = buildWeeklyRollups(allStops);
+
+    // ─── Source conflict detection (Uline vs Davis) ───
+    // Same logic as ingestFiles() — any week where files from more than one
+    // source contributed gets a conflict doc written to Firestore for review.
+    const byWeekSource = {};
+    for (const s of allStops) {
+      const src = s._source || "manual";
+      const key = `${s.week_ending}|${src}`;
+      if (!byWeekSource[key]) byWeekSource[key] = {
+        stop_count: 0, delivery_stops: 0, truckload_stops: 0, accessorial_stops: 0,
+        revenue: 0, delivery_revenue: 0, truckload_revenue: 0, accessorial_revenue: 0,
+      };
+      const b = byWeekSource[key];
+      const nc = s.new_cost || 0;
+      b.stop_count++;
+      b.revenue += nc;
+      if (s.service_type === "truckload") { b.truckload_stops++; b.truckload_revenue += nc; }
+      else if (s.service_type === "accessorial") { b.accessorial_stops++; b.accessorial_revenue += nc; }
+      else { b.delivery_stops++; b.delivery_revenue += nc; }
+    }
+    const detectedConflicts = [];
+    for (const [we, sources] of Object.entries(weekSources)) {
+      if (sources.size > 1) {
+        const filesForWeek = fileWeekImpact
+          .filter(f => f.weeks.includes(we))
+          .map(f => ({ filename: f.filename, source: f.source, kind: f.kind, service_type: f.service_type, stop_count: f.stop_count }));
+        const summaries = {};
+        for (const src of sources) {
+          summaries[src] = byWeekSource[`${we}|${src}`] || {
+            stop_count: 0, delivery_stops: 0, truckload_stops: 0, accessorial_stops: 0,
+            revenue: 0, delivery_revenue: 0, truckload_revenue: 0, accessorial_revenue: 0,
+          };
+        }
+        detectedConflicts.push({
+          week_ending: we, sources: Array.from(sources), files: filesForWeek, summaries,
+        });
+      }
+    }
 
     const reconByWeek = {};
     const unpaidStops = [];
@@ -4730,6 +4852,20 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       total_stops_processed: (existingMeta.total_stops_processed || 0) + allStops.length,
     });
 
+    // Persist source conflicts so the user can review them across sessions
+    for (const c of detectedConflicts) {
+      await FS.saveSourceConflict(c.week_ending, {
+        week_ending: c.week_ending,
+        sources: c.sources,
+        files: c.files,
+        summaries: c.summaries,
+        detected_at: new Date().toISOString(),
+        resolved: null,
+        resolved_at: null,
+        resolved_by: null,
+      });
+    }
+
     setLastResult({
       files_processed: files.length,
       counts: countsByKind,
@@ -4739,11 +4875,13 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       payroll: { entries: payrollEntries.length, weeks_saved: payWeeksSaved },
       qbo: { lines: qboEntries.length, periods_saved: qboPeriodsSaved },
       unknown: unknownFiles,
+      source_conflicts: detectedConflicts,
     });
     setStatus(`✓ Processed ${files.length} files across ${Object.values(countsByKind).filter(c=>c>0).length} source types`);
     setUploading(false);
     if (fileRef.current) fileRef.current.value = "";
     onRefresh();
+    loadSourceConflicts(); // Check for new source conflicts from this batch
 
     // Refresh source stats
     if (hasFirebase) {
@@ -4786,6 +4924,116 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
         <PrimaryBtn text={uploading?"Processing...":"Upload Files"} onClick={()=>fileRef.current?.click()} loading={uploading} />
       </div>
     } />
+
+    {sourceConflicts.length > 0 && (
+      <div style={{...cardStyle, borderColor: "#f59e0b", borderWidth: 2, background: "#fffbeb", marginBottom: 16}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:10}}>
+          <div>
+            <div style={{fontSize:14,fontWeight:700,color:"#92400e"}}>⚠️ Source Conflicts — {sourceConflicts.length} week{sourceConflicts.length>1?"s":""} have files from both Uline and Davis</div>
+            <div style={{fontSize:11,color:T.textMuted,marginTop:4,lineHeight:1.5}}>
+              Both files contributed to each week's rollup (highest $/PRO wins per stop). Davis corrections typically run higher than Uline originals — review and confirm, or override.
+            </div>
+          </div>
+        </div>
+
+        {sourceConflicts.map(c => {
+          const davis = c.summaries?.davis || { stop_count:0, delivery_stops:0, truckload_stops:0, accessorial_stops:0, revenue:0, accessorial_revenue:0, delivery_revenue:0, truckload_revenue:0 };
+          const uline = c.summaries?.uline || { stop_count:0, delivery_stops:0, truckload_stops:0, accessorial_stops:0, revenue:0, accessorial_revenue:0, delivery_revenue:0, truckload_revenue:0 };
+          const davisWins = davis.revenue >= uline.revenue;
+          const resolving = resolvingWeek === c.week_ending;
+          return (
+            <div key={c.week_ending} style={{
+              background: "white",
+              borderRadius: 8,
+              border: `1px solid ${davisWins ? T.green+"40" : T.red+"40"}`,
+              padding: "10px 12px",
+              marginBottom: 8,
+            }}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8,flexWrap:"wrap",marginBottom:6}}>
+                <div style={{fontWeight:700,fontSize:13}}>WE {c.week_ending}</div>
+                <div style={{fontSize:10,color:T.textMuted}}>{(c.files||[]).length} file{(c.files||[]).length>1?"s":""} from {c.sources?.join(" + ")}</div>
+              </div>
+
+              {/* Side-by-side summaries */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:11}}>
+                <div style={{padding:"8px 10px",borderRadius:6,background: davisWins ? "#ecfdf5" : T.bgSurface, border:`1px solid ${davisWins ? T.green+"50" : T.borderLight}`}}>
+                  <div style={{fontSize:10,fontWeight:700,color:"#92400e",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:4}}>
+                    ✏️ Davis correction {davisWins && <span style={{color:T.green,marginLeft:4}}>✓ winning</span>}
+                  </div>
+                  <div>Stops: <strong>{fmtNum(davis.stop_count)}</strong></div>
+                  <div>Revenue: <strong>{fmt(davis.revenue)}</strong></div>
+                  <div style={{color:T.textMuted,fontSize:10,marginTop:2}}>
+                    Del: {fmtNum(davis.delivery_stops)} · TK: {fmtNum(davis.truckload_stops)} · Acc: {fmtNum(davis.accessorial_stops)} ({fmt(davis.accessorial_revenue)})
+                  </div>
+                </div>
+                <div style={{padding:"8px 10px",borderRadius:6,background: !davisWins ? "#fef2f2" : T.bgSurface, border:`1px solid ${!davisWins ? T.red+"50" : T.borderLight}`}}>
+                  <div style={{fontSize:10,fontWeight:700,color:T.brand,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:4}}>
+                    📦 Uline original {!davisWins && <span style={{color:T.red,marginLeft:4}}>⚠️ winning</span>}
+                  </div>
+                  <div>Stops: <strong>{fmtNum(uline.stop_count)}</strong></div>
+                  <div>Revenue: <strong>{fmt(uline.revenue)}</strong></div>
+                  <div style={{color:T.textMuted,fontSize:10,marginTop:2}}>
+                    Del: {fmtNum(uline.delivery_stops)} · TK: {fmtNum(uline.truckload_stops)} · Acc: {fmtNum(uline.accessorial_stops)} ({fmt(uline.accessorial_revenue)})
+                  </div>
+                </div>
+              </div>
+
+              {/* Outcome narrative */}
+              <div style={{marginTop:8,padding:"6px 10px",borderRadius:6,background: davisWins?"#ecfdf5":"#fef2f2",fontSize:11,color: davisWins?"#065f46":T.redText}}>
+                {davisWins
+                  ? `✓ Davis revenue is ${fmt(davis.revenue - uline.revenue)} higher — correction applied successfully.`
+                  : `⚠️ Uline revenue is ${fmt(uline.revenue - davis.revenue)} higher than Davis. Unusual — verify the Davis file wasn't a partial correction.`}
+              </div>
+
+              {/* Files list */}
+              <details style={{marginTop:6}}>
+                <summary style={{fontSize:10,color:T.textMuted,cursor:"pointer"}}>Show {(c.files||[]).length} file{(c.files||[]).length>1?"s":""}</summary>
+                <div style={{marginTop:4,fontSize:10,fontFamily:"monospace",color:T.textMuted,lineHeight:1.6}}>
+                  {(c.files||[]).map((f, i) => (
+                    <div key={i}>
+                      <span style={{color: f.source==="davis"?"#92400e":T.brand,fontWeight:600}}>[{f.source}]</span> {f.filename} ({f.kind}{f.service_type?`/${f.service_type}`:""}, {fmtNum(f.stop_count||0)} rows)
+                    </div>
+                  ))}
+                </div>
+              </details>
+
+              {/* Action buttons */}
+              <div style={{marginTop:8,display:"flex",gap:6,flexWrap:"wrap"}}>
+                <button
+                  disabled={resolving}
+                  onClick={async () => {
+                    setResolvingWeek(c.week_ending);
+                    await FS.updateSourceConflict(c.week_ending, {
+                      resolved: "accept-current",
+                      resolved_at: new Date().toISOString(),
+                      resolved_note: davisWins ? "Davis winning — accepted as-is" : "Uline winning — accepted as-is",
+                    });
+                    setSourceConflicts(prev => prev.filter(x => x.week_ending !== c.week_ending));
+                    setResolvingWeek(null);
+                  }}
+                  style={{padding:"6px 12px",borderRadius:6,border:`1px solid ${T.green}`,background:"white",color:"#065f46",fontSize:11,fontWeight:700,cursor:resolving?"wait":"pointer"}}
+                >✓ Mark reviewed · accept current rollup</button>
+                <button
+                  disabled={resolving}
+                  onClick={async () => {
+                    if (!confirm(`Flag WE ${c.week_ending} for manual re-ingestion?\n\nThis marks the conflict as needing attention. You'll need to delete or re-upload files to fully override the rollup.`)) return;
+                    setResolvingWeek(c.week_ending);
+                    await FS.updateSourceConflict(c.week_ending, {
+                      resolved: "needs-manual",
+                      resolved_at: new Date().toISOString(),
+                      resolved_note: "User flagged for manual follow-up",
+                    });
+                    setSourceConflicts(prev => prev.filter(x => x.week_ending !== c.week_ending));
+                    setResolvingWeek(null);
+                  }}
+                  style={{padding:"6px 12px",borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,color:T.textMuted,fontSize:11,fontWeight:600,cursor:resolving?"wait":"pointer"}}
+                >Flag for manual follow-up</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    )}
 
     {pendingReview && (() => {
       const a = pendingReview.audit;
