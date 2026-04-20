@@ -1700,6 +1700,10 @@ function detectFileType(filename, firstRow) {
     // Time clock: employee + punch in/out or clock in/out
     if ((keySet.has("employee") || keySet.has("employee name") || keySet.has("driver") || keySet.has("driver name")) &&
         (keySet.has("punch in") || keySet.has("clock in") || keySet.has("time in") || keySet.has("in") || keySet.has("start time"))) return "timeclock";
+    // Time clock (CyberPay / B600 format): Display Name + In Time + Out Time + REG
+    if ((keySet.has("display name") || keySet.has("display id") || keySet.has("payroll id")) &&
+        keySet.has("in time") && keySet.has("out time") &&
+        (keySet.has("reg") || keySet.has("total"))) return "timeclock";
     // Payroll: employee + hours + gross
     if ((keySet.has("employee") || keySet.has("employee name") || keySet.has("name")) &&
         (keySet.has("gross") || keySet.has("gross pay") || keySet.has("total pay")) &&
@@ -1909,17 +1913,22 @@ function buildNuVizzWeekly(stops) {
 
 // ─── Time Clock Parser ──────────────────────────────────────
 // Flexible column mapping: employee/driver, date, clock in, clock out, hours
+// Supports both generic timeclock format AND CyberPay/B600 format (Display Name, In Time, Out Time, REG, OT1, OT2, Total)
 function parseTimeClock(rows) {
   const entries = [];
   for (const r of rows) {
-    const name = r["employee"] || r["employee name"] || r["driver"] || r["driver name"] || r["name"];
+    const name = r["employee"] || r["employee name"] || r["driver"] || r["driver name"] || r["name"] || r["display name"] || r["payroll id"];
     if (!name) continue;
     const dateRaw = r["date"] || r["punch date"] || r["work date"] || r["day"];
     const date = parseDateMDYFlexible(dateRaw) || (dateRaw ? parseDateMDY(dateRaw) : null);
-    const clockIn = r["clock in"] || r["punch in"] || r["time in"] || r["in"] || r["start time"];
-    const clockOut = r["clock out"] || r["punch out"] || r["time out"] || r["out"] || r["end time"];
-    const hoursRaw = r["hours"] || r["total hours"] || r["worked"] || r["duration"];
-    const hours = parseHours(hoursRaw);
+    const clockIn = r["clock in"] || r["punch in"] || r["time in"] || r["in"] || r["start time"] || r["in time"];
+    const clockOut = r["clock out"] || r["punch out"] || r["time out"] || r["out"] || r["end time"] || r["out time"];
+    // Hours: prefer explicit "Total" (CyberPay), else sum REG+OT1+OT2, else fall back to generic hours column
+    const regHrs = parseHours(r["reg"] ?? r["reg hours"] ?? r["regular hours"] ?? 0) || 0;
+    const ot1Hrs = parseHours(r["ot1"] ?? r["ot hours"] ?? r["overtime"] ?? 0) || 0;
+    const ot2Hrs = parseHours(r["ot2"] ?? 0) || 0;
+    const totalExplicit = parseHours(r["total"] ?? r["total hours"] ?? r["hours"] ?? r["worked"] ?? r["duration"]);
+    const hours = totalExplicit || (regHrs + ot1Hrs + ot2Hrs) || 0;
     entries.push({
       employee: normalizeName(name),
       date,
@@ -1928,6 +1937,9 @@ function parseTimeClock(rows) {
       clock_in: clockIn ? String(clockIn).trim() : null,
       clock_out: clockOut ? String(clockOut).trim() : null,
       hours,
+      reg_hours: regHrs,
+      ot_hours: ot1Hrs + ot2Hrs,
+      department: r["department"] ? String(r["department"]).trim() : null,
     });
   }
   return entries;
@@ -1941,17 +1953,21 @@ function buildTimeClockWeekly(entries) {
     if (!byWeek[w]) {
       byWeek[w] = {
         week_ending: w, month: e.month,
-        total_hours: 0, days_worked: 0,
+        total_hours: 0, reg_hours: 0, ot_hours: 0, days_worked: 0,
         unique_employees: new Set(),
         employees: {},
       };
     }
     const bw = byWeek[w];
     bw.total_hours += e.hours || 0;
+    bw.reg_hours += e.reg_hours || 0;
+    bw.ot_hours += e.ot_hours || 0;
     bw.days_worked++;
     bw.unique_employees.add(e.employee);
-    if (!bw.employees[e.employee]) bw.employees[e.employee] = { hours:0, days:0 };
+    if (!bw.employees[e.employee]) bw.employees[e.employee] = { hours:0, reg:0, ot:0, days:0 };
     bw.employees[e.employee].hours += e.hours || 0;
+    bw.employees[e.employee].reg += e.reg_hours || 0;
+    bw.employees[e.employee].ot += e.ot_hours || 0;
     bw.employees[e.employee].days++;
   }
   return Object.values(byWeek).map(w => ({
