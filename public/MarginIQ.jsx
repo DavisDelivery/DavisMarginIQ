@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.10.1";
+const APP_VERSION = "2.10.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1774,20 +1774,83 @@ async function readWorkbook(file) {
   });
 }
 async function readCSV(file) {
+  // Native CSV parser — avoids XLSX.read which recursively traverses the whole
+  // parsed workbook and overflows the stack on files >~10MB / >100K rows.
+  // Handles: quoted fields, embedded commas/quotes/newlines, CRLF, BOM, empty lines.
   return new Promise((resolve, reject) => {
     const r = new FileReader();
     r.onload = e => {
       try {
-        const wb = XLSX.read(e.target.result, { type: "string" });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
-        const norm = rows.map(r => { const o = {}; Object.keys(r).forEach(k => o[String(k).toLowerCase().trim()] = r[k]); return o; });
-        resolve(norm);
+        let text = e.target.result;
+        // Strip UTF-8 BOM
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        const rows = parseCSVStream(text);
+        if (rows.length === 0) return resolve([]);
+        const headers = rows[0].map(h => String(h || "").toLowerCase().trim());
+        const out = new Array(rows.length - 1);
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          // Skip completely empty lines
+          if (row.length === 1 && row[0] === "") { out[i-1] = null; continue; }
+          const obj = {};
+          for (let j = 0; j < headers.length; j++) {
+            const v = row[j];
+            obj[headers[j]] = (v === undefined || v === "") ? null : v;
+          }
+          out[i-1] = obj;
+        }
+        resolve(out.filter(Boolean));
       } catch(err) { reject(err); }
     };
     r.onerror = reject;
     r.readAsText(file);
   });
+}
+
+// Iterative RFC-4180 CSV parser. Handles quoted fields, embedded commas,
+// escaped quotes ("" inside quoted), and both \n and \r\n line endings.
+// Returns an array of arrays.
+function parseCSVStream(text) {
+  const rows = [];
+  let cur = [];
+  let field = "";
+  let inQuotes = false;
+  const len = text.length;
+  for (let i = 0; i < len; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i+1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+    } else {
+      if (c === '"') {
+        inQuotes = true;
+      } else if (c === ",") {
+        cur.push(field); field = "";
+      } else if (c === "\n") {
+        cur.push(field); field = "";
+        rows.push(cur); cur = [];
+      } else if (c === "\r") {
+        // Swallow \r; the following \n (if any) will push the row.
+        // If standalone \r (old Mac), treat as line terminator.
+        if (text[i+1] !== "\n") {
+          cur.push(field); field = "";
+          rows.push(cur); cur = [];
+        }
+      } else {
+        field += c;
+      }
+    }
+  }
+  // Flush final field/row
+  if (field !== "" || cur.length > 0) {
+    cur.push(field);
+    rows.push(cur);
+  }
+  return rows;
 }
 
 function normalizePro(v) {
