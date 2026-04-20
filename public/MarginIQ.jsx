@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.12.1";
+const APP_VERSION = "2.13.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1703,7 +1703,7 @@ function detectFileType(filename, firstRow) {
   // Uline family (existing)
   if (fn.startsWith("ddis820") || fn.includes("ddis")) return "ddis";
   if (fn.startsWith("master")) return "master";
-  if (fn.includes("accessorial") || fn.includes("acesorial") || fn.includes("acessorial") || fn.includes("accesorial") || fn.includes("acceessorial")) return "accessorials";
+  if (fn.includes("accessorial") || fn.includes("acesorial") || fn.includes("acessorial") || fn.includes("accesorial") || fn.includes("acceessorial") || fn.includes("accessiorial")) return "accessorials";
   if (fn.startsWith("das") || fn.startsWith("das ")) return "original";
   // NuVizz family
   if (fn.includes("driver_stops") || fn.includes("driver stops") || fn.includes("nuvizz")) return "nuvizz";
@@ -1925,10 +1925,25 @@ function applyTypoFixes(files, audit) {
 // If the user drops a .zip into Data Ingest, we unpack it in the browser and
 // return an array of File-shaped blobs — same interface readCSV/readWorkbook
 // already accept, so nothing downstream has to change.
+//
+// Also extracts CSV/XLSX/PDF attachments from .eml (email) files, so raw email
+// saves from Gmail that contain data attachments work without manual extraction.
 async function unzipIfNeeded(files) {
   const out = [];
   for (const f of files) {
     const name = (f.name || "").toLowerCase();
+    if (name.endsWith(".eml")) {
+      // Email file — try to extract data attachments directly
+      try {
+        const extracted = await extractAttachmentsFromEml(f);
+        for (const e of extracted) out.push(e);
+      } catch(err) {
+        console.warn("Failed to extract from .eml:", f.name, err);
+        // Push the .eml through so audit can flag it
+        out.push(f);
+      }
+      continue;
+    }
     if (!name.endsWith(".zip")) { out.push(f); continue; }
     if (typeof JSZip === "undefined") {
       throw new Error("JSZip not loaded — cannot unpack .zip file");
@@ -1942,21 +1957,110 @@ async function unzipIfNeeded(files) {
       if (entryName.includes("__MACOSX/")) continue;
       const base = entryName.split("/").pop();
       if (!base || base.startsWith(".") || base.startsWith("._")) continue;
-      // Only keep files the ingest knows how to handle
       const lower = base.toLowerCase();
       const isData = lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.endsWith(".csv");
       const isPdf = lower.endsWith(".pdf");
-      if (!isData && !isPdf) continue;
+      const isEml = lower.endsWith(".eml");
+      if (!isData && !isPdf && !isEml) continue;
       const blob = await entry.async("blob");
+      if (isEml) {
+        // Zip contained an .eml — extract its attachments too
+        try {
+          const emlFile = new File([blob], base, { type: "message/rfc822" });
+          const extracted = await extractAttachmentsFromEml(emlFile);
+          for (const e of extracted) {
+            e._zipSource = f.name;
+            out.push(e);
+          }
+        } catch(err) {
+          console.warn("Failed to extract .eml in zip:", base, err);
+        }
+        continue;
+      }
       // Wrap in a File so the existing FileReader code paths work unchanged
       const fakeFile = new File([blob], base, { type: blob.type || "application/octet-stream" });
-      // Tag with source info for the audit UI
       fakeFile._zipSource = f.name;
       fakeFile._isPdf = isPdf;
       out.push(fakeFile);
     }
   }
   return out;
+}
+
+// Parse an .eml file and extract data-type attachments (csv/xlsx/xls/pdf).
+// Handles multipart MIME messages with base64 or quoted-printable encoded
+// attachments. Returns an array of File objects.
+async function extractAttachmentsFromEml(emlFile) {
+  const text = await emlFile.text();
+  // Split headers from body
+  const headerEnd = text.search(/\r?\n\r?\n/);
+  if (headerEnd === -1) return [];
+  const headers = text.slice(0, headerEnd);
+  const body = text.slice(headerEnd).replace(/^\r?\n\r?\n/, "");
+
+  // Find the top-level boundary
+  const boundaryMatch = headers.match(/boundary="?([^";\r\n]+)"?/i);
+  if (!boundaryMatch) return [];
+
+  const extracted = [];
+  // Recursively walk parts — attachments can be nested in multipart/mixed → multipart/alternative etc.
+  walkParts(body, boundaryMatch[1], extracted);
+  return extracted;
+}
+
+function walkParts(body, boundary, outList) {
+  const parts = body.split(new RegExp(`--${boundary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:--)?\\s*`));
+  for (const part of parts) {
+    if (!part.trim()) continue;
+    const headerEnd = part.search(/\r?\n\r?\n/);
+    if (headerEnd === -1) continue;
+    const partHeaders = part.slice(0, headerEnd);
+    let partBody = part.slice(headerEnd).replace(/^\r?\n\r?\n/, "");
+
+    // Is this a nested multipart?
+    const nestedBoundary = partHeaders.match(/content-type:[^;]*multipart[^;]*;\s*[\s\S]*?boundary="?([^";\r\n]+)"?/i);
+    if (nestedBoundary) {
+      walkParts(partBody, nestedBoundary[1], outList);
+      continue;
+    }
+
+    // Look for an attachment filename
+    const fnMatch = partHeaders.match(/filename\*?=\s*"?([^";\r\n]+)"?/i);
+    if (!fnMatch) continue;
+    const filename = fnMatch[1].trim();
+    const lower = filename.toLowerCase();
+    const isData = lower.endsWith(".csv") || lower.endsWith(".xlsx") || lower.endsWith(".xls");
+    const isPdf = lower.endsWith(".pdf");
+    if (!isData && !isPdf) continue;
+
+    // Decode based on Content-Transfer-Encoding
+    const encMatch = partHeaders.match(/content-transfer-encoding:\s*([^\r\n]+)/i);
+    const encoding = encMatch ? encMatch[1].trim().toLowerCase() : "7bit";
+    let bytes;
+    if (encoding === "base64") {
+      // Strip whitespace from base64
+      const b64 = partBody.replace(/\s+/g, "");
+      try {
+        const bin = atob(b64);
+        bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      } catch(e) { continue; }
+    } else if (encoding === "quoted-printable") {
+      const decoded = partBody
+        .replace(/=\r?\n/g, "")
+        .replace(/=([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+      bytes = new TextEncoder().encode(decoded);
+    } else {
+      // 7bit, 8bit, binary — use as-is
+      bytes = new TextEncoder().encode(partBody);
+    }
+
+    const blob = new Blob([bytes], { type: isPdf ? "application/pdf" : "text/csv" });
+    const fakeFile = new File([blob], filename, { type: blob.type });
+    fakeFile._isPdf = isPdf;
+    fakeFile._extractedFromEml = emlFile => emlFile;
+    outList.push(fakeFile);
+  }
 }
 
 // ─── Filename audit ─────────────────────────────────────────
@@ -1989,7 +2093,7 @@ function auditFilenames(files) {
     const ext = lower.split(".").pop();
     const isPdf = ext === "pdf";
     const isBackup = /backup/i.test(name);
-    const isAccessorial = /accessorial|acessorial|accesorial|acesorial|acceessorial/i.test(name);
+    const isAccessorial = /accessorial|acessorial|accesorial|acesorial|acceessorial|accessiorial/i.test(name);
     const isDispute = /dispute/i.test(name);
     const isInvoicePdf = /^ra#|_invoice|backup accessorials|back accessorials/i.test(name);
 
@@ -2002,6 +2106,43 @@ function auditFilenames(files) {
     if (m) {
       startDate = parseYMD(m[1]);
       endDate = parseYMD(m[2]);
+      // If YYYYMMDD parse failed (e.g. "02092026" → year 0209 invalid), try
+      // interpreting both as MMDDYYYY: "02092026" → Feb 09 2026 → "20260209"
+      if (!startDate || !endDate) {
+        const asMMDDYYYY = (s) => {
+          const mm = s.slice(0,2), dd = s.slice(2,4), yyyy = s.slice(4,8);
+          return parseYMD(yyyy + mm + dd);
+        };
+        const s2 = asMMDDYYYY(m[1]);
+        const e2 = asMMDDYYYY(m[2]);
+        if (s2 && e2) {
+          parseStatus = "typo-mmddyyyy";
+          startDate = s2;
+          endDate = e2;
+          // Rename: replace each 8-digit block with its YYYYMMDD equivalent
+          const startYMD = s2.replace(/-/g, "");
+          const endYMD = e2.replace(/-/g, "");
+          suggestedRename = name.replace(m[1], startYMD).replace(m[2], endYMD);
+        }
+      }
+      // If still valid but end < start, check for year-off-by-one typo
+      // (e.g. "20251229 - 20250102" where end should be 20260102)
+      if (startDate && endDate && endDate < startDate) {
+        // Try bumping end year by 1
+        const endParts = m[2];
+        const bumpedYear = String(parseInt(endParts.slice(0,4),10) + 1);
+        const bumpedEnd = parseYMD(bumpedYear + endParts.slice(4));
+        if (bumpedEnd) {
+          // Sanity check: bumped end should be within ~2 weeks of start
+          const days = (new Date(bumpedEnd) - new Date(startDate)) / 86400000;
+          if (days > 0 && days < 15) {
+            parseStatus = "typo-yearoff";
+            endDate = bumpedEnd;
+            const fixedEnd = bumpedYear + endParts.slice(4);
+            suggestedRename = name.replace(m[2], fixedEnd);
+          }
+        }
+      }
     } else if ((m = name.match(patternBad7To8))) {
       parseStatus = "typo-7digit";
       // Heuristic 1: leading-zero typo. "0240608" → "20240608"
@@ -3736,7 +3877,7 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="📤" text="Data Ingest" right={
       <div>
-        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.zip,.pdf" multiple onChange={e=>handleFiles(e.target.files)} style={{display:"none"}} />
+        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.zip,.pdf,.eml" multiple onChange={e=>handleFiles(e.target.files)} style={{display:"none"}} />
         <PrimaryBtn text={uploading?"Processing...":"Upload Files"} onClick={()=>fileRef.current?.click()} loading={uploading} />
       </div>
     } />
