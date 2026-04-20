@@ -6,8 +6,14 @@ const VENDOR_QUERIES: Record<string, string> = {
   // NuVizz: daily/weekly driver stops CSV export
   nuvizz: 'from:nuvizzapps@nuvizzapps.com has:attachment',
 
-  // Uline: weekly billing files from various @uline.com senders
-  uline: 'from:@uline.com has:attachment',
+  // Uline weekly billing (DAS files — the delivery/truckload/accessorial
+  // xlsx files). Excludes the AP-Freight DDIS remittance emails which have
+  // their own vendor entry below.
+  uline: 'from:@uline.com -from:APFreight@uline.com has:attachment',
+
+  // Uline DDIS payment remittance — CSV files listing paid PROs. From the
+  // APFreight@uline.com sender with subject = filename (DDIS820_*.csv).
+  ddis: 'from:APFreight@uline.com filename:csv',
 
   // FuelFox: invoices sent VIA QuickBooks on FuelFox's behalf.
   // Subject always contains "FuelFox Atlanta". Each email has 2 PDFs

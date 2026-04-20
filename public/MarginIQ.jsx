@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.14.3";
+const APP_VERSION = "2.15.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1473,7 +1473,8 @@ function GmailSync({ onRefresh }) {
         {/* Vendor Panels */}
         {[
           { key:"nuvizz", icon:"🚚", label:"NuVizz", desc:"Weekly driver stops from nuvizzapps@nuvizzapps.com", color:T.blue, mode:"per-attachment" },
-          { key:"uline", icon:"📦", label:"Uline", desc:"Weekly billing + DDIS from @uline.com senders", color:T.brand, mode:"per-attachment" },
+          { key:"uline", icon:"📦", label:"Uline Billing", desc:"Weekly DAS xlsx files from @uline.com senders (delivery + truckload + accessorials)", color:T.brand, mode:"per-attachment" },
+          { key:"ddis", icon:"💰", label:"Uline DDIS Payments", desc:"Payment remittance CSVs from APFreight@uline.com (paid PROs for reconciliation)", color:T.green, mode:"per-attachment" },
           { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
           { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from ebilling@4flyers.com", color:"#2563eb", mode:"quickfuel" },
         ].map(v => {
