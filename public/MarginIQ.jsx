@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.20.1";
+const APP_VERSION = "2.21.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3505,14 +3505,118 @@ function runSanityChecks(context, data) {
     }
   }
 
-  if (context === "data-health" && data?.streamCoverage) {
-    const delivery = data.streamCoverage.delivery;
-    if (delivery && delivery.pct < 100) {
-      push("alarm",
-        `Delivery coverage is ${delivery.pct}% (${delivery.total - delivery.covered} missing)`,
-        `Delivery is your primary revenue stream. Missing weeks here directly understate revenue.`,
-        { coverage: `${delivery.pct}%` });
+  if (context === "data-health") {
+    const streamCov = data?.streamCoverage || {};
+    const comp = data?.completeness;
+    const fileLog = data?.fileLog || [];
+    const unknownFiles = data?.unknownFiles || [];
+
+    // Check 1 — Delivery coverage (the primary revenue stream)
+    const delivery = streamCov.delivery;
+    if (delivery) {
+      const missing = delivery.total - delivery.covered;
+      if (missing > 0) {
+        push(missing > 4 ? "alarm" : "warn",
+          `${missing} delivery week${missing>1?"s":""} missing (${delivery.pct}% coverage)`,
+          `Delivery is your primary revenue stream — each missing week directly understates revenue. ${delivery.covered} of ${delivery.total} weeks present in 2025+.`,
+          { coverage: `${delivery.pct}%`, missing });
+      } else if (delivery.total > 0) {
+        push("ok", `Delivery coverage complete`, `All ${delivery.total} expected weeks have delivery data.`);
+      }
     }
+
+    // Check 2 — Accessorial coverage
+    const acc = streamCov.accessorials;
+    if (acc && acc.total > 0) {
+      const missingAcc = acc.total - acc.covered;
+      const accPct = acc.pct;
+      if (accPct < 70) {
+        push("warn",
+          `${missingAcc} weeks missing accessorial data (${accPct}%)`,
+          `Missing accessorial files directly reduce billed revenue — typical LTL accessorials run 5-15% of delivery revenue.`,
+          { coverage: `${accPct}%`, missing: missingAcc });
+      }
+    }
+
+    // Check 3 — Truckload presence
+    const tk = streamCov.truckload;
+    if (tk && tk.covered === 0 && delivery?.covered > 5) {
+      push("info",
+        `No truckload (TK) data found`,
+        `Either you're not running TK routes, or TK files aren't being ingested. Check Gmail Sync for 'TK' variant filenames.`);
+    }
+
+    // Check 4 — DDIS (payment) coverage vs delivery
+    const ddis = streamCov.ddis;
+    if (ddis && delivery && delivery.covered > 10) {
+      const ratio = ddis.covered / delivery.covered;
+      if (ratio < 0.5) {
+        push("warn",
+          `DDIS payment coverage is sparse (${ddis.covered} weeks vs ${delivery.covered} delivery weeks)`,
+          `Reconciliation and AuditIQ only work where DDIS remittance files exist. Pull more from Gmail.`);
+      }
+    }
+
+    // Check 5 — NuVizz coverage (driver pay basis)
+    const nv = streamCov.nuvizz;
+    if (nv && delivery && delivery.covered > 10) {
+      const nvMissing = delivery.covered - nv.covered;
+      if (nvMissing > 4) {
+        push("warn",
+          `NuVizz data missing for ${nvMissing} week${nvMissing>1?"s":""}`,
+          `Driver pay calculations (1099 SealNbr × 40%) require NuVizz stops. Without them, those weeks show no contractor pay.`);
+      }
+    }
+
+    // Check 6 — Time Clock coverage (W2 payroll basis)
+    const tc = streamCov.timeclock;
+    if (tc && delivery && delivery.covered > 10) {
+      const tcMissing = delivery.covered - tc.covered;
+      if (tcMissing > 2) {
+        push("warn",
+          `Time Clock data missing for ${tcMissing} week${tcMissing>1?"s":""}`,
+          `W2 driver payroll costs can't be computed without time clock entries. Check B600 export or Gmail Sync.`);
+      }
+    }
+
+    // Check 7 — Sparse weeks (present but likely partial)
+    if (comp?.sparseWeeks?.length > 0) {
+      push("warn",
+        `${comp.sparseWeeks.length} sparse week${comp.sparseWeeks.length>1?"s":""} detected`,
+        `These weeks have data but stop counts are <50% of your average (${comp.avgStops}/week). Likely partial ingest — verify by re-searching Gmail for that date range.`);
+    }
+
+    // Check 8 — Unknown/unparsed files
+    if (unknownFiles.length > 0) {
+      push("info",
+        `${unknownFiles.length} file${unknownFiles.length>1?"s":""} couldn't be categorized`,
+        `Files that didn't match any known format. Either new formats, typos in filenames, or truly unknown sources.`,
+        { examples: unknownFiles.slice(0, 3) });
+    }
+
+    // Check 9 — File log staleness
+    if (fileLog.length > 0) {
+      const latest = fileLog[0]; // fileLog is ordered by uploaded_at desc
+      if (latest?.uploaded_at) {
+        const daysSince = Math.floor((Date.now() - new Date(latest.uploaded_at).getTime()) / 86400000);
+        if (daysSince > 14) {
+          push("warn",
+            `Last file uploaded ${daysSince} days ago`,
+            `If you're still running deliveries, new Uline files should be arriving weekly. Check Gmail Sync.`);
+        }
+      }
+    }
+
+    // If nothing flagged and we have data, celebrate briefly
+    if (findings.length === 0 && delivery?.covered > 0) {
+      push("ok",
+        `Data looks complete`,
+        `All primary streams (delivery, accessorials, DDIS, NuVizz, time clock) present with good coverage across the loaded date range.`);
+    }
+  }
+
+  if (context === "data-health-legacy-removed") {
+    // placeholder to keep diff minimal — old single-rule block replaced above
   }
 
   // Overall signal: max severity seen
@@ -4608,12 +4712,87 @@ function CoverageTimeline() {
 
 function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
   const hasUline = weeklyRollups && weeklyRollups.length > 0 && completeness;
+  const [streamCoverage, setStreamCoverage] = useState(null);
+
+  // Load per-stream coverage counts in parallel so AIInsight gets a full picture.
+  // Same data sources CoverageTimeline uses, but summarized to counts (not cells).
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) return;
+      try {
+        const [uline, nuvizz, timeclock, payroll, ddisFiles] = await Promise.all([
+          FS.getWeeklyRollups(),
+          FS.getNuVizzWeekly(),
+          FS.getTimeClockWeekly(),
+          FS.getPayrollWeekly(),
+          FS.getDDISFiles(),
+        ]);
+        const start = "2025-01-01";
+        const inRange = (w) => w >= start;
+
+        // Expected Friday weeks from Jan 3, 2025 through the most recent past Friday
+        const today = new Date();
+        const dow = today.getDay();
+        const daysBackToFri = dow >= 5 ? dow - 5 : dow + 2;
+        const lastFri = new Date(today);
+        lastFri.setDate(today.getDate() - daysBackToFri);
+        const firstFri = new Date("2025-01-03T00:00:00");
+        const expectedWeeks = [];
+        for (let d = new Date(firstFri); d <= lastFri; d.setDate(d.getDate() + 7)) {
+          expectedWeeks.push(d.toISOString().slice(0, 10));
+        }
+        const total = expectedWeeks.length;
+        const pct = (covered) => total > 0 ? Math.round((covered / total) * 100) : 0;
+
+        // Uline split by service_type
+        const ulineIn = uline.filter(w => inRange(w.week_ending));
+        const delWeeks = new Set(ulineIn.filter(w => (w.delivery_stops||w.stops||0) > 0).map(w => w.week_ending));
+        const tkWeeks = new Set(ulineIn.filter(w => (w.truckload_stops||0) > 0).map(w => w.week_ending));
+        const accWeeks = new Set(ulineIn.filter(w => (w.accessorial_stops||0) > 0 || (w.accessorial_revenue||0) > 0).map(w => w.week_ending));
+
+        // DDIS: cover any week whose bill_date range overlaps an expected Friday
+        const ddisWeekSet = new Set();
+        for (const f of ddisFiles) {
+          if (!f.earliest_bill_date || !f.latest_bill_date) continue;
+          for (const we of expectedWeeks) {
+            if (we >= f.earliest_bill_date && we <= f.latest_bill_date) ddisWeekSet.add(we);
+          }
+        }
+
+        const nvWeeks = new Set(nuvizz.filter(w => inRange(w.week_ending)).map(w => w.week_ending));
+        const tcWeeks = new Set(timeclock.filter(w => inRange(w.week_ending)).map(w => w.week_ending));
+        const payWeeks = new Set(payroll.filter(w => inRange(w.week_ending)).map(w => w.week_ending));
+
+        setStreamCoverage({
+          delivery:     { covered: delWeeks.size,  total, pct: pct(delWeeks.size) },
+          truckload:    { covered: tkWeeks.size,   total, pct: pct(tkWeeks.size) },
+          accessorials: { covered: accWeeks.size,  total, pct: pct(accWeeks.size) },
+          ddis:         { covered: ddisWeekSet.size, total, pct: pct(ddisWeekSet.size) },
+          nuvizz:       { covered: nvWeeks.size,   total, pct: pct(nvWeeks.size) },
+          timeclock:    { covered: tcWeeks.size,   total, pct: pct(tcWeeks.size) },
+          payroll:      { covered: payWeeks.size,  total, pct: pct(payWeeks.size) },
+        });
+      } catch(e) { console.error("streamCoverage err:", e); }
+    })();
+  }, []);
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="✅" text="Data Health" />
 
     {/* Coverage timeline — always rendered; loads its own data */}
     <CoverageTimeline />
+
+    {/* AI Insight — deterministic checks + optional Claude analysis */}
+    <AIInsight
+      context="data-health"
+      title="🔍 Health Check"
+      data={{
+        streamCoverage,
+        completeness,
+        fileLog: (fileLog || []).slice(0, 200),
+        unknownFiles: (fileLog || []).filter(f => f.kind === "unknown").map(f => f.filename).slice(0, 20),
+      }}
+    />
 
     {/* Existing Uline Completeness view — only shown if Uline data exists */}
     {!hasUline && (

@@ -155,6 +155,43 @@ function summarizeDataForContext(context: string, data: any) {
     };
   }
 
+  if (context === "data-health") {
+    const sc = data.streamCoverage || {};
+    const comp = data.completeness || {};
+    const fileLog = Array.isArray(data.fileLog) ? data.fileLog : [];
+
+    // File log breakdown by kind
+    const byKind: Record<string, number> = {};
+    const bySource: Record<string, number> = {};
+    let latestUpload: string | null = null;
+    for (const f of fileLog) {
+      byKind[f.kind || "unknown"] = (byKind[f.kind || "unknown"] || 0) + 1;
+      bySource[f.source || "manual"] = (bySource[f.source || "manual"] || 0) + 1;
+      if (f.uploaded_at && (!latestUpload || f.uploaded_at > latestUpload)) latestUpload = f.uploaded_at;
+    }
+
+    return {
+      stream_coverage: sc, // { delivery, truckload, accessorials, ddis, nuvizz, timeclock, payroll }
+      uline_completeness: {
+        total_expected_weeks: (comp.expected || []).length,
+        fully_missing_weeks: (comp.gaps || []).length,
+        sparse_weeks: (comp.sparseWeeks || []).length,
+        weeks_missing_accessorials: (comp.missingAccessorials || []).length,
+        avg_stops_per_week: comp.avgStops || 0,
+        first_we: comp.firstWE,
+        last_we: comp.lastWE,
+        sample_missing_weeks: (comp.gaps || []).slice(0, 10),
+      },
+      file_log_summary: {
+        total_files: fileLog.length,
+        by_kind: byKind,
+        by_source: bySource,
+        latest_upload_at: latestUpload,
+      },
+      unknown_file_examples: (data.unknownFiles || []).slice(0, 5),
+    };
+  }
+
   // Fallback: pass raw (risks token bloat, but never blocks)
   return data;
 }
