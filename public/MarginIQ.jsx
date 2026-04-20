@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.13.0";
+const APP_VERSION = "2.14.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3414,88 +3414,395 @@ function UlineRevenue({ weeklyRollups }) {
 }
 
 // ═══ DATA COMPLETENESS TAB ════════════════════════════════════
-function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
-  if (!completeness || weeklyRollups.length === 0) {
-    return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="✅" text="Data Completeness" />
-      <EmptyState icon="📤" title="No Data Loaded" sub="Upload files in the Data Ingest tab first." />
-    </div>;
+// ─── Coverage Timeline ─────────────────────────────────────
+// Shows a per-stream timeline of data coverage so gaps across Uline /
+// NuVizz / Time Clock / DDIS are visible at a glance. One row per stream,
+// one cell per week. Green = complete, yellow = partial, grey = gap.
+function CoverageTimeline() {
+  const [loading, setLoading] = useState(true);
+  const [streams, setStreams] = useState(null);
+  const [hover, setHover] = useState(null); // { streamIdx, weekISO, cell }
+  const [rangeMode, setRangeMode] = useState("auto"); // "auto" | "2024" | "2025" | "last12"
+
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) { setLoading(false); return; }
+      try {
+        const [uline, nuvizz, timeclock, ddisFiles] = await Promise.all([
+          FS.getWeeklyRollups(),
+          FS.getNuVizzWeekly(),
+          FS.getTimeClockWeekly(),
+          FS.getDDISFiles(),
+        ]);
+
+        // Build coverage map per stream: weekISO → {present, value}
+        // All streams normalize to Friday-ending weeks for visual alignment.
+        const fridayOf = (iso) => {
+          // Given any YYYY-MM-DD, return the week-ending Friday (on or after)
+          const d = new Date(iso + "T00:00:00");
+          const day = d.getDay();
+          const daysTo = (5 - day + 7) % 7;
+          d.setDate(d.getDate() + daysTo);
+          return d.toISOString().slice(0, 10);
+        };
+
+        const deliveryMap = {};
+        const truckloadMap = {};
+        const accessorialMap = {};
+        for (const w of uline) {
+          const fri = fridayOf(w.week_ending);
+          if ((w.delivery_stops || 0) > 0 || (w.stops || 0) > 0) {
+            // Fallback: older rollups don't have service_type split, treat as delivery
+            deliveryMap[fri] = {
+              stops: w.delivery_stops || w.stops || 0,
+              revenue: w.delivery_revenue || w.revenue || 0,
+            };
+          }
+          if ((w.truckload_stops || 0) > 0) {
+            truckloadMap[fri] = {
+              stops: w.truckload_stops || 0,
+              revenue: w.truckload_revenue || 0,
+            };
+          }
+          if ((w.accessorial_stops || 0) > 0 || (w.accessorial_revenue || 0) > 0) {
+            accessorialMap[fri] = {
+              stops: w.accessorial_stops || w.accessorial_count || 0,
+              revenue: w.accessorial_revenue || 0,
+            };
+          }
+        }
+
+        const nuvizzMap = {};
+        for (const w of nuvizz) {
+          if ((w.stops_effective || w.stops_total || 0) > 0) {
+            nuvizzMap[w.week_ending] = {
+              stops: w.stops_effective || w.stops_total || 0,
+              revenue: w.pay_base_total || 0,
+            };
+          }
+        }
+
+        // Time Clock uses Saturday week-endings; shift -1 day to align Friday-visual
+        const timeclockMap = {};
+        for (const w of timeclock) {
+          const satISO = w.week_ending;
+          const satDate = new Date(satISO + "T00:00:00");
+          satDate.setDate(satDate.getDate() - 1);
+          const fri = satDate.toISOString().slice(0, 10);
+          if ((w.total_hours || 0) > 0) {
+            timeclockMap[fri] = {
+              hours: w.total_hours || 0,
+              entries: w.entries_count || 0,
+            };
+          }
+        }
+
+        // DDIS: each file covers a date range. Mark every week touched by
+        // that range as covered.
+        const ddisMap = {};
+        for (const f of ddisFiles) {
+          if (!f.earliest_bill_date || !f.latest_bill_date) continue;
+          let cur = new Date(f.earliest_bill_date + "T00:00:00");
+          const end = new Date(f.latest_bill_date + "T00:00:00");
+          while (cur <= end) {
+            const iso = cur.toISOString().slice(0, 10);
+            const fri = fridayOf(iso);
+            if (!ddisMap[fri]) ddisMap[fri] = { files: 0, paid: 0 };
+            ddisMap[fri].files = Math.max(ddisMap[fri].files, 1);
+            cur.setDate(cur.getDate() + 7);
+          }
+          ddisMap[fridayOf(f.latest_bill_date)] = ddisMap[fridayOf(f.latest_bill_date)] || { files: 0, paid: 0 };
+        }
+        // Sum paid per week from per-file totals approximately:
+        // (we don't have per-week breakdown, so attribute file total to its earliest week)
+        for (const f of ddisFiles) {
+          if (!f.earliest_bill_date) continue;
+          const fri = fridayOf(f.earliest_bill_date);
+          if (!ddisMap[fri]) ddisMap[fri] = { files: 0, paid: 0 };
+          ddisMap[fri].files = (ddisMap[fri].files || 0) + 1;
+          ddisMap[fri].paid = (ddisMap[fri].paid || 0) + (f.total_paid || 0);
+        }
+
+        setStreams([
+          { key: "delivery",    label: "Uline · Delivery",    color: T.brand,   map: deliveryMap,    primary: "stops", fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)}` },
+          { key: "truckload",   label: "Uline · Truckload",   color: T.purple,  map: truckloadMap,   primary: "stops", fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)}` },
+          { key: "accessorial", label: "Uline · Accessorial", color: T.yellow,  map: accessorialMap, primary: "stops", fmtValue: (v) => `${v.stops ? fmtNum(v.stops)+" stops · " : ""}${fmt(v.revenue)}` },
+          { key: "nuvizz",      label: "NuVizz",              color: T.blue,    map: nuvizzMap,      primary: "stops", fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)} SealNbr` },
+          { key: "timeclock",   label: "Time Clock",          color: T.green,   map: timeclockMap,   primary: "hours", fmtValue: (v) => `${fmtNum(Math.round(v.hours))} hrs` },
+          { key: "ddis",        label: "DDIS Payments",       color: T.red,     map: ddisMap,        primary: "files", fmtValue: (v) => `${v.files} file${v.files===1?"":"s"} · ${fmt(v.paid)}` },
+        ]);
+        setLoading(false);
+      } catch (e) {
+        console.error("CoverageTimeline load err:", e);
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  if (loading) return <div style={cardStyle}><div style={{textAlign:"center",padding:20,color:T.textMuted,fontSize:12}}>Loading coverage data…</div></div>;
+  if (!streams) return null;
+
+  // Compute min/max week across all streams (plus date controls override)
+  const allWeeks = new Set();
+  for (const s of streams) for (const w of Object.keys(s.map)) allWeeks.add(w);
+  if (allWeeks.size === 0) {
+    return (
+      <div style={cardStyle}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>📊 Coverage Timeline</div>
+        <EmptyState icon="📤" title="No data yet" sub="Upload files in Data Ingest to see coverage across streams." />
+      </div>
+    );
   }
 
-  const { expected, gaps, sparseWeeks, missingAccessorials, avgStops, firstWE, lastWE } = completeness;
-  const completePct = expected.length > 0 ? ((expected.length - gaps.length) / expected.length * 100) : 100;
+  let firstWeek, lastWeek;
+  const sortedWeeks = Array.from(allWeeks).sort();
+  const dataEarliest = sortedWeeks[0];
+  const dataLatest = sortedWeeks[sortedWeeks.length - 1];
+
+  const todayFri = (() => {
+    const d = new Date();
+    const day = d.getDay();
+    const daysTo = (5 - day + 7) % 7;
+    d.setDate(d.getDate() + daysTo);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  if (rangeMode === "2024") { firstWeek = "2024-01-05"; lastWeek = todayFri; }
+  else if (rangeMode === "2025") { firstWeek = "2025-01-03"; lastWeek = todayFri; }
+  else if (rangeMode === "last12") {
+    const d = new Date();
+    d.setMonth(d.getMonth() - 12);
+    const day = d.getDay();
+    const daysTo = (5 - day + 7) % 7;
+    d.setDate(d.getDate() + daysTo);
+    firstWeek = d.toISOString().slice(0, 10);
+    lastWeek = todayFri;
+  }
+  else {
+    // auto: data earliest, or 2024-01 if data reaches there, else 2025-01
+    const dataFirstYear = parseInt(dataEarliest.slice(0,4), 10);
+    if (dataFirstYear <= 2024) firstWeek = "2024-01-05";
+    else firstWeek = "2025-01-03";
+    lastWeek = dataLatest > todayFri ? dataLatest : todayFri;
+  }
+
+  // Build column array (weeks from firstWeek → lastWeek inclusive)
+  const columns = [];
+  const addDaysISO = (iso, n) => { const d = new Date(iso + "T00:00:00"); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); };
+  {
+    let cur = firstWeek;
+    while (cur <= lastWeek) {
+      columns.push(cur);
+      cur = addDaysISO(cur, 7);
+    }
+  }
+
+  // Figure out month boundaries for axis labels
+  const monthLabels = [];
+  let lastMonth = "";
+  columns.forEach((w, i) => {
+    const mo = w.slice(0, 7);
+    if (mo !== lastMonth) {
+      monthLabels.push({ i, label: new Date(w+"T00:00:00").toLocaleString("en-US",{month:"short",year:"2-digit"}) });
+      lastMonth = mo;
+    }
+  });
+
+  const CELL_W = 10;
+  const CELL_H = 18;
+  const GAP = 2;
+  const ROW_GAP = 6;
+  const LABEL_W = 150;
+  const gridWidth = columns.length * (CELL_W + GAP);
+
+  const coverageStats = streams.map(s => {
+    const covered = columns.filter(w => s.map[w]).length;
+    return { key: s.key, covered, total: columns.length, pct: columns.length > 0 ? Math.round(covered/columns.length*100) : 0 };
+  });
+
+  return (
+    <div style={{...cardStyle, marginBottom:16}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:10}}>
+        <div style={{fontSize:13,fontWeight:700,color:T.text}}>📊 Coverage Timeline</div>
+        <div style={{display:"flex",gap:4,fontSize:11}}>
+          {[
+            { k: "auto", l: "Auto" },
+            { k: "2024", l: "2024→" },
+            { k: "2025", l: "2025→" },
+            { k: "last12", l: "Last 12mo" },
+          ].map(b => (
+            <button key={b.k}
+              onClick={() => setRangeMode(b.k)}
+              style={{
+                padding: "4px 10px",
+                borderRadius: 6,
+                border: `1px solid ${rangeMode === b.k ? T.brand : T.border}`,
+                background: rangeMode === b.k ? T.brandPale : "white",
+                color: rangeMode === b.k ? T.brand : T.textMuted,
+                cursor: "pointer",
+                fontWeight: rangeMode === b.k ? 600 : 400,
+                fontSize: 11,
+              }}>{b.l}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>
+        Each cell = one week (Friday-ending). Coloured = data present, grey = gap. Hover for details.
+      </div>
+
+      <div style={{overflowX:"auto",paddingBottom:8}}>
+        <div style={{minWidth: LABEL_W + gridWidth + 40}}>
+          {/* Month axis labels */}
+          <div style={{display:"flex",position:"relative",height:18,marginBottom:6,marginLeft:LABEL_W}}>
+            {monthLabels.map((m, idx) => (
+              <div key={idx} style={{
+                position:"absolute",
+                left: m.i * (CELL_W + GAP),
+                fontSize: 10,
+                color: T.textMuted,
+                whiteSpace: "nowrap",
+                borderLeft: `1px solid ${T.borderLight}`,
+                paddingLeft: 3,
+                height: 18,
+              }}>{m.label}</div>
+            ))}
+          </div>
+
+          {/* Stream rows */}
+          {streams.map((s, sIdx) => {
+            const stats = coverageStats[sIdx];
+            return (
+              <div key={s.key} style={{display:"flex",alignItems:"center",marginBottom: ROW_GAP}}>
+                <div style={{width: LABEL_W, paddingRight: 10, fontSize: 11, color: T.text}}>
+                  <div style={{fontWeight: 600}}>{s.label}</div>
+                  <div style={{fontSize: 10, color: stats.pct >= 95 ? T.green : stats.pct >= 50 ? T.yellowText : T.textMuted}}>
+                    {stats.covered}/{stats.total} weeks ({stats.pct}%)
+                  </div>
+                </div>
+                <div style={{display:"flex",gap: GAP}}>
+                  {columns.map((w, i) => {
+                    const cell = s.map[w];
+                    const present = !!cell;
+                    return (
+                      <div
+                        key={i}
+                        onMouseEnter={() => setHover({ streamIdx: sIdx, weekISO: w, cell })}
+                        onMouseLeave={() => setHover(null)}
+                        title={`${s.label} · WE ${w}${present ? " · " + s.fmtValue(cell) : " · no data"}`}
+                        style={{
+                          width: CELL_W,
+                          height: CELL_H,
+                          borderRadius: 2,
+                          background: present ? s.color : T.borderLight,
+                          opacity: present ? 1 : 0.4,
+                          cursor: "pointer",
+                          transition: "transform 0.1s",
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {hover && (
+        <div style={{marginTop:10,padding:"8px 12px",background:T.bgSurface,borderRadius:6,fontSize:11,color:T.text,border:`1px solid ${T.borderLight}`}}>
+          <div style={{fontWeight:700}}>{streams[hover.streamIdx].label} · WE {hover.weekISO}</div>
+          <div style={{color: hover.cell ? T.textMuted : T.red, marginTop:2}}>
+            {hover.cell ? streams[hover.streamIdx].fmtValue(hover.cell) : "No data for this week"}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
+  const hasUline = weeklyRollups && weeklyRollups.length > 0 && completeness;
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-    <SectionTitle icon="✅" text="Data Completeness" />
+    <SectionTitle icon="✅" text="Data Health" />
 
-    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
-      <KPI label="Coverage" value={fmtPct(completePct,0)} subColor={completePct>=95?T.green:completePct>=85?T.yellow:T.red} sub={`${expected.length-gaps.length}/${expected.length} weeks`} />
-      <KPI label="Missing Weeks" value={fmtNum(gaps.length)} subColor={gaps.length>0?T.red:T.green} sub="Zero data" />
-      <KPI label="Sparse Weeks" value={fmtNum(sparseWeeks.length)} subColor={sparseWeeks.length>0?T.yellow:T.green} sub="Possible partial" />
-      <KPI label="No Accessorials" value={fmtNum(missingAccessorials.length)} subColor={missingAccessorials.length>0?T.yellow:T.green} sub="Weeks missing acc file" />
-      <KPI label="Avg Stops/Week" value={fmtNum(avgStops)} sub={`${weekLabel(firstWE)} → ${weekLabel(lastWE)}`} />
-    </div>
+    {/* Coverage timeline — always rendered; loads its own data */}
+    <CoverageTimeline />
 
-    {gaps.length > 0 && (
+    {/* Existing Uline Completeness view — only shown if Uline data exists */}
+    {!hasUline && (
       <div style={cardStyle}>
-        <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.red}}>🚨 Missing Weeks — No Data At All ({gaps.length})</div>
-        <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have zero stops in the system. You worked these weeks — find the Uline files and re-upload.</div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6}}>
-          {gaps.map(w => (
-            <div key={w} style={{padding:"8px 12px",borderRadius:6,background:T.redBg,color:T.redText,fontSize:12,fontWeight:600,textAlign:"center",border:`1px solid ${T.red}30`}}>
-              WE {weekLabel(w)}
+        <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>📋 Uline Completeness</div>
+        <EmptyState icon="📤" title="No Uline revenue data yet" sub="Upload Uline weekly files in Data Ingest to see week-by-week coverage metrics." />
+      </div>
+    )}
+    {hasUline && (() => {
+      const { expected, gaps, sparseWeeks, missingAccessorials, avgStops, firstWE, lastWE } = completeness;
+      const completePct = expected.length > 0 ? ((expected.length - gaps.length) / expected.length * 100) : 100;
+      return (
+        <>
+          <div style={{fontSize:13,fontWeight:700,margin:"8px 0 12px",color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.08em"}}>Uline Completeness</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
+            <KPI label="Coverage" value={fmtPct(completePct,0)} subColor={completePct>=95?T.green:completePct>=85?T.yellow:T.red} sub={`${expected.length-gaps.length}/${expected.length} weeks`} />
+            <KPI label="Missing Weeks" value={fmtNum(gaps.length)} subColor={gaps.length>0?T.red:T.green} sub="Zero data" />
+            <KPI label="Sparse Weeks" value={fmtNum(sparseWeeks.length)} subColor={sparseWeeks.length>0?T.yellow:T.green} sub="Possible partial" />
+            <KPI label="No Accessorials" value={fmtNum(missingAccessorials.length)} subColor={missingAccessorials.length>0?T.yellow:T.green} sub="Weeks missing acc file" />
+            <KPI label="Avg Stops/Week" value={fmtNum(avgStops)} sub={`${weekLabel(firstWE)} → ${weekLabel(lastWE)}`} />
+          </div>
+          {gaps.length > 0 && (
+            <div style={cardStyle}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.red}}>🚨 Missing Weeks — No Data At All ({gaps.length})</div>
+              <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have zero stops in the system. You worked these weeks — find the Uline files and re-upload.</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6}}>
+                {gaps.map(w => (
+                  <div key={w} style={{padding:"8px 12px",borderRadius:6,background:T.redBg,color:T.redText,fontSize:12,fontWeight:600,textAlign:"center",border:`1px solid ${T.red}30`}}>
+                    WE {weekLabel(w)}
+                  </div>
+                ))}
+              </div>
             </div>
-          ))}
-        </div>
-      </div>
-    )}
-
-    {sparseWeeks.length > 0 && (
-      <div style={cardStyle}>
-        <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.yellowText}}>⚠️ Suspiciously Low-Volume Weeks ({sparseWeeks.length})</div>
-        <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have far fewer stops than your average of <strong>{fmtNum(avgStops)}</strong>. Data may be partial or a holiday week.</div>
-        <div style={{overflowX:"auto"}}>
-          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-            <thead><tr>{["Week Ending","Stops","Revenue","Expected Stops","Gap"].map(h=>
-              <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
-            )}</tr></thead>
-            <tbody>
-              {sparseWeeks.map((w,i) => (
-                <tr key={i}>
-                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(w.week_ending)}</td>
-                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmtNum(w.stops)}</td>
-                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmt(w.revenue)}</td>
-                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted}}>{fmtNum(w.expected_avg)}</td>
-                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red}}>{fmtNum(w.expected_avg - w.stops)} missing</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    )}
-
-    {missingAccessorials.length > 0 && (
-      <div style={cardStyle}>
-        <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.yellowText}}>📄 Weeks Missing Accessorials File ({missingAccessorials.length})</div>
-        <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have original data but no accessorial charges were found. Either you had zero accessorials that week (rare) or the accessorial file wasn't uploaded.</div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6}}>
-          {missingAccessorials.map((w,i) => (
-            <div key={i} style={{padding:"8px 12px",borderRadius:6,background:T.yellowBg,color:T.yellowText,fontSize:12,fontWeight:600,textAlign:"center",border:`1px solid ${T.yellow}30`}}>
-              WE {weekLabel(w.week_ending)}
+          )}
+          {sparseWeeks.length > 0 && (
+            <div style={cardStyle}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.yellowText}}>⚠️ Suspiciously Low-Volume Weeks ({sparseWeeks.length})</div>
+              <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have far fewer stops than your average of <strong>{fmtNum(avgStops)}</strong>. Data may be partial or a holiday week.</div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                  <thead><tr>{["Week Ending","Stops","Revenue","Expected Stops","Gap"].map(h=>
+                    <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
+                  )}</tr></thead>
+                  <tbody>
+                    {sparseWeeks.map((w,i) => (
+                      <tr key={i}>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(w.week_ending)}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.stops)}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600,color:T.green}}>{fmt(w.revenue||0)}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(avgStops)}</td>
+                        <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.red,fontWeight:600}}>{fmtNum(avgStops-w.stops)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
-          ))}
-        </div>
-      </div>
-    )}
-
-    {gaps.length === 0 && sparseWeeks.length === 0 && missingAccessorials.length === 0 && (
-      <div style={{...cardStyle, background:T.greenBg, borderColor:T.green, textAlign:"center", padding:30}}>
-        <div style={{fontSize:40,marginBottom:8}}>✅</div>
-        <div style={{fontSize:16,fontWeight:700,color:T.greenText,marginBottom:4}}>All Weeks Accounted For</div>
-        <div style={{fontSize:12,color:T.textMuted}}>Every week from {weekLabel(firstWE)} to {weekLabel(lastWE)} has data loaded.</div>
-      </div>
-    )}
+          )}
+          {missingAccessorials.length > 0 && (
+            <div style={cardStyle}>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:12,color:T.yellowText}}>⚠️ Weeks Missing Accessorial File ({missingAccessorials.length})</div>
+              <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have an original file but no accessorial (extra charges) file uploaded.</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:6}}>
+                {missingAccessorials.map(w => (
+                  <div key={w} style={{padding:"8px 12px",borderRadius:6,background:T.yellowBg,color:T.yellowText,fontSize:12,fontWeight:600,textAlign:"center",border:`1px solid ${T.yellow}50`}}>
+                    WE {weekLabel(w)}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      );
+    })()}
 
     {fileLog.length > 0 && (
       <div style={cardStyle}>
@@ -3521,6 +3828,7 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
     )}
   </div>;
 }
+
 
 // ═══ DATA INGEST ═══════════════════════════════════════════
 function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
