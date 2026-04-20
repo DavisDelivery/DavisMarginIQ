@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.17.1";
+const APP_VERSION = "2.18.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -190,11 +190,18 @@ async function ingestFiles(files, onStatus = () => {}) {
   const sourceFilesLog = [];
   const countsByKind = { master:0, original:0, accessorials:0, ddis:0, nuvizz:0, timeclock:0, payroll:0, qbo_pl:0, qbo_tb:0, qbo_gl:0, unknown:0 };
   const unknownFiles = [];
+  // Track which sources touched each week_ending — used to emit sourceConflicts.
+  // weekSources[weekKey] = Set of sources (e.g. "uline", "davis", "manual")
+  const weekSources = {};
+  // per-file breakdown of weeks touched: [{ filename, source, weeks: [...], kind, service_type }]
+  const fileWeekImpact = [];
 
   for (let i=0; i<files.length; i++) {
     const file = files[i];
     onStatus({ phase:"read", current:i+1, total:files.length, name:file.name });
     const fileId = file.name.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
+    const source = file._source || "manual"; // "uline" | "davis" | "gmail" | "manual"
+    const emailFrom = file._emailFrom || null;
     try {
       let rows;
       const isCSV = file.name.toLowerCase().endsWith(".csv");
@@ -205,16 +212,31 @@ async function ingestFiles(files, onStatus = () => {}) {
       const group = sourceGroup(kind);
       const serviceType = detectServiceType(file.name, kind);
       countsByKind[kind] = (countsByKind[kind]||0) + 1;
-      fileLogs.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
-      sourceFilesLog.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
+      const logEntry = { file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, source, email_from: emailFrom, uploaded_at: new Date().toISOString() };
+      fileLogs.push(logEntry);
+      sourceFilesLog.push(logEntry);
       if (kind === "master" || kind === "original" || kind === "accessorials") {
         const stops = parseOriginalOrAccessorial(rows, serviceType);
+        const weeksTouchedByThisFile = new Set();
         for (const s of stops) {
           if (!s.pro || !s.week_ending) continue;
+          weeksTouchedByThisFile.add(s.week_ending);
+          // Tag the stop with its source for traceability (keeps if not already set)
+          if (!s._source) s._source = source;
           const key = `${s.pro}|${s.service_type}`; // key by PRO + service_type so truckload and delivery don't clobber each other
           const existing = stopsByPro[key];
           if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[key] = s;
         }
+        // Record which weeks this specific file contributed to (for conflict report)
+        for (const we of weeksTouchedByThisFile) {
+          if (!weekSources[we]) weekSources[we] = new Set();
+          weekSources[we].add(source);
+        }
+        fileWeekImpact.push({
+          filename: file.name, source, kind, service_type: serviceType,
+          weeks: Array.from(weeksTouchedByThisFile).sort(),
+          stop_count: stops.length,
+        });
       } else if (kind === "ddis") {
         const payments = parseDDIS(rows);
         const billDates = payments.map(p => p.bill_date).filter(Boolean).sort();
@@ -389,6 +411,24 @@ async function ingestFiles(files, onStatus = () => {}) {
     total_stops_processed: (existingMeta.total_stops_processed || 0) + allStops.length,
   });
 
+  // Compute source conflicts: any week where files from more than one source
+  // contributed data during this ingest batch. Gives Chad a review list.
+  const sourceConflicts = [];
+  for (const [we, sources] of Object.entries(weekSources)) {
+    if (sources.size > 1) {
+      // Look up which files from this batch touched this week
+      const filesForWeek = fileWeekImpact
+        .filter(f => f.weeks.includes(we))
+        .map(f => ({ filename: f.filename, source: f.source, kind: f.kind, service_type: f.service_type, stop_count: f.stop_count }));
+      sourceConflicts.push({
+        week_ending: we,
+        sources: Array.from(sources),
+        files: filesForWeek,
+      });
+    }
+  }
+  sourceConflicts.sort((a, b) => a.week_ending.localeCompare(b.week_ending));
+
   return {
     files_processed: files.length,
     counts: countsByKind,
@@ -398,6 +438,7 @@ async function ingestFiles(files, onStatus = () => {}) {
     payroll: { entries: payrollEntries.length, weeks_saved: payWeeksSaved },
     qbo: { lines: qboEntries.length, periods_saved: qboPeriodsSaved },
     unknown: unknownFiles,
+    source_conflicts: sourceConflicts,
   };
 }
 
@@ -1283,6 +1324,15 @@ function GmailSync({ onRefresh }) {
       const blob = new Blob([bytes], { type: mimeType });
       const file = new File([blob], attachment.filename, { type: mimeType });
 
+      // Tag source based on email sender — downstream ingest reads file._source
+      // to detect conflicting Davis-corrected vs Uline-original files.
+      const fromLower = (email.from || "").toLowerCase();
+      if (fromLower.includes("billing@davisdelivery.com")) file._source = "davis";
+      else if (fromLower.includes("@uline.com")) file._source = "uline";
+      else file._source = "gmail";
+      file._emailFrom = email.from;
+      file._emailDate = email.emailDate;
+
       // 3. Route through shared ingest pipeline
       setImportStatus(`Parsing ${attachment.filename}...`);
       const result = await ingestFiles([file], (s) => {
@@ -1620,7 +1670,7 @@ function GmailSync({ onRefresh }) {
         {/* Vendor Panels */}
         {[
           { key:"nuvizz", icon:"🚚", label:"NuVizz", desc:"Weekly driver stops from nuvizzapps@nuvizzapps.com", color:T.blue, mode:"per-attachment" },
-          { key:"uline", icon:"📦", label:"Uline Billing", desc:"Weekly DAS xlsx files from @uline.com senders (delivery + truckload + accessorials)", color:T.brand, mode:"per-attachment" },
+          { key:"uline", icon:"📦", label:"Uline Billing", desc:"Weekly DAS xlsx files from @uline.com + billing@davisdelivery.com corrections (delivery + truckload + accessorials)", color:T.brand, mode:"per-attachment" },
           { key:"ddis", icon:"💰", label:"Uline DDIS Payments", desc:"Payment remittance CSVs from APFreight@uline.com (paid PROs for reconciliation)", color:T.green, mode:"per-attachment" },
           { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
           { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from ebilling@4flyers.com", color:"#2563eb", mode:"quickfuel" },
@@ -1687,9 +1737,26 @@ function GmailSync({ onRefresh }) {
                     }
 
                     // Default: per-attachment buttons (NuVizz, Uline, Quick Fuel)
+                    // For Uline: show source badge so Chad can see whether
+                    // this is from Uline or from his own billing@davisdelivery.com
+                    // correction address.
+                    const sourceBadge = (() => {
+                      if (v.key !== "uline") return null;
+                      const fromLower = (em.from || "").toLowerCase();
+                      if (fromLower.includes("billing@davisdelivery.com")) {
+                        return <span style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:"#fef3c7",color:"#92400e",marginLeft:6,whiteSpace:"nowrap"}}>✏️ DAVIS CORRECTION</span>;
+                      }
+                      if (fromLower.includes("@uline.com")) {
+                        return <span style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:T.brandPale,color:T.brand,marginLeft:6,whiteSpace:"nowrap"}}>📦 ULINE</span>;
+                      }
+                      return null;
+                    })();
                     return (
                       <div key={em.emailId} style={{padding:"8px 10px",borderTop:idx>0?`1px solid ${T.borderLight}`:"none"}}>
-                        <div style={{fontSize:12,fontWeight:600}}>{em.emailSubject || "(no subject)"}</div>
+                        <div style={{fontSize:12,fontWeight:600,display:"flex",alignItems:"center",flexWrap:"wrap",gap:4}}>
+                          <span>{em.emailSubject || "(no subject)"}</span>
+                          {sourceBadge}
+                        </div>
                         <div style={{fontSize:10,color:T.textMuted}}>{em.from} • {em.emailDate ? new Date(em.emailDate).toLocaleString() : "—"}</div>
                         {em.attachments?.length > 0 ? (
                           <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
