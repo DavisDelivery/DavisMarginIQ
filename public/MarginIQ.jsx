@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.11.1";
+const APP_VERSION = "2.12.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -199,15 +199,17 @@ async function ingestFiles(files, onStatus = () => {}) {
       if (!rows || rows.length === 0) { unknownFiles.push(file.name + " (empty)"); countsByKind.unknown++; continue; }
       const kind = detectFileType(file.name, rows[0]);
       const group = sourceGroup(kind);
+      const serviceType = detectServiceType(file.name, kind);
       countsByKind[kind] = (countsByKind[kind]||0) + 1;
-      fileLogs.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
-      sourceFilesLog.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
+      fileLogs.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
+      sourceFilesLog.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
       if (kind === "master" || kind === "original" || kind === "accessorials") {
-        const stops = parseOriginalOrAccessorial(rows);
+        const stops = parseOriginalOrAccessorial(rows, serviceType);
         for (const s of stops) {
           if (!s.pro || !s.week_ending) continue;
-          const existing = stopsByPro[s.pro];
-          if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[s.pro] = s;
+          const key = `${s.pro}|${s.service_type}`; // key by PRO + service_type so truckload and delivery don't clobber each other
+          const existing = stopsByPro[key];
+          if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[key] = s;
         }
       } else if (kind === "ddis") {
         const payments = parseDDIS(rows);
@@ -1747,6 +1749,27 @@ function detectFileType(filename, firstRow) {
   return "unknown";
 }
 
+// Distinguish Uline service type from the filename. Does NOT affect what
+// detectFileType returns — this is an orthogonal axis used for revenue
+// categorization and audit grouping.
+//   "truckload"   → filename has " TK" or "-TK" suffix (case-insensitive)
+//   "accessorial" → accessorial file (extra charges)
+//   "delivery"    → regular stop-by-stop weekly file (default)
+// Note: "JO" suffix is intentionally NOT detected — per user rule, JO files
+// are just regular weekly files (different employee initials in filename),
+// so they're treated as "delivery" by default.
+function detectServiceType(filename, kind) {
+  if (kind === "accessorials") return "accessorial";
+  const fn = filename.toLowerCase();
+  // Match " TK" or "-TK" followed by word boundary/extension/end — avoid false
+  // positives on "TK" embedded in other words. Handles cases like:
+  //   "das 20250503 - 20250509 TK.xlsx" → match
+  //   "das 20250503-20250509TK.xlsx"    → match
+  //   "das 20250503 - 20250509 STK.xlsx" → no match (preceded by S)
+  if (/(?:^|[\s\-_])tk(?=\.[a-z]+$|[\s\-_])/i.test(fn)) return "truckload";
+  return "delivery";
+}
+
 // Normalize file type to source group for UI grouping
 function sourceGroup(kind) {
   if (["master","original","accessorials","ddis"].includes(kind)) return "uline";
@@ -2048,36 +2071,49 @@ function auditFilenames(files) {
     else if (isAccessorial) kind = "accessorial";
     else kind = "original";
 
+    // Classify service_type: "truckload" if TK suffix, "accessorial" if accessorial file,
+    // else "delivery" (regular weekly — includes JO-suffixed files since those are
+    // just different employee initials per user rule).
+    let serviceType;
+    if (kind === "accessorial") serviceType = "accessorial";
+    else if (/(?:^|[\s\-_])tk(?=\.[a-z]+$|[\s\-_])/i.test(lower)) serviceType = "truckload";
+    else serviceType = "delivery";
+
     classified.push({
       file: f, name,
-      kind, isPdf,
+      kind, isPdf, serviceType,
       startDate, endDate, weekEnding,
       parseStatus, suggestedRename,
       size: f.size || 0,
     });
   }
 
-  // Group data files by week-ending (originals & accessorials only)
+  // Group data files by week-ending AND service_type. A regular + TK for the
+  // same week is NOT a duplicate — they're different billing streams that both
+  // need to be ingested for that week.
   const byWeek = {};
   for (const c of classified) {
     if (c.isPdf) continue;
     if (c.kind !== "original" && c.kind !== "accessorial") continue;
     if (!c.weekEnding) continue;
-    if (!byWeek[c.weekEnding]) byWeek[c.weekEnding] = { originals: [], accessorials: [] };
-    if (c.kind === "original") byWeek[c.weekEnding].originals.push(c);
-    else byWeek[c.weekEnding].accessorials.push(c);
+    if (!byWeek[c.weekEnding]) byWeek[c.weekEnding] = { delivery: [], truckload: [], accessorial: [] };
+    byWeek[c.weekEnding][c.serviceType].push(c);
   }
 
-  // Find duplicates (multiple files for same week+kind)
+  // Find duplicates: multiple files with same (week, serviceType).
+  // Regular + TK for the same week is NOT a duplicate.
   const duplicates = [];
   for (const [we, g] of Object.entries(byWeek)) {
-    if (g.originals.length > 1) duplicates.push({ weekEnding: we, kind: "original", files: g.originals });
-    if (g.accessorials.length > 1) duplicates.push({ weekEnding: we, kind: "accessorial", files: g.accessorials });
+    if (g.delivery.length > 1) duplicates.push({ weekEnding: we, serviceType: "delivery", kind: "original (regular delivery)", files: g.delivery });
+    if (g.truckload.length > 1) duplicates.push({ weekEnding: we, serviceType: "truckload", kind: "original (truckload)", files: g.truckload });
+    if (g.accessorial.length > 1) duplicates.push({ weekEnding: we, serviceType: "accessorial", kind: "accessorial", files: g.accessorial });
   }
 
-  // Find missing accessorials (weeks with original but no accessorial)
+  // Find missing accessorials: weeks where we have ANY delivery or truckload
+  // file but NO accessorial file. (A week can still be "complete" for billing
+  // purposes without an accessorial — it just means no extra charges that week.)
   const missingAccessorials = Object.entries(byWeek)
-    .filter(([, g]) => g.originals.length > 0 && g.accessorials.length === 0)
+    .filter(([, g]) => (g.delivery.length > 0 || g.truckload.length > 0) && g.accessorial.length === 0)
     .map(([we]) => we)
     .sort();
 
@@ -2119,7 +2155,11 @@ function auditFilenames(files) {
     byWeek,
     summary: {
       total: classified.length,
-      originals: classified.filter(c => c.kind === "original" && c.weekEnding).length,
+      // Break down 'originals' by service type. "delivery" = regular weekly files
+      // (includes JO-suffixed variants). "truckload" = TK-suffixed files.
+      delivery: classified.filter(c => c.kind === "original" && c.serviceType === "delivery" && c.weekEnding).length,
+      truckload: classified.filter(c => c.kind === "original" && c.serviceType === "truckload" && c.weekEnding).length,
+      originals: classified.filter(c => c.kind === "original" && c.weekEnding).length, // = delivery + truckload
       accessorials: classified.filter(c => c.kind === "accessorial" && c.weekEnding).length,
       pdfs: classified.filter(c => c.isPdf).length,
       typos: typos.length,
@@ -2146,8 +2186,9 @@ function normalizePro(v) {
   return stripped || s;
 }
 
-function parseOriginalOrAccessorial(rows) {
+function parseOriginalOrAccessorial(rows, serviceType) {
   const stops = [];
+  const st = serviceType || "delivery"; // default for backward-compat callers
   for (const r of rows) {
     const proRaw = r.pro ?? r["pro#"];
     if (!proRaw) continue;
@@ -2178,6 +2219,7 @@ function parseOriginalOrAccessorial(rows) {
       via: r.via ? String(r.via).trim() : null,
       code: r.code ? String(r.code).trim() : null,
       is_accessorial: !!r.code && (extraCost > 0),
+      service_type: st, // "delivery" | "truckload" | "accessorial"
     });
   }
   return stops;
@@ -2472,6 +2514,13 @@ function buildWeeklyRollups(stops) {
         week_ending: w,
         month: s.month,
         stops: 0, revenue: 0, base_revenue: 0, accessorial_revenue: 0,
+        // NEW: per-service-type subtotals. Delivery = regular stop-based billing.
+        // Truckload = full truckload billing (TK suffix files). Accessorial =
+        // extra-charges files. All three roll up into this one weekly doc so a
+        // week's reconciliation can check all streams at once.
+        delivery_stops: 0, delivery_revenue: 0,
+        truckload_stops: 0, truckload_revenue: 0,
+        accessorial_stops: 0,
         weight: 0, skids: 0,
         accessorial_count: 0,
         unique_pros: new Set(),
@@ -2488,6 +2537,18 @@ function buildWeeklyRollups(stops) {
     bw.skids += s.skid || 0;
     bw.unique_pros.add(s.pro);
     if (s.is_accessorial) bw.accessorial_count++;
+    // Route this stop's revenue to the right service-type bucket
+    const st = s.service_type || "delivery";
+    if (st === "truckload") {
+      bw.truckload_stops++;
+      bw.truckload_revenue += s.new_cost || 0;
+    } else if (st === "accessorial") {
+      bw.accessorial_stops++;
+      // accessorial_revenue already tracked above via extra_cost
+    } else {
+      bw.delivery_stops++;
+      bw.delivery_revenue += s.new_cost || 0;
+    }
     if (s.customer) {
       if (!bw.customers[s.customer]) bw.customers[s.customer] = { stops:0, revenue:0 };
       bw.customers[s.customer].stops++;
@@ -2500,13 +2561,23 @@ function buildWeeklyRollups(stops) {
     }
   }
   return Object.values(byWeek).map(w => ({
-    ...w,
+    week_ending: w.week_ending,
+    month: w.month,
+    stops: w.stops,
+    revenue: Number((w.revenue || 0).toFixed(2)),
+    base_revenue: Number((w.base_revenue || 0).toFixed(2)),
+    accessorial_revenue: Number((w.accessorial_revenue || 0).toFixed(2)),
+    delivery_stops: w.delivery_stops,
+    delivery_revenue: Number((w.delivery_revenue || 0).toFixed(2)),
+    truckload_stops: w.truckload_stops,
+    truckload_revenue: Number((w.truckload_revenue || 0).toFixed(2)),
+    accessorial_stops: w.accessorial_stops,
+    weight: Math.round(w.weight || 0),
+    skids: w.skids,
+    accessorial_count: w.accessorial_count,
     unique_pros: w.unique_pros.size,
-    // Keep top 20 customers and cities for Firebase storage
-    top_customers: Object.entries(w.customers).sort((a,b) => b[1].revenue - a[1].revenue).slice(0,20).map(([name, v]) => ({name, ...v})),
-    top_cities: Object.entries(w.cities).sort((a,b) => b[1].revenue - a[1].revenue).slice(0,20).map(([name, v]) => ({name, ...v})),
-    customers: undefined,
-    cities: undefined,
+    top_customers: Object.entries(w.customers).sort((a,b) => b[1].revenue - a[1].revenue).slice(0,20).map(([name, v]) => ({ name, stops: v.stops, revenue: Number(v.revenue.toFixed(2)) })),
+    top_cities: Object.entries(w.cities).sort((a,b) => b[1].revenue - a[1].revenue).slice(0,20).map(([name, v]) => ({ name, stops: v.stops, revenue: Number(v.revenue.toFixed(2)) })),
   }));
 }
 
@@ -3431,18 +3502,20 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
 
         const kind = detectFileType(file.name, rows[0]);
         const group = sourceGroup(kind);
+        const serviceType = detectServiceType(file.name, kind);
         countsByKind[kind] = (countsByKind[kind]||0) + 1;
 
-        fileLogs.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
-        sourceFiles.push({ file_id: fileId, filename: file.name, kind, group, row_count: rows.length, uploaded_at: new Date().toISOString() });
+        fileLogs.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
+        sourceFiles.push({ file_id: fileId, filename: file.name, kind, group, service_type: serviceType, row_count: rows.length, uploaded_at: new Date().toISOString() });
 
         // ─── Uline family ───
         if (kind === "master" || kind === "original" || kind === "accessorials") {
-          const stops = parseOriginalOrAccessorial(rows);
+          const stops = parseOriginalOrAccessorial(rows, serviceType);
           for (const s of stops) {
             if (!s.pro || !s.week_ending) continue;
-            const existing = stopsByPro[s.pro];
-            if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[s.pro] = s;
+            const key = `${s.pro}|${s.service_type}`; // key by PRO + service_type
+            const existing = stopsByPro[key];
+            if (!existing || (s.new_cost > existing.new_cost)) stopsByPro[key] = s;
           }
         } else if (kind === "ddis") {
           const payments = parseDDIS(rows);
@@ -3676,8 +3749,12 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
           {/* Summary grid */}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10,marginBottom:16}}>
             <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
-              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Originals</div>
-              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.originals}</div>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Delivery (regular)</div>
+              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.delivery || 0}</div>
+            </div>
+            <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Truckload (TK)</div>
+              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.truckload || 0}</div>
             </div>
             <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
               <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Accessorials</div>
@@ -3733,7 +3810,8 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
 
           {a.duplicates.length > 0 && (
             <div style={{background:"#fffbeb",border:`1px solid ${T.yellow}60`,borderRadius:8,padding:12,marginBottom:12}}>
-              <div style={{fontSize:12,fontWeight:700,color:T.yellowText,marginBottom:8}}>🟡 Duplicates ({a.duplicates.length}) — one {"{"}kind{"}"} per week expected</div>
+              <div style={{fontSize:12,fontWeight:700,color:T.yellowText,marginBottom:6}}>🟡 True Duplicates ({a.duplicates.length})</div>
+              <div style={{fontSize:11,color:T.textMuted,marginBottom:8}}>Multiple files for the same week AND same service type. (Regular + Truckload for the same week is OK — those are different billing streams.)</div>
               <div style={{maxHeight:200,overflowY:"auto"}}>
                 {a.duplicates.map((d,i) => (
                   <div key={i} style={{padding:"6px 0",borderBottom:i<a.duplicates.length-1?`1px solid ${T.borderLight}`:"none",fontSize:11}}>
