@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.15.0";
+const APP_VERSION = "2.15.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1149,9 +1149,25 @@ function GmailSync({ onRefresh }) {
   const [importing, setImporting] = useState({}); // emailId:attachmentId -> bool
   const [imported, setImported] = useState({}); // emailId:attachmentId -> result summary
   const [importStatus, setImportStatus] = useState("");
+  const [oauthMsg, setOauthMsg] = useState(null); // { kind: 'success'|'error', text }
 
   // Load Gmail connection state
   useEffect(() => {
+    // Handle OAuth callback redirect (?gmail=connected OR ?gmail=error)
+    const params = new URLSearchParams(window.location.search);
+    const gmailParam = params.get("gmail");
+    if (gmailParam === "connected") {
+      const email = params.get("email") || "unknown";
+      setOauthMsg({ kind: "success", text: `Gmail connected as ${email}` });
+      // Strip params so refreshes don't re-show the toast
+      window.history.replaceState({}, "", window.location.pathname);
+    } else if (gmailParam === "error") {
+      const reason = params.get("reason") || "unknown";
+      const detail = params.get("detail") || "";
+      setOauthMsg({ kind: "error", text: `Gmail OAuth failed: ${reason}${detail ? " — " + detail : ""}` });
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+
     (async () => {
       if (!hasFirebase) { setLoadingConn(false); return; }
       try {
@@ -1160,15 +1176,11 @@ function GmailSync({ onRefresh }) {
           const data = d.data();
           setGmailConn({ email: data.email, connected_at: data.connected_at });
         }
-      } catch(e) {}
+      } catch(e) {
+        setOauthMsg({ kind: "error", text: "Could not read Gmail token from Firestore: " + e.message });
+      }
       setLoadingConn(false);
     })();
-    // Handle OAuth callback redirect (?gmail=connected)
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("gmail") === "connected") {
-      window.history.replaceState({}, "", "/");
-      setTimeout(() => window.location.reload(), 200);
-    }
   }, []);
 
   const disconnect = async () => {
@@ -1434,6 +1446,37 @@ function GmailSync({ onRefresh }) {
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="📧" text="Gmail Sync" />
+
+    {oauthMsg && (
+      <div style={{
+        padding: "10px 14px",
+        marginBottom: 12,
+        borderRadius: 8,
+        border: `1px solid ${oauthMsg.kind === "success" ? T.green : T.red}`,
+        background: oauthMsg.kind === "success" ? "#ecfdf5" : "#fef2f2",
+        color: oauthMsg.kind === "success" ? "#065f46" : T.redText,
+        fontSize: 12,
+        fontWeight: 600,
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: 10,
+      }}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:16}}>{oauthMsg.kind === "success" ? "✓" : "⚠️"}</span>
+          <span style={{wordBreak:"break-word"}}>{oauthMsg.text}</span>
+        </div>
+        <button onClick={() => setOauthMsg(null)} style={{
+          border: "none",
+          background: "transparent",
+          color: "inherit",
+          cursor: "pointer",
+          fontSize: 18,
+          padding: "0 4px",
+          fontWeight: 700,
+        }}>×</button>
+      </div>
+    )}
 
     {!gmailConn ? (
       <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
@@ -5578,7 +5621,15 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups }) {
 
 // ═══ MAIN ═══════════════════════════════════════════════════
 function MarginIQ() {
-  const [tab, setTab] = useState("command");
+  // Allow URL to pre-select a tab (used by OAuth callbacks etc: ?tab=gmail)
+  const initialTab = (() => {
+    try {
+      const t = new URLSearchParams(window.location.search).get("tab");
+      if (t) return t;
+    } catch {}
+    return "command";
+  })();
+  const [tab, setTab] = useState(initialTab);
   const [costs, setCosts] = useState(DEFAULT_COSTS);
   const [weeklyRollups, setWeeklyRollups] = useState([]);
   const [reconWeekly, setReconWeekly] = useState([]);

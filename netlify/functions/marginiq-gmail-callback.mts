@@ -8,7 +8,7 @@ export default async (req: Request, context: Context) => {
   const REDIRECT_URI = "https://davis-marginiq.netlify.app/.netlify/functions/marginiq-gmail-callback";
 
   if (error || !code) {
-    return Response.redirect(`${SITE_URL}?gmail=error&reason=${error || "missing_code"}`, 302);
+    return Response.redirect(`${SITE_URL}?tab=gmail&gmail=error&reason=${error || "missing_code"}`, 302);
   }
 
   const CLIENT_ID = process.env["GOOGLE_CLIENT_ID"];
@@ -18,7 +18,7 @@ export default async (req: Request, context: Context) => {
 
   if (!CLIENT_ID || !CLIENT_SECRET || !FIREBASE_API_KEY) {
     const missing = [!CLIENT_ID && "CLIENT_ID", !CLIENT_SECRET && "SECRET", !FIREBASE_API_KEY && "FB_KEY"].filter(Boolean).join(",");
-    return Response.redirect(`${SITE_URL}?gmail=error&reason=missing_env_${missing}`, 302);
+    return Response.redirect(`${SITE_URL}?tab=gmail&gmail=error&reason=missing_env_${missing}`, 302);
   }
 
   try {
@@ -37,12 +37,12 @@ export default async (req: Request, context: Context) => {
 
     if (!tokenResp.ok) {
       const errBody = await tokenResp.text();
-      return Response.redirect(`${SITE_URL}?gmail=error&reason=token_exchange&detail=${encodeURIComponent(errBody.substring(0, 400))}`, 302);
+      return Response.redirect(`${SITE_URL}?tab=gmail&gmail=error&reason=token_exchange&detail=${encodeURIComponent(errBody.substring(0, 400))}`, 302);
     }
 
     const tokens = await tokenResp.json();
     if (!tokens.refresh_token) {
-      return Response.redirect(`${SITE_URL}?gmail=error&reason=no_refresh_token`, 302);
+      return Response.redirect(`${SITE_URL}?tab=gmail&gmail=error&reason=no_refresh_token`, 302);
     }
 
     // Get user's email
@@ -76,11 +76,11 @@ export default async (req: Request, context: Context) => {
 
     if (!firestoreResp.ok) {
       const errText = await firestoreResp.text();
-      return Response.redirect(`${SITE_URL}?gmail=error&reason=firestore_write&detail=${encodeURIComponent(errText.substring(0, 400))}`, 302);
+      return Response.redirect(`${SITE_URL}?tab=gmail&gmail=error&reason=firestore_write&detail=${encodeURIComponent(errText.substring(0, 400))}`, 302);
     }
 
-    return Response.redirect(`${SITE_URL}?gmail=connected&email=${encodeURIComponent(userEmail)}`, 302);
+    return Response.redirect(`${SITE_URL}?tab=gmail&gmail=connected&email=${encodeURIComponent(userEmail)}`, 302);
   } catch (e: any) {
-    return Response.redirect(`${SITE_URL}?gmail=error&reason=crash_${encodeURIComponent(e.message || "unknown")}`, 302);
+    return Response.redirect(`${SITE_URL}?tab=gmail&gmail=error&reason=crash_${encodeURIComponent(e.message || "unknown")}`, 302);
   }
 };
