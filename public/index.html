@@ -35,6 +35,7 @@
       appId: "1:131773007635:web:be408aab03d843333afce6",
     });
     window.db = firebase.firestore();
+    window.db.settings({ ignoreUndefinedProperties: true });
     window.fbStorage = firebase.storage();
   </script>
 

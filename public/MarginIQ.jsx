@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.9.0";
+const APP_VERSION = "2.9.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1646,8 +1646,8 @@ const FS = {
   async saveNuVizzStop(proKey, data) { if (!hasFirebase) return false; try { await window.db.collection("nuvizz_stops").doc(String(proKey)).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async saveNuVizzWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("nuvizz_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getNuVizzWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("nuvizz_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
-  async saveTimeClockDaily(id, data) { if (!hasFirebase) return false; try { await window.db.collection("timeclock_daily").doc(id).set(data, {merge:true}); return true; } catch(e) { return false; } },
-  async saveTimeClockWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("timeclock_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  async saveTimeClockDaily(id, data) { if (!hasFirebase) return false; try { await window.db.collection("timeclock_daily").doc(id).set(data, {merge:true}); return true; } catch(e) { console.error("saveTimeClockDaily failed:", id, e); return false; } },
+  async saveTimeClockWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("timeclock_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { console.error("saveTimeClockWeekly failed:", weekId, e); return false; } },
   async getTimeClockWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("timeclock_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async savePayrollWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("payroll_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getPayrollWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("payroll_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
@@ -1983,10 +1983,14 @@ function buildTimeClockWeekly(entries) {
     bw.employees[e.employee].days++;
   }
   return Object.values(byWeek).map(w => ({
-    ...w,
+    week_ending: w.week_ending,
+    month: w.month,
+    total_hours: w.total_hours,
+    reg_hours: w.reg_hours,
+    ot_hours: w.ot_hours,
+    days_worked: w.days_worked,
     unique_employees: w.unique_employees.size,
     top_employees: Object.entries(w.employees).sort((a,b) => b[1].hours - a[1].hours).slice(0,60).map(([name, v]) => ({name, ...v})),
-    employees: undefined,
   }));
 }
 
