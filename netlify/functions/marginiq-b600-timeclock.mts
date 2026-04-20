@@ -1,54 +1,144 @@
 import type { Context, Config } from "@netlify/functions";
 
 /**
- * Scheduled weekly pull of B600 time clock data.
+ * Davis MarginIQ — B600 Time Clock weekly auto-pull.
  *
- * Runs every Monday at 9:00 AM ET. Pulls the previous Mon–Sun window from the
- * B600 CyberPay web UI (via AtlantaFreightQuotes public tunnel), parses the CSV,
- * rolls up by Friday-ending week, and writes to Firestore (timeclock_weekly).
+ * Pulls previous Mon–Sun from the B600 (Icon Time TotalPass B600) web UI at
+ * b600.atlantafreightquotes.com, parses the CSV, rolls up by Friday-ending
+ * week, and writes to Firestore (timeclock_weekly).
  *
- * Collections written:
- *   - timeclock_weekly/{YYYY-MM-DD}   (aggregates keyed by Friday week-ending)
- *   - marginiq_config/b600_last_pull  (metadata: last_run_at, last_window, rows)
+ * ─── Flow (discovered via browser introspection, 2026-04-20) ───
  *
- * Environment variables (set in Netlify site config):
- *   FIREBASE_API_KEY   — Firestore REST API key
- *   B600_BASE_URL      — e.g. https://b600.atlantafreightquotes.com  (no trailing slash)
- *   B600_USERNAME      — CyberPay login
- *   B600_PASSWORD      — CyberPay login
- *   B600_EXPORT_PATH   — path to CSV export endpoint (default: /reports/timeclock/export)
+ * 1. GET  /login.html              → sets initial session cookie
+ * 2. POST /login.html              body: username=X&password=Y&buttonClicked=Submit
+ *                                  → sets authenticated session cookie, 302 → /index.html
+ * 3. POST /payroll.html            → primes server-side export context
+ *                                     (browser does this on Submit; exact body TBD)
+ * 4. GET  /export.html?type=4&timeFrame=4&provider=Paycom
+ *                                  → returns CSV body
+ *
+ * timeFrame=4 = "Last Week" (prior Mon–Sun). Perfect for Monday 9AM cron.
+ * provider=Paycom = CSV with columns Display Name, Date, In Time, Out Time,
+ *                   REG, OT1, OT2, Total — exactly what MarginIQ already parses.
+ *
+ * ─── Required Netlify env vars ───
+ *   FIREBASE_API_KEY    — for Firestore REST writes
+ *   B600_BASE_URL       — https://b600.atlantafreightquotes.com (no trailing slash)
+ *   B600_USERNAME       — TotalPass login username
+ *   B600_PASSWORD       — TotalPass login password
+ *
+ * ─── Testing ───
+ * Before enabling the schedule, trigger manually:
+ *   curl https://davis-marginiq.netlify.app/.netlify/functions/marginiq-b600-timeclock
+ * Inspect the JSON response. If successful, uncomment the schedule below.
  */
 
 const PROJECT_ID = "davismarginiq";
 const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
-const B600_BASE_URL = process.env["B600_BASE_URL"] || "https://b600.atlantafreightquotes.com";
+const B600_BASE_URL = (process.env["B600_BASE_URL"] || "https://b600.atlantafreightquotes.com").replace(/\/$/, "");
 const B600_USERNAME = process.env["B600_USERNAME"];
 const B600_PASSWORD = process.env["B600_PASSWORD"];
-const B600_EXPORT_PATH = process.env["B600_EXPORT_PATH"] || "/reports/timeclock/export";
 
-// ── Date helpers ──────────────────────────────────────────────────────────────
-function previousMondayToSunday(now: Date): { start: Date; end: Date } {
-  // Find the Monday of the PREVIOUS week (the week just completed)
-  const d = new Date(now);
-  const day = d.getDay(); // 0=Sun, 1=Mon, ...
-  // How many days back to the most recent Sunday (end of previous week)
-  const daysBackToSun = day === 0 ? 7 : day;
-  const end = new Date(d);
-  end.setDate(d.getDate() - daysBackToSun);
-  end.setHours(23, 59, 59, 999);
-  const start = new Date(end);
-  start.setDate(end.getDate() - 6);
-  start.setHours(0, 0, 0, 0);
-  return { start, end };
+// ─── Cookie jar ──────────────────────────────────────────────────────────────
+class CookieJar {
+  private cookies: Map<string, string> = new Map();
+
+  absorb(resp: Response) {
+    const setCookies: string[] = (resp.headers as any).getSetCookie
+      ? (resp.headers as any).getSetCookie()
+      : (resp.headers.get("set-cookie") ? [resp.headers.get("set-cookie")!] : []);
+    for (const sc of setCookies) {
+      const [pair] = sc.split(";");
+      const eq = pair.indexOf("=");
+      if (eq < 0) continue;
+      const name = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      if (name) this.cookies.set(name, value);
+    }
+  }
+
+  header(): string {
+    return [...this.cookies.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+  }
 }
 
-function fmtMDY(d: Date): string {
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const yy = String(d.getFullYear()).slice(-2);
-  return `${mm}/${dd}/${yy}`;
+// ─── B600 session ────────────────────────────────────────────────────────────
+async function b600Login(): Promise<CookieJar> {
+  if (!B600_USERNAME || !B600_PASSWORD) {
+    throw new Error("B600_USERNAME / B600_PASSWORD not configured");
+  }
+  const jar = new CookieJar();
+
+  // 1. Seed session with GET /login.html
+  const seed = await fetch(`${B600_BASE_URL}/login.html`, { redirect: "manual" });
+  jar.absorb(seed);
+
+  // 2. POST credentials
+  const body = new URLSearchParams({
+    username: B600_USERNAME,
+    password: B600_PASSWORD,
+    buttonClicked: "Submit",
+  }).toString();
+
+  const loginResp = await fetch(`${B600_BASE_URL}/login.html`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Cookie: jar.header(),
+    },
+    body,
+    redirect: "manual",
+  });
+  jar.absorb(loginResp);
+
+  if (loginResp.status >= 400) {
+    throw new Error(`B600 login failed: ${loginResp.status}`);
+  }
+
+  // 3. Verify session carries
+  const verify = await fetch(`${B600_BASE_URL}/index.html`, {
+    headers: { Cookie: jar.header() },
+    redirect: "manual",
+  });
+  jar.absorb(verify);
+  if (verify.status === 302 && (verify.headers.get("location") || "").includes("login")) {
+    throw new Error("B600 login did not persist — still redirecting to login");
+  }
+
+  return jar;
 }
 
+async function b600FetchCSV(jar: CookieJar): Promise<string> {
+  // Prime: browser POSTs to /payroll.html on Submit before GETting export.html.
+  // The exact form body it sends is not yet characterized. Sending empty body
+  // works for some devices; if the GET below 503s, revisit by capturing the
+  // browser's POST body via Dev Tools → Network → payroll.html → Payload.
+  await fetch(`${B600_BASE_URL}/payroll.html`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Cookie: jar.header(),
+    },
+    body: "",
+    redirect: "manual",
+  }).catch(() => { /* ignore — the POST itself may 503 but primes server state */ });
+
+  const url = `${B600_BASE_URL}/export.html?type=4&timeFrame=4&provider=Paycom`;
+  const resp = await fetch(url, {
+    headers: { Cookie: jar.header(), Accept: "text/csv, */*" },
+  });
+
+  if (!resp.ok) {
+    throw new Error(`B600 export failed: ${resp.status} ${(await resp.text()).slice(0, 200)}`);
+  }
+  const text = await resp.text();
+  if (!text.toLowerCase().includes("display name")) {
+    throw new Error(`B600 export returned unexpected body (first 200 chars): ${text.slice(0, 200)}`);
+  }
+  return text;
+}
+
+// ─── Date helpers ────────────────────────────────────────────────────────────
 function parseDateMDY(s: string): Date | null {
   const m = String(s).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
   if (!m) return null;
@@ -58,43 +148,19 @@ function parseDateMDY(s: string): Date | null {
 }
 
 function weekEndingFriday(d: Date): string {
-  // Friday = 5 in JS Date.getDay() (Sun=0, Mon=1, ..., Fri=5)
   const day = d.getDay();
   const daysToFri = (5 - day + 7) % 7;
   const fri = new Date(d);
   fri.setDate(d.getDate() + daysToFri);
   const y = fri.getFullYear();
-  const m = String(fri.getMonth() + 1).padStart(2, "0");
+  const mo = String(fri.getMonth() + 1).padStart(2, "0");
   const dd = String(fri.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
+  return `${y}-${mo}-${dd}`;
 }
 
-// ── B600 auth + CSV fetch ────────────────────────────────────────────────────
-async function fetchB600CSV(startDate: Date, endDate: Date): Promise<string> {
-  if (!B600_USERNAME || !B600_PASSWORD) {
-    throw new Error("B600_USERNAME / B600_PASSWORD not configured");
-  }
-
-  // Most CyberPay web UIs expect a form-login flow. This implementation uses
-  // HTTP basic auth first; if the endpoint requires a session cookie, extend
-  // this function to POST to /login and persist the cookie before hitting the
-  // export URL.
-  const auth = "Basic " + Buffer.from(`${B600_USERNAME}:${B600_PASSWORD}`).toString("base64");
-  const url = `${B600_BASE_URL}${B600_EXPORT_PATH}?from=${fmtMDY(startDate)}&to=${fmtMDY(endDate)}&format=csv`;
-
-  const resp = await fetch(url, {
-    headers: { Authorization: auth, Accept: "text/csv" },
-  });
-
-  if (!resp.ok) {
-    throw new Error(`B600 fetch failed: ${resp.status} ${await resp.text()}`);
-  }
-  return resp.text();
-}
-
-// ── CSV parser (CyberPay format) ─────────────────────────────────────────────
+// ─── CSV parser ──────────────────────────────────────────────────────────────
 function parseCSV(text: string): Record<string, string>[] {
-  const lines = text.replace(/\r\n/g, "\n").split("\n").filter(Boolean);
+  const lines = text.replace(/\r\n/g, "\n").split("\n").filter(l => l.trim().length > 0);
   if (lines.length < 2) return [];
   const parseLine = (line: string): string[] => {
     const out: string[] = [];
@@ -113,7 +179,7 @@ function parseCSV(text: string): Record<string, string>[] {
     out.push(cur);
     return out;
   };
-  const headers = parseLine(lines[0]).map((h) => h.toLowerCase().trim());
+  const headers = parseLine(lines[0]).map(h => h.toLowerCase().trim());
   const rows: Record<string, string>[] = [];
   for (let i = 1; i < lines.length; i++) {
     const vals = parseLine(lines[i]);
@@ -130,12 +196,10 @@ function parseHours(v: string): number {
   return isFinite(n) ? n : 0;
 }
 
+// ─── Weekly rollup ───────────────────────────────────────────────────────────
 interface WeeklyAgg {
   week_ending: string;
-  total_hours: number;
-  reg_hours: number;
-  ot_hours: number;
-  days_worked: number;
+  total_hours: number; reg_hours: number; ot_hours: number; days_worked: number;
   unique_employees: Set<string>;
   employees: Record<string, { hours: number; reg: number; ot: number; days: number }>;
 }
@@ -172,7 +236,7 @@ function rollupWeekly(rows: Record<string, string>[]): any[] {
     bw.employees[name].ot += ot;
     bw.employees[name].days++;
   }
-  return Object.values(byWeek).map((w) => ({
+  return Object.values(byWeek).map(w => ({
     week_ending: w.week_ending,
     total_hours: Number(w.total_hours.toFixed(2)),
     reg_hours: Number(w.reg_hours.toFixed(2)),
@@ -192,7 +256,7 @@ function rollupWeekly(rows: Record<string, string>[]): any[] {
   }));
 }
 
-// ── Firestore writer ─────────────────────────────────────────────────────────
+// ─── Firestore writer ────────────────────────────────────────────────────────
 function toFsValue(v: any): any {
   if (v === null || v === undefined) return { nullValue: null };
   if (typeof v === "string") return { stringValue: v };
@@ -221,12 +285,12 @@ async function fsWrite(collection: string, docId: string, data: any): Promise<bo
   return resp.ok;
 }
 
-// ── Main handler ─────────────────────────────────────────────────────────────
-export default async (req: Request, _context: Context) => {
+// ─── Main handler ────────────────────────────────────────────────────────────
+export default async (_req: Request, _context: Context) => {
   const startedAt = new Date().toISOString();
   try {
-    const { start, end } = previousMondayToSunday(new Date());
-    const csv = await fetchB600CSV(start, end);
+    const jar = await b600Login();
+    const csv = await b600FetchCSV(jar);
     const rows = parseCSV(csv);
     const weekly = rollupWeekly(rows);
 
@@ -242,20 +306,13 @@ export default async (req: Request, _context: Context) => {
 
     await fsWrite("marginiq_config", "b600_last_pull", {
       last_run_at: startedAt,
-      window_start: start.toISOString(),
-      window_end: end.toISOString(),
       rows_fetched: rows.length,
       weeks_saved: saved,
       status: "ok",
     });
 
     return new Response(
-      JSON.stringify({
-        ok: true,
-        window: { start: start.toISOString(), end: end.toISOString() },
-        rows_fetched: rows.length,
-        weeks_saved: saved,
-      }),
+      JSON.stringify({ ok: true, rows_fetched: rows.length, weeks_saved: saved }),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
   } catch (err: any) {
@@ -271,9 +328,8 @@ export default async (req: Request, _context: Context) => {
   }
 };
 
-// Schedule: every Monday at 9:00 AM ET (13:00 UTC standard / 14:00 UTC DST).
-// Netlify scheduled functions run in UTC. We use 13:00 UTC which = 9AM EST / 8AM EDT.
-// Adjust if you prefer a specific local time year-round.
+// Schedule: Monday 13:00 UTC (9AM EST / 8AM EDT).
+// Intentionally commented out — enable only after a successful manual test.
 export const config: Config = {
-  schedule: "0 13 * * 1",
+  // schedule: "0 13 * * 1",
 };
