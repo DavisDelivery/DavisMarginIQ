@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.10.0";
+const APP_VERSION = "2.10.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1906,9 +1906,12 @@ function buildNuVizzWeekly(stops) {
     if (!byWeek[w]) {
       byWeek[w] = {
         week_ending: w, month: s.month,
-        stops_total: 0, stops_completed: 0,
-        pay_base_total: 0,             // sum of all SealNbr values
-        contractor_pay_if_all_1099: 0, // upper bound cost if every driver were 1099
+        stops_total: 0,            // every row seen
+        stops_completed: 0,        // status = "Completed"
+        stops_manually_completed: 0, // status = "Manually Completed"
+        stops_effective: 0,        // Completed + Manually Completed (what we count for pay)
+        pay_base_total: 0,             // sum of SealNbr for EFFECTIVE stops only
+        contractor_pay_if_all_1099: 0, // 40% of pay_base_total
         unique_drivers: new Set(),
         unique_customers: new Set(),
         drivers: {},
@@ -1916,24 +1919,43 @@ function buildNuVizzWeekly(stops) {
     }
     const bw = byWeek[w];
     bw.stops_total++;
-    if (s.status && s.status.toLowerCase() === "completed") bw.stops_completed++;
-    bw.pay_base_total += s.contractor_pay_base || 0;
-    bw.contractor_pay_if_all_1099 += s.contractor_pay_at_40 || 0;
-    if (s.driver_name) {
+    const st = (s.status || "").toLowerCase().trim();
+    const isCompleted = st === "completed";
+    const isManual = st === "manually completed";
+    const isEffective = isCompleted || isManual;
+    if (isCompleted) bw.stops_completed++;
+    if (isManual) bw.stops_manually_completed++;
+    if (isEffective) {
+      bw.stops_effective++;
+      bw.pay_base_total += s.contractor_pay_base || 0;
+      bw.contractor_pay_if_all_1099 += s.contractor_pay_at_40 || 0;
+    }
+    if (s.driver_name && isEffective) {
       bw.unique_drivers.add(s.driver_name);
       if (!bw.drivers[s.driver_name]) bw.drivers[s.driver_name] = { stops:0, pay_base:0, pay_at_40:0 };
       bw.drivers[s.driver_name].stops++;
       bw.drivers[s.driver_name].pay_base += s.contractor_pay_base || 0;
       bw.drivers[s.driver_name].pay_at_40 += s.contractor_pay_at_40 || 0;
     }
-    if (s.ship_to) bw.unique_customers.add(s.ship_to);
+    if (s.ship_to && isEffective) bw.unique_customers.add(s.ship_to);
   }
   return Object.values(byWeek).map(w => ({
-    ...w,
+    week_ending: w.week_ending,
+    month: w.month,
+    stops_total: w.stops_total,
+    stops_completed: w.stops_completed,
+    stops_manually_completed: w.stops_manually_completed,
+    stops_effective: w.stops_effective,
+    pay_base_total: Number(w.pay_base_total.toFixed(2)),
+    contractor_pay_if_all_1099: Number(w.contractor_pay_if_all_1099.toFixed(2)),
     unique_drivers: w.unique_drivers.size,
     unique_customers: w.unique_customers.size,
-    top_drivers: Object.entries(w.drivers).sort((a,b) => b[1].stops - a[1].stops).slice(0,60).map(([name, v]) => ({name, ...v})),
-    drivers: undefined,
+    top_drivers: Object.entries(w.drivers).sort((a,b) => b[1].stops - a[1].stops).slice(0,60).map(([name, v]) => ({
+      name,
+      stops: v.stops,
+      pay_base: Number(v.pay_base.toFixed(2)),
+      pay_at_40: Number(v.pay_at_40.toFixed(2)),
+    })),
   }));
 }
 
