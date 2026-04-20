@@ -223,13 +223,13 @@ async function ingestFiles(files, onStatus = () => {}) {
         });
         for (const p of payments) paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
       } else if (kind === "nuvizz") {
-        nuvizzStops.push(...parseNuVizz(rows));
+        for (const s of parseNuVizz(rows)) nuvizzStops.push(s);
       } else if (kind === "timeclock") {
-        timeClockEntries.push(...parseTimeClock(rows));
+        for (const e of parseTimeClock(rows)) timeClockEntries.push(e);
       } else if (kind === "payroll") {
-        payrollEntries.push(...parsePayroll(rows));
+        for (const p of parsePayroll(rows)) payrollEntries.push(p);
       } else if (kind === "qbo_pl" || kind === "qbo_tb" || kind === "qbo_gl") {
-        qboEntries.push(...parseQBO(rows, kind).map(e => ({...e, source_file: file.name})));
+        for (const e of parseQBO(rows, kind)) qboEntries.push({...e, source_file: file.name});
       } else {
         unknownFiles.push(file.name);
       }
@@ -3112,19 +3112,19 @@ function DataIngest({ weeklyRollups, reconMeta, onRefresh }) {
         }
         // ─── NuVizz ───
         else if (kind === "nuvizz") {
-          nuvizzStops.push(...parseNuVizz(rows));
+          for (const s of parseNuVizz(rows)) nuvizzStops.push(s);
         }
         // ─── Time Clock ───
         else if (kind === "timeclock") {
-          timeClockEntries.push(...parseTimeClock(rows));
+          for (const e of parseTimeClock(rows)) timeClockEntries.push(e);
         }
         // ─── Payroll ───
         else if (kind === "payroll") {
-          payrollEntries.push(...parsePayroll(rows));
+          for (const p of parsePayroll(rows)) payrollEntries.push(p);
         }
         // ─── QBO ───
         else if (kind === "qbo_pl" || kind === "qbo_tb" || kind === "qbo_gl") {
-          qboEntries.push(...parseQBO(rows, kind).map(e => ({...e, source_file: file.name})));
+          for (const e of parseQBO(rows, kind)) qboEntries.push({...e, source_file: file.name});
         }
         else {
           unknownFiles.push(file.name);
