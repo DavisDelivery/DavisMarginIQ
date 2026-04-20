@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.14.0";
+const APP_VERSION = "2.14.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3524,12 +3524,12 @@ function CoverageTimeline() {
         }
 
         setStreams([
-          { key: "delivery",    label: "Uline · Delivery",    color: T.brand,   map: deliveryMap,    primary: "stops", fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)}` },
-          { key: "truckload",   label: "Uline · Truckload",   color: T.purple,  map: truckloadMap,   primary: "stops", fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)}` },
-          { key: "accessorial", label: "Uline · Accessorial", color: T.yellow,  map: accessorialMap, primary: "stops", fmtValue: (v) => `${v.stops ? fmtNum(v.stops)+" stops · " : ""}${fmt(v.revenue)}` },
-          { key: "nuvizz",      label: "NuVizz",              color: T.blue,    map: nuvizzMap,      primary: "stops", fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)} SealNbr` },
-          { key: "timeclock",   label: "Time Clock",          color: T.green,   map: timeclockMap,   primary: "hours", fmtValue: (v) => `${fmtNum(Math.round(v.hours))} hrs` },
-          { key: "ddis",        label: "DDIS Payments",       color: T.red,     map: ddisMap,        primary: "files", fmtValue: (v) => `${v.files} file${v.files===1?"":"s"} · ${fmt(v.paid)}` },
+          { key: "delivery",    label: "Uline · Delivery",    color: T.brand,   map: deliveryMap,    primary: "stops", isPrimary: true,  fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)}` },
+          { key: "truckload",   label: "Uline · Truckload",   color: T.purple,  map: truckloadMap,   primary: "stops", isPrimary: false, fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)}` },
+          { key: "accessorial", label: "Uline · Accessorial", color: T.yellow,  map: accessorialMap, primary: "stops", isPrimary: false, fmtValue: (v) => `${v.stops ? fmtNum(v.stops)+" stops · " : ""}${fmt(v.revenue)}` },
+          { key: "nuvizz",      label: "NuVizz",              color: T.blue,    map: nuvizzMap,      primary: "stops", isPrimary: false, fmtValue: (v) => `${fmtNum(v.stops)} stops · ${fmt(v.revenue)} SealNbr` },
+          { key: "timeclock",   label: "Time Clock",          color: T.green,   map: timeclockMap,   primary: "hours", isPrimary: false, fmtValue: (v) => `${fmtNum(Math.round(v.hours))} hrs` },
+          { key: "ddis",        label: "DDIS Payments",       color: T.red,     map: ddisMap,        primary: "files", isPrimary: false, fmtValue: (v) => `${v.files} file${v.files===1?"":"s"} · ${fmt(v.paid)}` },
         ]);
         setLoading(false);
       } catch (e) {
@@ -3620,10 +3620,79 @@ function CoverageTimeline() {
     return { key: s.key, covered, total: columns.length, pct: columns.length > 0 ? Math.round(covered/columns.length*100) : 0 };
   });
 
+  const deliveryStats = coverageStats.find(s => s.key === "delivery") || { covered: 0, total: 0, pct: 0 };
+  const deliveryStream = streams.find(s => s.key === "delivery");
+  const deliveryGaps = columns.filter(w => !deliveryStream.map[w]);
+  const deliveryRevenue = Object.values(deliveryStream.map).reduce((sum, v) => sum + (v.revenue || 0), 0);
+
   return (
     <div style={{...cardStyle, marginBottom:16}}>
+      {/* Uline Delivery hero block — this is 90% of revenue, gaps here hurt most */}
+      <div style={{
+        padding: "14px 16px",
+        marginBottom: 16,
+        borderRadius: 10,
+        background: deliveryStats.pct >= 100 ? "#ecfdf5" : deliveryStats.pct >= 85 ? "#fffbeb" : "#fef2f2",
+        border: `1px solid ${deliveryStats.pct >= 100 ? T.green : deliveryStats.pct >= 85 ? T.yellow : T.red}`,
+      }}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontSize:11,fontWeight:700,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:4}}>
+              Primary Revenue Stream
+            </div>
+            <div style={{fontSize:15,fontWeight:700,color:T.text}}>Uline · Delivery</div>
+            <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>
+              90%+ of revenue. Gaps here understate reported revenue.
+            </div>
+          </div>
+          <div style={{display:"flex",gap:16,alignItems:"center"}}>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>Coverage</div>
+              <div style={{fontSize:26,fontWeight:800,color: deliveryStats.pct >= 100 ? T.green : deliveryStats.pct >= 85 ? T.yellowText : T.redText, lineHeight:1.1}}>
+                {deliveryStats.pct}%
+              </div>
+              <div style={{fontSize:10,color:T.textMuted}}>{deliveryStats.covered}/{deliveryStats.total} wks</div>
+            </div>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>Gaps</div>
+              <div style={{fontSize:26,fontWeight:800,color: deliveryGaps.length === 0 ? T.green : T.redText, lineHeight:1.1}}>
+                {deliveryGaps.length}
+              </div>
+              <div style={{fontSize:10,color:T.textMuted}}>missing</div>
+            </div>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>Revenue</div>
+              <div style={{fontSize:26,fontWeight:800,color:T.text,lineHeight:1.1}}>
+                {deliveryRevenue >= 1000000 ? `$${(deliveryRevenue/1000000).toFixed(1)}M` : deliveryRevenue >= 1000 ? `$${Math.round(deliveryRevenue/1000)}K` : fmt(deliveryRevenue)}
+              </div>
+              <div style={{fontSize:10,color:T.textMuted}}>in range</div>
+            </div>
+          </div>
+        </div>
+        {deliveryGaps.length > 0 && (
+          <div style={{marginTop:12,paddingTop:10,borderTop:`1px solid ${deliveryStats.pct >= 85 ? T.yellow+"50" : T.red+"40"}`}}>
+            <div style={{fontSize:11,fontWeight:700,color:T.redText,marginBottom:6}}>🚨 Missing Delivery Weeks — find and upload these</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+              {deliveryGaps.slice(0, 30).map(w => (
+                <div key={w} style={{
+                  padding: "3px 8px",
+                  borderRadius: 4,
+                  background: "white",
+                  color: T.redText,
+                  fontSize: 10,
+                  fontWeight: 600,
+                  border: `1px solid ${T.red}30`,
+                  fontFamily: "monospace",
+                }}>WE {w.slice(5)}</div>
+              ))}
+              {deliveryGaps.length > 30 && <div style={{padding:"3px 8px",fontSize:10,color:T.textMuted}}>+{deliveryGaps.length - 30} more</div>}
+            </div>
+          </div>
+        )}
+      </div>
+
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:10}}>
-        <div style={{fontSize:13,fontWeight:700,color:T.text}}>📊 Coverage Timeline</div>
+        <div style={{fontSize:13,fontWeight:700,color:T.text}}>📊 Coverage Timeline — All Streams</div>
         <div style={{display:"flex",gap:4,fontSize:11}}>
           {[
             { k: "auto", l: "Auto" },
@@ -3648,7 +3717,7 @@ function CoverageTimeline() {
       </div>
 
       <div style={{fontSize:11,color:T.textMuted,marginBottom:12}}>
-        Each cell = one week (Friday-ending). Coloured = data present, grey = gap. Hover for details.
+        Each cell = one week (Friday-ending). Coloured = data present, grey = gap. Hover for details. <strong style={{color:T.text}}>Delivery row is emphasized</strong> — it's the primary revenue stream.
       </div>
 
       <div style={{overflowX:"auto",paddingBottom:8}}>
@@ -3669,14 +3738,23 @@ function CoverageTimeline() {
             ))}
           </div>
 
-          {/* Stream rows */}
+          {/* Stream rows — primary stream (Delivery) rendered larger & bolder */}
           {streams.map((s, sIdx) => {
             const stats = coverageStats[sIdx];
+            const cellH = s.isPrimary ? 28 : 14;
+            const cellW = CELL_W; // keep column alignment
+            const rowGap = s.isPrimary ? 12 : ROW_GAP;
+            const labelFontSize = s.isPrimary ? 13 : 11;
+            const gapBg = s.isPrimary ? "#fca5a5" : T.borderLight; // red-tinted for primary gaps
+            const gapOpacity = s.isPrimary ? 0.5 : 0.35;
             return (
-              <div key={s.key} style={{display:"flex",alignItems:"center",marginBottom: ROW_GAP}}>
-                <div style={{width: LABEL_W, paddingRight: 10, fontSize: 11, color: T.text}}>
-                  <div style={{fontWeight: 600}}>{s.label}</div>
-                  <div style={{fontSize: 10, color: stats.pct >= 95 ? T.green : stats.pct >= 50 ? T.yellowText : T.textMuted}}>
+              <div key={s.key} style={{display:"flex",alignItems:"center",marginBottom: rowGap, paddingBottom: s.isPrimary ? 10 : 0, borderBottom: s.isPrimary ? `2px solid ${T.borderLight}` : "none"}}>
+                <div style={{width: LABEL_W, paddingRight: 10, fontSize: labelFontSize, color: T.text}}>
+                  <div style={{fontWeight: s.isPrimary ? 700 : 600}}>
+                    {s.isPrimary && <span style={{color: T.brand, marginRight: 4}}>★</span>}
+                    {s.label}
+                  </div>
+                  <div style={{fontSize: 10, color: stats.pct >= 95 ? T.green : stats.pct >= 50 ? T.yellowText : T.textMuted, fontWeight: s.isPrimary ? 700 : 400}}>
                     {stats.covered}/{stats.total} weeks ({stats.pct}%)
                   </div>
                 </div>
@@ -3691,11 +3769,11 @@ function CoverageTimeline() {
                         onMouseLeave={() => setHover(null)}
                         title={`${s.label} · WE ${w}${present ? " · " + s.fmtValue(cell) : " · no data"}`}
                         style={{
-                          width: CELL_W,
-                          height: CELL_H,
+                          width: cellW,
+                          height: cellH,
                           borderRadius: 2,
-                          background: present ? s.color : T.borderLight,
-                          opacity: present ? 1 : 0.4,
+                          background: present ? s.color : gapBg,
+                          opacity: present ? 1 : gapOpacity,
                           cursor: "pointer",
                           transition: "transform 0.1s",
                         }}
