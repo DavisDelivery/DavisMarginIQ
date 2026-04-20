@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.12.0";
+const APP_VERSION = "2.12.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2055,7 +2055,14 @@ function auditFilenames(files) {
       endDate = parseYMD(e);
       suggestedRename = name.replace(m[0], `${s}-${e}`);
     } else {
-      parseStatus = isPdf ? "pdf-no-date" : "unparsed";
+      // No date range found. Some file types legitimately don't have one (DDIS
+      // files, dispute logs, PDF backups) — those aren't "unparsed", they just
+      // don't need a week-ending. Only flag as unparsed if we can't otherwise
+      // classify the file.
+      const hasDdisName = /^ddis820|\bddis\b/i.test(lower);
+      const hasDisputeName = /dispute/i.test(name);
+      if (hasDdisName || hasDisputeName || isPdf) parseStatus = "no-date-ok";
+      else parseStatus = "unparsed";
     }
 
     // Compute Friday week-ending if we have an end date
@@ -2068,6 +2075,7 @@ function auditFilenames(files) {
     if (isDispute) kind = "uline-dispute";
     else if (isBackup || isInvoicePdf) kind = "pdf-backup";
     else if (isPdf) kind = "pdf-other";
+    else if (/^ddis820|\bddis\b/i.test(lower)) kind = "ddis";
     else if (isAccessorial) kind = "accessorial";
     else kind = "original";
 
@@ -2161,6 +2169,7 @@ function auditFilenames(files) {
       truckload: classified.filter(c => c.kind === "original" && c.serviceType === "truckload" && c.weekEnding).length,
       originals: classified.filter(c => c.kind === "original" && c.weekEnding).length, // = delivery + truckload
       accessorials: classified.filter(c => c.kind === "accessorial" && c.weekEnding).length,
+      ddis: classified.filter(c => c.kind === "ddis").length,
       pdfs: classified.filter(c => c.isPdf).length,
       typos: typos.length,
       unparsed: unparsed.length,
@@ -3760,6 +3769,12 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
               <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>Accessorials</div>
               <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.accessorials}</div>
             </div>
+            {(a.summary.ddis || 0) > 0 && (
+              <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
+                <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>DDIS Payments</div>
+                <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.ddis}</div>
+              </div>
+            )}
             <div style={{background:T.bgSurface,padding:"10px 12px",borderRadius:8,border:`1px solid ${T.borderLight}`}}>
               <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.05em"}}>PDF Backups</div>
               <div style={{fontSize:18,fontWeight:700,color:T.text}}>{a.summary.pdfs}</div>
