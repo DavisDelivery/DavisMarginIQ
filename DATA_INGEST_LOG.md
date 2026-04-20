@@ -26,7 +26,8 @@ Last updated: **2026-04-20** (v2.9.0 — Time Clock tab + AI analyst)
 
 | Batch date | Window | Files / method | Rows | Weeks | Hours | Saved by |
 |---|---|---|---|---|---|---|
-| **2026-04-20** | 2025-01-01 → 2026-04-10 | 4 CSV backfill (Data Ingest tab upload) | 14,773 | 67 | 126,893.57 | Chad (manual upload, v2.9.1) |
+| 2026-04-20 (Friday-keyed, superseded) | 2025-01-01 → 2026-04-10 | 4 CSV backfill (Data Ingest tab upload) | 14,773 | 67 | 126,893.57 | Chad (manual upload, v2.9.1) |
+| 2026-04-20 (pending re-ingest) | 2025-01-01 → 2026-04-18 | 4 backfill CSVs + 1 icon CSV (Saturday-keyed) | — | — | — | Chad (after purge + re-upload, v2.10.0) |
 
 ### Coverage gaps
 _None detected in the 4-CSV backfill — continuous weekly coverage Jan 2025 through Apr 10 2026._
@@ -67,6 +68,8 @@ Successful response: `{"ok":true,"rows_fetched":N,"weeks_saved":M}`. Error respo
 ### Fixes / history
 - **2026-04-20 (commit `77eca82`)** — Fixed: SheetJS auto-converts CSV date columns (`01/17/25`) to Excel serial numbers (`45674`), causing every timeclock row to have `date=null` and the weekly rollup to produce 0 weeks. `parseDateMDYFlexible()` now handles numeric Excel serial input transparently.
 - **2026-04-20 (v2.9.0)** — New Time Clock tab with overview stats, weekly drill-in (top 20 employees per week), anomaly detection (spike/drop vs trailing-8-week avg, OT >20%, staff drops), and AI chat (ask-anything via `marginiq-analyze-timeclock` Netlify function).
+- **2026-04-20 (v2.9.1, commit `9e1cf83`)** — Fixed silent Firestore write failures on timeclock_weekly. Root cause: `buildTimeClockWeekly` returned `employees: undefined`, which Firestore rejects by default. Enabled `ignoreUndefinedProperties: true` globally and rewrote the return shape explicitly. First successful backfill: 14,773 entries → 67 weeks → 126,893.57 hrs.
+- **2026-04-20 (v2.10.0)** — **Switched Time Clock to Saturday week-endings** (was Friday). B600's native "Last Week" export is Sun→Sat, so Friday-ending was splitting every B600 week across two MarginIQ buckets. A partial re-upload on 2026-04-20 that included 2 Sunday punches (4/12/26) overwrote the week-4/10 rollup and lost ~1,830 hrs. Added `weekEndingSaturday()` to the client, updated `parseTimeClock` + the B600 auto-pull function, and added `marginiq-purge-timeclock` endpoint (token-protected) to wipe the collection cleanly before the Saturday-keyed backfill.
 
 ---
 

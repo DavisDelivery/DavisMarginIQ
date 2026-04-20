@@ -108,14 +108,19 @@ function formatMDYY(d: Date): string {
   return `${m}/${dd}/${yy}`;
 }
 
-function previousWeekMondayToSunday(now: Date = new Date()): { from: Date; to: Date } {
-  // Today's day of week (0=Sun, 1=Mon, ..., 6=Sat)
-  const dow = now.getDay();
-  // Days back to the most recent Sunday (end of previous week if today is Mon)
-  // Mon → go back 1 day to Sunday; Tue → 2; ...; Sun → 7 (prior Sunday, not today)
-  const daysBackToSun = dow === 0 ? 7 : dow;
+// B600 "Last Week" = previous Sunday through Saturday (inclusive).
+// If today is Monday, the previous Sun-Sat just completed yesterday. For any
+// other day within the current Sun-Sat week, we still return the PREVIOUS
+// completed Sun-Sat (not this one in progress).
+function previousWeekSunToSat(now: Date = new Date()): { from: Date; to: Date } {
+  const dow = now.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+  // Days back to the most recent Saturday (end of the previous Sun-Sat week).
+  // If today is Sunday (0), the previous week ended yesterday (-1 day to Sat) = 1.
+  // If today is Monday (1), previous week ended 2 days ago (Sat) = 2.
+  // If today is Saturday (6), previous week ended 7 days ago = 7.
+  const daysBackToSat = dow + 1;
   const to = new Date(now);
-  to.setDate(now.getDate() - daysBackToSun);
+  to.setDate(now.getDate() - daysBackToSat);
   to.setHours(23, 59, 59, 999);
   const from = new Date(to);
   from.setDate(to.getDate() - 6);
@@ -131,14 +136,16 @@ function parseDateMDY(s: string): Date | null {
   return new Date(yr, parseInt(m[1], 10) - 1, parseInt(m[2], 10));
 }
 
-function weekEndingFriday(d: Date): string {
+// Week-ending = Saturday (matches B600's Sun-Sat week convention).
+// A Sunday date rolls forward to the following Saturday (6 days).
+function weekEndingSaturday(d: Date): string {
   const day = d.getDay();
-  const daysToFri = (5 - day + 7) % 7;
-  const fri = new Date(d);
-  fri.setDate(d.getDate() + daysToFri);
-  const y = fri.getFullYear();
-  const mo = String(fri.getMonth() + 1).padStart(2, "0");
-  const dd = String(fri.getDate()).padStart(2, "0");
+  const daysToSat = (6 - day + 7) % 7;
+  const sat = new Date(d);
+  sat.setDate(d.getDate() + daysToSat);
+  const y = sat.getFullYear();
+  const mo = String(sat.getMonth() + 1).padStart(2, "0");
+  const dd = String(sat.getDate()).padStart(2, "0");
   return `${y}-${mo}-${dd}`;
 }
 
@@ -219,7 +226,7 @@ function rollupWeekly(rows: Record<string, string>[]): any[] {
     if (!name) continue;
     const d = parseDateMDY(r["date"]);
     if (!d) continue;
-    const we = weekEndingFriday(d);
+    const we = weekEndingSaturday(d);
     const reg = parseHours(r["reg"]);
     const ot = parseHours(r["ot1"]) + parseHours(r["ot2"]);
     const tot = parseHours(r["total"]) || reg + ot;
@@ -297,7 +304,7 @@ async function fsWrite(collection: string, docId: string, data: any): Promise<bo
 export default async (_req: Request, _context: Context) => {
   const startedAt = new Date().toISOString();
   try {
-    const { from, to } = previousWeekMondayToSunday();
+    const { from, to } = previousWeekSunToSat();
     const jar = await b600Login();
     const csv = await b600FetchCSV(jar, from, to);
     const rows = parseCSV(csv);

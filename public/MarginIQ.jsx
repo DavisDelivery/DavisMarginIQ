@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.9.1";
+const APP_VERSION = "2.10.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1606,7 +1606,7 @@ function parseHours(v) {
   return isNaN(n) ? 0 : n;
 }
 
-// Compute the Friday week-ending for a YYYY-MM-DD date
+// Compute the Friday week-ending for a YYYY-MM-DD date (used for Uline Revenue)
 function weekEndingFriday(dateStr) {
   if (!dateStr) return null;
   const d = new Date(dateStr + "T00:00:00");
@@ -1620,6 +1620,20 @@ function weekEndingFriday(dateStr) {
   const f = new Date(d);
   f.setDate(d.getDate() + add);
   return f.toISOString().slice(0,10);
+}
+// Compute the Saturday week-ending (Sun-Sat week) for a YYYY-MM-DD date.
+// Used by Time Clock ingestion to match B600's native "Last Week" convention
+// (Sun → Sat). A Sunday date rolls forward to the following Saturday (6 days).
+function weekEndingSaturday(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + "T00:00:00");
+  if (isNaN(d)) return null;
+  const day = d.getDay(); // Sun=0...Sat=6
+  // Saturday = 6. Roll forward to next Saturday (or 0 days if already Sat).
+  const add = (6 - day + 7) % 7;
+  const s = new Date(d);
+  s.setDate(d.getDate() + add);
+  return s.toISOString().slice(0,10);
 }
 function addDays(dateStr, n) { const d = new Date(dateStr+"T00:00:00"); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); }
 function weekLabel(friday) { if (!friday) return "—"; const d = new Date(friday+"T00:00:00"); return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"}); }
@@ -1944,7 +1958,7 @@ function parseTimeClock(rows) {
     entries.push({
       employee: normalizeName(name),
       date,
-      week_ending: date ? weekEndingFriday(date) : null,
+      week_ending: date ? weekEndingSaturday(date) : null,
       month: date ? dateToMonth(date) : null,
       clock_in: clockIn ? String(clockIn).trim() : null,
       clock_out: clockOut ? String(clockOut).trim() : null,

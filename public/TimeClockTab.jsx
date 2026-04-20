@@ -111,7 +111,7 @@ async function askAI(question, weeks, history=[]) {
 
   const systemPrompt = `You are a business analyst for Davis Delivery Service, a LTL trucking company. You analyze time clock data to help the owner (Chad Davis) understand labor costs, overtime trends, and anomalies. Be concise, direct, and focus on actionable insight. Use numbers from the provided data — never invent figures. When calling out an employee, use their name exactly as it appears. Always reference specific week-ending dates when discussing trends.`;
 
-  const userContent = `Here is the time clock data (most recent 52 weeks, each row = one Friday-week-ending rollup):
+  const userContent = `Here is the time clock data (most recent 52 weeks, each row = one Saturday-week-ending rollup matching the B600 Sun-Sat work week):
 
 ${JSON.stringify(summary, null, 2)}
 
