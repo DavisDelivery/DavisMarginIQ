@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.14.2";
+const APP_VERSION = "2.14.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3620,14 +3620,32 @@ function CoverageTimeline() {
     return { key: s.key, covered, total: columns.length, pct: columns.length > 0 ? Math.round(covered/columns.length*100) : 0 };
   });
 
-  const deliveryStats = coverageStats.find(s => s.key === "delivery") || { covered: 0, total: 0, pct: 0 };
+  // Uline Delivery hero is ALWAYS calculated from 2025-01-03 onwards —
+  // independent of the range selector. User explicitly doesn't want to
+  // track 2024 gaps and doesn't want to be warned about them.
+  const PRIMARY_FROM = "2025-01-03"; // first Friday of 2025
   const deliveryStream = streams.find(s => s.key === "delivery");
-  const deliveryGaps = columns.filter(w => !deliveryStream.map[w]);
-  const deliveryRevenue = Object.values(deliveryStream.map).reduce((sum, v) => sum + (v.revenue || 0), 0);
+  const primaryColumns = [];
+  {
+    const effectiveEnd = lastWeek;
+    let cur = PRIMARY_FROM;
+    while (cur <= effectiveEnd) {
+      primaryColumns.push(cur);
+      cur = addDaysISO(cur, 7);
+    }
+  }
+  const deliveryGaps = primaryColumns.filter(w => !deliveryStream.map[w]);
+  const deliveryCovered = primaryColumns.length - deliveryGaps.length;
+  const deliveryPct = primaryColumns.length > 0 ? Math.round(deliveryCovered / primaryColumns.length * 100) : 0;
+  const deliveryStats = { covered: deliveryCovered, total: primaryColumns.length, pct: deliveryPct };
+  const deliveryRevenue = Object.entries(deliveryStream.map)
+    .filter(([w]) => w >= PRIMARY_FROM)
+    .reduce((sum, [, v]) => sum + (v.revenue || 0), 0);
 
   return (
     <div style={{...cardStyle, marginBottom:16}}>
-      {/* Uline Delivery hero block — this is 90% of revenue, gaps here hurt most */}
+      {/* Uline Delivery hero block — this is 90% of revenue, gaps here hurt most.
+          Always scoped to 2025-01-03+ regardless of timeline range selector. */}
       <div style={{
         padding: "14px 16px",
         marginBottom: 16,
@@ -3642,7 +3660,7 @@ function CoverageTimeline() {
             </div>
             <div style={{fontSize:15,fontWeight:700,color:T.text}}>Uline · Delivery</div>
             <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>
-              90%+ of revenue. Gaps here understate reported revenue.
+              90%+ of revenue. Gaps here understate reported revenue. <strong style={{color:T.text}}>Tracked from Jan 2025.</strong>
             </div>
           </div>
           <div style={{display:"flex",gap:16,alignItems:"center"}}>
@@ -3651,21 +3669,21 @@ function CoverageTimeline() {
               <div style={{fontSize:26,fontWeight:800,color: deliveryStats.pct >= 100 ? T.green : deliveryStats.pct >= 85 ? T.yellowText : T.redText, lineHeight:1.1}}>
                 {deliveryStats.pct}%
               </div>
-              <div style={{fontSize:10,color:T.textMuted}}>{deliveryStats.covered}/{deliveryStats.total} wks</div>
+              <div style={{fontSize:10,color:T.textMuted}}>{deliveryStats.covered}/{deliveryStats.total} wks (2025+)</div>
             </div>
             <div style={{textAlign:"center"}}>
               <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>Gaps</div>
               <div style={{fontSize:26,fontWeight:800,color: deliveryGaps.length === 0 ? T.green : T.redText, lineHeight:1.1}}>
                 {deliveryGaps.length}
               </div>
-              <div style={{fontSize:10,color:T.textMuted}}>missing</div>
+              <div style={{fontSize:10,color:T.textMuted}}>missing (2025+)</div>
             </div>
             <div style={{textAlign:"center"}}>
               <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>Revenue</div>
               <div style={{fontSize:26,fontWeight:800,color:T.text,lineHeight:1.1}}>
                 {deliveryRevenue >= 1000000 ? `$${(deliveryRevenue/1000000).toFixed(1)}M` : deliveryRevenue >= 1000 ? `$${Math.round(deliveryRevenue/1000)}K` : fmt(deliveryRevenue)}
               </div>
-              <div style={{fontSize:10,color:T.textMuted}}>in range</div>
+              <div style={{fontSize:10,color:T.textMuted}}>2025+</div>
             </div>
           </div>
         </div>
@@ -3681,7 +3699,6 @@ function CoverageTimeline() {
                 satDate.setDate(satDate.getDate() - 6);
                 const fmt = (d) => d.toISOString().slice(0,10).replace(/-/g,"");
                 const expectedFilename = `das ${fmt(satDate)}-${fmt(friDate)}.xlsx`;
-                const accFilename = `das ${fmt(satDate)}-${fmt(friDate)} accessorials.xlsx`;
                 const humanRange = `${satDate.toLocaleDateString("en-US",{month:"short",day:"numeric"})} – ${friDate.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}`;
                 return (
                   <div key={we} style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11}}>
@@ -3690,10 +3707,7 @@ function CoverageTimeline() {
                       <div style={{fontSize:10,color:T.textMuted}}>{humanRange}</div>
                     </div>
                     <div style={{fontFamily:"monospace",fontSize:11,color:T.text,marginTop:4,wordBreak:"break-all"}}>
-                      <span style={{color:T.textDim}}>Delivery:</span> <strong>{expectedFilename}</strong>
-                    </div>
-                    <div style={{fontFamily:"monospace",fontSize:10,color:T.textMuted,marginTop:2,wordBreak:"break-all"}}>
-                      <span>Accessorial:</span> {accFilename}
+                      <strong>{expectedFilename}</strong>
                     </div>
                   </div>
                 );
