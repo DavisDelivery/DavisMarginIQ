@@ -43,7 +43,8 @@ export default async (req: Request, context: Context) => {
     const body = await req.json();
     const vendor: string = (body.vendor || "").toLowerCase();
     const afterDate: string = body.afterDate || ""; // YYYY/MM/DD
-    const maxResults: number = Math.min(body.maxResults || 20, 50);
+    const beforeDate: string = body.beforeDate || ""; // YYYY/MM/DD
+    const maxResults: number = Math.min(body.maxResults || 20, 200);
 
     if (!vendor || !VENDOR_QUERIES[vendor]) {
       return json({ error: `Unknown vendor. Supported: ${Object.keys(VENDOR_QUERIES).join(", ")}` }, 400);
@@ -84,6 +85,7 @@ export default async (req: Request, context: Context) => {
     // Build query
     let query = VENDOR_QUERIES[vendor];
     if (afterDate) query += ` after:${afterDate}`;
+    if (beforeDate) query += ` before:${beforeDate}`;
 
     // Search messages
     const searchUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`;

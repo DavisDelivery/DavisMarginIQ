@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.15.1";
+const APP_VERSION = "2.16.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1151,6 +1151,12 @@ function GmailSync({ onRefresh }) {
   const [importStatus, setImportStatus] = useState("");
   const [oauthMsg, setOauthMsg] = useState(null); // { kind: 'success'|'error', text }
 
+  // Date range controls — shared across all vendor searches.
+  // rangePreset values: "30d" | "60d" | "90d" | "6mo" | "12mo" | "ytd" | "all" | "custom"
+  const [rangePreset, setRangePreset] = useState("60d");
+  const [customFrom, setCustomFrom] = useState(""); // YYYY-MM-DD
+  const [customTo, setCustomTo] = useState("");     // YYYY-MM-DD
+
   // Load Gmail connection state
   useEffect(() => {
     // Handle OAuth callback redirect (?gmail=connected OR ?gmail=error)
@@ -1190,17 +1196,54 @@ function GmailSync({ onRefresh }) {
     setResults({});
   };
 
+  // Convert current rangePreset + customFrom/customTo into {afterDate, beforeDate}
+  // that Gmail query understands (YYYY/MM/DD, slashes). Returns empty strings
+  // for "no bound" (used by "all time" and when user leaves custom fields blank).
+  const resolveDateRange = () => {
+    const toGmail = (d) => `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()}`;
+    const isoToGmail = (iso) => {
+      if (!iso) return "";
+      const [y,m,day] = iso.split("-").map(Number);
+      return `${y}/${m}/${day}`;
+    };
+    const today = new Date();
+    if (rangePreset === "custom") {
+      return { afterDate: isoToGmail(customFrom), beforeDate: isoToGmail(customTo) };
+    }
+    if (rangePreset === "all") return { afterDate: "", beforeDate: "" };
+    if (rangePreset === "ytd") {
+      return { afterDate: `${today.getFullYear()}/1/1`, beforeDate: "" };
+    }
+    const d = new Date();
+    const daysMap = { "30d": 30, "60d": 60, "90d": 90 };
+    const monthsMap = { "6mo": 6, "12mo": 12 };
+    if (daysMap[rangePreset]) d.setDate(d.getDate() - daysMap[rangePreset]);
+    else if (monthsMap[rangePreset]) d.setMonth(d.getMonth() - monthsMap[rangePreset]);
+    return { afterDate: toGmail(d), beforeDate: "" };
+  };
+
+  // Human-readable label for the current range (shown in UI)
+  const rangeLabel = () => {
+    if (rangePreset === "custom") {
+      if (customFrom && customTo) return `${customFrom} → ${customTo}`;
+      if (customFrom) return `${customFrom} → now`;
+      if (customTo) return `all time → ${customTo}`;
+      return "Custom (no dates set)";
+    }
+    const labels = { "30d":"Last 30 days","60d":"Last 60 days","90d":"Last 90 days","6mo":"Last 6 months","12mo":"Last 12 months","ytd":"Year to date","all":"All time" };
+    return labels[rangePreset] || rangePreset;
+  };
+
   const searchVendor = async (vendor) => {
     setLoading(prev => ({...prev, [vendor]: true}));
     try {
-      // Default to last 60 days
-      const d = new Date();
-      d.setDate(d.getDate() - 60);
-      const afterDate = `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()}`;
+      const { afterDate, beforeDate } = resolveDateRange();
+      // Longer ranges likely need higher maxResults. Let the server cap at 200.
+      const maxResults = rangePreset === "all" || rangePreset === "12mo" || rangePreset === "custom" ? 100 : 50;
       const resp = await fetch("/.netlify/functions/marginiq-gmail-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ vendor, afterDate, maxResults: 30 }),
+        body: JSON.stringify({ vendor, afterDate, beforeDate, maxResults }),
       });
       const data = await resp.json();
       if (data.error) {
@@ -1512,6 +1555,63 @@ function GmailSync({ onRefresh }) {
             {importStatus}
           </div>
         )}
+
+        {/* Date range picker — applies to every vendor search below */}
+        <div style={{...cardStyle, padding:"12px 14px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+            <div>
+              <div style={{fontSize:12,fontWeight:700,color:T.text}}>📅 Search date range</div>
+              <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>
+                Applied to every vendor search. Current: <strong style={{color:T.text}}>{rangeLabel()}</strong>
+              </div>
+            </div>
+          </div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+            {[
+              { k:"30d",   l:"Last 30d" },
+              { k:"60d",   l:"Last 60d" },
+              { k:"90d",   l:"Last 90d" },
+              { k:"6mo",   l:"Last 6mo" },
+              { k:"12mo",  l:"Last 12mo" },
+              { k:"ytd",   l:"Year to date" },
+              { k:"all",   l:"All time" },
+              { k:"custom",l:"Custom…" },
+            ].map(p => (
+              <button key={p.k}
+                onClick={() => setRangePreset(p.k)}
+                style={{
+                  padding: "5px 10px",
+                  borderRadius: 6,
+                  border: `1px solid ${rangePreset === p.k ? T.brand : T.border}`,
+                  background: rangePreset === p.k ? T.brandPale : T.bgWhite,
+                  color: rangePreset === p.k ? T.brand : T.textMuted,
+                  cursor: "pointer",
+                  fontWeight: rangePreset === p.k ? 700 : 500,
+                  fontSize: 11,
+                }}>{p.l}</button>
+            ))}
+          </div>
+          {rangePreset === "custom" && (
+            <div style={{marginTop:10,display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              <div style={{display:"flex",flexDirection:"column",gap:2}}>
+                <label style={{fontSize:10,color:T.textMuted,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em"}}>From</label>
+                <input type="date" value={customFrom} onChange={e=>setCustomFrom(e.target.value)}
+                  style={{padding:"6px 10px",borderRadius:6,border:`1px solid ${T.border}`,fontSize:12,fontFamily:"inherit"}} />
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:2}}>
+                <label style={{fontSize:10,color:T.textMuted,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.06em"}}>To</label>
+                <input type="date" value={customTo} onChange={e=>setCustomTo(e.target.value)}
+                  style={{padding:"6px 10px",borderRadius:6,border:`1px solid ${T.border}`,fontSize:12,fontFamily:"inherit"}} />
+              </div>
+              {(customFrom || customTo) && (
+                <button onClick={() => { setCustomFrom(""); setCustomTo(""); }}
+                  style={{padding:"6px 10px",borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,color:T.textMuted,cursor:"pointer",fontSize:11,alignSelf:"flex-end"}}>
+                  Clear
+                </button>
+              )}
+            </div>
+          )}
+        </div>
 
         {/* Vendor Panels */}
         {[
