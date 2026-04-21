@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.39.0";
+const APP_VERSION = "2.39.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7823,6 +7823,10 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
             value={adminToken}
             onChange={e => setAdminToken(e.target.value)}
             placeholder="MARGINIQ_ADMIN_TOKEN"
+            autoCapitalize="off"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
             style={inputStyle}
           />
         </div>
@@ -7982,6 +7986,10 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
         <label style={{fontSize:11,fontWeight:600,color:T.text}}>
           Admin token (MARGINIQ_ADMIN_TOKEN)
           <input type="password" value={purgeToken} onChange={e=>setPurgeToken(e.target.value)} placeholder="enter admin token"
+            autoCapitalize="off"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
             style={{display:"block",marginTop:4,padding:"8px 10px",border:`1px solid ${T.border}`,borderRadius:6,fontSize:12,width:"100%",maxWidth:300}} />
         </label>
         <label style={{fontSize:11,fontWeight:600,color:T.text}}>
