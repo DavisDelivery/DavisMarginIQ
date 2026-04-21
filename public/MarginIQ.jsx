@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.35.0";
+const APP_VERSION = "2.36.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1508,6 +1508,9 @@ function GmailSync({ onRefresh }) {
 
       setImported(prev => ({...prev, [refKey]: result}));
       setImportStatus(`✓ Imported ${attachment.filename}`);
+      // Update the in-memory dedupe set so the UI reflects this file as a
+      // duplicate on the next search without waiting for a full file_log reload.
+      setAlreadyImportedFilenames(prev => new Set([...prev, attachment.filename.toLowerCase()]));
       if (onRefresh) onRefresh();
     } catch(e) {
       setImported(prev => ({...prev, [refKey]: { error: e.message }}));
@@ -1613,6 +1616,13 @@ function GmailSync({ onRefresh }) {
 
       setImported(prev => ({...prev, [refKey]: { ok: true, trucks: redist.rows.length, total: grandTotal, rate: trueRate }}));
       setImportStatus(`✓ FuelFox ${invData.invoice_number}: ${redist.rows.length} trucks, $${grandTotal.toFixed(2)} @ $${trueRate.toFixed(4)}/gal`);
+      // Mark both PDFs as duplicates in-memory — pair is only a duplicate
+      // when ALL its PDFs are flagged, so adding both here handles it.
+      setAlreadyImportedFilenames(prev => {
+        const next = new Set(prev);
+        for (const a of pdfs) next.add(a.filename.toLowerCase());
+        return next;
+      });
       if (onRefresh) onRefresh();
     } catch(e) {
       setImported(prev => ({...prev, [refKey]: { error: e.message }}));
@@ -1698,6 +1708,7 @@ function GmailSync({ onRefresh }) {
 
       setImported(prev => ({...prev, [refKey]: { ok: true, trucks: data.rows.length, total: grandTotal, rate: avgRate }}));
       setImportStatus(`✓ Quick Fuel ${invBase}: ${data.rows.length} trucks, $${grandTotal.toFixed(2)} @ $${avgRate?.toFixed(4)}/gal${invoiceFees > 0 ? ` (includes $${invoiceFees.toFixed(2)} redistributed fees)` : ""}`);
+      setAlreadyImportedFilenames(prev => new Set([...prev, attachment.filename.toLowerCase()]));
       if (onRefresh) onRefresh();
     } catch(e) {
       setImported(prev => ({...prev, [refKey]: { error: e.message }}));
@@ -2028,13 +2039,23 @@ function GmailSync({ onRefresh }) {
                       const refKey = `${em.emailId}:fuelfox_pair`;
                       const isImp = importing[refKey];
                       const imp = imported[refKey];
+                      // Pair-level dedupe: the pair is a duplicate only when
+                      // every PDF in it is already in file_log. If only one
+                      // of the two showed up before (rare partial-import
+                      // scenario), allow a normal import rather than blocking.
+                      const isDuplicate = pdfs.length > 0 && pdfs.every(p =>
+                        alreadyImportedFilenames.has(p.filename.toLowerCase())
+                      );
                       return (
                         <div key={em.emailId} style={{padding:"8px 10px",borderTop:idx>0?`1px solid ${T.borderLight}`:"none"}}>
                           <div style={{fontSize:12,fontWeight:600}}>{em.emailSubject || "(no subject)"}</div>
                           <div style={{fontSize:10,color:T.textMuted}}>{em.from} • {em.emailDate ? new Date(em.emailDate).toLocaleString() : "—"}</div>
-                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:8,padding:"6px 10px",background:T.bgSurface,borderRadius:6}}>
+                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginTop:8,padding:"6px 10px",background:isDuplicate?"#fef9c3":T.bgSurface,borderRadius:6,border:isDuplicate?`1px solid ${T.yellow}40`:"1px solid transparent"}}>
                             <div style={{flex:1,fontSize:11}}>
-                              📎 {pdfs.length} PDF{pdfs.length!==1?"s":""}{pdfs.length === 2 ? " (summary + log)" : pdfs.length < 2 ? " ⚠️ expected 2" : ""}
+                              <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                                <span>📎 {pdfs.length} PDF{pdfs.length!==1?"s":""}{pdfs.length === 2 ? " (summary + log)" : pdfs.length < 2 ? " ⚠️ expected 2" : ""}</span>
+                                {isDuplicate && !imp && <span title="Both PDFs already in file_log — safe to skip" style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:T.yellow,color:"#78350f"}}>⚠ DUPLICATE</span>}
+                              </div>
                               <div style={{fontSize:9,color:T.textDim,marginTop:2}}>{pdfs.map(p => p.filename).join(" · ")}</div>
                             </div>
                             {imp?.error ? (
@@ -2044,6 +2065,17 @@ function GmailSync({ onRefresh }) {
                                 <div style={{fontSize:10,color:T.greenText,fontWeight:700}}>✓ {imp.trucks} trucks</div>
                                 <div style={{fontSize:9,color:T.textMuted}}>${imp.total.toFixed(2)} @ ${imp.rate.toFixed(4)}/gal</div>
                               </div>
+                            ) : isDuplicate ? (
+                              <button
+                                onClick={() => {
+                                  if (!confirm(`Both PDFs in this FuelFox pair have already been imported. Re-importing is safe (max-merge guarantees no data is destroyed), but it's usually redundant.\n\nAre you sure you want to re-import?`)) return;
+                                  importFuelFoxPair(em);
+                                }}
+                                disabled={isImp || pdfs.length < 2}
+                                title="Already imported — click to re-import anyway (safe, max-merge)"
+                                style={{padding:"6px 12px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${T.yellow}`,background:isImp?T.bgSurface:"#fde68a",color:"#78350f",cursor:isImp?"wait":(pdfs.length < 2?"not-allowed":"pointer"),opacity:(isImp || pdfs.length < 2)?0.6:1}}>
+                                {isImp ? "Processing..." : "↻ Re-import"}
+                              </button>
                             ) : (
                               <button onClick={() => importFuelFoxPair(em)} disabled={isImp || pdfs.length < 2}
                                 style={{padding:"6px 12px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${v.color}`,background:(isImp || pdfs.length < 2)?T.bgSurface:v.color,color:(isImp || pdfs.length < 2)?T.text:"#fff",cursor:isImp?"wait":(pdfs.length < 2 ? "not-allowed":"pointer"),opacity:(isImp || pdfs.length < 2)?0.6:1}}>
