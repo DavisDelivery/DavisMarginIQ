@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.27.0";
+const APP_VERSION = "2.28.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3468,6 +3468,116 @@ function PrimaryBtn({ text, onClick, loading, disabled, style:sx }) {
   return <button onClick={onClick} disabled={loading||disabled} style={{padding:"10px 20px",borderRadius:"10px",border:"none",background:(loading||disabled)?"#94a3b8":`linear-gradient(135deg,${T.brand},${T.brandLight})`,color:"#fff",fontSize:"13px",fontWeight:700,cursor:(loading||disabled)?"not-allowed":"pointer",...sx}}>{loading?"Loading...":text}</button>;
 }
 
+// ═══ SORTABLE TABLE UTILITIES ═════════════════════════════════════════
+// One pattern used across every table in the app so all columns are sortable
+// and any new table we add gets sortability by default.
+//
+// Usage pattern:
+//   const { sorted, sortKey, sortDir, toggleSort } = useSortable(rows, "week_ending", "desc");
+//   <thead><tr>
+//     <SortableTh label="Week" col="week_ending" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+//     <SortableTh label="Revenue" col="revenue" align="right" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+//   </tr></thead>
+//   <tbody>{sorted.map(r => ...)}</tbody>
+//
+// For computed/derived columns (e.g. filename→coverage date), pass a custom
+// extractor via the `colAccessors` option:
+//   const { sorted, ... } = useSortable(rows, "coverage", "desc", {
+//     coverage: (r) => parseCoverage(r.filename)?.startISO || ""
+//   });
+//
+// Clicking a column header toggles asc/desc. Clicking a different column
+// starts at a sensible default (desc for numbers/dates, asc for strings).
+
+function useSortable(rows, defaultKey = null, defaultDir = "desc", accessors = {}) {
+  const [sortKey, setSortKey] = useState(defaultKey);
+  const [sortDir, setSortDir] = useState(defaultDir);
+
+  const toggleSort = (col) => {
+    if (sortKey === col) {
+      setSortDir(d => d === "asc" ? "desc" : "asc");
+    } else {
+      setSortKey(col);
+      // Sensible default direction based on value type of first non-null row
+      const sample = (rows || []).find(r => {
+        const v = accessors[col] ? accessors[col](r) : r?.[col];
+        return v !== null && v !== undefined && v !== "";
+      });
+      const sampleVal = sample ? (accessors[col] ? accessors[col](sample) : sample[col]) : null;
+      // Numbers and dates default desc (biggest/newest first); strings default asc
+      const isNumLike = typeof sampleVal === "number" || (typeof sampleVal === "string" && /^\d{4}-\d{2}-\d{2}/.test(sampleVal));
+      setSortDir(isNumLike ? "desc" : "asc");
+    }
+  };
+
+  const sorted = useMemo(() => {
+    if (!rows || !Array.isArray(rows) || !sortKey) return rows || [];
+    const arr = [...rows];
+    const getVal = (r) => accessors[sortKey] ? accessors[sortKey](r) : r?.[sortKey];
+    arr.sort((a, b) => {
+      const va = getVal(a); const vb = getVal(b);
+      // null/undefined/empty-string always sort last regardless of direction
+      const aEmpty = va === null || va === undefined || va === "";
+      const bEmpty = vb === null || vb === undefined || vb === "";
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1;
+      if (bEmpty) return -1;
+      // Numeric comparison
+      if (typeof va === "number" && typeof vb === "number") {
+        return sortDir === "asc" ? va - vb : vb - va;
+      }
+      // Boolean
+      if (typeof va === "boolean" || typeof vb === "boolean") {
+        const na = va ? 1 : 0; const nb = vb ? 1 : 0;
+        return sortDir === "asc" ? na - nb : nb - na;
+      }
+      // Date-like strings (YYYY-MM-DD...) work naturally with localeCompare
+      const sa = String(va); const sb = String(vb);
+      const cmp = sa.localeCompare(sb, undefined, { numeric: true, sensitivity: "base" });
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, sortKey, sortDir]);
+
+  return { sorted, sortKey, sortDir, toggleSort, setSortKey, setSortDir };
+}
+
+// Sortable column header. Drop-in replacement for a plain <th>.
+function SortableTh({ label, col, sortKey, sortDir, onSort, align = "left", style = {}, title }) {
+  const active = sortKey === col;
+  const arrow = !active ? "↕" : (sortDir === "asc" ? "▲" : "▼");
+  return (
+    <th
+      onClick={() => onSort(col)}
+      title={title || `Sort by ${label}`}
+      style={{
+        textAlign: align,
+        padding: "8px 10px",
+        borderBottom: `1px solid ${T.border}`,
+        color: active ? T.brand : T.textMuted,
+        fontSize: 10,
+        fontWeight: 700,
+        textTransform: "uppercase",
+        letterSpacing: "0.06em",
+        position: "sticky",
+        top: 0,
+        background: T.bgSurface,
+        zIndex: 1,
+        cursor: "pointer",
+        userSelect: "none",
+        whiteSpace: "nowrap",
+        ...style,
+      }}
+    >
+      <span style={{display:"inline-flex",alignItems:"center",gap:4}}>
+        {label}
+        <span style={{fontSize:9,opacity:active?1:0.35,color:active?T.brand:T.textDim}}>{arrow}</span>
+      </span>
+    </th>
+  );
+}
+
 // ═══ AI INSIGHT PANEL ═════════════════════════════════════════════════
 // Shared analyzer component. Any tab can drop <AIInsight context="X" data={{...}} />
 // and get two passes: (1) instant deterministic sanity checks computed from the
@@ -5133,6 +5243,9 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   const [sourceConflicts, setSourceConflicts] = useState([]); // Uline vs Davis conflicts pending review
   const [resolvingWeek, setResolvingWeek] = useState(null); // week_ending currently being resolved
   const [dragOver, setDragOver] = useState(false); // drop-zone visual state
+  // Upload History sort state — default: When desc (most recent first, matches prior behavior)
+  const [historySortBy, setHistorySortBy] = useState("when");
+  const [historySortDir, setHistorySortDir] = useState("desc");
   const fileRef = useRef(null);
 
   // Load source conflicts from Firestore — survive across page loads
@@ -5979,26 +6092,84 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
         return { startISO: start.toISOString().slice(0,10), endISO: end.toISOString().slice(0,10), label };
       };
 
+      // Sort column → row accessor map. Each returns a comparable value; null/undefined sort to end.
+      const accessors = {
+        filename: (f) => (f.filename || "").toLowerCase(),
+        covers:   (f) => { const c = parseCoverage(f.filename); return c ? c.startISO : null; },
+        type:     (f) => (f.kind || "").toLowerCase(),
+        source:   (f) => (f.group || "").toLowerCase(),
+        rows:     (f) => Number(f.row_count || 0),
+        when:     (f) => f.uploaded_at || null,
+      };
+      // Toggle sort: same column clicked → flip direction; different column → default to asc
+      // (except for numeric/date columns where desc-first is more intuitive).
+      const toggleSort = (col) => {
+        if (historySortBy === col) {
+          setHistorySortDir(historySortDir === "asc" ? "desc" : "asc");
+        } else {
+          setHistorySortBy(col);
+          setHistorySortDir(col === "rows" || col === "when" || col === "covers" ? "desc" : "asc");
+        }
+      };
+      // Apply sort to a copy of fileLog. Nulls always sort to the bottom regardless of direction.
+      const sortedFileLog = [...fileLog].sort((a, b) => {
+        const va = accessors[historySortBy](a);
+        const vb = accessors[historySortBy](b);
+        const aNull = va === null || va === undefined || va === "";
+        const bNull = vb === null || vb === undefined || vb === "";
+        if (aNull && bNull) return 0;
+        if (aNull) return 1;
+        if (bNull) return -1;
+        let cmp;
+        if (typeof va === "number" && typeof vb === "number") cmp = va - vb;
+        else cmp = String(va).localeCompare(String(vb));
+        return historySortDir === "asc" ? cmp : -cmp;
+      });
+      const columns = [
+        { key: "filename", label: "Filename" },
+        { key: "covers",   label: "Covers" },
+        { key: "type",     label: "Type" },
+        { key: "source",   label: "Source" },
+        { key: "rows",     label: "Rows",  align: "right" },
+        { key: "when",     label: "When" },
+      ];
+
       return (
       <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,padding:"16px 20px",marginTop:16,boxShadow:T.shadow}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
           <div style={{fontSize:13,fontWeight:700,color:T.text}}>📋 Upload History</div>
-          <div style={{fontSize:11,color:T.textDim}}>Showing {Math.min(fileLog.length,100)} most recent {fileLog.length > 100 ? `of ${fmtNum(fileLog.length)}` : ""}</div>
+          <div style={{fontSize:11,color:T.textDim}}>Showing {Math.min(fileLog.length,100)} most recent {fileLog.length > 100 ? `of ${fmtNum(fileLog.length)}` : ""} · Tap column to sort</div>
         </div>
         <div style={{overflowX:"auto",maxHeight:500,borderRadius:T.radiusSm,border:`1px solid ${T.borderLight}`}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
             <thead>
               <tr>
-                {["Filename","Covers","Type","Source","Rows","When"].map(h =>
-                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textMuted,fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",position:"sticky",top:0,background:T.bgSurface,zIndex:1}}>{h}</th>
-                )}
+                {columns.map(c => {
+                  const active = historySortBy === c.key;
+                  const arrow = active ? (historySortDir === "asc" ? " ▲" : " ▼") : "";
+                  return (
+                    <th key={c.key}
+                      onClick={() => toggleSort(c.key)}
+                      style={{
+                        textAlign: c.align || "left",
+                        padding:"8px 10px",
+                        borderBottom:`1px solid ${T.border}`,
+                        color: active ? T.brand : T.textMuted,
+                        fontSize:10, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.06em",
+                        position:"sticky", top:0, background: active ? T.brandPale : T.bgSurface,
+                        zIndex:1, cursor:"pointer", userSelect:"none", whiteSpace:"nowrap",
+                      }}
+                      title={`Sort by ${c.label}`}
+                    >{c.label}{arrow}</th>
+                  );
+                })}
               </tr>
             </thead>
             <tbody>
-              {fileLog.slice(0,100).map((f,i) => {
+              {sortedFileLog.slice(0,100).map((f,i) => {
                 const cov = parseCoverage(f.filename);
                 return (
-                <tr key={i} style={{transition:"background 0.15s"}} onMouseEnter={e => e.currentTarget.style.background=T.bgSurface} onMouseLeave={e => e.currentTarget.style.background="transparent"}>
+                <tr key={f.file_id || i} style={{transition:"background 0.15s"}} onMouseEnter={e => e.currentTarget.style.background=T.bgSurface} onMouseLeave={e => e.currentTarget.style.background="transparent"}>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontSize:11,color:T.text,maxWidth:340,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={f.filename}>{f.filename}</td>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11,color:cov ? T.text : T.textDim,whiteSpace:"nowrap",fontWeight: cov ? 600 : 400}} title={cov ? `${cov.startISO} → ${cov.endISO}` : "Could not parse date range from filename"}>{cov ? cov.label : "—"}</td>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{f.kind ? <Badge text={f.kind} color={T.brand} bg={T.brandPale} /> : <span style={{color:T.textDim,fontSize:11}}>—</span>}</td>
