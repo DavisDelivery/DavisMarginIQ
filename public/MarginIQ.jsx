@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.37.0";
+const APP_VERSION = "2.38.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -424,18 +424,47 @@ async function ingestFiles(files, onStatus = () => {}) {
   let nvWeeksSaved = 0, nvStopsSaved = 0;
   if (nuvizzStops.length > 0) {
     onStatus({ phase:"save", message:`Saving NuVizz (${nuvizzStops.length} stops)...` });
-    const nvWeekly = buildNuVizzWeekly(nuvizzStops);
-    nvWeeksSaved = await batchWrite(nvWeekly,
-      w => FS.saveNuVizzWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()}),
-      25, "Saving NuVizz weekly");
-    const recent = nuvizzStops
-      .filter(s => s.pro && s.delivery_date)
-      .sort((a,b) => (b.delivery_date||"").localeCompare(a.delivery_date||""))
-      .slice(0, 2000);
-    const toSave = recent.filter(s => (s.pro || s.stop_number));
+
+    // STEP 1: Save every individual stop first (nuvizz_stops collection).
+    // Keyed by PRO → same PRO re-uploaded just overwrites itself, idempotent.
+    // Cap raised to the full batch — capping at 2000 meant weekly rebuilds
+    // below would miss historical PROs that fell out of the window.
+    const toSave = nuvizzStops.filter(s => (s.pro || s.stop_number) && s.delivery_date);
     nvStopsSaved = await batchWrite(toSave,
       s => FS.saveNuVizzStop(s.pro || s.stop_number, s),
       25, "Saving NuVizz stops");
+
+    // STEP 2: Identify which weeks this batch touched, then rebuild each
+    // affected weekly rollup from the UNION of (existing Firestore stops +
+    // new stops). This avoids the double-count bug where a partial file
+    // overwrote a complete rollup via shallow merge. PRO-level dedup is
+    // implicit because stops are keyed by PRO — we read distinct PROs back
+    // from Firestore.
+    const touchedWeeks = new Set(nuvizzStops.map(s => s.week_ending).filter(Boolean));
+    onStatus({ phase:"save", message:`Rebuilding ${touchedWeeks.size} NuVizz weekly rollup(s) from merged PRO set...` });
+
+    for (const weekEnding of touchedWeeks) {
+      try {
+        // Pull every stop Firestore has for this week (now includes the ones
+        // we just wrote). nuvizz_stops has week_ending on each doc.
+        const snap = await window.db.collection("nuvizz_stops")
+          .where("week_ending", "==", weekEnding)
+          .limit(10000) // safety — a single week shouldn't exceed this
+          .get();
+        const weekStops = snap.docs.map(d => d.data());
+        if (weekStops.length === 0) continue;
+        // Rebuild this week's rollup from the full deduplicated set
+        const weeklyArr = buildNuVizzWeekly(weekStops);
+        if (weeklyArr.length > 0) {
+          // buildNuVizzWeekly returns an array; for a single week it's length 1
+          const w = weeklyArr[0];
+          await FS.saveNuVizzWeekly(weekEnding, { ...w, updated_at: new Date().toISOString(), rebuilt_from_stops: true });
+          nvWeeksSaved++;
+        }
+      } catch(e) {
+        console.error("NuVizz weekly rebuild failed for", weekEnding, e);
+      }
+    }
   }
 
   // Time Clock
@@ -5875,23 +5904,37 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
     // ─── NuVizz: rollups + cross-ref stops ───
     let nvWeeksSaved = 0, nvStopsSaved = 0;
     if (nuvizzStops.length > 0) {
-      setStatus(`Building NuVizz weekly rollups (${nuvizzStops.length} stops)...`);
-      const nvWeekly = buildNuVizzWeekly(nuvizzStops);
-      for (const w of nvWeekly) {
-        const ok = await FS.saveNuVizzWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()});
-        if (ok) nvWeeksSaved++;
-      }
-      // Save up to 2000 most recent stops for cross-reference (avoid bloating Firebase)
-      setStatus("Saving NuVizz stop cross-references...");
-      const recent = nuvizzStops
-        .filter(s => s.pro && s.delivery_date)
-        .sort((a,b) => (b.delivery_date||"").localeCompare(a.delivery_date||""))
-        .slice(0, 2000);
-      for (const s of recent) {
+      // STEP 1: Save individual stops first — keyed by PRO for natural dedupe
+      setStatus(`Saving ${nuvizzStops.length} NuVizz stops...`);
+      const toSave = nuvizzStops.filter(s => (s.pro || s.stop_number) && s.delivery_date);
+      for (const s of toSave) {
         const key = s.pro || s.stop_number;
         if (!key) continue;
         const ok = await FS.saveNuVizzStop(key, s);
         if (ok) nvStopsSaved++;
+      }
+
+      // STEP 2: Rebuild every week this batch touched from the full Firestore
+      // stop set, so overlapping uploads don't double-count (PRO-level dedup
+      // is handled by the stop doc being keyed by PRO).
+      const touchedWeeks = new Set(nuvizzStops.map(s => s.week_ending).filter(Boolean));
+      setStatus(`Rebuilding ${touchedWeeks.size} NuVizz weekly rollup(s)...`);
+      for (const weekEnding of touchedWeeks) {
+        try {
+          const snap = await window.db.collection("nuvizz_stops")
+            .where("week_ending", "==", weekEnding)
+            .limit(10000)
+            .get();
+          const weekStops = snap.docs.map(d => d.data());
+          if (weekStops.length === 0) continue;
+          const weeklyArr = buildNuVizzWeekly(weekStops);
+          if (weeklyArr.length > 0) {
+            const ok = await FS.saveNuVizzWeekly(weekEnding, { ...weeklyArr[0], updated_at: new Date().toISOString(), rebuilt_from_stops: true });
+            if (ok) nvWeeksSaved++;
+          }
+        } catch(e) {
+          console.error("NuVizz weekly rebuild failed for", weekEnding, e);
+        }
       }
     }
 
