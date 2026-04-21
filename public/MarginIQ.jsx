@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.28.0";
+const APP_VERSION = "2.29.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2311,8 +2311,15 @@ function detectFileType(filename, firstRow) {
       if (keySet.has("debit") || keySet.has("credit")) return "qbo_tb";
       return "qbo_pl";
     }
-    // Uline original/accessorial
-    if (keys.some(k => k === "pro" || k === "pro#") && keySet.has("new cost")) {
+    // Uline original/accessorial — accepts both modern ("new cost" present) and
+    // legacy ("cost" only, no "new cost" column) format variants. The parser in
+    // parseOriginalOrAccessorial already falls back to cost when new_cost is
+    // absent, so detection just needs to confirm this is Uline-shaped data.
+    // Required signature: pro/pro# + at least a few revenue-related columns.
+    if (keys.some(k => k === "pro" || k === "pro#") && (keySet.has("new cost") || keySet.has("cost"))) {
+      // Accessorials are identified either by an explicit "code" column value
+      // on the first data row, or by a filename-level hint (checked upstream
+      // in detectServiceType/filename routing). Absent both, treat as original.
       return firstRow.code ? "accessorials" : "original";
     }
   }
@@ -4311,6 +4318,40 @@ function UlineRevenue({ weeklyRollups }) {
   }
   const topCities = Object.values(cityAgg).sort((a,b) => b.revenue - a.revenue).slice(0,20);
 
+  // Sortable column hooks — one per table. Derived columns (avg/stop, pct of total)
+  // use custom accessors so the numbers sort correctly.
+  const weeklySort = useSortable(filtered, "week_ending", "desc", {
+    week_ending: (w) => w.week_ending || "",
+    stops: (w) => Number(w.stops || 0),
+    revenue: (w) => Number(w.revenue || 0),
+    base_revenue: (w) => Number(w.base_revenue || 0),
+    accessorial_revenue: (w) => Number(w.accessorial_revenue || 0),
+    avg_stop: (w) => w.stops > 0 ? (w.revenue || 0) / w.stops : 0,
+    weight: (w) => Number(w.weight || 0),
+  });
+  const monthlySort = useSortable(monthly, "month", "desc", {
+    month: (m) => m.month || "",
+    weeks: (m) => Number(m.weeks || 0),
+    stops: (m) => Number(m.stops || 0),
+    revenue: (m) => Number(m.revenue || 0),
+    accessorial_revenue: (m) => Number(m.accessorial_revenue || 0),
+    avg_stop: (m) => m.stops > 0 ? (m.revenue || 0) / m.stops : 0,
+    avg_week: (m) => m.weeks > 0 ? (m.revenue || 0) / m.weeks : 0,
+  });
+  const customersSort = useSortable(topCustomers, "revenue", "desc", {
+    customer: (c) => (c.customer || "").toLowerCase(),
+    stops: (c) => Number(c.stops || 0),
+    revenue: (c) => Number(c.revenue || 0),
+    avg_stop: (c) => c.stops > 0 ? (c.revenue || 0) / c.stops : 0,
+    pct: (c) => totalRevenue > 0 ? (c.revenue || 0) / totalRevenue : 0,
+  });
+  const citiesSort = useSortable(topCities, "revenue", "desc", {
+    city: (c) => (c.city || "").toLowerCase(),
+    stops: (c) => Number(c.stops || 0),
+    revenue: (c) => Number(c.revenue || 0),
+    avg_stop: (c) => c.stops > 0 ? (c.revenue || 0) / c.stops : 0,
+  });
+
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="💰" text="Uline Revenue" right={
       <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
@@ -4351,11 +4392,17 @@ function UlineRevenue({ weeklyRollups }) {
             <LineTrend data={filtered.slice(-26)} xKey="week_ending" yKey="revenue" label="Billed" color={T.brand} height={220} />
             <div style={{marginTop:16,overflowX:"auto",maxHeight:500}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr>{["Week Ending","Stops","Revenue","Base","Accessorials","Avg/Stop","Weight"].map(h=>
-                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite,zIndex:1}}>{h}</th>
-                )}</tr></thead>
+                <thead><tr>
+                  <SortableTh label="Week Ending" col="week_ending" sortKey={weeklySort.sortKey} sortDir={weeklySort.sortDir} onSort={weeklySort.toggleSort} />
+                  <SortableTh label="Stops" col="stops" sortKey={weeklySort.sortKey} sortDir={weeklySort.sortDir} onSort={weeklySort.toggleSort} />
+                  <SortableTh label="Revenue" col="revenue" sortKey={weeklySort.sortKey} sortDir={weeklySort.sortDir} onSort={weeklySort.toggleSort} />
+                  <SortableTh label="Base" col="base_revenue" sortKey={weeklySort.sortKey} sortDir={weeklySort.sortDir} onSort={weeklySort.toggleSort} />
+                  <SortableTh label="Accessorials" col="accessorial_revenue" sortKey={weeklySort.sortKey} sortDir={weeklySort.sortDir} onSort={weeklySort.toggleSort} />
+                  <SortableTh label="Avg/Stop" col="avg_stop" sortKey={weeklySort.sortKey} sortDir={weeklySort.sortDir} onSort={weeklySort.toggleSort} />
+                  <SortableTh label="Weight" col="weight" sortKey={weeklySort.sortKey} sortDir={weeklySort.sortDir} onSort={weeklySort.toggleSort} />
+                </tr></thead>
                 <tbody>
-                  {filtered.slice().reverse().map((w,i) => (
+                  {weeklySort.sorted.map((w,i) => (
                     <tr key={i}>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{weekLabel(w.week_ending)}</td>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(w.stops)}</td>
@@ -4378,11 +4425,17 @@ function UlineRevenue({ weeklyRollups }) {
             <LineTrend data={monthly} xKey="month" yKey="revenue" label="Billed" color={T.brand} height={220} />
             <div style={{marginTop:16,overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr>{["Month","Weeks","Stops","Revenue","Accessorials","Avg/Stop","Avg/Week"].map(h=>
-                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
-                )}</tr></thead>
+                <thead><tr>
+                  <SortableTh label="Month" col="month" sortKey={monthlySort.sortKey} sortDir={monthlySort.sortDir} onSort={monthlySort.toggleSort} />
+                  <SortableTh label="Weeks" col="weeks" sortKey={monthlySort.sortKey} sortDir={monthlySort.sortDir} onSort={monthlySort.toggleSort} />
+                  <SortableTh label="Stops" col="stops" sortKey={monthlySort.sortKey} sortDir={monthlySort.sortDir} onSort={monthlySort.toggleSort} />
+                  <SortableTh label="Revenue" col="revenue" sortKey={monthlySort.sortKey} sortDir={monthlySort.sortDir} onSort={monthlySort.toggleSort} />
+                  <SortableTh label="Accessorials" col="accessorial_revenue" sortKey={monthlySort.sortKey} sortDir={monthlySort.sortDir} onSort={monthlySort.toggleSort} />
+                  <SortableTh label="Avg/Stop" col="avg_stop" sortKey={monthlySort.sortKey} sortDir={monthlySort.sortDir} onSort={monthlySort.toggleSort} />
+                  <SortableTh label="Avg/Week" col="avg_week" sortKey={monthlySort.sortKey} sortDir={monthlySort.sortDir} onSort={monthlySort.toggleSort} />
+                </tr></thead>
                 <tbody>
-                  {monthly.slice().reverse().map((m,i) => (
+                  {monthlySort.sorted.map((m,i) => (
                     <tr key={i}>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{m.month}</td>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{m.weeks}</td>
@@ -4405,11 +4458,15 @@ function UlineRevenue({ weeklyRollups }) {
             <BarChart data={topCustomers} labelKey="customer" valueKey="revenue" color={T.green} maxBars={20} />
             <div style={{marginTop:16,overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr>{["Customer","Stops","Revenue","Avg/Stop","% of Total"].map(h=>
-                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
-                )}</tr></thead>
+                <thead><tr>
+                  <SortableTh label="Customer" col="customer" sortKey={customersSort.sortKey} sortDir={customersSort.sortDir} onSort={customersSort.toggleSort} />
+                  <SortableTh label="Stops" col="stops" sortKey={customersSort.sortKey} sortDir={customersSort.sortDir} onSort={customersSort.toggleSort} />
+                  <SortableTh label="Revenue" col="revenue" sortKey={customersSort.sortKey} sortDir={customersSort.sortDir} onSort={customersSort.toggleSort} />
+                  <SortableTh label="Avg/Stop" col="avg_stop" sortKey={customersSort.sortKey} sortDir={customersSort.sortDir} onSort={customersSort.toggleSort} />
+                  <SortableTh label="% of Total" col="pct" sortKey={customersSort.sortKey} sortDir={customersSort.sortDir} onSort={customersSort.toggleSort} />
+                </tr></thead>
                 <tbody>
-                  {topCustomers.map((c,i) => (
+                  {customersSort.sorted.map((c,i) => (
                     <tr key={i}>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(c.stops)}</td>
@@ -4430,11 +4487,14 @@ function UlineRevenue({ weeklyRollups }) {
             <BarChart data={topCities} labelKey="city" valueKey="revenue" color={T.blue} maxBars={20} />
             <div style={{marginTop:16,overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr>{["City","Stops","Revenue","Avg/Stop"].map(h=>
-                  <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
-                )}</tr></thead>
+                <thead><tr>
+                  <SortableTh label="City" col="city" sortKey={citiesSort.sortKey} sortDir={citiesSort.sortDir} onSort={citiesSort.toggleSort} />
+                  <SortableTh label="Stops" col="stops" sortKey={citiesSort.sortKey} sortDir={citiesSort.sortDir} onSort={citiesSort.toggleSort} />
+                  <SortableTh label="Revenue" col="revenue" sortKey={citiesSort.sortKey} sortDir={citiesSort.sortDir} onSort={citiesSort.toggleSort} />
+                  <SortableTh label="Avg/Stop" col="avg_stop" sortKey={citiesSort.sortKey} sortDir={citiesSort.sortDir} onSort={citiesSort.toggleSort} />
+                </tr></thead>
                 <tbody>
-                  {topCities.map((c,i) => (
+                  {citiesSort.sorted.map((c,i) => (
                     <tr key={i}>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.city}</td>
                       <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{fmtNum(c.stops)}</td>
@@ -5243,10 +5303,29 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   const [sourceConflicts, setSourceConflicts] = useState([]); // Uline vs Davis conflicts pending review
   const [resolvingWeek, setResolvingWeek] = useState(null); // week_ending currently being resolved
   const [dragOver, setDragOver] = useState(false); // drop-zone visual state
-  // Upload History sort state — default: When desc (most recent first, matches prior behavior)
-  const [historySortBy, setHistorySortBy] = useState("when");
-  const [historySortDir, setHistorySortDir] = useState("desc");
   const fileRef = useRef(null);
+
+  // Upload History sort — hook must live at component top level (not inside the
+  // conditional IIFE that renders the table). Covers column uses the filename-
+  // parsing helper defined there, duplicated here to keep the accessor local.
+  const historyAccessors = {
+    filename: (f) => (f.filename || "").toLowerCase(),
+    covers:   (f) => {
+      if (!f.filename) return null;
+      const m = f.filename.match(/(\d{8})\s*-\s*(\d{8})/);
+      if (!m) return null;
+      const s = m[1];
+      for (const y of ["2023","2024","2025","2026","2027"]) {
+        if (s.startsWith(y)) return `${y}-${s.slice(4,6)}-${s.slice(6,8)}`;
+      }
+      return `${s.slice(4,8)}-${s.slice(0,2)}-${s.slice(2,4)}`;
+    },
+    kind:     (f) => (f.kind || "").toLowerCase(),
+    group:    (f) => (f.group || "").toLowerCase(),
+    row_count:(f) => Number(f.row_count || 0),
+    uploaded_at: (f) => f.uploaded_at || null,
+  };
+  const historySort = useSortable(fileLog || [], "uploaded_at", "desc", historyAccessors);
 
   // Load source conflicts from Firestore — survive across page loads
   const loadSourceConflicts = async () => {
@@ -6092,47 +6171,11 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
         return { startISO: start.toISOString().slice(0,10), endISO: end.toISOString().slice(0,10), label };
       };
 
-      // Sort column → row accessor map. Each returns a comparable value; null/undefined sort to end.
-      const accessors = {
-        filename: (f) => (f.filename || "").toLowerCase(),
-        covers:   (f) => { const c = parseCoverage(f.filename); return c ? c.startISO : null; },
-        type:     (f) => (f.kind || "").toLowerCase(),
-        source:   (f) => (f.group || "").toLowerCase(),
-        rows:     (f) => Number(f.row_count || 0),
-        when:     (f) => f.uploaded_at || null,
-      };
-      // Toggle sort: same column clicked → flip direction; different column → default to asc
-      // (except for numeric/date columns where desc-first is more intuitive).
-      const toggleSort = (col) => {
-        if (historySortBy === col) {
-          setHistorySortDir(historySortDir === "asc" ? "desc" : "asc");
-        } else {
-          setHistorySortBy(col);
-          setHistorySortDir(col === "rows" || col === "when" || col === "covers" ? "desc" : "asc");
-        }
-      };
-      // Apply sort to a copy of fileLog. Nulls always sort to the bottom regardless of direction.
-      const sortedFileLog = [...fileLog].sort((a, b) => {
-        const va = accessors[historySortBy](a);
-        const vb = accessors[historySortBy](b);
-        const aNull = va === null || va === undefined || va === "";
-        const bNull = vb === null || vb === undefined || vb === "";
-        if (aNull && bNull) return 0;
-        if (aNull) return 1;
-        if (bNull) return -1;
-        let cmp;
-        if (typeof va === "number" && typeof vb === "number") cmp = va - vb;
-        else cmp = String(va).localeCompare(String(vb));
-        return historySortDir === "asc" ? cmp : -cmp;
-      });
-      const columns = [
-        { key: "filename", label: "Filename" },
-        { key: "covers",   label: "Covers" },
-        { key: "type",     label: "Type" },
-        { key: "source",   label: "Source" },
-        { key: "rows",     label: "Rows",  align: "right" },
-        { key: "when",     label: "When" },
-      ];
+      // Shared sort logic — historySort is computed at component top level
+      // (hooks can't run inside this conditional IIFE). parseCoverage here
+      // builds the display label; the sort accessor (defined at the top) does
+      // its own YYYYMMDD parse to avoid a closure capture.
+      const { sorted: sortedFileLog, sortKey, sortDir, toggleSort } = historySort;
 
       return (
       <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,padding:"16px 20px",marginTop:16,boxShadow:T.shadow}}>
@@ -6144,25 +6187,12 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
             <thead>
               <tr>
-                {columns.map(c => {
-                  const active = historySortBy === c.key;
-                  const arrow = active ? (historySortDir === "asc" ? " ▲" : " ▼") : "";
-                  return (
-                    <th key={c.key}
-                      onClick={() => toggleSort(c.key)}
-                      style={{
-                        textAlign: c.align || "left",
-                        padding:"8px 10px",
-                        borderBottom:`1px solid ${T.border}`,
-                        color: active ? T.brand : T.textMuted,
-                        fontSize:10, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.06em",
-                        position:"sticky", top:0, background: active ? T.brandPale : T.bgSurface,
-                        zIndex:1, cursor:"pointer", userSelect:"none", whiteSpace:"nowrap",
-                      }}
-                      title={`Sort by ${c.label}`}
-                    >{c.label}{arrow}</th>
-                  );
-                })}
+                <SortableTh label="Filename" col="filename" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Covers" col="covers" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Type" col="kind" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Source" col="group" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Rows" col="row_count" align="right" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="When" col="uploaded_at" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
               </tr>
             </thead>
             <tbody>
@@ -7421,6 +7451,16 @@ function UlineNuVizzRecon({ weeklyRollups }) {
   }, { uline_total: 0, nv_total: 0, weeks_match: 0, weeks_close: 0, weeks_diverge: 0, weeks_uline_missing: 0, weeks_nv_missing: 0 });
   const overallDelta = totals.uline_total - totals.nv_total;
 
+  // Sortable weekly reconciliation rows
+  const reconSort = useSortable(rows, "we", "desc", {
+    we: (r) => r.we || "",
+    ulineStops: (r) => r.u ? Number(r.ulineStops || 0) : -1,
+    nvStops: (r) => r.n ? Number(r.nvStops || 0) : -1,
+    nvTotal: (r) => r.n ? Number(r.nvTotal || 0) : -1,
+    delta: (r) => (r.u && r.n) ? r.delta : null,
+    status: (r) => r.status || "",
+  });
+
   const statusColor = (s) => ({
     match: T.green,
     close: T.yellow,
@@ -7465,11 +7505,17 @@ function UlineNuVizzRecon({ weeklyRollups }) {
       <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>Week-by-Week Comparison ({rows.length} weeks)</div>
       <div style={{overflowX:"auto"}}>
         <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-          <thead><tr>{["Week Ending","Uline Stops","NuVizz Effective","NuVizz Total","Delta","Status",""].map(h =>
-            <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
-          )}</tr></thead>
+          <thead><tr>
+            <SortableTh label="Week Ending" col="we" sortKey={reconSort.sortKey} sortDir={reconSort.sortDir} onSort={reconSort.toggleSort} />
+            <SortableTh label="Uline Stops" col="ulineStops" sortKey={reconSort.sortKey} sortDir={reconSort.sortDir} onSort={reconSort.toggleSort} />
+            <SortableTh label="NuVizz Effective" col="nvStops" sortKey={reconSort.sortKey} sortDir={reconSort.sortDir} onSort={reconSort.toggleSort} />
+            <SortableTh label="NuVizz Total" col="nvTotal" sortKey={reconSort.sortKey} sortDir={reconSort.sortDir} onSort={reconSort.toggleSort} />
+            <SortableTh label="Delta" col="delta" sortKey={reconSort.sortKey} sortDir={reconSort.sortDir} onSort={reconSort.toggleSort} />
+            <SortableTh label="Status" col="status" sortKey={reconSort.sortKey} sortDir={reconSort.sortDir} onSort={reconSort.toggleSort} />
+            <th style={{padding:"8px 10px",borderBottom:`1px solid ${T.border}`,background:T.bgSurface,position:"sticky",top:0,zIndex:1}}></th>
+          </tr></thead>
           <tbody>
-            {rows.map((r, i) => {
+            {reconSort.sorted.map((r, i) => {
               const isOpen = detailWeek === r.we;
               return (
                 <React.Fragment key={r.we}>
