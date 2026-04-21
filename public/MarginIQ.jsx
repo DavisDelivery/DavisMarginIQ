@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.23.0";
+const APP_VERSION = "2.24.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -6966,6 +6966,277 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
   </div>;
 }
 
+// ═══ ULINE ↔ NUVIZZ WEEKLY RECONCILIATION ═══════════════════
+// Cross-check Uline billed stops vs NuVizz delivered stops for each
+// Friday-ending week in 2025. Designed to surface:
+//   - Weeks where NuVizz shows deliveries but Uline didn't bill (lost revenue)
+//   - Weeks where Uline billed but NuVizz has no delivery record (driver log gap)
+//   - Gross count mismatches in either direction (suggests data quality issue)
+//
+// Starts with a weekly count comparison using only the *_weekly rollup docs
+// (fast, works with existing data). Stop-level PRO matching ("which specific
+// PROs are missing") can be added later if nuvizz_stops is fully populated.
+function UlineNuVizzRecon({ weeklyRollups }) {
+  const [nvWeekly, setNvWeekly] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [detailWeek, setDetailWeek] = useState(null); // expanded row
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) { setLoading(false); return; }
+      try {
+        const nv = await FS.getNuVizzWeekly();
+        setNvWeekly(nv);
+      } catch(e) { console.error("nvWeekly err:", e); }
+      setLoading(false);
+    })();
+  }, []);
+
+  // Fetch stop-level PRO lists for a specific week when user expands it
+  const loadDetail = async (weekEnding) => {
+    setDetailWeek(weekEnding);
+    setDetail(null);
+    setDetailLoading(true);
+    try {
+      if (!hasFirebase) return;
+      // Pull NuVizz stops for this week
+      const nvSnap = await window.db.collection("nuvizz_stops")
+        .where("week_ending", "==", weekEnding).limit(5000).get();
+      const nvStops = nvSnap.docs.map(d => d.data()).filter(s => s.pro);
+      const nvProSet = new Set(nvStops.map(s => String(s.pro)));
+
+      // Pull Uline audit_items + unpaid_stops for this week (they each store PRO)
+      // Note: Uline stop-level data isn't stored as a flat collection — we have
+      // audit_items (variance-flagged stops) and unpaid_stops. For full PRO list
+      // we'd need to re-parse, but these two cover most actionable cases.
+      const audSnap = await window.db.collection("audit_items")
+        .where("week_ending", "==", weekEnding).limit(5000).get();
+      const upSnap = await window.db.collection("unpaid_stops")
+        .where("week_ending", "==", weekEnding).limit(5000).get();
+      const ulineAudit = audSnap.docs.map(d => d.data());
+      const ulineUnpaid = upSnap.docs.map(d => d.data());
+      const ulineProSet = new Set([
+        ...ulineAudit.map(s => String(s.pro)),
+        ...ulineUnpaid.map(s => String(s.pro)),
+      ]);
+
+      // Compare
+      const onlyNv = [];
+      const onlyUline = [];
+      const matched = [];
+      for (const p of nvProSet) {
+        if (ulineProSet.has(p)) matched.push(p);
+        else onlyNv.push(p);
+      }
+      for (const p of ulineProSet) {
+        if (!nvProSet.has(p)) onlyUline.push(p);
+      }
+
+      setDetail({
+        nv_count: nvProSet.size,
+        uline_count: ulineProSet.size,
+        matched: matched.length,
+        only_nv: onlyNv.slice(0, 100),
+        only_uline: onlyUline.slice(0, 100),
+        only_nv_count: onlyNv.length,
+        only_uline_count: onlyUline.length,
+        note: ulineProSet.size < 500 ? "⚠️ Uline PRO coverage is limited — only audit_items and unpaid_stops are in Firestore. For full PRO-level matching, the app would need to store every Uline stop individually (not currently done)." : null,
+      });
+    } catch(e) {
+      console.error("loadDetail err:", e);
+      setDetail({ error: e.message });
+    }
+    setDetailLoading(false);
+  };
+
+  if (loading) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading reconciliation data…</div>;
+
+  // Build weekly comparison. Index both by week_ending, join, compute variance.
+  const ulineByWeek = {};
+  for (const w of weeklyRollups) ulineByWeek[w.week_ending] = w;
+  const nvByWeek = {};
+  for (const w of nvWeekly) nvByWeek[w.week_ending] = w;
+
+  // Union of both week sets, filtered to 2025+
+  const allWeeks = new Set([
+    ...Object.keys(ulineByWeek).filter(w => w >= "2025-01-01"),
+    ...Object.keys(nvByWeek).filter(w => w >= "2025-01-01"),
+  ]);
+  const rows = Array.from(allWeeks).sort().map(we => {
+    const u = ulineByWeek[we];
+    const n = nvByWeek[we];
+    // Uline delivery stops: prefer delivery_stops (newer rollups), fall back to
+    // stops (older rollups without service-type split).
+    const ulineStops = u ? (u.delivery_stops ?? u.stops ?? 0) : 0;
+    const ulineRev = u ? (u.delivery_revenue ?? u.revenue ?? 0) : 0;
+    // NuVizz: prefer effective stops (completed + manually completed) for
+    // a fair apples-to-apples comparison with Uline's billed stops.
+    const nvStops = n ? (n.stops_effective ?? n.stops_total ?? 0) : 0;
+    const nvTotal = n ? (n.stops_total ?? 0) : 0;
+    const delta = ulineStops - nvStops;
+    const absDelta = Math.abs(delta);
+    const pctDelta = nvStops > 0 ? (delta / nvStops * 100) : (ulineStops > 0 ? 100 : 0);
+    // Classify
+    let status, hint;
+    if (!u && !n) { status = "none"; hint = "No data either side"; }
+    else if (!u) { status = "uline_missing"; hint = "NuVizz ran but no Uline billing"; }
+    else if (!n) { status = "nv_missing"; hint = "Uline billed but no NuVizz record"; }
+    else if (absDelta <= 5) { status = "match"; hint = "✓ In agreement"; }
+    else if (absDelta <= 30) { status = "close"; hint = `${delta > 0 ? "+" : ""}${delta} diff`; }
+    else { status = "diverge"; hint = `${delta > 0 ? "Uline higher" : "NuVizz higher"} by ${absDelta}`; }
+    return { we, u, n, ulineStops, ulineRev, nvStops, nvTotal, delta, pctDelta, status, hint };
+  });
+
+  // Summary metrics
+  const totals = rows.reduce((acc, r) => {
+    acc.uline_total += r.ulineStops;
+    acc.nv_total += r.nvStops;
+    acc.weeks_match += r.status === "match" ? 1 : 0;
+    acc.weeks_close += r.status === "close" ? 1 : 0;
+    acc.weeks_diverge += r.status === "diverge" ? 1 : 0;
+    acc.weeks_uline_missing += r.status === "uline_missing" ? 1 : 0;
+    acc.weeks_nv_missing += r.status === "nv_missing" ? 1 : 0;
+    return acc;
+  }, { uline_total: 0, nv_total: 0, weeks_match: 0, weeks_close: 0, weeks_diverge: 0, weeks_uline_missing: 0, weeks_nv_missing: 0 });
+  const overallDelta = totals.uline_total - totals.nv_total;
+
+  const statusColor = (s) => ({
+    match: T.green,
+    close: T.yellow,
+    diverge: T.red,
+    uline_missing: T.red,
+    nv_missing: "#8b5cf6",
+    none: T.textDim,
+  })[s] || T.textDim;
+  const statusBg = (s) => ({
+    match: "#ecfdf5",
+    close: "#fef9c3",
+    diverge: "#fef2f2",
+    uline_missing: "#fef2f2",
+    nv_missing: "#f5f3ff",
+    none: T.bgSurface,
+  })[s] || T.bgSurface;
+
+  return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="🔄" text="Uline ↔ NuVizz Reconciliation" />
+
+    {/* Summary KPIs */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:16}}>
+      <KPI label="Uline stops" value={fmtNum(totals.uline_total)} sub={`${rows.filter(r=>r.u).length} weeks with data`} />
+      <KPI label="NuVizz stops" value={fmtNum(totals.nv_total)} sub={`${rows.filter(r=>r.n).length} weeks with data`} />
+      <KPI label="Net delta" value={(overallDelta >= 0 ? "+" : "") + fmtNum(overallDelta)}
+        subColor={Math.abs(overallDelta) < 200 ? T.green : Math.abs(overallDelta) < 1000 ? T.yellow : T.red}
+        sub={overallDelta > 0 ? "Uline has more" : overallDelta < 0 ? "NuVizz has more" : "Match"} />
+      <KPI label="Weeks in agreement" value={fmtNum(totals.weeks_match)} subColor={T.green} sub={`${rows.length} total weeks`} />
+      <KPI label="Weeks diverging" value={fmtNum(totals.weeks_diverge + totals.weeks_uline_missing + totals.weeks_nv_missing)} subColor={T.red} sub="Worth investigating" />
+    </div>
+
+    {/* Legend */}
+    <div style={{fontSize:10,color:T.textDim,marginBottom:8,display:"flex",gap:12,flexWrap:"wrap"}}>
+      <span><span style={{display:"inline-block",width:10,height:10,borderRadius:2,background:T.green,marginRight:4}}></span>Match (±5)</span>
+      <span><span style={{display:"inline-block",width:10,height:10,borderRadius:2,background:T.yellow,marginRight:4}}></span>Close (±6-30)</span>
+      <span><span style={{display:"inline-block",width:10,height:10,borderRadius:2,background:T.red,marginRight:4}}></span>Diverge (&gt;30)</span>
+      <span><span style={{display:"inline-block",width:10,height:10,borderRadius:2,background:"#8b5cf6",marginRight:4}}></span>NuVizz missing</span>
+    </div>
+
+    {/* Weekly table */}
+    <div style={cardStyle}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>Week-by-Week Comparison ({rows.length} weeks)</div>
+      <div style={{overflowX:"auto"}}>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+          <thead><tr>{["Week Ending","Uline Stops","NuVizz Effective","NuVizz Total","Delta","Status",""].map(h =>
+            <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
+          )}</tr></thead>
+          <tbody>
+            {rows.map((r, i) => {
+              const isOpen = detailWeek === r.we;
+              return (
+                <React.Fragment key={r.we}>
+                  <tr style={{background: isOpen ? T.yellowBg : "transparent"}}>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>WE {weekLabel(r.we)}</td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{r.u ? fmtNum(r.ulineStops) : <span style={{color:T.textDim,fontStyle:"italic"}}>—</span>}</td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{r.n ? fmtNum(r.nvStops) : <span style={{color:T.textDim,fontStyle:"italic"}}>—</span>}</td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted}}>{r.n ? fmtNum(r.nvTotal) : "—"}</td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:statusColor(r.status),fontWeight:600}}>
+                      {r.u && r.n ? `${r.delta > 0 ? "+" : ""}${fmtNum(r.delta)}` : "—"}
+                    </td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>
+                      <span style={{fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:4,background:statusBg(r.status),color:statusColor(r.status)}}>{r.hint}</span>
+                    </td>
+                    <td style={{padding:"4px 6px",borderBottom:`1px solid ${T.borderLight}`}}>
+                      <button type="button" onClick={() => isOpen ? setDetailWeek(null) : loadDetail(r.we)}
+                        style={{background:isOpen?T.yellow:T.brand,color:"#fff",border:"none",padding:"4px 10px",borderRadius:6,fontSize:10,fontWeight:700,cursor:"pointer"}}>
+                        {isOpen?"▼ Close":"🔬 Details"}
+                      </button>
+                    </td>
+                  </tr>
+                  {isOpen && (
+                    <tr>
+                      <td colSpan={7} style={{padding:"10px 12px",background:T.bgSurface,borderBottom:`1px solid ${T.borderLight}`}}>
+                        {detailLoading && <div style={{fontSize:12,color:T.textMuted}}>Loading PRO-level match…</div>}
+                        {detail?.error && <div style={{fontSize:12,color:T.redText}}>✗ {detail.error}</div>}
+                        {detail && !detail.error && !detailLoading && (
+                          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                            {detail.note && <div style={{fontSize:11,color:T.yellowText,background:T.yellowBg,padding:"6px 10px",borderRadius:6}}>{detail.note}</div>}
+                            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8}}>
+                              <div style={{padding:"8px 10px",background:"white",borderRadius:6,border:`1px solid ${T.borderLight}`}}>
+                                <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase"}}>Matched PROs</div>
+                                <div style={{fontSize:16,fontWeight:700,color:T.green}}>{fmtNum(detail.matched)}</div>
+                              </div>
+                              <div style={{padding:"8px 10px",background:"white",borderRadius:6,border:`1px solid ${T.red}40`}}>
+                                <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase"}}>NuVizz only</div>
+                                <div style={{fontSize:16,fontWeight:700,color:T.red}}>{fmtNum(detail.only_nv_count)}</div>
+                                <div style={{fontSize:9,color:T.textMuted}}>delivered but not billed?</div>
+                              </div>
+                              <div style={{padding:"8px 10px",background:"white",borderRadius:6,border:`1px solid #8b5cf640`}}>
+                                <div style={{fontSize:10,color:T.textDim,textTransform:"uppercase"}}>Uline only</div>
+                                <div style={{fontSize:16,fontWeight:700,color:"#8b5cf6"}}>{fmtNum(detail.only_uline_count)}</div>
+                                <div style={{fontSize:9,color:T.textMuted}}>billed but no driver record?</div>
+                              </div>
+                            </div>
+                            {detail.only_nv.length > 0 && (
+                              <details>
+                                <summary style={{fontSize:11,fontWeight:600,cursor:"pointer",color:T.redText}}>Sample NuVizz-only PROs ({detail.only_nv.length} shown)</summary>
+                                <div style={{fontSize:10,fontFamily:"monospace",color:T.textMuted,padding:"6px 0",lineHeight:1.6}}>
+                                  {detail.only_nv.join(", ")}
+                                </div>
+                              </details>
+                            )}
+                            {detail.only_uline.length > 0 && (
+                              <details>
+                                <summary style={{fontSize:11,fontWeight:600,cursor:"pointer",color:"#6d28d9"}}>Sample Uline-only PROs ({detail.only_uline.length} shown)</summary>
+                                <div style={{fontSize:10,fontFamily:"monospace",color:T.textMuted,padding:"6px 0",lineHeight:1.6}}>
+                                  {detail.only_uline.join(", ")}
+                                </div>
+                              </details>
+                            )}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    {/* Help panel */}
+    <div style={{...cardStyle, background:"#eff6ff", borderColor:"#3b82f640"}}>
+      <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:"#1e40af"}}>📖 How to read this</div>
+      <div style={{fontSize:11,color:T.text,lineHeight:1.6}}>
+        <p style={{margin:"0 0 8px"}}><strong>NuVizz effective stops</strong> = stops marked "Completed" or "Manually Completed" in NuVizz. That's the apples-to-apples comparison to Uline's billed stops.</p>
+        <p style={{margin:"0 0 8px"}}><strong>Red "Diverge"</strong> weeks are the real concern — you either billed for stops that weren't delivered (invoice problem) or delivered stops that didn't get billed (lost revenue).</p>
+        <p style={{margin:0}}><strong>PRO-level matching in Details</strong> uses stops stored in Firestore — which only includes audit_items and unpaid_stops, so count mismatches here are normal. For true 1:1 PRO matching, NuVizz ingestion needs to run with the full stop set saved.</p>
+      </div>
+    </div>
+  </div>;
+}
+
 // ═══ MAIN ═══════════════════════════════════════════════════
 function MarginIQ() {
   // Allow URL to pre-select a tab (used by OAuth callbacks etc: ?tab=gmail)
@@ -7044,6 +7315,7 @@ function MarginIQ() {
     { id:"command", icon:"🎯", label:"Command" },
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
+    { id:"nvrecon", icon:"🔄", label:"Uline↔NuVizz" },
     { id:"drivers", icon:"👥", label:"Drivers" },
     { id:"timeclock", icon:"⏰", label:"Time Clock" },
     { id:"fuel", icon:"⛽", label:"Fuel" },
@@ -7079,6 +7351,7 @@ function MarginIQ() {
     {!loading && tab==="command" && <CommandCenter margins={margins} weeklyRollups={weeklyRollups} completeness={completeness} qboConnected={qboConnected} reconMeta={reconMeta} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
     {!loading && tab==="recon" && <Audit reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
+    {!loading && tab==="nvrecon" && <UlineNuVizzRecon weeklyRollups={weeklyRollups} />}
     {!loading && tab==="drivers" && <Drivers />}
     {!loading && tab==="timeclock" && (typeof window !== "undefined" && window.TimeClockTab ? React.createElement(window.TimeClockTab) : <EmptyState icon="⏰" title="Time Clock module not loaded" sub="TimeClockTab.jsx did not load. Check console." />)}
     {!loading && tab==="fuel" && <Fuel />}
