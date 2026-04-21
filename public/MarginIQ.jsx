@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.31.0";
+const APP_VERSION = "2.32.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1125,6 +1125,22 @@ async function loadPdfJs() {
   window.pdfjsLib.GlobalWorkerOptions.workerSrc =
     "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   return window.pdfjsLib;
+}
+
+// Lazy-load jsPDF from CDN for client-side PDF generation. pdf.js above is
+// read-only; jsPDF handles drawing new PDFs (used by the Run Sheet tab). Only
+// loaded on first use to keep the initial page bundle light.
+async function loadJsPdf() {
+  if (window.jspdf && window.jspdf.jsPDF) return window.jspdf.jsPDF;
+  if (window.jsPDF) return window.jsPDF;
+  await new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return window.jspdf.jsPDF;
 }
 
 // Convert a PDF File or base64 string to an array of PNG dataURLs (one per page).
@@ -7680,6 +7696,408 @@ function UlineNuVizzRecon({ weeklyRollups }) {
   </div>;
 }
 
+// ═══ RUN SHEET GENERATOR ══════════════════════════════════
+// Takes a NuVizz stop export (xlsx) and generates a printable Davis Delivery
+// run sheet PDF for a specific driver. Ports the standalone Flask/reportlab
+// app (davis_runsheet.zip) to a native MarginIQ tab — client-side rendering
+// via jsPDF, no server round-trip.
+//
+// The NuVizz export has Ship To Name + Stop SealNbr per stop (plus Delivery
+// End date). Driver pay = 40% of summed SealNbr (the standard 1099 contractor
+// rate). The PDF layout mirrors the reportlab template: brand blue header,
+// driver share callout, stop table with alternating row shading, and a
+// totals block at the bottom.
+function RunSheet() {
+  const [driver, setDriver] = useState("");
+  const [shipper, setShipper] = useState("ULINE");
+  const [file, setFile] = useState(null);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState(null);
+  const [lastGenerated, setLastGenerated] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = useRef(null);
+
+  // Convenience: let user pick a driver they've seen in past NuVizz ingestion
+  // (reads from nuvizz_weekly rollups which keep a driver list per week).
+  // Populates the driver dropdown with unique names seen recently.
+  const [knownDrivers, setKnownDrivers] = useState([]);
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) return;
+      try {
+        const nvW = await FS.getNuVizzWeekly();
+        const names = new Set();
+        for (const w of nvW) {
+          if (w.drivers) {
+            for (const d of Object.keys(w.drivers)) names.add(d);
+          }
+        }
+        setKnownDrivers(Array.from(names).sort());
+      } catch(e) { /* non-fatal */ }
+    })();
+  }, []);
+
+  const handleFileChange = (f) => {
+    if (!f) return;
+    if (!/\.(xlsx?|csv)$/i.test(f.name)) {
+      setError(`Unsupported file type: ${f.name}. Upload an .xlsx / .xls / .csv.`);
+      return;
+    }
+    setFile(f);
+    setError(null);
+  };
+
+  const handleGenerate = async () => {
+    setError(null);
+    if (!driver.trim()) { setError("Driver name is required."); return; }
+    if (!file) { setError("Upload a NuVizz stop export first."); return; }
+    setGenerating(true);
+    try {
+      // Read + parse the NuVizz export. readWorkbook handles meta-hint row
+      // skipping automatically (same logic used for Uline files).
+      const rows = await readWorkbook(file);
+      if (!rows || rows.length === 0) {
+        throw new Error("File is empty or couldn't be parsed.");
+      }
+
+      // Filter to just this driver's stops. NuVizz column "driver name" is
+      // normalized upstream; match case-insensitively with whitespace tolerance.
+      const driverNorm = driver.trim().toLowerCase().replace(/\s+/g, " ");
+      const driverRows = rows.filter(r => {
+        const n = String(r["driver name"] || "").trim().toLowerCase().replace(/\s+/g, " ");
+        return n === driverNorm;
+      });
+      if (driverRows.length === 0) {
+        // If no exact match, fall back to contains — helps when the file has
+        // "FRANK OKINE" and user typed "Frank Okine" but also "Okine, Frank"
+        const loose = rows.filter(r => {
+          const n = String(r["driver name"] || "").toLowerCase();
+          return n.includes(driverNorm) || driverNorm.split(" ").every(p => p && n.includes(p));
+        });
+        if (loose.length === 0) {
+          const available = Array.from(new Set(rows.map(r => r["driver name"]).filter(Boolean))).slice(0, 10);
+          throw new Error(`No stops found for driver "${driver}". Drivers in file: ${available.join(", ") || "(none)"}`);
+        }
+        driverRows.push(...loose);
+      }
+
+      // Build the stop list — name + amount. Skip blank names.
+      const stops = [];
+      for (const r of driverRows) {
+        const name = String(r["ship to name"] || "").trim();
+        if (!name || name.toLowerCase() === "nan") continue;
+        const amt = parseMoney(r["stop sealnbr"]) || 0;
+        stops.push({ name, amt });
+      }
+      if (stops.length === 0) {
+        throw new Error(`Driver "${driver}" has no valid stops in this file.`);
+      }
+
+      // Pick a representative delivery-end date for the sheet header
+      let dateStr = "";
+      for (const r of driverRows) {
+        if (r["delivery end"]) {
+          const iso = parseDateMDYFlexible(r["delivery end"]);
+          if (iso) {
+            const [y,m,d] = iso.split("-");
+            dateStr = `${m}/${d}/${y.slice(2)}`;
+            break;
+          }
+        }
+      }
+      if (!dateStr) {
+        const today = new Date();
+        dateStr = `${String(today.getMonth()+1).padStart(2,"0")}/${String(today.getDate()).padStart(2,"0")}/${String(today.getFullYear()).slice(2)}`;
+      }
+
+      const total = stops.reduce((s, r) => s + r.amt, 0);
+      const share = total * 0.40;
+
+      // Generate the PDF — layout matches the Flask/reportlab template 1:1
+      // but rendered via jsPDF. Note: jsPDF's origin is top-left (Y increases
+      // downward), so coordinates are simpler than reportlab's bottom-left.
+      const jsPDFCtor = await loadJsPdf();
+      const doc = new jsPDFCtor({ unit: "pt", format: "letter" });
+      const W = 612, H = 792, L = 36, R = W - 36, T = 36;
+      const brandRgb = [30, 91, 146];
+      const textRgb = [20, 20, 20];
+
+      // Header band
+      doc.setFillColor(...brandRgb);
+      doc.rect(0, T, W, 50, "F");
+      doc.setTextColor(255, 255, 255);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(20);
+      doc.text("DAVIS", W/2, T + 26, { align: "center" });
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.text("DELIVERY SERVICE", W/2, T + 39, { align: "center" });
+
+      // Driver share callout (light gray panel on right)
+      doc.setFillColor(237, 237, 237);
+      doc.rect(R - 145, T, 145, 50, "F");
+      doc.setTextColor(...brandRgb);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.text("Driver Share: $", R - 140, T + 18);
+      doc.setTextColor(...textRgb);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(13);
+      doc.text(`${share.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`, R - 6, T + 42, { align: "right" });
+
+      // Info row: Name / Date
+      const infoY = T + 72;
+      doc.setTextColor(...textRgb);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.text("Name:", L, infoY);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text(driver, L + 40, infoY);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.text("Date:", W/2 - 20, infoY);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text(dateStr, W/2 + 10, infoY);
+      doc.setDrawColor(0, 0, 0);
+      doc.setLineWidth(0.5);
+      doc.line(L + 38, infoY + 3, L + 200, infoY + 3);
+      doc.line(W/2 + 8, infoY + 3, W/2 + 160, infoY + 3);
+
+      // Table header
+      const tableY = infoY + 24;
+      const colH = 16;
+      doc.setFillColor(220, 220, 220);
+      doc.rect(L, tableY, R - L, colH, "F");
+      doc.setDrawColor(150, 150, 150);
+      doc.setLineWidth(0.5);
+      doc.rect(L, tableY, R - L, colH);
+      const cx = { num:L+2, ship:L+24, cons:L+92, skids:L+288, del:L+328, det:L+368, amt:R-5 };
+      doc.setTextColor(...textRgb);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8);
+      doc.text("#", cx.num, tableY + 11);
+      doc.text("Shipper", cx.ship, tableY + 11);
+      doc.text("Consignee", cx.cons, tableY + 11);
+      doc.text("Skids/Weight", cx.skids, tableY + 11);
+      doc.text("Del/Pu", cx.del, tableY + 11);
+      doc.text("Detention/Inside Del", cx.det, tableY + 11);
+      doc.text("Amount", cx.amt, tableY + 11, { align: "right" });
+
+      // Table rows with alternating shading
+      const rowH = 20;
+      let rowY = tableY + colH;
+      stops.forEach((s, i) => {
+        if (i % 2 === 0) {
+          doc.setFillColor(247, 247, 247);
+          doc.rect(L, rowY, R - L, rowH, "F");
+        }
+        doc.setDrawColor(204, 204, 204);
+        doc.setLineWidth(0.3);
+        doc.line(L, rowY + rowH, R, rowY + rowH);
+        for (const x of [L+22, L+90, L+286, L+326, L+366, R-70]) {
+          doc.line(x, rowY, x, rowY + rowH);
+        }
+        doc.setTextColor(...textRgb);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9);
+        doc.text(String(i + 1), cx.num, rowY + 14);
+        doc.text(shipper || "", cx.ship, rowY + 14);
+        const name = s.name.length > 40 ? s.name.slice(0, 40) + "…" : s.name;
+        doc.text(name, cx.cons, rowY + 14);
+        doc.text(`$${s.amt.toFixed(2)}`, cx.amt, rowY + 14, { align: "right" });
+        rowY += rowH;
+      });
+
+      // Pad blank rows to always show 16 minimum (matches printed form height)
+      const minRows = 16;
+      const padRows = Math.max(0, minRows - stops.length);
+      for (let i = 0; i < padRows; i++) {
+        doc.setDrawColor(204, 204, 204);
+        doc.setLineWidth(0.3);
+        doc.line(L, rowY + rowH, R, rowY + rowH);
+        for (const x of [L+22, L+90, L+286, L+326, L+366, R-70]) {
+          doc.line(x, rowY, x, rowY + rowH);
+        }
+        rowY += rowH;
+      }
+
+      // Totals block
+      rowY += 8;
+      doc.setDrawColor(...brandRgb);
+      doc.setLineWidth(1.2);
+      doc.line(L, rowY, R, rowY);
+      rowY += 18;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      doc.setTextColor(...textRgb);
+      doc.text("TOTAL:", R - 80, rowY, { align: "right" });
+      doc.text(`$${total.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`, R - 5, rowY, { align: "right" });
+      rowY += 20;
+      doc.setTextColor(...brandRgb);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      doc.text("DRIVER SHARE (40%):", L + 4, rowY);
+      doc.setFontSize(13);
+      doc.text(`$${share.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`, R - 5, rowY, { align: "right" });
+
+      // Outer border around the main content area
+      const topBorder = T + 54;
+      doc.setDrawColor(...brandRgb);
+      doc.setLineWidth(1.5);
+      doc.rect(L - 4, topBorder, R - L + 8, (rowY + 10) - topBorder);
+
+      // Footer
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(153, 153, 153);
+      doc.text("Davis Delivery Service Inc.  |  davisdelivery.com", W/2, H - 20, { align: "center" });
+
+      const safeName = driver.replace(/\s+/g, "_") || "driver";
+      const safeDate = dateStr.replace(/\//g, "-");
+      const filename = `RunSheet_${safeName}_${safeDate}.pdf`;
+      doc.save(filename);
+      setLastGenerated({ filename, stops: stops.length, total, share, driver, dateStr });
+    } catch(e) {
+      console.error("RunSheet generate failed:", e);
+      setError(e.message || String(e));
+    }
+    setGenerating(false);
+  };
+
+  return <div style={{padding:"16px",maxWidth:700,margin:"0 auto"}} className="fade-in">
+    <SectionTitle icon="📋" text="Run Sheet Generator" />
+
+    <div style={{fontSize:12,color:T.textMuted,marginBottom:16,lineHeight:1.5}}>
+      Upload a NuVizz stop export and a printable driver run sheet PDF will be generated. Driver share auto-calculates at 40% of total SealNbr — the standard 1099 contractor rate.
+    </div>
+
+    <div style={cardStyle}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+        <div>
+          <label style={{fontSize:10,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,display:"block",marginBottom:5}}>Driver Name</label>
+          {knownDrivers.length > 0 ? (
+            <div style={{display:"flex",gap:4}}>
+              <input
+                type="text"
+                value={driver}
+                onChange={e => setDriver(e.target.value)}
+                placeholder="e.g. Frank Okine"
+                list="known-drivers"
+                style={{...inputStyle, flex:1}}
+              />
+              <datalist id="known-drivers">
+                {knownDrivers.map(d => <option key={d} value={d} />)}
+              </datalist>
+            </div>
+          ) : (
+            <input
+              type="text"
+              value={driver}
+              onChange={e => setDriver(e.target.value)}
+              placeholder="e.g. Frank Okine"
+              style={inputStyle}
+            />
+          )}
+          {knownDrivers.length > 0 && (
+            <div style={{fontSize:10,color:T.textDim,marginTop:3}}>{knownDrivers.length} driver(s) from past NuVizz data auto-suggest as you type</div>
+          )}
+        </div>
+        <div>
+          <label style={{fontSize:10,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,display:"block",marginBottom:5}}>Shipper</label>
+          <input
+            type="text"
+            value={shipper}
+            onChange={e => setShipper(e.target.value)}
+            style={inputStyle}
+          />
+        </div>
+      </div>
+
+      <label style={{fontSize:10,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,display:"block",marginBottom:5}}>Stop Export File (XLS / XLSX / CSV)</label>
+      <div
+        onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true); }}
+        onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true); }}
+        onDragLeave={(e) => {
+          e.preventDefault(); e.stopPropagation();
+          if (e.currentTarget.contains(e.relatedTarget)) return;
+          setDragOver(false);
+        }}
+        onDrop={(e) => {
+          e.preventDefault(); e.stopPropagation();
+          setDragOver(false);
+          const f = e.dataTransfer.files?.[0];
+          if (f) handleFileChange(f);
+        }}
+        onClick={() => !generating && fileRef.current?.click()}
+        style={{
+          border: `2px dashed ${dragOver ? T.brand : T.border}`,
+          borderRadius: 10,
+          padding: "26px 20px",
+          textAlign: "center",
+          cursor: generating ? "wait" : "pointer",
+          background: dragOver ? "#dbeafe" : T.bgSurface,
+          transition: "background 0.15s, border-color 0.15s",
+        }}
+      >
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".xlsx,.xls,.csv"
+          onChange={e => handleFileChange(e.target.files?.[0])}
+          style={{display:"none"}}
+        />
+        <div style={{fontSize:28,marginBottom:6}}>{dragOver ? "⬇️" : "📂"}</div>
+        <div style={{fontSize:14,color:T.text,marginBottom:3}}>
+          {file ? file.name : (dragOver ? "Drop to upload" : "Click to browse or drag & drop")}
+        </div>
+        <div style={{fontSize:11,color:T.textDim}}>NuVizz .xls / .xlsx stop export</div>
+      </div>
+
+      <button
+        onClick={handleGenerate}
+        disabled={generating || !driver.trim() || !file}
+        style={{
+          width: "100%",
+          marginTop: 16,
+          padding: "12px",
+          borderRadius: 10,
+          border: "none",
+          background: (generating || !driver.trim() || !file) ? "#94a3b8" : `linear-gradient(135deg,${T.brand},${T.brandLight})`,
+          color: "#fff",
+          fontSize: 14,
+          fontWeight: 700,
+          cursor: (generating || !driver.trim() || !file) ? "not-allowed" : "pointer",
+        }}
+      >
+        {generating ? "Generating…" : "Generate & Download PDF"}
+      </button>
+
+      {error && (
+        <div style={{marginTop:12,padding:"10px 14px",background:T.redBg,borderRadius:8,border:`1px solid ${T.red}40`,fontSize:12,color:T.redText}}>
+          ✗ {error}
+        </div>
+      )}
+
+      {lastGenerated && !error && (
+        <div style={{marginTop:12,padding:"10px 14px",background:T.greenBg,borderRadius:8,border:`1px solid ${T.green}40`,fontSize:12,color:T.greenText}}>
+          ✓ Generated <strong>{lastGenerated.filename}</strong> — {lastGenerated.stops} stops, ${lastGenerated.total.toFixed(2)} total, ${lastGenerated.share.toFixed(2)} driver share
+        </div>
+      )}
+    </div>
+
+    <div style={{...cardStyle, background:"#eff6ff", borderColor:"#3b82f640", marginTop:12}}>
+      <div style={{fontSize:12,fontWeight:700,marginBottom:6,color:"#1e40af"}}>📖 How it works</div>
+      <div style={{fontSize:11,color:T.text,lineHeight:1.6}}>
+        <p style={{margin:"0 0 6px"}}>The NuVizz export is expected to contain one row per stop with columns <code>Ship To Name</code>, <code>Stop SealNbr</code>, <code>Driver Name</code>, and <code>Delivery End</code>. Stops with a blank Ship To are skipped.</p>
+        <p style={{margin:"0 0 6px"}}>Driver share is computed as <strong>40% of the summed Stop SealNbr</strong>. This matches the business rule for 1099 contractors (W2 drivers are paid hourly and should not use this sheet).</p>
+        <p style={{margin:0}}>If you've already ingested NuVizz data in MarginIQ, the driver name field will auto-suggest from the drivers the system has seen.</p>
+      </div>
+    </div>
+  </div>;
+}
+
 // ═══ MAIN ═══════════════════════════════════════════════════
 function MarginIQ() {
   // Allow URL to pre-select a tab (used by OAuth callbacks etc: ?tab=gmail)
@@ -7759,6 +8177,7 @@ function MarginIQ() {
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
     { id:"nvrecon", icon:"🔄", label:"Uline↔NuVizz" },
+    { id:"runsheet", icon:"📋", label:"Run Sheet" },
     { id:"drivers", icon:"👥", label:"Drivers" },
     { id:"timeclock", icon:"⏰", label:"Time Clock" },
     { id:"fuel", icon:"⛽", label:"Fuel" },
@@ -7795,6 +8214,7 @@ function MarginIQ() {
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
     {!loading && tab==="recon" && <Audit reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
     {!loading && tab==="nvrecon" && <UlineNuVizzRecon weeklyRollups={weeklyRollups} />}
+    {!loading && tab==="runsheet" && <RunSheet />}
     {!loading && tab==="drivers" && <Drivers />}
     {!loading && tab==="timeclock" && (typeof window !== "undefined" && window.TimeClockTab ? React.createElement(window.TimeClockTab) : <EmptyState icon="⏰" title="Time Clock module not loaded" sub="TimeClockTab.jsx did not load. Check console." />)}
     {!loading && tab==="fuel" && <Fuel />}
