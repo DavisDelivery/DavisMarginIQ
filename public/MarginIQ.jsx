@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.39.2";
+const APP_VERSION = "2.39.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -8100,11 +8100,13 @@ function UlineNuVizzRecon({ weeklyRollups }) {
     setDetailLoading(false);
   };
 
-  if (loading) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading reconciliation data…</div>;
-
-  // Build weekly comparison. Index both by week_ending, join, compute variance.
+  // Build weekly comparison BEFORE the early return so `useSortable` (a hook)
+  // is called on every render — required by the Rules of Hooks. When loading
+  // is true, nvWeekly is [] and weeklyRollups may also be [], producing an
+  // empty rows array — but useSortable still runs, keeping hook order stable
+  // across the loading→loaded transition.
   const ulineByWeek = {};
-  for (const w of weeklyRollups) ulineByWeek[w.week_ending] = w;
+  for (const w of (weeklyRollups || [])) ulineByWeek[w.week_ending] = w;
   const nvByWeek = {};
   for (const w of nvWeekly) nvByWeek[w.week_ending] = w;
 
@@ -8116,18 +8118,13 @@ function UlineNuVizzRecon({ weeklyRollups }) {
   const rows = Array.from(allWeeks).sort().map(we => {
     const u = ulineByWeek[we];
     const n = nvByWeek[we];
-    // Uline delivery stops: prefer delivery_stops (newer rollups), fall back to
-    // stops (older rollups without service-type split).
     const ulineStops = u ? (u.delivery_stops ?? u.stops ?? 0) : 0;
     const ulineRev = u ? (u.delivery_revenue ?? u.revenue ?? 0) : 0;
-    // NuVizz: prefer effective stops (completed + manually completed) for
-    // a fair apples-to-apples comparison with Uline's billed stops.
     const nvStops = n ? (n.stops_effective ?? n.stops_total ?? 0) : 0;
     const nvTotal = n ? (n.stops_total ?? 0) : 0;
     const delta = ulineStops - nvStops;
     const absDelta = Math.abs(delta);
     const pctDelta = nvStops > 0 ? (delta / nvStops * 100) : (ulineStops > 0 ? 100 : 0);
-    // Classify
     let status, hint;
     if (!u && !n) { status = "none"; hint = "No data either side"; }
     else if (!u) { status = "uline_missing"; hint = "NuVizz ran but no Uline billing"; }
@@ -8137,6 +8134,18 @@ function UlineNuVizzRecon({ weeklyRollups }) {
     else { status = "diverge"; hint = `${delta > 0 ? "Uline higher" : "NuVizz higher"} by ${absDelta}`; }
     return { we, u, n, ulineStops, ulineRev, nvStops, nvTotal, delta, pctDelta, status, hint };
   });
+
+  // Sortable weekly reconciliation rows — MUST be called before any early return
+  const reconSort = useSortable(rows, "we", "desc", {
+    we: (r) => r.we || "",
+    ulineStops: (r) => r.u ? Number(r.ulineStops || 0) : -1,
+    nvStops: (r) => r.n ? Number(r.nvStops || 0) : -1,
+    nvTotal: (r) => r.n ? Number(r.nvTotal || 0) : -1,
+    delta: (r) => (r.u && r.n) ? r.delta : null,
+    status: (r) => r.status || "",
+  });
+
+  if (loading) return <div style={{padding:40,textAlign:"center",color:T.textMuted}}>Loading reconciliation data…</div>;
 
   // Summary metrics
   const totals = rows.reduce((acc, r) => {
@@ -8150,16 +8159,6 @@ function UlineNuVizzRecon({ weeklyRollups }) {
     return acc;
   }, { uline_total: 0, nv_total: 0, weeks_match: 0, weeks_close: 0, weeks_diverge: 0, weeks_uline_missing: 0, weeks_nv_missing: 0 });
   const overallDelta = totals.uline_total - totals.nv_total;
-
-  // Sortable weekly reconciliation rows
-  const reconSort = useSortable(rows, "we", "desc", {
-    we: (r) => r.we || "",
-    ulineStops: (r) => r.u ? Number(r.ulineStops || 0) : -1,
-    nvStops: (r) => r.n ? Number(r.nvStops || 0) : -1,
-    nvTotal: (r) => r.n ? Number(r.nvTotal || 0) : -1,
-    delta: (r) => (r.u && r.n) ? r.delta : null,
-    status: (r) => r.status || "",
-  });
 
   const statusColor = (s) => ({
     match: T.green,
