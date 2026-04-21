@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.26.0";
+const APP_VERSION = "2.27.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -5942,7 +5942,44 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       </div>
     )}
 
-    {fileLog && fileLog.length > 0 && (
+    {fileLog && fileLog.length > 0 && (() => {
+      // Parse the date range out of a filename. Handles Uline's YYYYMMDD-YYYYMMDD
+      // and MMDDYYYY-MMDDYYYY variants, with or without spaces around the dash,
+      // and an 'accessiorial' typo. Returns {startISO, endISO, label} or null.
+      const parseCoverage = (filename) => {
+        if (!filename) return null;
+        const m = filename.match(/(\d{8})\s*-\s*(\d{8})/);
+        if (!m) return null;
+        const parse8 = (s) => {
+          // Try YYYYMMDD
+          for (const y of ["2023","2024","2025","2026","2027"]) {
+            if (s.startsWith(y)) {
+              const mo = parseInt(s.slice(4,6),10), d = parseInt(s.slice(6,8),10);
+              if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return new Date(parseInt(y,10), mo-1, d);
+            }
+          }
+          // Try MMDDYYYY
+          const mo = parseInt(s.slice(0,2),10), d = parseInt(s.slice(2,4),10), y = parseInt(s.slice(4,8),10);
+          if (y >= 2023 && y <= 2027 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return new Date(y, mo-1, d);
+          return null;
+        };
+        const start = parse8(m[1]);
+        let end = parse8(m[2]);
+        if (!start || !end) return null;
+        // Year-off-by-one fix: if end < start, infer same-year or next-year wrap
+        if (end < start) {
+          const fixed = new Date(end); fixed.setFullYear(start.getFullYear());
+          end = fixed >= start ? fixed : new Date(start.getFullYear()+1, end.getMonth(), end.getDate());
+        }
+        const fmt = (d) => d.toLocaleDateString("en-US", { month:"short", day:"numeric" });
+        const yrs = start.getFullYear() === end.getFullYear();
+        const label = yrs
+          ? `${fmt(start)} – ${fmt(end)}, ${end.getFullYear()}`
+          : `${fmt(start)} ${start.getFullYear()} – ${fmt(end)} ${end.getFullYear()}`;
+        return { startISO: start.toISOString().slice(0,10), endISO: end.toISOString().slice(0,10), label };
+      };
+
+      return (
       <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,padding:"16px 20px",marginTop:16,boxShadow:T.shadow}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
           <div style={{fontSize:13,fontWeight:700,color:T.text}}>📋 Upload History</div>
@@ -5952,26 +5989,30 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
             <thead>
               <tr>
-                {["Filename","Type","Source","Rows","When"].map(h =>
+                {["Filename","Covers","Type","Source","Rows","When"].map(h =>
                   <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textMuted,fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",position:"sticky",top:0,background:T.bgSurface,zIndex:1}}>{h}</th>
                 )}
               </tr>
             </thead>
             <tbody>
-              {fileLog.slice(0,100).map((f,i) => (
+              {fileLog.slice(0,100).map((f,i) => {
+                const cov = parseCoverage(f.filename);
+                return (
                 <tr key={i} style={{transition:"background 0.15s"}} onMouseEnter={e => e.currentTarget.style.background=T.bgSurface} onMouseLeave={e => e.currentTarget.style.background="transparent"}>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontSize:11,color:T.text,maxWidth:340,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={f.filename}>{f.filename}</td>
+                  <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11,color:cov ? T.text : T.textDim,whiteSpace:"nowrap",fontWeight: cov ? 600 : 400}} title={cov ? `${cov.startISO} → ${cov.endISO}` : "Could not parse date range from filename"}>{cov ? cov.label : "—"}</td>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{f.kind ? <Badge text={f.kind} color={T.brand} bg={T.brandPale} /> : <span style={{color:T.textDim,fontSize:11}}>—</span>}</td>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11,color:T.textMuted}}>{f.group || "—"}</td>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:12,fontWeight:600,color:T.text,textAlign:"right"}}>{fmtNum(f.row_count || 0)}</td>
                   <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontSize:11,color:T.textMuted,whiteSpace:"nowrap"}}>{f.uploaded_at ? new Date(f.uploaded_at).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit"}) : "—"}</td>
                 </tr>
-              ))}
+              );})}
             </tbody>
           </table>
         </div>
       </div>
-    )}
+      );
+    })()}
   </div>;
 }
 
