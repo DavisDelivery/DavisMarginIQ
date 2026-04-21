@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.38.0";
+const APP_VERSION = "2.39.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7679,6 +7679,82 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
   const [purging, setPurging] = useState(false);
   const [purgeResult, setPurgeResult] = useState(null);
 
+  // Backups state
+  const [backups, setBackups] = useState([]);
+  const [backupsLoading, setBackupsLoading] = useState(true);
+  const [backupAction, setBackupAction] = useState(null); // "run" | "restore" | null
+  const [backupMsg, setBackupMsg] = useState(null);
+  const [restoreDate, setRestoreDate] = useState(null);
+  const [restoreConfirm, setRestoreConfirm] = useState("");
+  const [adminToken, setAdminToken] = useState("");
+
+  const loadBackups = async () => {
+    setBackupsLoading(true);
+    try {
+      const resp = await fetch("/.netlify/functions/marginiq-backup?action=list");
+      const data = await resp.json();
+      if (data.ok) setBackups(data.backups || []);
+    } catch(e) { /* non-fatal */ }
+    setBackupsLoading(false);
+  };
+  useEffect(() => { loadBackups(); }, []);
+
+  const runBackupNow = async () => {
+    if (!adminToken.trim()) { setBackupMsg({ error: "Admin token required" }); return; }
+    setBackupAction("run");
+    setBackupMsg(null);
+    try {
+      const resp = await fetch(`/.netlify/functions/marginiq-backup?token=${encodeURIComponent(adminToken.trim())}`);
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+      setBackupMsg({ ok: true, text: `✓ Backup created: ${data.manifest.total_docs} docs across ${data.manifest.collections_captured} collections (${Math.round(data.manifest.compressed_bytes/1024)} KB compressed)` });
+      await loadBackups();
+    } catch(e) {
+      setBackupMsg({ error: e.message });
+    }
+    setBackupAction(null);
+  };
+
+  const downloadBackup = async (date) => {
+    try {
+      const resp = await fetch(`/.netlify/functions/marginiq-backup?action=download&date=${date}&token=${encodeURIComponent(adminToken.trim())}`);
+      const data = await resp.json();
+      if (!data.ok) throw new Error(data.error || "Download failed");
+      window.open(data.url, "_blank");
+    } catch(e) {
+      setBackupMsg({ error: `Download failed: ${e.message}` });
+    }
+  };
+
+  const confirmRestore = async () => {
+    if (restoreConfirm !== `RESTORE ${restoreDate}`) {
+      setBackupMsg({ error: `Confirmation text must be exactly: RESTORE ${restoreDate}` });
+      return;
+    }
+    if (!adminToken.trim()) { setBackupMsg({ error: "Admin token required" }); return; }
+    setBackupAction("restore");
+    setBackupMsg(null);
+    try {
+      const resp = await fetch(`/.netlify/functions/marginiq-backup?action=restore&token=${encodeURIComponent(adminToken.trim())}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: restoreDate }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+      const collCount = Object.keys(data.results).length;
+      const totalRestored = Object.values(data.results).reduce((s, r) => s + r.restored, 0);
+      const totalDeleted = Object.values(data.results).reduce((s, r) => s + r.deleted, 0);
+      setBackupMsg({ ok: true, text: `✓ Restored snapshot from ${restoreDate}: ${totalRestored} docs written, ${totalDeleted} extraneous docs removed across ${collCount} collections` });
+      setRestoreDate(null);
+      setRestoreConfirm("");
+      if (onRefresh) await onRefresh();
+    } catch(e) {
+      setBackupMsg({ error: e.message });
+    }
+    setBackupAction(null);
+  };
+
   const handlePurge = async () => {
     if (purgeConfirmText !== "PURGE ULINE") {
       setPurgeResult({ error: "Confirmation text must be exactly: PURGE ULINE" });
@@ -7726,6 +7802,154 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
       <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>System Info</div>
       {[["Firebase","davismarginiq"],["Netlify","davis-marginiq.netlify.app"],["Version",APP_VERSION],["Weekly Rollups",weeklyRollups.length],["DDIS Files Loaded",reconMeta?reconMeta.files_count:0],["Last Upload",reconMeta?.last_upload?new Date(reconMeta.last_upload).toLocaleString():"Never"]].map(([l,v])=>
         <DataRow key={l} label={l} value={String(v)} />
+      )}
+    </div>
+
+    {/* DAILY BACKUPS */}
+    <div style={cardStyle}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+        <div style={{fontSize:13,fontWeight:700}}>💾 Daily Backups</div>
+        <div style={{fontSize:10,color:T.textMuted}}>Auto-runs 3AM EST · kept 30 days + monthly archives</div>
+      </div>
+      <div style={{fontSize:11,color:T.textMuted,marginBottom:12,lineHeight:1.5}}>
+        Every night at 3AM EST, MarginIQ snapshots every Firestore collection to Firebase Storage under <code>backups/YYYY-MM-DD/</code>. If an ingest goes sideways or data looks wrong, you can restore to any recent daily snapshot. Older snapshots (beyond 30 days) are pruned down to one per month for long-term history.
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"flex-end"}}>
+        <div style={{flex:"1 1 200px"}}>
+          <label style={{fontSize:10,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,display:"block",marginBottom:4}}>Admin token</label>
+          <input
+            type="password"
+            value={adminToken}
+            onChange={e => setAdminToken(e.target.value)}
+            placeholder="MARGINIQ_ADMIN_TOKEN"
+            style={inputStyle}
+          />
+        </div>
+        <button
+          onClick={runBackupNow}
+          disabled={backupAction === "run" || !adminToken.trim()}
+          style={{
+            padding:"9px 16px",borderRadius:8,border:"none",
+            background: (backupAction === "run" || !adminToken.trim()) ? T.bgSurface : T.brand,
+            color: (backupAction === "run" || !adminToken.trim()) ? T.textMuted : "#fff",
+            fontSize:12,fontWeight:700,
+            cursor: (backupAction === "run" || !adminToken.trim()) ? "wait" : "pointer",
+          }}
+        >
+          {backupAction === "run" ? "Backing up…" : "💾 Backup Now"}
+        </button>
+      </div>
+
+      {backupMsg?.ok && (
+        <div style={{padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText,marginBottom:10}}>
+          {backupMsg.text}
+        </div>
+      )}
+      {backupMsg?.error && (
+        <div style={{padding:"8px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText,marginBottom:10}}>
+          ✗ {backupMsg.error}
+        </div>
+      )}
+
+      <div style={{fontSize:11,fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}}>
+        Available Snapshots
+      </div>
+      {backupsLoading ? (
+        <div style={{fontSize:12,color:T.textMuted,padding:"8px 0"}}>Loading…</div>
+      ) : backups.length === 0 ? (
+        <div style={{padding:"12px",background:T.bgSurface,borderRadius:6,fontSize:12,color:T.textMuted,textAlign:"center"}}>
+          No backups yet. Click "Backup Now" to create the first snapshot, or wait until 3AM EST for the automatic run.
+        </div>
+      ) : (
+        <div style={{maxHeight:300,overflowY:"auto",border:`1px solid ${T.borderLight}`,borderRadius:8}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+            <thead>
+              <tr style={{background:T.bgSurface}}>
+                <th style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textMuted,fontSize:10,fontWeight:700,textTransform:"uppercase"}}>Date</th>
+                <th style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textMuted,fontSize:10,fontWeight:700,textTransform:"uppercase"}}>Taken</th>
+                <th style={{textAlign:"right",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textMuted,fontSize:10,fontWeight:700,textTransform:"uppercase"}}>Docs</th>
+                <th style={{textAlign:"right",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textMuted,fontSize:10,fontWeight:700,textTransform:"uppercase"}}>Size</th>
+                <th style={{padding:"8px 10px",borderBottom:`1px solid ${T.border}`}}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {backups.map(b => {
+                const isToday = b.date === new Date().toISOString().slice(0,10);
+                return (
+                  <tr key={b.date}>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontFamily:"monospace",fontWeight:600,color:isToday?T.brand:T.text}}>
+                      {b.date}{isToday && <span style={{marginLeft:6,fontSize:9,color:T.brand,fontWeight:700}}>TODAY</span>}
+                    </td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,color:T.textMuted}}>
+                      {b.taken_at ? new Date(b.taken_at).toLocaleString("en-US",{hour:"numeric",minute:"2-digit",month:"short",day:"numeric"}) : "—"}
+                    </td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,textAlign:"right",fontWeight:600}}>
+                      {fmtNum(b.total_docs || 0)}
+                    </td>
+                    <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,textAlign:"right",color:T.textMuted,fontSize:10}}>
+                      {b.compressed_bytes ? `${Math.round(b.compressed_bytes/1024)} KB` : "—"}
+                    </td>
+                    <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,display:"flex",gap:6,justifyContent:"flex-end"}}>
+                      <button
+                        onClick={() => downloadBackup(b.date)}
+                        style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${T.border}`,background:"transparent",color:T.text,cursor:"pointer"}}
+                      >⬇ Download</button>
+                      <button
+                        onClick={() => { setRestoreDate(b.date); setRestoreConfirm(""); setBackupMsg(null); }}
+                        style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${T.yellow}`,background:"#fef9c3",color:"#78350f",cursor:"pointer"}}
+                      >↻ Restore</button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {restoreDate && (
+        <div style={{marginTop:12,padding:"12px 14px",background:"#fef9c3",border:`2px solid ${T.yellow}`,borderRadius:8}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#78350f",marginBottom:8}}>
+            ⚠ Restore Snapshot from {restoreDate}?
+          </div>
+          <div style={{fontSize:11,color:T.text,lineHeight:1.5,marginBottom:12}}>
+            This will <strong>overwrite every Firestore collection</strong> with the state from {restoreDate}. Any docs added or changed since that backup will be reverted. Docs that didn't exist in the backup will be <strong>deleted</strong>. This is a full system rollback — use only if you're sure you want to undo everything since the backup date.
+          </div>
+          <div style={{marginBottom:10}}>
+            <label style={{fontSize:10,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,display:"block",marginBottom:4}}>
+              Type <code style={{background:"#fde68a",padding:"1px 5px",borderRadius:3}}>RESTORE {restoreDate}</code> to confirm
+            </label>
+            <input
+              type="text"
+              value={restoreConfirm}
+              onChange={e => setRestoreConfirm(e.target.value)}
+              placeholder={`RESTORE ${restoreDate}`}
+              style={inputStyle}
+            />
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <button
+              onClick={confirmRestore}
+              disabled={backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`}
+              style={{
+                padding:"9px 16px",borderRadius:8,border:"none",
+                background: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`) ? T.bgSurface : T.red,
+                color: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`) ? T.textMuted : "#fff",
+                fontSize:12,fontWeight:700,
+                cursor: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`) ? "not-allowed" : "pointer",
+              }}
+            >
+              {backupAction === "restore" ? "Restoring…" : `↻ Yes, Restore from ${restoreDate}`}
+            </button>
+            <button
+              onClick={() => { setRestoreDate(null); setRestoreConfirm(""); }}
+              style={{padding:"9px 16px",borderRadius:8,border:`1px solid ${T.border}`,background:"transparent",color:T.text,fontSize:12,fontWeight:600,cursor:"pointer"}}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
     </div>
 
