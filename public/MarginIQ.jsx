@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.39.3";
+const APP_VERSION = "2.39.4";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7714,17 +7714,6 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
     setBackupAction(null);
   };
 
-  const downloadBackup = async (date) => {
-    try {
-      const resp = await fetch(`/.netlify/functions/marginiq-backup?action=download&date=${date}`);
-      const data = await resp.json();
-      if (!data.ok) throw new Error(data.error || "Download failed");
-      window.open(data.url, "_blank");
-    } catch(e) {
-      setBackupMsg({ error: `Download failed: ${e.message}` });
-    }
-  };
-
   const confirmRestore = async () => {
     if (restoreConfirm !== `RESTORE ${restoreDate}`) {
       setBackupMsg({ error: `Confirmation text must be exactly: RESTORE ${restoreDate}` });
@@ -7811,7 +7800,7 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
         <div style={{fontSize:10,color:T.textMuted}}>Auto-runs 3AM EST · kept 30 days + monthly archives</div>
       </div>
       <div style={{fontSize:11,color:T.textMuted,marginBottom:12,lineHeight:1.5}}>
-        Every night at 3AM EST, MarginIQ snapshots every Firestore collection to Firebase Storage under <code>backups/YYYY-MM-DD/</code>. If an ingest goes sideways or data looks wrong, you can restore to any recent daily snapshot. Older snapshots (beyond 30 days) are pruned down to one per month for long-term history.
+        Every night at 3AM EST, MarginIQ snapshots every Firestore collection to the <code>backups</code> collection as gzipped chunks. If an ingest goes sideways or data looks wrong, you can restore to any recent daily snapshot. Older snapshots (beyond 30 days) are pruned down to one per month for long-term history.
       </div>
 
       <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
@@ -7881,10 +7870,6 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
                       {b.compressed_bytes ? `${Math.round(b.compressed_bytes/1024)} KB` : "—"}
                     </td>
                     <td style={{padding:"6px 8px",borderBottom:`1px solid ${T.borderLight}`,display:"flex",gap:6,justifyContent:"flex-end"}}>
-                      <button
-                        onClick={() => downloadBackup(b.date)}
-                        style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${T.border}`,background:"transparent",color:T.text,cursor:"pointer"}}
-                      >⬇ Download</button>
                       <button
                         onClick={() => { setRestoreDate(b.date); setRestoreConfirm(""); setBackupMsg(null); }}
                         style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${T.yellow}`,background:"#fef9c3",color:"#78350f",cursor:"pointer"}}
