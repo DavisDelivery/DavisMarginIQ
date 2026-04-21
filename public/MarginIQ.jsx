@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.24.0";
+const APP_VERSION = "2.25.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2141,9 +2141,76 @@ const FS = {
   async getCosts() { if (!hasFirebase) return null; try { const d=await window.db.collection("marginiq_config").doc("cost_structure").get(); return d.exists?d.data():null; } catch(e) { return null; } },
   async saveCosts(data) { if (!hasFirebase) return false; try { await window.db.collection("marginiq_config").doc("cost_structure").set({...data, updated_at:new Date().toISOString()}); return true; } catch(e) { return false; } },
   async getWeeklyRollups() { if (!hasFirebase) return []; try { const s=await window.db.collection("uline_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
-  async saveWeeklyRollup(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("uline_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  // CRITICAL FIX (v2.25): Per-service-type merging.
+  // Uline weekly files come in 3 flavors (delivery/truckload/accessorials) and
+  // are ingested as SEPARATE files per week. When Gmail Sync imports each file
+  // individually (different ingestFiles() calls), each call builds a rollup from
+  // only its own stops and the naive {merge:true} write would overwrite the
+  // other service-types' numbers with zeros. That's how a week ends up showing
+  // 47 stops $3K (accessorials only) even though the 3,248-row delivery file
+  // was ingested 1 second before.
+  //
+  // Fix: read existing doc, then for each service-type bucket, TAKE THE MAX
+  // of the existing value and the incoming value. That way:
+  //   - First file (delivery) writes delivery_stops=3248, truckload_stops=0, accessorial_stops=0
+  //   - Second file (accessorials) writes delivery_stops=0, truckload_stops=0, accessorial_stops=47
+  //   - Merged result: delivery_stops=3248 (keep), accessorial_stops=47 (take), total stops=3295
+  //
+  // Non-service-type fields (month, week_ending, customers, cities) use naive merge.
+  async saveWeeklyRollup(weekId, data) {
+    if (!hasFirebase) return false;
+    try {
+      const ref = window.db.collection("uline_weekly").doc(weekId);
+      const existing = await ref.get();
+      const cur = existing.exists ? existing.data() : {};
+      // Per-service-type fields: take max of existing vs incoming (non-destructive)
+      const maxField = (k) => Math.max(Number(cur[k] || 0), Number(data[k] || 0));
+      const merged = {
+        ...cur, ...data,
+        // Per-service-type counts and revenue — never reduce below existing
+        delivery_stops:    maxField("delivery_stops"),
+        delivery_revenue:  maxField("delivery_revenue"),
+        truckload_stops:   maxField("truckload_stops"),
+        truckload_revenue: maxField("truckload_revenue"),
+        accessorial_stops: maxField("accessorial_stops"),
+        accessorial_revenue: maxField("accessorial_revenue"),
+        // Total stops = sum of the three service-type stops (recomputed from merged)
+        stops: 0, // placeholder — recomputed below
+        revenue: 0, // placeholder — recomputed below
+        base_revenue: maxField("base_revenue"),
+        accessorial_count: maxField("accessorial_count"),
+        weight: maxField("weight"),
+        skids: maxField("skids"),
+      };
+      // Now recompute totals from merged per-service-type
+      merged.stops = merged.delivery_stops + merged.truckload_stops + merged.accessorial_stops;
+      merged.revenue = Math.round((merged.delivery_revenue + merged.truckload_revenue + merged.accessorial_revenue) * 100) / 100;
+      await ref.set(merged, { merge: true });
+      return true;
+    } catch(e) { console.error("saveWeeklyRollup failed:", weekId, e); return false; }
+  },
   async getReconWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("recon_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
-  async saveReconWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("recon_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  // Same merging concern as saveWeeklyRollup — multiple files per week can
+  // each produce recon deltas and we can't let them zero each other out.
+  async saveReconWeekly(weekId, data) {
+    if (!hasFirebase) return false;
+    try {
+      const ref = window.db.collection("recon_weekly").doc(weekId);
+      const existing = await ref.get();
+      const cur = existing.exists ? existing.data() : {};
+      const maxField = (k) => Math.max(Number(cur[k] || 0), Number(data[k] || 0));
+      const merged = {
+        ...cur, ...data,
+        billed: maxField("billed"),
+        paid_matched: maxField("paid_matched"),
+        unpaid_count: maxField("unpaid_count"),
+        unpaid_amount: maxField("unpaid_amount"),
+      };
+      merged.collection_rate = merged.billed > 0 ? (merged.paid_matched / merged.billed * 100) : null;
+      await ref.set(merged, { merge: true });
+      return true;
+    } catch(e) { console.error("saveReconWeekly failed:", weekId, e); return false; }
+  },
   async getReconMeta() { if (!hasFirebase) return null; try { const d = await window.db.collection("marginiq_config").doc("recon_meta").get(); return d.exists?d.data():null; } catch(e) { return null; } },
   async saveReconMeta(data) { if (!hasFirebase) return false; try { await window.db.collection("marginiq_config").doc("recon_meta").set(data, {merge:true}); return true; } catch(e) { return false; } },
   async saveUnpaidStop(proKey, data) { if (!hasFirebase) return false; try { await window.db.collection("unpaid_stops").doc(String(proKey)).set(data, {merge:true}); return true; } catch(e) { return false; } },
