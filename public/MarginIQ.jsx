@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.29.0";
+const APP_VERSION = "2.30.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -4964,15 +4964,82 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
       // The rollup doc
       const rollup = weeklyRollups.find(w => w.week_ending === weekEnding);
 
-      // Files whose filename date-range overlaps this week_ending.
-      // Uline filename convention: das YYYYMMDD-YYYYMMDD.xlsx (Sat→Fri).
-      // Week ending = the YYYYMMDD after the dash.
-      const targetYMD = weekEnding.replace(/-/g, "");
-      const matchingFiles = (fileLog || []).filter(f => {
-        const fn = (f.filename || "").toLowerCase();
-        // Match either exact YYYYMMDD match in filename, or a small date window
-        return fn.includes(targetYMD) || fn.includes(weekEnding);
-      });
+      // Find files whose date range overlaps OR is adjacent to this week.
+      // Adjacency matters: Uline files cover Sat→Fri, but our week_ending is the
+      // Friday end-of-week. A file covering the NEXT week (Sat X → Fri X+7) can
+      // still contribute stops to THIS week because pickups dated Sat/Sun in that
+      // file get bucketed back to THIS week's Friday via weekEndingFriday's
+      // Sat→prior Fri rollback rule. So for WE 2025-01-03, the file
+      // "das 20250104-20250110.xlsx" is a legitimate source even though no date
+      // in its name matches 01/03.
+      //
+      // Strategy: parse the YYYYMMDD-YYYYMMDD range from each filename, compute
+      // the file's covered date span (as an interval of dates), and match if the
+      // file's span touches the target week OR the week immediately after
+      // (adjacent-week rollback).
+      const parseFilenameRange = (fn) => {
+        if (!fn) return null;
+        const m = fn.match(/(\d{8})\s*-\s*(\d{8})/);
+        if (!m) return null;
+        const parse8 = (s) => {
+          // YYYYMMDD variant
+          for (const y of ["2023","2024","2025","2026","2027"]) {
+            if (s.startsWith(y)) {
+              const mo = parseInt(s.slice(4,6),10), d = parseInt(s.slice(6,8),10);
+              if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return `${y}-${String(mo).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+            }
+          }
+          // MMDDYYYY variant
+          const mo = parseInt(s.slice(0,2),10), d = parseInt(s.slice(2,4),10), y = parseInt(s.slice(4,8),10);
+          if (y >= 2023 && y <= 2027 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+            return `${y}-${String(mo).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+          }
+          return null;
+        };
+        const start = parse8(m[1]);
+        let end = parse8(m[2]);
+        if (!start || !end) return null;
+        // Year-off-by-one typo fix — if end < start, try same-year or next-year wrap
+        if (end < start) {
+          const sY = parseInt(start.slice(0,4),10);
+          const fixed = `${sY}${end.slice(4)}`;
+          end = fixed >= start ? fixed : `${sY+1}${end.slice(4)}`;
+        }
+        return { start, end };
+      };
+
+      // Compute the week's date span: Sat = WE - 6 days, Fri = WE
+      const addDays = (iso, n) => {
+        const [y,m,d] = iso.split("-").map(Number);
+        const dt = new Date(Date.UTC(y, m-1, d));
+        dt.setUTCDate(dt.getUTCDate() + n);
+        return dt.toISOString().slice(0,10);
+      };
+      const weekStart = addDays(weekEnding, -6);  // Saturday that starts this week
+      const weekEnd = weekEnding;                  // Friday that ends this week
+      // Adjacent-next-week span (for Sat/Sun rollback matches)
+      const nextWeekStart = addDays(weekEnding, 1);   // Sat after this Fri
+      const nextWeekEnd = addDays(weekEnding, 7);     // following Fri
+
+      const matchingFiles = (fileLog || []).map(f => {
+        const range = parseFilenameRange(f.filename || "");
+        if (!range) {
+          // No date range in filename — fall back to substring match on the WE date itself
+          const targetYMD = weekEnding.replace(/-/g, "");
+          const fn = (f.filename || "").toLowerCase();
+          if (fn.includes(targetYMD) || fn.includes(weekEnding)) {
+            return { ...f, match_reason: "filename contains week date" };
+          }
+          return null;
+        }
+        // Primary match: file range overlaps this week
+        const overlapsThis = !(range.end < weekStart || range.start > weekEnd);
+        // Adjacent match: file covers the following Sat-Fri (Sat/Sun stops roll back)
+        const overlapsNext = !(range.end < nextWeekStart || range.start > nextWeekEnd);
+        if (overlapsThis) return { ...f, match_reason: "file covers this week", file_range: range };
+        if (overlapsNext) return { ...f, match_reason: "adjacent file (Sat/Sun pickups roll back)", file_range: range, adjacent: true };
+        return null;
+      }).filter(Boolean);
 
       // Pull any recon doc for this week
       let reconDoc = null;
@@ -5213,17 +5280,25 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
 
                         {/* Files matching this week */}
                         <div>
-                          <div style={{fontSize:10,fontWeight:700,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Files in file_log matching this week ({d.matchingFiles.length})</div>
+                          <div style={{fontSize:10,fontWeight:700,color:T.textDim,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Files contributing to this week ({d.matchingFiles.length})</div>
                           {d.matchingFiles.length === 0 ? (
-                            <div style={{fontSize:12,color:T.redText,fontStyle:"italic"}}>⚠️ No file_log entries match this week. The rollup was built from files that are no longer logged, OR from files whose filenames don't include this date.</div>
+                            <div style={{fontSize:12,color:T.redText,fontStyle:"italic"}}>⚠️ No files in file_log touch this week, even checking adjacent weeks. The rollup may have been built from files that are no longer logged.</div>
                           ) : (
-                            <div style={{fontSize:11,fontFamily:"monospace",display:"flex",flexDirection:"column",gap:3}}>
-                              {d.matchingFiles.map((f,i) => (
-                                <div key={i} style={{padding:"4px 8px",background:"white",borderRadius:4,display:"flex",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
-                                  <span>📎 {f.filename}</span>
-                                  <span style={{color:T.textMuted,fontSize:10}}>{f.kind}{f.service_type?`/${f.service_type}`:""} • {f.row_count||0} rows</span>
+                            <div style={{fontSize:11,display:"flex",flexDirection:"column",gap:4}}>
+                              {d.matchingFiles.map((f,i) => {
+                                const rangeLabel = f.file_range ? ` • covers ${f.file_range.start} → ${f.file_range.end}` : "";
+                                return (
+                                <div key={i} style={{padding:"6px 10px",background:"white",borderRadius:6,border:`1px solid ${f.adjacent?T.yellow+"40":T.borderLight}`,display:"flex",flexDirection:"column",gap:2}}>
+                                  <div style={{display:"flex",justifyContent:"space-between",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                                    <span style={{fontFamily:"monospace",fontWeight:600,fontSize:11}}>📎 {f.filename}</span>
+                                    <span style={{color:T.textMuted,fontSize:10,whiteSpace:"nowrap"}}>{f.kind}{f.service_type?`/${f.service_type}`:""} • {fmtNum(f.row_count||0)} rows</span>
+                                  </div>
+                                  <div style={{fontSize:10,color:f.adjacent?T.yellowText:T.textMuted,fontStyle:f.adjacent?"italic":"normal"}}>
+                                    {f.adjacent ? "⤴️ " : "✓ "}{f.match_reason}{rangeLabel}
+                                    {f.uploaded_at && <span style={{color:T.textDim}}> • uploaded {new Date(f.uploaded_at).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit"})}</span>}
+                                  </div>
                                 </div>
-                              ))}
+                              );})}
                             </div>
                           )}
                         </div>
