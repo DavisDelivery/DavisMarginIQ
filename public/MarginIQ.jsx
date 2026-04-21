@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.30.0";
+const APP_VERSION = "2.31.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2104,16 +2104,22 @@ function parseHours(v) {
 }
 
 // Compute the Friday week-ending for a YYYY-MM-DD date (used for Uline Revenue)
+// Compute Uline's Friday week-ending for a given date. Uline invoices on a
+// SATURDAY-TO-FRIDAY cycle. That means:
+//   Sat pickup → invoiced on the UPCOMING Friday (6 days later), not the prior Fri
+//   Sun pickup → invoiced on the UPCOMING Friday (5 days later), not the prior Fri
+//   Mon–Fri pickup → invoiced on THIS week's Friday
+// Previously this function rolled Sat/Sun BACKWARD to the previous Friday, which
+// put those stops on the wrong invoice. The rule is "always advance to the next
+// Friday (or today if already Friday)." The formula (5 - day + 7) % 7 gives:
+//   Sun(0) → +5 days   Mon(1) → +4   Tue(2) → +3   Wed(3) → +2
+//   Thu(4) → +1        Fri(5) → +0   Sat(6) → +6 days (to next Friday)
 function weekEndingFriday(dateStr) {
   if (!dateStr) return null;
   const d = new Date(dateStr + "T00:00:00");
   if (isNaN(d)) return null;
   const day = d.getDay(); // Sun=0...Sat=6
-  // Distance to Friday (day 5): if already Fri, 0. Else roll forward to Fri.
-  let add = (5 - day + 7) % 7;
-  // If Sat or Sun, roll back to prev Fri
-  if (day === 6) add = -1;
-  if (day === 0) add = -2;
+  const add = (5 - day + 7) % 7;
   const f = new Date(d);
   f.setDate(d.getDate() + add);
   return f.toISOString().slice(0,10);
@@ -5008,7 +5014,10 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
         return { start, end };
       };
 
-      // Compute the week's date span: Sat = WE - 6 days, Fri = WE
+      // Compute the week's date span: Sat = WE - 6 days, Fri = WE.
+      // With the corrected weekEndingFriday (forward-rolling), every stop that
+      // a file produces lands inside the Sat-Fri span the filename describes —
+      // there's no longer any boundary spillover to neighboring weeks.
       const addDays = (iso, n) => {
         const [y,m,d] = iso.split("-").map(Number);
         const dt = new Date(Date.UTC(y, m-1, d));
@@ -5017,9 +5026,6 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
       };
       const weekStart = addDays(weekEnding, -6);  // Saturday that starts this week
       const weekEnd = weekEnding;                  // Friday that ends this week
-      // Adjacent-next-week span (for Sat/Sun rollback matches)
-      const nextWeekStart = addDays(weekEnding, 1);   // Sat after this Fri
-      const nextWeekEnd = addDays(weekEnding, 7);     // following Fri
 
       const matchingFiles = (fileLog || []).map(f => {
         const range = parseFilenameRange(f.filename || "");
@@ -5032,12 +5038,9 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
           }
           return null;
         }
-        // Primary match: file range overlaps this week
+        // File's covered span overlaps this Sat-Fri window
         const overlapsThis = !(range.end < weekStart || range.start > weekEnd);
-        // Adjacent match: file covers the following Sat-Fri (Sat/Sun stops roll back)
-        const overlapsNext = !(range.end < nextWeekStart || range.start > nextWeekEnd);
         if (overlapsThis) return { ...f, match_reason: "file covers this week", file_range: range };
-        if (overlapsNext) return { ...f, match_reason: "adjacent file (Sat/Sun pickups roll back)", file_range: range, adjacent: true };
         return null;
       }).filter(Boolean);
 
