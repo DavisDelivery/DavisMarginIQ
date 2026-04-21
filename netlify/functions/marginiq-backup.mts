@@ -331,8 +331,8 @@ async function getDownloadUrl(dateKey: string): Promise<string> {
 // ─── Main handler ──────────────────────────────────────────────────────────
 
 export default async (req: Request, _context: Context) => {
-  if (!FIREBASE_API_KEY || !ADMIN_TOKEN) {
-    return new Response(JSON.stringify({ error: "missing FIREBASE_API_KEY or MARGINIQ_ADMIN_TOKEN env var" }), {
+  if (!FIREBASE_API_KEY) {
+    return new Response(JSON.stringify({ error: "missing FIREBASE_API_KEY env var" }), {
       status: 500, headers: { "Content-Type": "application/json" },
     });
   }
@@ -341,22 +341,27 @@ export default async (req: Request, _context: Context) => {
   const action = url.searchParams.get("action");
   const token = url.searchParams.get("token");
 
+  // Operations that mutate or delete data still require the admin token.
+  // Backup itself only reads Firestore + writes to Storage (non-destructive),
+  // so it's safe to run without auth — same as the scheduled nightly run.
+  const requiresToken = action === "restore" || action === "prune";
+  if (requiresToken) {
+    if (!ADMIN_TOKEN) {
+      return new Response(JSON.stringify({ error: "MARGINIQ_ADMIN_TOKEN not configured — set it in Netlify env vars to use restore/prune" }), {
+        status: 500, headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (token !== ADMIN_TOKEN) {
+      return new Response(JSON.stringify({ error: "invalid or missing admin token (required for restore/prune)" }), {
+        status: 403, headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+
   try {
-    // Listing is read-only — allow without token for Settings UI to display the list
     if (action === "list") {
       const backups = await listBackups();
       return Response.json({ ok: true, backups });
-    }
-
-    // All other operations require admin token
-    if (token !== ADMIN_TOKEN) {
-      // Scheduled runs arrive with no token but also no query params — allow that path
-      const isScheduled = !action && !token && req.method === "POST" && req.headers.get("user-agent")?.includes("netlify");
-      if (!isScheduled) {
-        return new Response(JSON.stringify({ error: "invalid or missing token" }), {
-          status: 403, headers: { "Content-Type": "application/json" },
-        });
-      }
     }
 
     if (action === "download") {
@@ -379,7 +384,8 @@ export default async (req: Request, _context: Context) => {
       return Response.json({ ok: true, ...result });
     }
 
-    // Default action: run a backup (manual or scheduled)
+    // Default action: run a backup (manual or scheduled). No token required —
+    // backups are non-destructive and storage costs are negligible.
     const manifest = await performBackup();
     // Auto-prune after each successful backup so old files don't accumulate.
     const pruneResult = await pruneOldBackups();

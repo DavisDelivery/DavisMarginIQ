@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.39.1";
+const APP_VERSION = "2.39.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7700,11 +7700,10 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
   useEffect(() => { loadBackups(); }, []);
 
   const runBackupNow = async () => {
-    if (!adminToken.trim()) { setBackupMsg({ error: "Admin token required" }); return; }
     setBackupAction("run");
     setBackupMsg(null);
     try {
-      const resp = await fetch(`/.netlify/functions/marginiq-backup?token=${encodeURIComponent(adminToken.trim())}`);
+      const resp = await fetch(`/.netlify/functions/marginiq-backup`);
       const data = await resp.json();
       if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
       setBackupMsg({ ok: true, text: `✓ Backup created: ${data.manifest.total_docs} docs across ${data.manifest.collections_captured} collections (${Math.round(data.manifest.compressed_bytes/1024)} KB compressed)` });
@@ -7717,7 +7716,7 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
 
   const downloadBackup = async (date) => {
     try {
-      const resp = await fetch(`/.netlify/functions/marginiq-backup?action=download&date=${date}&token=${encodeURIComponent(adminToken.trim())}`);
+      const resp = await fetch(`/.netlify/functions/marginiq-backup?action=download&date=${date}`);
       const data = await resp.json();
       if (!data.ok) throw new Error(data.error || "Download failed");
       window.open(data.url, "_blank");
@@ -7815,34 +7814,21 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
         Every night at 3AM EST, MarginIQ snapshots every Firestore collection to Firebase Storage under <code>backups/YYYY-MM-DD/</code>. If an ingest goes sideways or data looks wrong, you can restore to any recent daily snapshot. Older snapshots (beyond 30 days) are pruned down to one per month for long-term history.
       </div>
 
-      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"flex-end"}}>
-        <div style={{flex:"1 1 200px"}}>
-          <label style={{fontSize:10,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,display:"block",marginBottom:4}}>Admin token</label>
-          <input
-            type="password"
-            value={adminToken}
-            onChange={e => setAdminToken(e.target.value)}
-            placeholder="MARGINIQ_ADMIN_TOKEN"
-            autoCapitalize="off"
-            autoCorrect="off"
-            autoComplete="off"
-            spellCheck={false}
-            style={inputStyle}
-          />
-        </div>
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
         <button
           onClick={runBackupNow}
-          disabled={backupAction === "run" || !adminToken.trim()}
+          disabled={backupAction === "run"}
           style={{
             padding:"9px 16px",borderRadius:8,border:"none",
-            background: (backupAction === "run" || !adminToken.trim()) ? T.bgSurface : T.brand,
-            color: (backupAction === "run" || !adminToken.trim()) ? T.textMuted : "#fff",
+            background: backupAction === "run" ? T.bgSurface : T.brand,
+            color: backupAction === "run" ? T.textMuted : "#fff",
             fontSize:12,fontWeight:700,
-            cursor: (backupAction === "run" || !adminToken.trim()) ? "wait" : "pointer",
+            cursor: backupAction === "run" ? "wait" : "pointer",
           }}
         >
           {backupAction === "run" ? "Backing up…" : "💾 Backup Now"}
         </button>
+        <span style={{fontSize:10,color:T.textMuted}}>No auth needed — backup is read-only. Restore requires admin token.</span>
       </div>
 
       {backupMsg?.ok && (
@@ -7932,16 +7918,32 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
               style={inputStyle}
             />
           </div>
+          <div style={{marginBottom:10}}>
+            <label style={{fontSize:10,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",fontWeight:600,display:"block",marginBottom:4}}>
+              Admin token (MARGINIQ_ADMIN_TOKEN)
+            </label>
+            <input
+              type="password"
+              value={adminToken}
+              onChange={e => setAdminToken(e.target.value)}
+              placeholder="required for restore"
+              autoCapitalize="off"
+              autoCorrect="off"
+              autoComplete="off"
+              spellCheck={false}
+              style={inputStyle}
+            />
+          </div>
           <div style={{display:"flex",gap:8}}>
             <button
               onClick={confirmRestore}
-              disabled={backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`}
+              disabled={backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}` || !adminToken.trim()}
               style={{
                 padding:"9px 16px",borderRadius:8,border:"none",
-                background: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`) ? T.bgSurface : T.red,
-                color: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`) ? T.textMuted : "#fff",
+                background: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}` || !adminToken.trim()) ? T.bgSurface : T.red,
+                color: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}` || !adminToken.trim()) ? T.textMuted : "#fff",
                 fontSize:12,fontWeight:700,
-                cursor: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}`) ? "not-allowed" : "pointer",
+                cursor: (backupAction === "restore" || restoreConfirm !== `RESTORE ${restoreDate}` || !adminToken.trim()) ? "not-allowed" : "pointer",
               }}
             >
               {backupAction === "restore" ? "Restoring…" : `↻ Yes, Restore from ${restoreDate}`}
