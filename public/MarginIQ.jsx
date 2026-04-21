@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.33.0";
+const APP_VERSION = "2.34.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2935,9 +2935,32 @@ function normalizePro(v) {
   return stripped || s;
 }
 
+// Parse a Uline delivery/accessorial/truckload spreadsheet into stop records.
+//
+// Revenue source of truth: NEW COST column. For every row produced here,
+// stop.new_cost is the authoritative billed amount that will flow into the
+// weekly rollup. If a row only has the legacy "cost" column (older file
+// format), that value is used as the fallback. Downstream rollup code
+// (bw.revenue, bw.delivery_revenue, etc.) sums new_cost — never extra_cost
+// or base cost — so "new cost" is the universal revenue figure.
+//
+// Service-type determination is PER-ROW, not per-file. This matters because
+// Uline's going-forward format is a single file per week containing delivery
+// rows AND accessorial rows AND (sometimes) truckload rows, all mixed. Old
+// multi-file weeks still work because each file is single-type by nature.
+//
+// Per-row rule:
+//   - Truckload file (filename has TK suffix): every row is truckload.
+//     This is file-level because TK rows don't have a distinguishing
+//     content marker beyond the filename.
+//   - Row has a non-empty `code` field: accessorial (e.g. "DET", "INS",
+//     "LIF", any non-blank charge code). Covers both the old accessorials-
+//     only files (every row has a code) and combined-file accessorial
+//     lines interleaved with delivery lines.
+//   - Otherwise: delivery. This is the default for stop-by-stop freight.
 function parseOriginalOrAccessorial(rows, serviceType) {
   const stops = [];
-  const st = serviceType || "delivery"; // default for backward-compat callers
+  const fileST = serviceType || "delivery";
   for (const r of rows) {
     const proRaw = r.pro ?? r["pro#"];
     if (!proRaw) continue;
@@ -2952,6 +2975,14 @@ function parseOriginalOrAccessorial(rows, serviceType) {
     const skid = parseInt(r.skid) || 0;
     const loose = parseInt(r.loose) || 0;
     const pu = r.pu ? parseInt(r.pu) : null;
+    const codeStr = r.code ? String(r.code).trim() : null;
+    const hasCode = !!(codeStr && codeStr.length > 0);
+    // Per-row service type. TK wins if the file is a truckload file; otherwise
+    // code presence classifies accessorial vs delivery on a per-row basis.
+    let rowST;
+    if (fileST === "truckload") rowST = "truckload";
+    else if (hasCode) rowST = "accessorial";
+    else rowST = "delivery";
     stops.push({
       pro,
       order: r.order ? String(r.order) : null,
@@ -2962,13 +2993,16 @@ function parseOriginalOrAccessorial(rows, serviceType) {
       pu, pu_date: pu ? puToDate(pu) : null,
       month: pu ? puToMonth(pu) : null,
       week_ending: pu ? weekEndingFriday(puToDate(pu)) : null,
+      // new_cost is ALWAYS the source of truth for revenue. cost is retained
+      // for base-vs-accessorial analysis in older per-row files; new_cost
+      // falls back to cost if empty (older legacy files have no new_cost col).
       cost, new_cost: newCost || cost, extra_cost: extraCost,
       warehouse: r.wh ? String(r.wh).trim() : null,
       skid, loose, weight: wgt,
       via: r.via ? String(r.via).trim() : null,
-      code: r.code ? String(r.code).trim() : null,
-      is_accessorial: !!r.code && (extraCost > 0),
-      service_type: st, // "delivery" | "truckload" | "accessorial"
+      code: codeStr,
+      is_accessorial: hasCode,
+      service_type: rowST, // "delivery" | "truckload" | "accessorial" — per row
     });
   }
   return stops;
@@ -3281,19 +3315,23 @@ function buildWeeklyRollups(stops) {
     bw.stops++;
     bw.revenue += s.new_cost || 0;
     bw.base_revenue += s.cost || 0;
-    bw.accessorial_revenue += s.extra_cost || 0;
     bw.weight += s.weight || 0;
     bw.skids += s.skid || 0;
     bw.unique_pros.add(s.pro);
     if (s.is_accessorial) bw.accessorial_count++;
-    // Route this stop's revenue to the right service-type bucket
+    // Route this stop's revenue to the right service-type bucket. new_cost is
+    // the source of truth for every bucket — never extra_cost or base cost.
+    // accessorial_revenue is now driven by new_cost of accessorial-type rows
+    // (previously a misleading sum of extra_cost across all rows; that approach
+    // under-reported combined-file accessorials where the full line amount
+    // sits in new_cost with extra_cost blank).
     const st = s.service_type || "delivery";
     if (st === "truckload") {
       bw.truckload_stops++;
       bw.truckload_revenue += s.new_cost || 0;
     } else if (st === "accessorial") {
       bw.accessorial_stops++;
-      // accessorial_revenue already tracked above via extra_cost
+      bw.accessorial_revenue += s.new_cost || 0;
     } else {
       bw.delivery_stops++;
       bw.delivery_revenue += s.new_cost || 0;
