@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.32.0";
+const APP_VERSION = "2.33.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -8177,13 +8177,13 @@ function MarginIQ() {
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
     { id:"nvrecon", icon:"🔄", label:"Uline↔NuVizz" },
-    { id:"runsheet", icon:"📋", label:"Run Sheet" },
     { id:"drivers", icon:"👥", label:"Drivers" },
     { id:"timeclock", icon:"⏰", label:"Time Clock" },
     { id:"fuel", icon:"⛽", label:"Fuel" },
     { id:"completeness", icon:"✅", label:"Data Health" },
     { id:"ingest", icon:"📤", label:"Data Ingest" },
     { id:"gmail", icon:"📧", label:"Gmail Sync" },
+    { id:"runsheet", icon:"📋", label:"Run Sheet" },
     { id:"costs", icon:"⚙️", label:"Costs" },
     { id:"settings", icon:"🔧", label:"Settings" },
   ];
