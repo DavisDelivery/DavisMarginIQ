@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.25.0";
+const APP_VERSION = "2.26.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -5132,6 +5132,7 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
   const [pendingReview, setPendingReview] = useState(null); // {audit, expandedFiles} while awaiting user confirmation
   const [sourceConflicts, setSourceConflicts] = useState([]); // Uline vs Davis conflicts pending review
   const [resolvingWeek, setResolvingWeek] = useState(null); // week_ending currently being resolved
+  const [dragOver, setDragOver] = useState(false); // drop-zone visual state
   const fileRef = useRef(null);
 
   // Load source conflicts from Firestore — survive across page loads
@@ -5825,10 +5826,49 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       );
     })()}
 
-    <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
-      <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand}}>📤 Bulk Upload — Any Data Source</div>
+    <div
+      onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true); }}
+      onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true); }}
+      onDragLeave={(e) => {
+        e.preventDefault(); e.stopPropagation();
+        // Only clear dragOver if we're truly leaving the zone (not just crossing a child element)
+        if (e.currentTarget.contains(e.relatedTarget)) return;
+        setDragOver(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault(); e.stopPropagation();
+        setDragOver(false);
+        const dropped = [];
+        if (e.dataTransfer.items) {
+          for (let i = 0; i < e.dataTransfer.items.length; i++) {
+            const item = e.dataTransfer.items[i];
+            if (item.kind === "file") {
+              const f = item.getAsFile();
+              if (f) dropped.push(f);
+            }
+          }
+        } else if (e.dataTransfer.files) {
+          for (let i = 0; i < e.dataTransfer.files.length; i++) dropped.push(e.dataTransfer.files[i]);
+        }
+        if (dropped.length > 0 && !uploading) handleFiles(dropped);
+      }}
+      onClick={() => !uploading && fileRef.current?.click()}
+      style={{
+        ...cardStyle,
+        background: dragOver ? "#dbeafe" : T.brandPale,
+        borderColor: dragOver ? T.brand : T.brand,
+        borderWidth: 2,
+        borderStyle: dragOver ? "solid" : "dashed",
+        cursor: uploading ? "wait" : "pointer",
+        transition: "background 0.15s, border-color 0.15s",
+      }}
+    >
+      <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand,display:"flex",alignItems:"center",gap:8}}>
+        <span style={{fontSize:24}}>{dragOver ? "⬇️" : "📤"}</span>
+        <span>{dragOver ? "Drop files to upload" : "Drag & Drop or Click to Upload"}</span>
+      </div>
       <div style={{fontSize:12,color:T.text,lineHeight:1.6}}>
-        Select any combination of files — individual <code>.xlsx</code>/<code>.csv</code> or a <code>.zip</code> archive (e.g., a year's worth of Uline weeklies). MarginIQ unpacks zips, audits for typos/duplicates/gaps, shows you a review before ingesting, and auto-detects each type:
+        Drop any combination of files here — individual <code>.xlsx</code>/<code>.csv</code>/<code>.pdf</code> or a <code>.zip</code> archive (e.g., a year's worth of Uline weeklies). MarginIQ unpacks zips, audits for typos/duplicates/gaps, shows you a review before ingesting, and auto-detects each type:
         <ul style={{marginTop:8,marginLeft:20,fontSize:12}}>
           <li><strong>Uline</strong> (master / originals / accessorials / DDIS) → weekly revenue (source of truth) + reconciliation</li>
           <li><strong>NuVizz</strong> (driver stops export) → weekly driver rollups + 1099 contractor pay base (40% per stop). <em>Not revenue.</em></li>
@@ -5837,7 +5877,7 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
           <li><strong>QuickBooks</strong> (P&L, Trial Balance, GL exports) → financial history</li>
         </ul>
         <div style={{fontSize:11,color:T.textMuted,marginTop:8}}>
-          Upload all at once — no need to separate. Files auto-detected by filename and column headers.
+          Files auto-detected by filename and column headers. On mobile, click here or the Upload Files button at the top.
         </div>
       </div>
     </div>
