@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.34.0";
+const APP_VERSION = "2.35.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1934,21 +1934,31 @@ function GmailSync({ onRefresh }) {
               )}
 
               {r?.list && r.list.length > 0 && (() => {
-                // Count how many attachments would be skipped (already imported)
+                // Count totals and collect duplicate filenames for display. Dedup
+                // detection is based on filename match against file_log (loaded on
+                // mount as alreadyImportedFilenames). Gmail message IDs aren't
+                // tracked in file_log, so filename is the practical dedupe key.
                 let totalData = 0, alreadyDone = 0;
+                const duplicateFiles = []; // filenames flagged as already ingested
                 for (const em of r.list) {
                   if (v.mode === "pair") {
                     const pdfs = (em.attachments||[]).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
                     if (pdfs.length > 0) {
                       totalData++;
-                      if (pdfs.every(p => alreadyImportedFilenames.has(p.filename.toLowerCase()))) alreadyDone++;
+                      if (pdfs.every(p => alreadyImportedFilenames.has(p.filename.toLowerCase()))) {
+                        alreadyDone++;
+                        duplicateFiles.push(pdfs.map(p => p.filename).join(" + "));
+                      }
                     }
                   } else {
                     for (const a of (em.attachments||[])) {
                       const lc = a.filename.toLowerCase();
                       if (!(lc.endsWith(".xlsx") || lc.endsWith(".xls") || lc.endsWith(".csv") || lc.endsWith(".pdf"))) continue;
                       totalData++;
-                      if (alreadyImportedFilenames.has(lc)) alreadyDone++;
+                      if (alreadyImportedFilenames.has(lc)) {
+                        alreadyDone++;
+                        duplicateFiles.push(a.filename);
+                      }
                     }
                   }
                 }
@@ -1995,6 +2005,20 @@ function GmailSync({ onRefresh }) {
                         </div>
                       )}
                     </div>
+                    {duplicateFiles.length > 0 && (
+                      <details style={{marginBottom:8,padding:"6px 10px",background:"#fef9c3",borderRadius:6,border:`1px solid ${T.yellow}40`,fontSize:11}}>
+                        <summary style={{cursor:"pointer",fontWeight:700,color:"#78350f",listStyle:"none",display:"flex",alignItems:"center",gap:6}}>
+                          <span>⚠ {duplicateFiles.length} duplicate{duplicateFiles.length>1?"s":""} detected — already in file_log, will be auto-skipped</span>
+                          <span style={{fontSize:10,fontWeight:400,color:T.textMuted}}>(click to view)</span>
+                        </summary>
+                        <div style={{marginTop:6,paddingLeft:4,display:"flex",flexDirection:"column",gap:2,fontFamily:"monospace",fontSize:10,color:"#78350f"}}>
+                          {duplicateFiles.map((fn, i) => <div key={i}>• {fn}</div>)}
+                        </div>
+                        <div style={{marginTop:6,fontSize:10,color:T.textMuted,fontStyle:"italic"}}>
+                          Import All automatically skips these. Max-merge ensures re-importing can't corrupt data if you do choose to re-import.
+                        </div>
+                      </details>
+                    )}
                     {v.mode === "pair" && <div style={{fontSize:10,color:T.textMuted,marginBottom:6,fontStyle:"italic"}}>FuelFox sends summary + service log PDFs together — each pair imports as one unit.</div>}
 
                     {r.list.map((em, idx) => {
@@ -2061,9 +2085,19 @@ function GmailSync({ onRefresh }) {
                               const imp = imported[refKey];
                               const disabled = v.comingSoon;
                               const isQuickFuelPdf = v.mode === "quickfuel" && a.filename.toLowerCase().endsWith(".pdf");
+                              // Detect if this filename has already been ingested in a prior session.
+                              // Gmail message IDs aren't stored in file_log, so filename is the
+                              // practical dedupe key. Case-insensitive to match the normalization
+                              // used elsewhere. v2.25 max-merge makes accidental re-import
+                              // non-destructive, but surfacing this visibly gives the user
+                              // confidence that nothing was double-entered.
+                              const isDuplicate = alreadyImportedFilenames.has(a.filename.toLowerCase());
                               return (
-                                <div key={a.attachmentId} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"4px 8px",background:T.bgSurface,borderRadius:6}}>
-                                  <div style={{flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>📎 {a.filename} <span style={{color:T.textDim}}>({Math.round(a.size/1024)} KB)</span></div>
+                                <div key={a.attachmentId} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"4px 8px",background:isDuplicate?"#fef9c3":T.bgSurface,borderRadius:6,border:isDuplicate?`1px solid ${T.yellow}40`:"1px solid transparent"}}>
+                                  <div style={{flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:6}}>
+                                    <span>📎 {a.filename} <span style={{color:T.textDim}}>({Math.round(a.size/1024)} KB)</span></span>
+                                    {isDuplicate && !imp && <span title="This exact filename has already been ingested — safe to skip" style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:T.yellow,color:"#78350f",whiteSpace:"nowrap"}}>⚠ DUPLICATE</span>}
+                                  </div>
                                   {imp?.error ? (
                                     <span style={{fontSize:10,color:T.redText,maxWidth:180,whiteSpace:"normal"}}>✗ {imp.error.substring(0,80)}</span>
                                   ) : imp?.ok && v.mode === "quickfuel" ? (
@@ -2075,6 +2109,17 @@ function GmailSync({ onRefresh }) {
                                     <span style={{fontSize:10,color:T.greenText,fontWeight:600}}>✓ Imported</span>
                                   ) : disabled ? (
                                     <span style={{fontSize:9,color:T.textDim,fontStyle:"italic"}}>parser pending</span>
+                                  ) : isDuplicate ? (
+                                    <button
+                                      onClick={() => {
+                                        if (!confirm(`"${a.filename}" has already been imported. Re-importing is safe (max-merge guarantees no data is destroyed), but it's usually redundant.\n\nAre you sure you want to re-import?`)) return;
+                                        isQuickFuelPdf ? importQuickFuel(em, a) : importAttachment(em, a);
+                                      }}
+                                      disabled={isImp}
+                                      title="Already imported — click to re-import anyway (safe, max-merge)"
+                                      style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${T.yellow}`,background:isImp?T.bgSurface:"#fde68a",color:"#78350f",cursor:isImp?"wait":"pointer",opacity:isImp?0.6:1}}>
+                                      {isImp ? "..." : "↻ Re-import"}
+                                    </button>
                                   ) : (
                                     <button
                                       onClick={() => isQuickFuelPdf ? importQuickFuel(em, a) : importAttachment(em, a)}
