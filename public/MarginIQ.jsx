@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.36.0";
+const APP_VERSION = "2.37.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -182,6 +182,7 @@ async function ingestFiles(files, onStatus = () => {}) {
   const stopsByPro = {};
   const paymentByPro = {};
   const ddisFileRecords = [];
+  const ddisPayments = []; // per-PRO payment rows to persist (audit queue needs these)
   const nuvizzStops = [];
   const timeClockEntries = [];
   const payrollEntries = [];
@@ -249,7 +250,22 @@ async function ingestFiles(files, onStatus = () => {}) {
           checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
           uploaded_at: new Date().toISOString(),
         });
-        for (const p of payments) paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
+        for (const p of payments) {
+          paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
+          // Persist per-PRO payment so the audit rebuild can do real
+          // billed-vs-paid variance matching without re-ingesting files.
+          // ID keyed by pro+bill_date+check so the same PRO paid in two
+          // different checks writes two distinct rows (merge-safe on dup).
+          if (p.pro && p.paid > 0) {
+            const payId = `${p.pro}_${p.bill_date || "nodate"}_${p.check || "nocheck"}`;
+            ddisPayments.push({
+              id: payId, pro: p.pro, paid_amount: p.paid,
+              bill_date: p.bill_date || null, check: p.check || null,
+              voucher: p.voucher || null, source_file: file.name,
+              uploaded_at: new Date().toISOString(),
+            });
+          }
+        }
       } else if (kind === "nuvizz") {
         for (const s of parseNuVizz(rows)) nuvizzStops.push(s);
       } else if (kind === "timeclock") {
@@ -355,6 +371,14 @@ async function ingestFiles(files, onStatus = () => {}) {
     r => FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()}),
     25, "Saving reconciliation");
   await batchWrite(ddisFileRecords, f => FS.saveDDISFile(f.file_id, f), 25);
+  // Persist per-PRO payments so audit queue rebuild can do real matching.
+  // Cap at 10K rows — DDIS files rarely exceed this, and keeps write time
+  // under control if someone ingests a year's worth at once.
+  if (ddisPayments.length > 0) {
+    const toSave = ddisPayments.slice(0, 10000);
+    onStatus({ phase:"save", message:`Saving ${toSave.length} DDIS payments...` });
+    await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments");
+  }
   // Without DDIS payment data, every stop looks unpaid — cap hard to avoid
   // writing 500 meaningless rows. With payment data, keep full 500 for audit.
   const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, hasPaymentData ? 500 : 100);
@@ -2316,6 +2340,12 @@ const FS = {
   async getUnpaidStops(limit=500) { if (!hasFirebase) return []; try { const s=await window.db.collection("unpaid_stops").orderBy("billed","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveDDISFile(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("ddis_files").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getDDISFiles() { if (!hasFirebase) return []; try { const s=await window.db.collection("ddis_files").orderBy("latest_bill_date","desc").get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  // Per-PRO payment records. Keyed by pro+bill_date+amount so the same PRO
+  // getting paid twice (partial, or adjustment) writes two rows. The audit
+  // rebuild reads this collection to compute accurate billed-vs-paid variance.
+  // Without these records, audit can only do file-level totals which misses
+  // per-PRO short-pays — the main category the audit queue exists to surface.
+  async saveDDISPayment(id, data) { if (!hasFirebase) return false; try { await window.db.collection("ddis_payments").doc(String(id)).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async saveFileLog(fileId, data) { if (!hasFirebase) return false; try { await window.db.collection("file_log").doc(fileId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getFileLog(limit=500) { if (!hasFirebase) return []; try { const s=await window.db.collection("file_log").orderBy("uploaded_at","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
 
@@ -5636,6 +5666,7 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
     const stopsByPro = {};         // Uline: pro -> merged stop
     const paymentByPro = {};       // DDIS
     const ddisFileRecords = [];
+    const ddisPayments = [];       // per-PRO rows to persist for audit rebuild
     const nuvizzStops = [];
     const timeClockEntries = [];
     const payrollEntries = [];
@@ -5712,7 +5743,18 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
             checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
             uploaded_at: new Date().toISOString(),
           });
-          for (const p of payments) paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
+          for (const p of payments) {
+            paymentByPro[p.pro] = (paymentByPro[p.pro] || 0) + p.paid;
+            if (p.pro && p.paid > 0) {
+              const payId = `${p.pro}_${p.bill_date || "nodate"}_${p.check || "nocheck"}`;
+              ddisPayments.push({
+                id: payId, pro: p.pro, paid_amount: p.paid,
+                bill_date: p.bill_date || null, check: p.check || null,
+                voucher: p.voucher || null, source_file: file.name,
+                uploaded_at: new Date().toISOString(),
+              });
+            }
+          }
         }
         // ─── NuVizz ───
         else if (kind === "nuvizz") {
@@ -5819,6 +5861,14 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       if (ok) savedRecon++;
     }
     for (const f of ddisFileRecords) await FS.saveDDISFile(f.file_id, f);
+    // Persist per-PRO payments so audit rebuild has real match data
+    if (ddisPayments.length > 0) {
+      const toSave = ddisPayments.slice(0, 10000);
+      for (let i = 0; i < toSave.length; i += 25) {
+        const batch = toSave.slice(i, i + 25);
+        await Promise.all(batch.map(p => FS.saveDDISPayment(p.id, p)));
+      }
+    }
     const topUnpaid = unpaidStops.sort((a,b) => b.billed - a.billed).slice(0, 500);
     for (const s of topUnpaid) await FS.saveUnpaidStop(s.pro, s);
 
@@ -6473,6 +6523,136 @@ function Audit({ reconWeekly, weeklyRollups }) {
 
   useEffect(() => { loadData(); }, [loadData]);
 
+  // Rebuild audit_items from existing Firestore data WITHOUT re-ingesting
+  // files. Joins unpaid_stops (which already has PRO-level billed amounts,
+  // produced at Uline ingest time) with ddis_files / DDIS payment records
+  // (which have paid amounts per PRO). Writes a fresh audit_items doc for
+  // every PRO with a positive variance after applying the match.
+  //
+  // Why this exists: audit_items are produced only during Uline ingest, and
+  // only when DDIS payment data was already present at that ingest moment.
+  // After a purge + re-ingest where the DDIS file was imported AFTER the
+  // Uline files (or not in the same session), audit_items end up empty
+  // even though recon_weekly + unpaid_stops are fully populated. This
+  // rebuild reads what's already in Firestore and catches up.
+  const [rebuilding, setRebuilding] = useState(false);
+  const [rebuildStatus, setRebuildStatus] = useState("");
+  const [rebuildResult, setRebuildResult] = useState(null);
+
+  const rebuildAuditItems = async () => {
+    if (rebuilding) return;
+    if (!hasFirebase) { alert("Firebase not connected"); return; }
+    setRebuilding(true);
+    setRebuildResult(null);
+    setRebuildStatus("Loading data from Firestore…");
+    try {
+      // 1) Pull DDIS payment records — iterate all ddis_files docs and
+      //    build a PRO → total-paid map. Each DDIS row is a payment
+      //    against a specific PRO; multiple rows can share a PRO.
+      const ddisFiles = await FS.getDDISFiles();
+      if (ddisFiles.length === 0) {
+        setRebuildResult({ error: "No DDIS payment files in Firestore. Ingest one first via Data Ingest or Gmail Sync." });
+        setRebuilding(false);
+        return;
+      }
+      setRebuildStatus(`Reading ${ddisFiles.length} DDIS file(s)…`);
+
+      // DDIS payment records sit in a `ddis_payments` subcollection per file
+      // OR as flat top-level rows depending on ingest version. Try flat first.
+      const paymentByPro = {};
+      try {
+        const snap = await window.db.collection("ddis_payments").limit(20000).get();
+        snap.forEach(doc => {
+          const d = doc.data();
+          if (!d.pro) return;
+          const amt = Number(d.paid_amount || d.paid || 0);
+          if (amt > 0) paymentByPro[d.pro] = (paymentByPro[d.pro] || 0) + amt;
+        });
+      } catch(e) { /* collection may not exist in some versions */ }
+
+      // If ddis_payments collection didn't yield, fall back to file-level
+      // totals which at least let us compute week-level variances.
+      const hasPerProPayments = Object.keys(paymentByPro).length > 0;
+
+      // 2) Pull unpaid_stops (billed amounts per PRO, already keyed by PRO)
+      setRebuildStatus("Reading unpaid_stops…");
+      const unpaidStops = await FS.getUnpaidStops(2000);
+      if (unpaidStops.length === 0) {
+        setRebuildResult({ error: "No unpaid_stops in Firestore. Re-ingest Uline weekly files to populate them." });
+        setRebuilding(false);
+        return;
+      }
+
+      // 3) For each unpaid stop, compute variance = billed - paid.
+      //    If per-PRO payments are known, subtract them. Otherwise variance
+      //    equals billed (true "unpaid" state since we have no PRO-level match).
+      const today = new Date().toISOString().slice(0,10);
+      const items = [];
+      for (const s of unpaidStops) {
+        if (!s.pro) continue;
+        const billed = Number(s.billed || 0);
+        if (billed <= 0) continue;
+        const paid = hasPerProPayments ? (paymentByPro[s.pro] || 0) : 0;
+        const variance = billed - paid;
+        if (variance <= 1) continue; // ignore dust / fully-paid
+        const ageDays = daysBetween(s.pu_date, today) || 0;
+        const category = categorize(billed, paid, false, 0, ageDays);
+        items.push({
+          pro: s.pro,
+          customer: s.customer || "Unknown",
+          customer_key: customerKey(s.customer),
+          city: s.city, state: s.state, zip: s.zip,
+          pu_date: s.pu_date, week_ending: s.week_ending, month: s.month,
+          billed, paid, variance,
+          variance_pct: billed > 0 ? (variance / billed * 100) : null,
+          accessorial_amount: 0,
+          base_cost: 0,
+          code: s.code, weight: s.weight, order: s.order,
+          age_days: ageDays,
+          age_bucket: ageBucket(ageDays),
+          category,
+          dispute_status: "new",
+          notes: [],
+          rebuilt_from_firestore: true,
+          updated_at: new Date().toISOString(),
+        });
+      }
+
+      if (items.length === 0) {
+        setRebuildResult({ error: "No variance items to write — every unpaid stop has paid === billed after matching." });
+        setRebuilding(false);
+        return;
+      }
+
+      // 4) Write in parallel batches of 25 (same cadence as ingest pipeline)
+      setRebuildStatus(`Writing ${items.length} audit items to Firestore…`);
+      let saved = 0;
+      const batchSize = 25;
+      for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        const results = await Promise.all(batch.map(a => FS.saveAuditItem(a.pro, a)));
+        saved += results.filter(r => r).length;
+        setRebuildStatus(`Writing audit items… ${Math.min(i+batchSize, items.length)}/${items.length}`);
+      }
+
+      setRebuildResult({
+        ok: true,
+        generated: items.length,
+        saved,
+        withPayments: hasPerProPayments,
+        ddisFiles: ddisFiles.length,
+        totalVariance: items.reduce((s, i) => s + i.variance, 0),
+      });
+      // Reload to populate the dashboard
+      await loadData();
+    } catch(e) {
+      console.error("rebuildAuditItems failed:", e);
+      setRebuildResult({ error: e.message });
+    }
+    setRebuilding(false);
+    setRebuildStatus("");
+  };
+
   // Recompute age_days on load (they were stored at ingest time and may be stale)
   const itemsWithFreshAge = useMemo(() => {
     const today = new Date().toISOString().slice(0,10);
@@ -6691,7 +6871,41 @@ function Audit({ reconWeekly, weeklyRollups }) {
 
         {itemsWithFreshAge.length === 0 ? (
           <div style={cardStyle}>
-            <EmptyState icon="🧾" title="No Audit Data Yet" sub="Upload Uline DDIS payment files in Data Ingest. Every billed-vs-paid discrepancy will appear here for you to chase." />
+            <EmptyState icon="🧾" title="No Audit Data Yet" sub="Audit tracks billed-vs-paid discrepancies. The button below reads existing Uline + DDIS data from Firestore and builds the audit queue — no re-ingest needed." />
+            <div style={{marginTop:14,padding:"12px 14px",background:T.brandPale,borderRadius:8,border:`1px solid ${T.brand}30`}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.brand,marginBottom:4}}>🔧 Build audit queue from existing data</div>
+              <div style={{fontSize:11,color:T.text,lineHeight:1.5,marginBottom:10}}>
+                Joins <code>unpaid_stops</code> (PRO-level billed amounts from Uline ingest) with <code>ddis_files</code> (Uline payment files). Every PRO with a variance ≥ $1 gets an audit item you can chase, categorize, and build dispute packets against.
+              </div>
+              <button
+                onClick={rebuildAuditItems}
+                disabled={rebuilding}
+                style={{
+                  padding: "9px 18px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: rebuilding ? T.bgSurface : `linear-gradient(135deg,${T.brand},${T.brandLight})`,
+                  color: rebuilding ? T.text : "#fff",
+                  fontSize: 12,
+                  fontWeight: 700,
+                  cursor: rebuilding ? "wait" : "pointer",
+                }}
+              >
+                {rebuilding ? "⏳ Building…" : "🚀 Build Audit Queue Now"}
+              </button>
+              {rebuildStatus && <div style={{marginTop:8,fontSize:11,color:T.textMuted}}>{rebuildStatus}</div>}
+              {rebuildResult?.error && (
+                <div style={{marginTop:10,padding:"8px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText}}>
+                  ✗ {rebuildResult.error}
+                </div>
+              )}
+              {rebuildResult?.ok && (
+                <div style={{marginTop:10,padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
+                  ✓ Generated {rebuildResult.generated} audit items ({fmtK(rebuildResult.totalVariance)} total variance)
+                  {!rebuildResult.withPayments && <div style={{marginTop:4,fontSize:10}}>Note: no PRO-level payment matching possible — only DDIS file-level totals are stored. Re-ingesting DDIS will improve match fidelity.</div>}
+                </div>
+              )}
+            </div>
           </div>
         ) : (
           <>
