@@ -170,14 +170,17 @@ type WeekResult = {
   week_ambiguous: boolean;
   ambiguous_candidates: { friday: string; rows: number }[];
   top5_bill_dates: { date: string; count: number }[];
+  covers_weeks: string[];
 };
 
+const COVERS_PCT = 0.20; // v2.40.12: file "covers" a week if ≥20% of rows land there
 function computeBillWeekEnding(billDates: string[]): WeekResult {
   const result: WeekResult = {
     bill_week_ending: null,
     week_ambiguous: false,
     ambiguous_candidates: [],
     top5_bill_dates: [],
+    covers_weeks: [],
   };
   if (!Array.isArray(billDates) || billDates.length === 0) return result;
   const dateCounts = new Map<string, number>();
@@ -186,6 +189,7 @@ function computeBillWeekEnding(billDates: string[]): WeekResult {
     dateCounts.set(bd, (dateCounts.get(bd) || 0) + 1);
   }
   if (dateCounts.size === 0) return result;
+  const totalRows = billDates.filter(Boolean).length;
   const sorted = [...dateCounts.entries()].sort((a, b) => b[1] - a[1]);
   const top5 = sorted.slice(0, 5).map(([date, count]) => ({ date, count }));
   result.top5_bill_dates = top5;
@@ -208,6 +212,21 @@ function computeBillWeekEnding(billDates: string[]): WeekResult {
   } else {
     result.bill_week_ending = envs[0][0];
   }
+  // v2.40.12: compute covers_weeks across ALL bill_dates (not just top 5)
+  const allEnvelopeCounts = new Map<string, number>();
+  for (const [bd, count] of dateCounts.entries()) {
+    const fri = fridayEndOf(bd);
+    if (!fri) continue;
+    allEnvelopeCounts.set(fri, (allEnvelopeCounts.get(fri) || 0) + count);
+  }
+  const threshold = Math.max(1, Math.ceil(totalRows * COVERS_PCT));
+  const coversSet = new Set<string>();
+  for (const [fri, count] of allEnvelopeCounts.entries()) {
+    if (count >= threshold) coversSet.add(fri);
+  }
+  if (result.bill_week_ending) coversSet.add(result.bill_week_ending);
+  for (const c of result.ambiguous_candidates) coversSet.add(c.friday);
+  result.covers_weeks = [...coversSet].sort();
   return result;
 }
 
@@ -293,6 +312,7 @@ async function runBackfill(): Promise<{ processed: number; updated: number; skip
         week_ambiguous: wk.week_ambiguous,
         ambiguous_candidates: wk.ambiguous_candidates,
         top5_bill_dates: wk.top5_bill_dates,
+        covers_weeks: wk.covers_weeks,
         bill_week_computed_at: new Date().toISOString(),
       });
 

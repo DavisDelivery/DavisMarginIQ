@@ -263,10 +263,37 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
     console.log(`audit-rebuild: ${payDocs.length} payment rows read, ${prosWithPayments} unique PROs with payments`);
     await writeStatus({
       phase: "reading_stops",
-      progress_text: `Found ${prosWithPayments.toLocaleString()} PROs with payments. Reading unpaid_stops…`,
+      progress_text: `Found ${prosWithPayments.toLocaleString()} PROs with payments. Reading ddis_files…`,
       payment_rows_read: payDocs.length,
       with_payments: hasPerProPayments,
     });
+
+    // v2.40.12: load ddis_files to build the set of Friday-weeks that have a
+    // matching payment file. A stop whose week_ending isn't in this set (and
+    // isn't in the "recent" grace window below) is exempted from the audit —
+    // we're missing the DDIS for its week, so we can't know if it's truly
+    // unpaid or just unmatched.
+    const ddisFilesDocs = await listAllDocsMask(
+      "ddis_files",
+      ["bill_week_ending", "covers_weeks", "week_ambiguous"],
+    );
+    const coveredWeeks = new Set<string>();
+    for (const fdoc of ddisFilesDocs) {
+      const f = fdoc.fields || {};
+      // covers_weeks is the authoritative multi-week list (v2.40.12).
+      // Fallback to bill_week_ending for pre-backfill files.
+      const cw = f.covers_weeks?.arrayValue?.values || [];
+      if (cw.length > 0) {
+        for (const v of cw) {
+          const s = v?.stringValue;
+          if (s) coveredWeeks.add(s);
+        }
+      } else {
+        const bwe = f.bill_week_ending?.stringValue;
+        if (bwe) coveredWeeks.add(bwe);
+      }
+    }
+    console.log(`audit-rebuild: ${ddisFilesDocs.length} ddis_files docs, ${coveredWeeks.size} unique covered weeks`);
 
     // 2) Read all unpaid_stops
     const stopDocs = await listAllDocsMask(
@@ -280,16 +307,51 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
       unpaid_stops_read: stopDocs.length,
     });
 
+    // v2.40.12: recent-week cutoff. Stops with week_ending within the last
+    // RECENT_DAYS days are exempt from the audit queue regardless of DDIS
+    // match — the DDIS file for that week may not have arrived yet.
+    const RECENT_DAYS = 21;
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - RECENT_DAYS);
+    const recentCutoffISO = cutoffDate.toISOString().slice(0, 10);
+
     // 3) Compute audit items
     const today = new Date().toISOString().slice(0, 10);
     const items: Array<{ docId: string; item: any }> = [];
     let totalVariance = 0;
+    let skippedRecent = 0;       // exempted — within last RECENT_DAYS
+    let skippedNoDdis = 0;       // no matching DDIS file for this week
+    let skippedNoWeek = 0;       // unpaid_stop has no week_ending at all
+    const awaitingWeeks = new Map<string, { stops: number; billed: number }>(); // per-week sideline
+    const recentWeeks = new Map<string, { stops: number; billed: number }>();
     for (const sdoc of stopDocs) {
       const f = sdoc.fields || {};
       const pro = f.pro?.stringValue;
       if (!pro) continue;
       const billed = Number(f.billed?.doubleValue ?? f.billed?.integerValue ?? 0);
       if (billed <= 0) continue;
+      const weekEnding = f.week_ending?.stringValue || null;
+      // v2.40.12 filters —
+      if (!weekEnding) {
+        skippedNoWeek += 1;
+        continue;
+      }
+      if (weekEnding >= recentCutoffISO) {
+        // Too recent — exempt from audit, count on sideline
+        skippedRecent += 1;
+        const agg = recentWeeks.get(weekEnding) || { stops: 0, billed: 0 };
+        agg.stops += 1; agg.billed += billed;
+        recentWeeks.set(weekEnding, agg);
+        continue;
+      }
+      if (!coveredWeeks.has(weekEnding)) {
+        // Older week but no matching DDIS file — can't match payments
+        skippedNoDdis += 1;
+        const agg = awaitingWeeks.get(weekEnding) || { stops: 0, billed: 0 };
+        agg.stops += 1; agg.billed += billed;
+        awaitingWeeks.set(weekEnding, agg);
+        continue;
+      }
       const paid = hasPerProPayments ? (paymentByPro[pro] || 0) : 0;
       const variance = billed - paid;
       if (variance <= 1) continue; // skip dust / fully-paid
@@ -306,7 +368,7 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
         state: f.state?.stringValue || null,
         zip: f.zip?.stringValue || null,
         pu_date,
-        week_ending: f.week_ending?.stringValue || null,
+        week_ending: weekEnding,
         month: f.month?.stringValue || null,
         billed,
         paid,
@@ -323,18 +385,42 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
         dispute_status: "new",
         notes: [] as any[],
         rebuilt_from_firestore: true,
-        rebuild_source: "background_v2.40.10",
+        rebuild_source: "background_v2.40.12",
         updated_at: new Date().toISOString(),
       };
       totalVariance += variance;
       items.push({ docId: pro, item });
     }
-    console.log(`audit-rebuild: ${items.length} audit items generated, $${totalVariance.toFixed(2)} total variance`);
+    // v2.40.12: flatten the sideline maps into sortable arrays for the status doc
+    const recentWeeksArr = [...recentWeeks.entries()]
+      .map(([wk, v]) => ({ week: wk, stops: v.stops, billed: Math.round(v.billed * 100) / 100 }))
+      .sort((a, b) => (a.week < b.week ? 1 : -1));
+    const awaitingWeeksArr = [...awaitingWeeks.entries()]
+      .map(([wk, v]) => ({ week: wk, stops: v.stops, billed: Math.round(v.billed * 100) / 100 }))
+      .sort((a, b) => (a.week < b.week ? 1 : -1));
+    const recentTotalBilled = recentWeeksArr.reduce((s, r) => s + r.billed, 0);
+    const awaitingTotalBilled = awaitingWeeksArr.reduce((s, r) => s + r.billed, 0);
+    console.log(
+      `audit-rebuild: ${items.length} audit items, $${totalVariance.toFixed(2)} variance | ` +
+      `sidelined — recent:${skippedRecent} stops across ${recentWeeksArr.length}wks ($${recentTotalBilled.toFixed(0)}) · ` +
+      `awaiting-ddis:${skippedNoDdis} stops across ${awaitingWeeksArr.length}wks ($${awaitingTotalBilled.toFixed(0)}) · ` +
+      `no-week:${skippedNoWeek}`
+    );
     await writeStatus({
       phase: "writing",
       progress_text: `Writing ${items.length.toLocaleString()} audit items…`,
       items_generated: items.length,
       total_variance: totalVariance,
+      // v2.40.12 sideline counts
+      sidelined_recent_stops: skippedRecent,
+      sidelined_recent_billed: recentTotalBilled,
+      sidelined_recent_weeks: recentWeeksArr,
+      sidelined_awaiting_stops: skippedNoDdis,
+      sidelined_awaiting_billed: awaitingTotalBilled,
+      sidelined_awaiting_weeks: awaitingWeeksArr,
+      sidelined_noweek_stops: skippedNoWeek,
+      recent_cutoff_iso: recentCutoffISO,
+      covered_weeks_count: coveredWeeks.size,
     });
 
     // 4) Convert items to Firestore field shape and batch-write
@@ -345,11 +431,14 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
     const result = await batchWriteDocs("audit_items", toWrite);
     console.log(`audit-rebuild: wrote ${result.ok} / ${toWrite.length} items (${result.failed} failed)`);
 
+    const sidelineNote = (skippedRecent || skippedNoDdis || skippedNoWeek)
+      ? ` · sidelined: ${skippedRecent} recent, ${skippedNoDdis} awaiting DDIS, ${skippedNoWeek} no-week`
+      : "";
     await writeStatus({
       state: "complete",
       completed_at: new Date().toISOString(),
       phase: "done",
-      progress_text: `✓ Rebuilt ${result.ok.toLocaleString()} audit items ($${Math.round(totalVariance).toLocaleString()} variance) from ${payDocs.length.toLocaleString()} payment rows × ${stopDocs.length.toLocaleString()} unpaid stops`,
+      progress_text: `✓ Rebuilt ${result.ok.toLocaleString()} audit items ($${Math.round(totalVariance).toLocaleString()} variance) from ${payDocs.length.toLocaleString()} payment rows × ${stopDocs.length.toLocaleString()} unpaid stops${sidelineNote}`,
       items_written: result.ok,
       with_payments: hasPerProPayments,
     });

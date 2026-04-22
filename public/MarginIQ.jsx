@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.11";
+const APP_VERSION = "2.40.12";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -252,6 +252,7 @@ async function ingestFiles(files, onStatus = () => {}) {
           week_ambiguous: wk.week_ambiguous,
           ambiguous_candidates: wk.ambiguous_candidates,
           top5_bill_dates: wk.top5,
+          covers_weeks: wk.covers_weeks,
           checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
           uploaded_at: new Date().toISOString(),
         });
@@ -3350,7 +3351,7 @@ function parseDDIS(rows) {
   return payments;
 }
 
-// ─── DDIS bill-week computation (v2.40.9) ───────────────────────────
+// ─── DDIS bill-week computation (v2.40.9, extended v2.40.12) ──────────
 // Uline's weekly 820 remit: one file = one Friday-week, BUT each file also
 // includes straggler PROs from older invoices paid in the same settlement.
 // Date spans on a file can be anything from 0 days to 900+ days of stragglers.
@@ -3360,16 +3361,20 @@ function parseDDIS(rows) {
 // 5 dates to its Sat→Fri envelope (Friday-ending), pick the envelope that
 // holds the most top-5 rows. That envelope's Friday = file's bill_week_ending.
 //
-// If two envelopes tie on top-5 row count, we flag the file ambiguous
-// (week_ambiguous: true, bill_week_ending: null, ambiguous_candidates: [...])
-// and let the user resolve it in Settings.
+// v2.40.12 adds `covers_weeks`: the list of Friday-envelopes (inclusive of
+// bill_week_ending) where this file contributes ≥ COVERS_PCT of its TOTAL
+// row count. This catches consolidation files like Thanksgiving where one
+// DDIS pays two DAS weeks — the winning week is the bulk, but a secondary
+// week can still have 30%+ of the rows. Normal files: covers_weeks ==
+// [bill_week_ending]. Consolidation files: more than one entry.
 //
 // Inputs: billDates = array of "YYYY-MM-DD" strings (may be empty, may have dupes).
-// Output: { bill_week_ending, week_ambiguous, ambiguous_candidates, top5 }
+// Output: { bill_week_ending, week_ambiguous, ambiguous_candidates, top5, covers_weeks }
 //   bill_week_ending: "YYYY-MM-DD" (Friday) or null if undeterminable/ambiguous
 //   week_ambiguous: true only on tie (requires user resolution)
 //   ambiguous_candidates: [{friday, rows}] when ambiguous, else []
 //   top5: [{date, count}] for debugging/transparency on the file card
+//   covers_weeks: ["YYYY-MM-DD", …] Friday ends where file has ≥20% of rows
 function fridayEndOf(iso) {
   const d = new Date(iso + "T00:00:00");
   if (isNaN(d.getTime())) return null;
@@ -3378,8 +3383,15 @@ function fridayEndOf(iso) {
   d.setDate(d.getDate() + daysTo);
   return d.toISOString().slice(0, 10);
 }
+const COVERS_PCT = 0.20; // v2.40.12: ≥20% of total rows = file covers that week
 function computeBillWeekEnding(billDates) {
-  const result = { bill_week_ending: null, week_ambiguous: false, ambiguous_candidates: [], top5: [] };
+  const result = {
+    bill_week_ending: null,
+    week_ambiguous: false,
+    ambiguous_candidates: [],
+    top5: [],
+    covers_weeks: [],
+  };
   if (!Array.isArray(billDates) || billDates.length === 0) return result;
   // Count rows per date
   const dateCounts = new Map();
@@ -3388,6 +3400,7 @@ function computeBillWeekEnding(billDates) {
     dateCounts.set(bd, (dateCounts.get(bd) || 0) + 1);
   }
   if (dateCounts.size === 0) return result;
+  const totalRows = billDates.filter(Boolean).length;
   // Top 5 most-common dates
   const sorted = [...dateCounts.entries()].sort((a, b) => b[1] - a[1]);
   const top5 = sorted.slice(0, 5).map(([date, count]) => ({ date, count }));
@@ -3404,12 +3417,30 @@ function computeBillWeekEnding(billDates) {
   const envs = [...envelopeCounts.entries()].sort((a, b) => b[1] - a[1]);
   if (envs.length > 1 && envs[0][1] === envs[1][1]) {
     result.week_ambiguous = true;
-    // All envelopes tied at the top count
     const tieCount = envs[0][1];
     result.ambiguous_candidates = envs.filter(([, n]) => n === tieCount).map(([friday, rows]) => ({ friday, rows }));
   } else {
     result.bill_week_ending = envs[0][0];
   }
+  // v2.40.12: compute covers_weeks across ALL bill_dates (not just top 5)
+  // so we catch consolidation files where a secondary week has 20-40% of rows.
+  const allEnvelopeCounts = new Map();
+  for (const [bd, count] of dateCounts.entries()) {
+    const fri = fridayEndOf(bd);
+    if (!fri) continue;
+    allEnvelopeCounts.set(fri, (allEnvelopeCounts.get(fri) || 0) + count);
+  }
+  const threshold = Math.max(1, Math.ceil(totalRows * COVERS_PCT));
+  const coversSet = new Set();
+  for (const [fri, count] of allEnvelopeCounts.entries()) {
+    if (count >= threshold) coversSet.add(fri);
+  }
+  // Always include the winning bill_week_ending even if slightly under threshold
+  // (e.g. ambiguous files still get their top candidates included so stops for
+  // those weeks aren't orphaned from the audit).
+  if (result.bill_week_ending) coversSet.add(result.bill_week_ending);
+  for (const c of result.ambiguous_candidates) coversSet.add(c.friday);
+  result.covers_weeks = [...coversSet].sort();
   return result;
 }
 
@@ -6013,6 +6044,7 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
             week_ambiguous: wk.week_ambiguous,
             ambiguous_candidates: wk.ambiguous_candidates,
             top5_bill_dates: wk.top5,
+            covers_weeks: wk.covers_weeks,
             checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
             uploaded_at: new Date().toISOString(),
           });
@@ -6864,8 +6896,18 @@ function Audit({ reconWeekly, weeklyRollups }) {
               generated: st.items_generated || 0,
               saved: st.items_written || 0,
               withPayments: !!st.with_payments,
-              ddisFiles: null, // not tracked separately by bg function; shown in dashboard elsewhere
+              ddisFiles: null,
               totalVariance: st.total_variance || 0,
+              // v2.40.12 sideline fields
+              sidelinedRecentStops: st.sidelined_recent_stops || 0,
+              sidelinedRecentBilled: st.sidelined_recent_billed || 0,
+              sidelinedRecentWeeks: st.sidelined_recent_weeks || [],
+              sidelinedAwaitingStops: st.sidelined_awaiting_stops || 0,
+              sidelinedAwaitingBilled: st.sidelined_awaiting_billed || 0,
+              sidelinedAwaitingWeeks: st.sidelined_awaiting_weeks || [],
+              sidelinedNoWeekStops: st.sidelined_noweek_stops || 0,
+              coveredWeeksCount: st.covered_weeks_count || 0,
+              recentCutoffISO: st.recent_cutoff_iso || null,
             });
             await loadData();
             setRebuilding(false);
@@ -7187,9 +7229,49 @@ function Audit({ reconWeekly, weeklyRollups }) {
                 </div>
               )}
               {rebuildResult?.ok && (
-                <div style={{marginTop:10,padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
-                  ✓ Rebuilt {rebuildResult.generated} audit items ({fmtK(rebuildResult.totalVariance)} total variance) from {rebuildResult.ddisFiles} DDIS files
-                  {!rebuildResult.withPayments && <div style={{marginTop:4,fontSize:10}}>Note: no PRO-level payment matching — re-ingest a DDIS file to enable.</div>}
+                <div style={{marginTop:10}}>
+                  <div style={{padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
+                    ✓ Rebuilt {rebuildResult.generated} audit items ({fmtK(rebuildResult.totalVariance)} total variance)
+                    {!rebuildResult.withPayments && <div style={{marginTop:4,fontSize:10}}>Note: no PRO-level payment matching — re-ingest a DDIS file to enable.</div>}
+                  </div>
+                  {/* v2.40.12: sideline summary — stops exempted from the audit queue */}
+                  {(rebuildResult.sidelinedRecentStops > 0 || rebuildResult.sidelinedAwaitingStops > 0) && (
+                    <div style={{marginTop:6,padding:"8px 12px",background:T.bgSurface,borderRadius:6,border:`1px solid ${T.border}`,fontSize:11,color:T.textMuted}}>
+                      <div style={{fontWeight:700,color:T.text,marginBottom:4}}>ℹ️ Sidelined from audit queue</div>
+                      {rebuildResult.sidelinedRecentStops > 0 && (
+                        <div>
+                          <strong style={{color:T.text}}>{rebuildResult.sidelinedRecentStops.toLocaleString()} stops</strong>
+                          {" "}({fmtK(rebuildResult.sidelinedRecentBilled)}) too recent — {rebuildResult.sidelinedRecentWeeks.length} week{rebuildResult.sidelinedRecentWeeks.length===1?"":"s"} after {rebuildResult.recentCutoffISO}, waiting on DDIS file
+                          {rebuildResult.sidelinedRecentWeeks.length > 0 && (
+                            <div style={{fontSize:10,marginTop:2,color:T.textDim}}>
+                              {rebuildResult.sidelinedRecentWeeks.slice(0,6).map(w => `${w.week} (${w.stops})`).join(" · ")}
+                              {rebuildResult.sidelinedRecentWeeks.length > 6 ? ` · +${rebuildResult.sidelinedRecentWeeks.length-6} more` : ""}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {rebuildResult.sidelinedAwaitingStops > 0 && (
+                        <div style={{marginTop:rebuildResult.sidelinedRecentStops>0?6:0}}>
+                          <strong style={{color:T.text}}>{rebuildResult.sidelinedAwaitingStops.toLocaleString()} stops</strong>
+                          {" "}({fmtK(rebuildResult.sidelinedAwaitingBilled)}) awaiting DDIS — {rebuildResult.sidelinedAwaitingWeeks.length} older week{rebuildResult.sidelinedAwaitingWeeks.length===1?"":"s"} with no matching payment file yet
+                          {rebuildResult.sidelinedAwaitingWeeks.length > 0 && (
+                            <div style={{fontSize:10,marginTop:2,color:T.textDim}}>
+                              {rebuildResult.sidelinedAwaitingWeeks.slice(0,6).map(w => `${w.week} (${w.stops})`).join(" · ")}
+                              {rebuildResult.sidelinedAwaitingWeeks.length > 6 ? ` · +${rebuildResult.sidelinedAwaitingWeeks.length-6} more` : ""}
+                            </div>
+                          )}
+                          <div style={{fontSize:10,marginTop:4,fontStyle:"italic"}}>
+                            Try Gmail Sync → DDIS → &quot;Show missing only&quot; → Import All to fill these in.
+                          </div>
+                        </div>
+                      )}
+                      {rebuildResult.sidelinedNoWeekStops > 0 && (
+                        <div style={{marginTop:6,fontSize:10,color:T.textDim}}>
+                          {rebuildResult.sidelinedNoWeekStops} stops have no week_ending field set (re-ingest the source DAS file to fix).
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
