@@ -91,13 +91,31 @@ async function searchOneInbox(
   account: TokenDoc, accessToken: string, query: string, maxResults: number
 ): Promise<{ account: string; results: any[]; error?: string }> {
   try {
-    const searchUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`;
-    const searchResp = await fetch(searchUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
-    const searchData = await searchResp.json();
-    if (!searchResp.ok) {
-      return { account: account.email, results: [], error: "Gmail search failed: " + JSON.stringify(searchData).substring(0, 300) };
+    // v2.40.11: page Gmail list API. Single call returns at most 500 message
+    // IDs and a nextPageToken; older DDIS history (100+ weekly files over
+    // ~2 years) was being clipped. We loop pageToken until we have maxResults
+    // OR Gmail says there are no more pages.
+    const messages: Array<{ id: string }> = [];
+    let pageToken: string | undefined;
+    let pages = 0;
+    const GMAIL_PAGE_SIZE = 500; // Gmail API hard max per call
+    while (messages.length < maxResults && pages < 20) {
+      const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+      url.searchParams.set("q", query);
+      url.searchParams.set("maxResults", String(Math.min(GMAIL_PAGE_SIZE, maxResults - messages.length)));
+      if (pageToken) url.searchParams.set("pageToken", pageToken);
+      const searchResp = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
+      const searchData = await searchResp.json();
+      if (!searchResp.ok) {
+        return { account: account.email, results: [], error: "Gmail search failed: " + JSON.stringify(searchData).substring(0, 300) };
+      }
+      const batch = searchData.messages || [];
+      if (batch.length === 0) break;
+      messages.push(...batch);
+      pageToken = searchData.nextPageToken;
+      pages += 1;
+      if (!pageToken) break;
     }
-    const messages = searchData.messages || [];
     if (messages.length === 0) return { account: account.email, results: [] };
 
     const results = await Promise.all(messages.map(async (msg: any) => {
@@ -211,7 +229,7 @@ export default async (req: Request, context: Context) => {
     const vendor: string = (body.vendor || "").toLowerCase();
     const afterDate: string = body.afterDate || ""; // YYYY/MM/DD
     const beforeDate: string = body.beforeDate || ""; // YYYY/MM/DD
-    const maxResults: number = Math.min(body.maxResults || 20, 200);
+    const maxResults: number = Math.min(body.maxResults || 20, 1000);
     const accountFilter: string = (body.account_email || "").toLowerCase();
 
     if (!vendor || !VENDOR_QUERIES[vendor]) {

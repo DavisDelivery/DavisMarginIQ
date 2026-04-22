@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.10";
+const APP_VERSION = "2.40.11";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1450,6 +1450,10 @@ function GmailSync({ onRefresh }) {
   // Import All state — tracks when a bulk import is running per vendor
   const [bulkImporting, setBulkImporting] = useState({});     // vendor -> { current, total, skipped, failed, running }
   const [alreadyImportedFilenames, setAlreadyImportedFilenames] = useState(new Set());
+  // v2.40.11: per-vendor toggle to hide already-imported emails from the list.
+  // Useful after pagination fix when DDIS search returns 100+ results, most
+  // already ingested — flipping this to show just the gaps makes them obvious.
+  const [showMissingOnly, setShowMissingOnly] = useState({});  // vendor -> bool
 
   // Date range controls — shared across all vendor searches.
   // rangePreset values: "30d" | "60d" | "90d" | "6mo" | "12mo" | "ytd" | "all" | "custom"
@@ -1567,8 +1571,12 @@ function GmailSync({ onRefresh }) {
     setLoading(prev => ({...prev, [vendor]: true}));
     try {
       const { afterDate, beforeDate } = resolveDateRange();
-      // Longer ranges likely need higher maxResults. Let the server cap at 200.
-      const maxResults = rangePreset === "all" || rangePreset === "12mo" || rangePreset === "custom" ? 100 : 50;
+      // v2.40.11: longer ranges need more headroom. DDIS alone has 100+
+      // weekly files over 2+ years. Server now pages Gmail API and caps at
+      // 1000 so we can ask for the high end without being clipped.
+      const maxResults = rangePreset === "all" ? 1000
+        : (rangePreset === "12mo" || rangePreset === "custom" || rangePreset === "6mo") ? 500
+        : 100;
       // v2.40.1: accountFilter pins the search to a single connected inbox
       // (useful for "Billing@ Outbox" which should only show billing@'s sent).
       const body = { vendor, afterDate, beforeDate, maxResults };
@@ -2169,6 +2177,25 @@ function GmailSync({ onRefresh }) {
                 const bulk = bulkImporting[v.key];
                 const bulkRunning = bulk?.running;
 
+                // v2.40.11: Missing-only filter — hide emails whose every data
+                // attachment is already in file_log. Pair-mode emails are
+                // filtered out only when ALL PDFs in the pair are already in.
+                const missingOnly = !!showMissingOnly[v.key];
+                const emailIsFullyImported = (em) => {
+                  if (v.mode === "pair") {
+                    const pdfs = (em.attachments||[]).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
+                    if (pdfs.length === 0) return false;
+                    return pdfs.every(p => alreadyImportedFilenames.has(dedupKey(p.filename)));
+                  }
+                  const atts = (em.attachments||[]).filter(a => {
+                    const lc = a.filename.toLowerCase();
+                    return lc.endsWith(".xlsx") || lc.endsWith(".xls") || lc.endsWith(".csv") || lc.endsWith(".pdf");
+                  });
+                  if (atts.length === 0) return false;
+                  return atts.every(a => alreadyImportedFilenames.has(dedupKey(a.filename)));
+                };
+                const displayList = missingOnly ? r.list.filter(em => !emailIsFullyImported(em)) : r.list;
+
                 return (
                   <div style={{marginTop:8}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:8,padding:"8px 10px",background:T.bgSurface,borderRadius:6}}>
@@ -2178,35 +2205,52 @@ function GmailSync({ onRefresh }) {
                         <span>{totalData} {v.mode === "pair" ? "pair(s)" : "file(s)"}</span>
                         {alreadyDone > 0 && <span style={{color:T.greenText}}> · {alreadyDone} already imported</span>}
                         {pending > 0 && <span style={{color:T.brand,fontWeight:600}}> · {pending} pending</span>}
+                        {missingOnly && <span style={{color:T.textMuted}}> · showing {displayList.length} missing</span>}
                       </div>
-                      {pending > 0 && !bulkRunning && (
-                        <button
-                          onClick={() => {
-                            if (!confirm(`Import ${pending} ${v.mode==="pair"?"email pair(s)":"file(s)"} from ${v.label}?\n\nAlready-imported files will be skipped automatically.`)) return;
-                            importAllForVendor(v.key);
-                          }}
-                          style={{
-                            padding: "6px 14px",
-                            borderRadius: 6,
-                            border: "none",
-                            background: `linear-gradient(135deg,${v.color},${v.color})`,
-                            color: "#fff",
-                            fontSize: 11,
-                            fontWeight: 700,
-                            cursor: "pointer",
-                          }}
-                        >🚀 Import All ({pending})</button>
-                      )}
-                      {bulkRunning && (
-                        <div style={{fontSize:11,color:v.color,fontWeight:700}}>
-                          ⏳ {bulk.current}/{bulk.total} · ✓{bulk.imported} ⏭{bulk.skipped} ✗{bulk.failed}
-                        </div>
-                      )}
-                      {!bulkRunning && bulk && bulk.current > 0 && (
-                        <div style={{fontSize:11,color:T.greenText,fontWeight:700}}>
-                          ✓ Done — imported {bulk.imported}, skipped {bulk.skipped}, failed {bulk.failed}
-                        </div>
-                      )}
+                      <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                        {alreadyDone > 0 && (
+                          <button
+                            onClick={() => setShowMissingOnly(prev => ({...prev, [v.key]: !prev[v.key]}))}
+                            style={{
+                              padding:"5px 10px",borderRadius:6,
+                              border:`1px solid ${missingOnly ? v.color : T.border}`,
+                              background: missingOnly ? v.color : "transparent",
+                              color: missingOnly ? "#fff" : T.textMuted,
+                              fontSize:10,fontWeight:700,cursor:"pointer",
+                            }}
+                          >
+                            {missingOnly ? "✓ Missing only" : "Show missing only"}
+                          </button>
+                        )}
+                        {pending > 0 && !bulkRunning && (
+                          <button
+                            onClick={() => {
+                              if (!confirm(`Import ${pending} ${v.mode==="pair"?"email pair(s)":"file(s)"} from ${v.label}?\n\nAlready-imported files will be skipped automatically.`)) return;
+                              importAllForVendor(v.key);
+                            }}
+                            style={{
+                              padding: "6px 14px",
+                              borderRadius: 6,
+                              border: "none",
+                              background: `linear-gradient(135deg,${v.color},${v.color})`,
+                              color: "#fff",
+                              fontSize: 11,
+                              fontWeight: 700,
+                              cursor: "pointer",
+                            }}
+                          >🚀 Import All ({pending})</button>
+                        )}
+                        {bulkRunning && (
+                          <div style={{fontSize:11,color:v.color,fontWeight:700}}>
+                            ⏳ {bulk.current}/{bulk.total} · ✓{bulk.imported} ⏭{bulk.skipped} ✗{bulk.failed}
+                          </div>
+                        )}
+                        {!bulkRunning && bulk && bulk.current > 0 && (
+                          <div style={{fontSize:11,color:T.greenText,fontWeight:700}}>
+                            ✓ Done — imported {bulk.imported}, skipped {bulk.skipped}, failed {bulk.failed}
+                          </div>
+                        )}
+                      </div>
                     </div>
                     {duplicateFiles.length > 0 && (
                       <details style={{marginBottom:8,padding:"6px 10px",background:"#fef9c3",borderRadius:6,border:`1px solid ${T.yellow}40`,fontSize:11}}>
@@ -2224,7 +2268,7 @@ function GmailSync({ onRefresh }) {
                     )}
                     {v.mode === "pair" && <div style={{fontSize:10,color:T.textMuted,marginBottom:6,fontStyle:"italic"}}>FuelFox sends summary + service log PDFs together — each pair imports as one unit.</div>}
 
-                    {r.list.map((em, idx) => {
+                    {displayList.map((em, idx) => {
                     // For FuelFox: single "Import Pair" button per email
                     if (v.mode === "pair") {
                       const pdfs = (em.attachments || []).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
