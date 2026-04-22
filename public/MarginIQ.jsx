@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.8";
+const APP_VERSION = "2.40.9";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -242,11 +242,16 @@ async function ingestFiles(files, onStatus = () => {}) {
         const payments = parseDDIS(rows);
         const billDates = payments.map(p => p.bill_date).filter(Boolean).sort();
         const totalPaid = payments.reduce((s,p) => s + p.paid, 0);
+        const wk = computeBillWeekEnding(billDates);
         ddisFileRecords.push({
           file_id: fileId, filename: file.name,
           record_count: payments.length, total_paid: totalPaid,
           earliest_bill_date: billDates[0] || null,
           latest_bill_date: billDates[billDates.length-1] || null,
+          bill_week_ending: wk.bill_week_ending,
+          week_ambiguous: wk.week_ambiguous,
+          ambiguous_candidates: wk.ambiguous_candidates,
+          top5_bill_dates: wk.top5,
           checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
           uploaded_at: new Date().toISOString(),
         });
@@ -3301,6 +3306,69 @@ function parseDDIS(rows) {
   return payments;
 }
 
+// ─── DDIS bill-week computation (v2.40.9) ───────────────────────────
+// Uline's weekly 820 remit: one file = one Friday-week, BUT each file also
+// includes straggler PROs from older invoices paid in the same settlement.
+// Date spans on a file can be anything from 0 days to 900+ days of stragglers.
+//
+// Rule (per Chad): take the top 5 most-common bill_dates in the file —
+// those are the week this file is primarily settling. Bucket each of those
+// 5 dates to its Sat→Fri envelope (Friday-ending), pick the envelope that
+// holds the most top-5 rows. That envelope's Friday = file's bill_week_ending.
+//
+// If two envelopes tie on top-5 row count, we flag the file ambiguous
+// (week_ambiguous: true, bill_week_ending: null, ambiguous_candidates: [...])
+// and let the user resolve it in Settings.
+//
+// Inputs: billDates = array of "YYYY-MM-DD" strings (may be empty, may have dupes).
+// Output: { bill_week_ending, week_ambiguous, ambiguous_candidates, top5 }
+//   bill_week_ending: "YYYY-MM-DD" (Friday) or null if undeterminable/ambiguous
+//   week_ambiguous: true only on tie (requires user resolution)
+//   ambiguous_candidates: [{friday, rows}] when ambiguous, else []
+//   top5: [{date, count}] for debugging/transparency on the file card
+function fridayEndOf(iso) {
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d.getTime())) return null;
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const daysTo = (5 - day + 7) % 7;
+  d.setDate(d.getDate() + daysTo);
+  return d.toISOString().slice(0, 10);
+}
+function computeBillWeekEnding(billDates) {
+  const result = { bill_week_ending: null, week_ambiguous: false, ambiguous_candidates: [], top5: [] };
+  if (!Array.isArray(billDates) || billDates.length === 0) return result;
+  // Count rows per date
+  const dateCounts = new Map();
+  for (const bd of billDates) {
+    if (!bd) continue;
+    dateCounts.set(bd, (dateCounts.get(bd) || 0) + 1);
+  }
+  if (dateCounts.size === 0) return result;
+  // Top 5 most-common dates
+  const sorted = [...dateCounts.entries()].sort((a, b) => b[1] - a[1]);
+  const top5 = sorted.slice(0, 5).map(([date, count]) => ({ date, count }));
+  result.top5 = top5;
+  // Bucket each top-5 date to its Fri-ending envelope, sum row counts per envelope
+  const envelopeCounts = new Map();
+  for (const { date, count } of top5) {
+    const fri = fridayEndOf(date);
+    if (!fri) continue;
+    envelopeCounts.set(fri, (envelopeCounts.get(fri) || 0) + count);
+  }
+  if (envelopeCounts.size === 0) return result;
+  // Winner = envelope with most rows. Tie → flag ambiguous.
+  const envs = [...envelopeCounts.entries()].sort((a, b) => b[1] - a[1]);
+  if (envs.length > 1 && envs[0][1] === envs[1][1]) {
+    result.week_ambiguous = true;
+    // All envelopes tied at the top count
+    const tieCount = envs[0][1];
+    result.ambiguous_candidates = envs.filter(([, n]) => n === tieCount).map(([friday, rows]) => ({ friday, rows }));
+  } else {
+    result.bill_week_ending = envs[0][0];
+  }
+  return result;
+}
+
 // ─── NuVizz Parser ──────────────────────────────────────────
 // Columns: Delivery End, Stop Number, Stop Status, Driver Name,
 //          Ship To Name, Ship To, Ship To - City, Ship To - Zip Code, Stop SealNbr
@@ -4929,27 +4997,15 @@ function CoverageTimeline() {
           }
         }
 
-        // DDIS: each file covers a date range. Mark every week touched by
-        // that range as covered.
+        // DDIS: v2.40.9 — one file = one week, keyed off bill_week_ending
+        // (the Fri envelope of the top-5 most-common bill_dates). Falls back
+        // to earliest_bill_date's Friday for pre-backfill files so the viz
+        // doesn't go blank while the backfill is pending.
         const ddisMap = {};
         for (const f of ddisFiles) {
-          if (!f.earliest_bill_date || !f.latest_bill_date) continue;
-          let cur = new Date(f.earliest_bill_date + "T00:00:00");
-          const end = new Date(f.latest_bill_date + "T00:00:00");
-          while (cur <= end) {
-            const iso = cur.toISOString().slice(0, 10);
-            const fri = fridayOf(iso);
-            if (!ddisMap[fri]) ddisMap[fri] = { files: 0, paid: 0 };
-            ddisMap[fri].files = Math.max(ddisMap[fri].files, 1);
-            cur.setDate(cur.getDate() + 7);
-          }
-          ddisMap[fridayOf(f.latest_bill_date)] = ddisMap[fridayOf(f.latest_bill_date)] || { files: 0, paid: 0 };
-        }
-        // Sum paid per week from per-file totals approximately:
-        // (we don't have per-week breakdown, so attribute file total to its earliest week)
-        for (const f of ddisFiles) {
-          if (!f.earliest_bill_date) continue;
-          const fri = fridayOf(f.earliest_bill_date);
+          let fri = f.bill_week_ending;
+          if (!fri && f.earliest_bill_date) fri = fridayOf(f.earliest_bill_date);
+          if (!fri) continue; // ambiguous or no dates
           if (!ddisMap[fri]) ddisMap[fri] = { files: 0, paid: 0 };
           ddisMap[fri].files = (ddisMap[fri].files || 0) + 1;
           ddisMap[fri].paid = (ddisMap[fri].paid || 0) + (f.total_paid || 0);
@@ -5429,13 +5485,15 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
         const tkWeeks = new Set(ulineIn.filter(w => (w.truckload_stops||0) > 0).map(w => w.week_ending));
         const accWeeks = new Set(ulineIn.filter(w => (w.accessorial_stops||0) > 0 || (w.accessorial_revenue||0) > 0).map(w => w.week_ending));
 
-        // DDIS: cover any week whose bill_date range overlaps an expected Friday
+        // DDIS: v2.40.9 — each file claims one week (bill_week_ending).
+        // Files in the ambiguous state (week_ambiguous: true) don't count
+        // until the user resolves them in Settings.
+        const expectedWeeksSet = new Set(expectedWeeks);
         const ddisWeekSet = new Set();
         for (const f of ddisFiles) {
-          if (!f.earliest_bill_date || !f.latest_bill_date) continue;
-          for (const we of expectedWeeks) {
-            if (we >= f.earliest_bill_date && we <= f.latest_bill_date) ddisWeekSet.add(we);
-          }
+          let fri = f.bill_week_ending;
+          if (!fri && f.earliest_bill_date && !f.week_ambiguous) fri = fridayOf(f.earliest_bill_date); // pre-backfill fallback
+          if (fri && expectedWeeksSet.has(fri)) ddisWeekSet.add(fri);
         }
 
         const nvWeeks = new Set(nuvizz.filter(w => inRange(w.week_ending)).map(w => w.week_ending));
@@ -5901,11 +5959,16 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
           const payments = parseDDIS(rows);
           const billDates = payments.map(p => p.bill_date).filter(Boolean).sort();
           const totalPaid = payments.reduce((s,p) => s + p.paid, 0);
+          const wk = computeBillWeekEnding(billDates);
           ddisFileRecords.push({
             file_id: fileId, filename: file.name,
             record_count: payments.length, total_paid: totalPaid,
             earliest_bill_date: billDates[0] || null,
             latest_bill_date: billDates[billDates.length-1] || null,
+            bill_week_ending: wk.bill_week_ending,
+            week_ambiguous: wk.week_ambiguous,
+            ambiguous_candidates: wk.ambiguous_candidates,
+            top5_bill_dates: wk.top5,
             checks: [...new Set(payments.map(p => p.check).filter(Boolean))],
             uploaded_at: new Date().toISOString(),
           });
@@ -7871,37 +7934,47 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
   const [restoreConfirm, setRestoreConfirm] = useState("");
   const [adminToken, setAdminToken] = useState("");
 
+  // v2.40.9: DDIS bill-week backfill state
+  const [backfillRunning, setBackfillRunning] = useState(false);
+  const [backfillMsg, setBackfillMsg] = useState(null);
+  // Resolve-ambiguous state (manual week pick for tie files)
+  const [resolvingFile, setResolvingFile] = useState(null); // file_id being resolved
+  const [resolveMsg, setResolveMsg] = useState(null);
+
   // v2.40.8: Live DDIS stats pulled from the ddis_files collection itself.
   // Previous versions read reconMeta.files_count, a counter kept in a side
   // doc inside marginiq_config that got out of sync with reality (user had
   // 42 real files but the counter read 1). Ground-truthing against the
   // collection avoids that drift entirely.
   const [ddisStats, setDdisStats] = useState(null);
+  const [ddisAmbiguous, setDdisAmbiguous] = useState([]);
+  const [ddisNeedingBackfill, setDdisNeedingBackfill] = useState(0);
   useEffect(() => {
     (async () => {
       if (!hasFirebase) return;
       try {
         const files = await FS.getDDISFiles();
-        if (!files || files.length === 0) { setDdisStats({ count: 0, totalPaid: 0, rows: 0 }); return; }
+        if (!files || files.length === 0) { setDdisStats({ count: 0, totalPaid: 0, rows: 0, weeksCovered: 0 }); return; }
         let totalPaid = 0, rows = 0, earliest = null, latest = null;
         const weeks = new Set();
+        const ambiguous = [];
+        let needBackfill = 0;
         for (const f of files) {
           totalPaid += Number(f.total_paid || 0);
           rows += Number(f.record_count || 0);
           const eb = f.earliest_bill_date, lb = f.latest_bill_date;
           if (eb && (!earliest || eb < earliest)) earliest = eb;
           if (lb && (!latest || lb > latest)) latest = lb;
-          // Weeks covered — one file typically spans one payment cycle
-          // (roughly a week). Use earliest_bill_date bucketed to ISO week.
-          if (eb) {
-            // Friday-ending week key — same convention as Uline weekly rollups
-            const d = new Date(eb + "T00:00:00Z");
-            if (!isNaN(d.getTime())) {
-              const day = d.getUTCDay(); // 0=Sun..6=Sat
-              const diffToFri = (5 - day + 7) % 7;
-              d.setUTCDate(d.getUTCDate() + diffToFri);
-              weeks.add(d.toISOString().slice(0, 10));
-            }
+          // v2.40.9: each file contributes ONE week (its bill_week_ending),
+          // computed at ingestion as the Fri-envelope of the top-5 most-common
+          // bill_dates. Ambiguous ties get surfaced for user resolution.
+          if (f.week_ambiguous) {
+            ambiguous.push(f);
+          } else if (f.bill_week_ending) {
+            weeks.add(f.bill_week_ending);
+          } else {
+            // Pre-v2.40.9 file — needs backfill run
+            needBackfill += 1;
           }
         }
         setDdisStats({
@@ -7911,7 +7984,11 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
           earliest,
           latest,
           weeksCovered: weeks.size,
+          ambiguousCount: ambiguous.length,
+          backfillNeeded: needBackfill,
         });
+        setDdisAmbiguous(ambiguous);
+        setDdisNeedingBackfill(needBackfill);
       } catch(e) { console.error("DDIS stats load failed:", e); }
     })();
   }, []);
@@ -7926,6 +8003,44 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
     setBackupsLoading(false);
   };
   useEffect(() => { loadBackups(); }, []);
+
+  const runBackfill = async () => {
+    if (backfillRunning) return;
+    setBackfillRunning(true);
+    setBackfillMsg(null);
+    try {
+      const resp = await fetch("/.netlify/functions/marginiq-ddis-week-backfill-background", {
+        method: "POST",
+      });
+      if (resp.status === 202 || resp.ok) {
+        setBackfillMsg({ ok: true, text: "✓ Backfill queued. Recomputes bill_week_ending for every DDIS file. Reload Settings in ~60s to see updated counts." });
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+    } catch (e) {
+      setBackfillMsg({ error: e.message });
+    }
+    // Keep the spinner on for ~60s so user doesn't double-click
+    setTimeout(() => setBackfillRunning(false), 60000);
+  };
+
+  const resolveAmbiguousFile = async (fileId, friday) => {
+    setResolvingFile(fileId);
+    setResolveMsg(null);
+    try {
+      await FS.saveDDISFile(fileId, {
+        bill_week_ending: friday,
+        week_ambiguous: false,
+        week_resolved_manually: true,
+        week_resolved_at: new Date().toISOString(),
+      });
+      setResolveMsg({ ok: true, text: `✓ ${fileId} assigned to week ending ${friday}. Reload to refresh counters.` });
+    } catch (e) {
+      setResolveMsg({ error: `Failed to save: ${e.message}` });
+    }
+    setResolvingFile(null);
+  };
 
   const runBackupNow = async () => {
     setBackupAction("run");
@@ -8049,29 +8164,120 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
         {s.action && <a href={s.action} style={{padding:"6px 14px",borderRadius:8,border:`1px solid ${T.brand}`,color:T.brand,fontSize:12,fontWeight:600,textDecoration:"none"}}>Connect</a>}
       </div>)}
     </div>
+
+    {/* v2.40.9: DDIS bill-week backfill banner — appears when any file lacks bill_week_ending */}
+    {ddisNeedingBackfill > 0 && (
+      <div style={{...cardStyle, border:`1px solid ${T.yellow}60`, background:T.yellowBg || T.bgSurface}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <div style={{fontSize:14}}>⚠️</div>
+          <div style={{flex:1,minWidth:200}}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>DDIS Bill-Week Backfill Needed</div>
+            <div style={{fontSize:11,color:T.textMuted,lineHeight:1.5}}>
+              <strong>{ddisNeedingBackfill}</strong> DDIS file{ddisNeedingBackfill===1?"":"s"} {ddisNeedingBackfill===1?"was":"were"} uploaded before v2.40.9 and need{ddisNeedingBackfill===1?"s":""} the <code>bill_week_ending</code> field computed. The counter will stay stale until this runs. Background job — takes ~30–90s, safe to run anytime.
+            </div>
+          </div>
+          <button
+            onClick={runBackfill}
+            disabled={backfillRunning}
+            style={{
+              padding:"9px 16px",borderRadius:8,border:"none",
+              background: backfillRunning ? T.bgSurface : T.brand,
+              color: backfillRunning ? T.textMuted : "#fff",
+              fontSize:12,fontWeight:700,
+              cursor: backfillRunning ? "wait" : "pointer",
+              whiteSpace:"nowrap",
+            }}
+          >
+            {backfillRunning ? "Running…" : "🔁 Run Backfill"}
+          </button>
+        </div>
+        {backfillMsg?.ok && (
+          <div style={{marginTop:10,padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
+            {backfillMsg.text}
+          </div>
+        )}
+        {backfillMsg?.error && (
+          <div style={{marginTop:10,padding:"8px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText}}>
+            ✗ {backfillMsg.error}
+          </div>
+        )}
+      </div>
+    )}
+
+    {/* v2.40.9: Needs Review — files with ambiguous bill-week (tie on top-5 row count) */}
+    {ddisAmbiguous && ddisAmbiguous.length > 0 && (
+      <div style={{...cardStyle, border:`1px solid ${T.yellow}60`}}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>🔎 Needs Review — Ambiguous Bill Week</div>
+        <div style={{fontSize:11,color:T.textMuted,marginBottom:12,lineHeight:1.5}}>
+          The top-5 most-common bill dates in {ddisAmbiguous.length===1?"this file":"these files"} split evenly across two or more Sat→Fri envelopes — no single week has the bulk of the payments. Pick which week {ddisAmbiguous.length===1?"this file":"each file"} should count toward, or leave it null (it won't contribute to the coverage count).
+        </div>
+        {ddisAmbiguous.map(f => (
+          <div key={f.file_id} style={{padding:"10px 12px",border:`1px solid ${T.border}`,borderRadius:6,marginBottom:8}}>
+            <div style={{fontSize:12,fontWeight:600,marginBottom:4}}>{f.filename || f.file_id}</div>
+            <div style={{fontSize:10,color:T.textMuted,marginBottom:8}}>
+              {(f.record_count||0).toLocaleString()} rows · ${Number(f.total_paid||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})} · {f.earliest_bill_date} → {f.latest_bill_date}
+            </div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {(f.ambiguous_candidates || []).map(c => (
+                <button
+                  key={c.friday}
+                  onClick={() => resolveAmbiguousFile(f.file_id, c.friday)}
+                  disabled={resolvingFile === f.file_id}
+                  style={{
+                    padding:"6px 12px",borderRadius:6,border:`1px solid ${T.brand}`,
+                    background: "transparent", color: T.brand,
+                    fontSize:11, fontWeight:600,
+                    cursor: resolvingFile === f.file_id ? "wait" : "pointer",
+                  }}
+                >
+                  Week ending {c.friday} ({c.rows} rows)
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+        {resolveMsg?.ok && (
+          <div style={{padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
+            {resolveMsg.text}
+          </div>
+        )}
+        {resolveMsg?.error && (
+          <div style={{padding:"8px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText}}>
+            ✗ {resolveMsg.error}
+          </div>
+        )}
+      </div>
+    )}
+
     <div style={cardStyle}>
       <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>System Info</div>
       {(() => {
-        // v2.40.8: Live-count DDIS stats from the actual ddis_files collection
-        // (not the stale reconMeta.files_count which drifts).
+        // v2.40.9: DDIS stats. Files Loaded counts docs; Coverage counts
+        // distinct bill_week_ending values (each file = one week). Ambiguous
+        // files don't contribute to the week count until resolved.
         const ddisCount  = ddisStats ? ddisStats.count : "—";
-        const ddisWeeks  = ddisStats?.count ? `${ddisStats.weeksCovered} weeks` : "—";
+        const ddisWeeks  = ddisStats?.count ? `${ddisStats.weeksCovered} week${ddisStats.weeksCovered===1?"":"s"}` : "—";
+        const ddisAmbig  = ddisStats ? (ddisStats.ambiguousCount || 0) : 0;
         const ddisPaid   = ddisStats?.count ? `$${(ddisStats.totalPaid || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—";
         const ddisRange  = ddisStats?.earliest && ddisStats?.latest ? `${ddisStats.earliest} → ${ddisStats.latest}` : "—";
         const ddisRows   = ddisStats?.count ? `${(ddisStats.rows || 0).toLocaleString()} payment rows` : "—";
         const lastUpload = reconMeta?.last_upload ? new Date(reconMeta.last_upload).toLocaleString() : "Never";
-        return [
+        const rows = [
           ["Firebase", "davismarginiq"],
           ["Netlify", "davis-marginiq.netlify.app"],
           ["Version", APP_VERSION],
           ["Weekly Rollups", String(weeklyRollups.length)],
           ["DDIS Files Loaded", String(ddisCount)],
           ["DDIS Coverage", ddisWeeks],
+        ];
+        if (ddisAmbig > 0) rows.push(["DDIS Needs Review", `${ddisAmbig} file${ddisAmbig===1?"":"s"}`]);
+        rows.push(
           ["DDIS Total Paid", ddisPaid],
           ["DDIS Date Range", ddisRange],
           ["DDIS Payment Rows", ddisRows],
           ["Last DDIS Upload", lastUpload],
-        ].map(([l, v]) => <DataRow key={l} label={l} value={v} />);
+        );
+        return rows.map(([l, v]) => <DataRow key={l} label={l} value={v} />);
       })()}
     </div>
 
