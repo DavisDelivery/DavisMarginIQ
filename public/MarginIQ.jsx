@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.17";
+const APP_VERSION = "2.40.18";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7016,6 +7016,42 @@ function Audit({ reconWeekly, weeklyRollups }) {
     setRebuildStatus("");
   };
 
+  // v2.40.18: Purge audit queue — nukes ALL audit_items. Use sparingly. The
+  // rebuild now preserves dispute history across runs, so in normal operation
+  // you shouldn't need this. It exists to clean up pre-v2.40.18 ghost items
+  // accumulated from old rebuilds that never deleted stale docs.
+  const [purging, setPurging] = useState(false);
+  const [purgeResult, setPurgeResult] = useState(null);
+  const purgeAuditItems = async () => {
+    if (purging || rebuilding) return;
+    const count = itemsWithFreshAge.length;
+    const confirmed = window.confirm(
+      `Purge will DELETE all ${count.toLocaleString()} audit items.\n\n` +
+      `Dispute history (won/lost/partial/written_off/recovered_paid) will also be lost — if you want to preserve those, cancel and just run Rebuild instead.\n\n` +
+      `Type OK in the next prompt to confirm.`
+    );
+    if (!confirmed) return;
+    const typed = window.prompt(`Type "PURGE" (all caps) to confirm deletion of ${count.toLocaleString()} audit items:`);
+    if (typed !== "PURGE") { alert("Cancelled — confirmation phrase didn't match."); return; }
+    setPurging(true);
+    setPurgeResult(null);
+    try {
+      const resp = await fetch("/.netlify/functions/marginiq-audit-purge", { method: "POST" });
+      if (!resp.ok) {
+        const t = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${t.slice(0, 200)}`);
+      }
+      const body = await resp.json();
+      setPurgeResult({ ok: true, deleted: body.deleted, failed: body.failed, elapsed_s: body.elapsed_s });
+      // Reload audit data so the UI reflects the empty state.
+      await loadData();
+    } catch(e) {
+      console.error("purgeAuditItems failed:", e);
+      setPurgeResult({ error: e.message });
+    }
+    setPurging(false);
+  };
+
   // Recompute age_days on load (they were stored at ingest time and may be stale)
   const itemsWithFreshAge = useMemo(() => {
     const today = new Date().toISOString().slice(0,10);
@@ -7069,12 +7105,28 @@ function Audit({ reconWeekly, weeklyRollups }) {
 
   // Dashboard stats
   const stats = useMemo(() => {
-    const active = rangedItems.filter(i => i.dispute_status !== "written_off" && i.dispute_status !== "won");
+    // v2.40.18: exclude recovered_paid (Uline paid after we saw the variance)
+    // and recovered (zero-variance historical markers) from Outstanding.
+    const active = rangedItems.filter(i =>
+      i.dispute_status !== "written_off" &&
+      i.dispute_status !== "won" &&
+      i.dispute_status !== "recovered_paid"
+    );
     const outstanding = active.reduce((s,i) => s + (i.variance||0), 0);
     const outstandingCount = active.length;
     const thisMonth = new Date().toISOString().slice(0,7);
     const wonThisMonth = disputes.filter(d => d.outcome === "won" && (d.response_date||"").startsWith(thisMonth));
-    const recovered = wonThisMonth.reduce((s,d) => s + (d.amount_recovered||0), 0);
+    // v2.40.18: passively-recovered items (Uline paid without a formal dispute)
+    // also count toward "Recovered this month" — their recovered_at stamp is
+    // written by the background rebuild when variance drops to ≤ $1.
+    const recoveredPaidThisMonth = rangedItems.filter(i =>
+      i.dispute_status === "recovered_paid" &&
+      (i.recovered_at||"").startsWith(thisMonth)
+    );
+    const recoveredFromDisputes = wonThisMonth.reduce((s,d) => s + (d.amount_recovered||0), 0);
+    const recoveredFromPassive = recoveredPaidThisMonth.reduce((s,i) => s + (i.recovered_amount||0), 0);
+    const recovered = recoveredFromDisputes + recoveredFromPassive;
+    const recoveredCount = wonThisMonth.length + recoveredPaidThisMonth.length;
     const allDisputed = disputes.filter(d => d.submitted_date);
     const won = allDisputed.filter(d => d.outcome === "won" || d.outcome === "partial");
     const winRate = allDisputed.length > 0 ? (won.length / allDisputed.length * 100) : null;
@@ -7083,7 +7135,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
       .filter(d => d.submitted_date && d.response_date && (d.outcome === "won" || d.outcome === "partial"))
       .map(d => daysBetween(d.submitted_date.slice(0,10), d.response_date.slice(0,10)) || 0);
     const avgTurnaround = turnarounds.length > 0 ? Math.round(turnarounds.reduce((s,t)=>s+t,0)/turnarounds.length) : null;
-    return { outstanding, outstandingCount, recovered, wonThisMonthCount: wonThisMonth.length, winRate, avgTurnaround };
+    return { outstanding, outstandingCount, recovered, wonThisMonthCount: recoveredCount, winRate, avgTurnaround };
   }, [rangedItems, disputes]);
 
   // Aging bucket breakdown (active only)
@@ -7091,7 +7143,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
     const buckets = {};
     for (const b of AGE_BUCKETS) buckets[b] = { bucket: b, count: 0, amount: 0 };
     for (const i of rangedItems) {
-      if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
+      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid") continue;
       const b = i.age_bucket || "unknown";
       if (!buckets[b]) buckets[b] = { bucket: b, count: 0, amount: 0 };
       buckets[b].count++;
@@ -7104,7 +7156,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
   const topCustomers = useMemo(() => {
     const byC = {};
     for (const i of rangedItems) {
-      if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
+      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid") continue;
       const c = i.customer || "Unknown";
       if (!byC[c]) byC[c] = { customer: c, customer_key: i.customer_key, count: 0, amount: 0, oldest_age: 0 };
       byC[c].count++;
@@ -7119,7 +7171,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
     const out = {};
     for (const c of CATEGORIES) out[c] = { category: c, count: 0, amount: 0 };
     for (const i of rangedItems) {
-      if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
+      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid") continue;
       const c = i.category || "short_paid";
       if (!out[c]) out[c] = { category: c, count: 0, amount: 0 };
       out[c].count++;
@@ -7170,6 +7222,166 @@ function Audit({ reconWeekly, weeklyRollups }) {
     const updated = { ...item, dispute_status: newStatus, ...extras, updated_at: new Date().toISOString() };
     await FS.saveAuditItem(pro, updated);
     setAuditItems(prev => prev.map(i => i.pro === pro ? updated : i));
+  };
+
+  // v2.40.18: Uline export — dumps selected (or filtered) audit items to CSV/XLSX/PDF
+  // for sending to Uline AP. Distinct from generateDisputePdf below:
+  //   - No dispute record created (this is a discovery-stage export, not a formal submission)
+  //   - No item statuses changed
+  //   - Supports three formats (user picks per export)
+  //   - Scope: if anything is selected, export selected; else export current filter result
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportStatus, setExportStatus] = useState("");
+
+  // Shared column definitions for CSV + XLSX. PDF uses its own layout server-side.
+  const EXPORT_COLUMNS = [
+    { key: "pro",           label: "PRO" },
+    { key: "customer",      label: "End Customer" },
+    { key: "pu_date",       label: "PU Date" },
+    { key: "week_ending",   label: "Week Ending" },
+    { key: "city",          label: "City" },
+    { key: "state",         label: "ST" },
+    { key: "zip",           label: "ZIP" },
+    { key: "service_type",  label: "Service" },
+    { key: "code",          label: "Accessorial Code" },
+    { key: "weight",        label: "Weight (lb)" },
+    { key: "order",         label: "Order #" },
+    { key: "billed",        label: "Billed ($)" },
+    { key: "paid",          label: "Paid ($)" },
+    { key: "variance",      label: "Variance ($)" },
+    { key: "variance_pct",  label: "Variance %" },
+    { key: "age_days",      label: "Age (days)" },
+    { key: "category",      label: "Category" },
+    { key: "dispute_status",label: "Status" },
+  ];
+
+  const getExportScope = () => {
+    if (selectedItems.length > 0) return { rows: selectedItems, scopeLabel: `${selectedItems.length} selected` };
+    return { rows: filteredItems, scopeLabel: `${filteredItems.length} filtered` };
+  };
+
+  const buildExportRows = (rows) => rows.map(r => {
+    const out = {};
+    for (const col of EXPORT_COLUMNS) {
+      let v = r[col.key];
+      if (v === undefined || v === null) v = "";
+      // Round money + pct fields for readability
+      if (["billed","paid","variance"].includes(col.key) && typeof v === "number") v = Math.round(v * 100) / 100;
+      if (col.key === "variance_pct" && typeof v === "number") v = Math.round(v * 10) / 10;
+      out[col.label] = v;
+    }
+    return out;
+  });
+
+  const exportFilename = (ext) => {
+    const today = new Date().toISOString().slice(0,10);
+    return `davis-uline-audit-${today}.${ext}`;
+  };
+
+  const exportCSV = () => {
+    const { rows, scopeLabel } = getExportScope();
+    if (rows.length === 0) { setExportStatus("✗ Nothing to export."); return; }
+    setExportBusy(true);
+    try {
+      const headers = EXPORT_COLUMNS.map(c => c.label);
+      const escape = (v) => {
+        if (v === null || v === undefined) return "";
+        const s = String(v);
+        // Standard CSV escaping: wrap in quotes if it contains ", comma, newline, or leading space.
+        if (/[",\n\r]/.test(s) || s !== s.trim()) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+      };
+      const lines = [headers.map(escape).join(",")];
+      for (const r of buildExportRows(rows)) {
+        lines.push(headers.map(h => escape(r[h])).join(","));
+      }
+      const csv = "\uFEFF" + lines.join("\r\n"); // BOM for Excel compatibility
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = exportFilename("csv");
+      link.click();
+      URL.revokeObjectURL(link.href);
+      setExportStatus(`✓ Exported ${rows.length} items to CSV (${scopeLabel})`);
+      setExportOpen(false);
+    } catch (e) {
+      console.error("exportCSV failed:", e);
+      setExportStatus(`✗ CSV export failed: ${e.message}`);
+    }
+    setExportBusy(false);
+  };
+
+  const exportXLSX = () => {
+    const { rows, scopeLabel } = getExportScope();
+    if (rows.length === 0) { setExportStatus("✗ Nothing to export."); return; }
+    if (typeof window.XLSX === "undefined") {
+      setExportStatus("✗ SheetJS not loaded — use CSV instead.");
+      return;
+    }
+    setExportBusy(true);
+    try {
+      const data = buildExportRows(rows);
+      const totals = {};
+      for (const c of EXPORT_COLUMNS) totals[c.label] = "";
+      totals[EXPORT_COLUMNS[0].label] = "TOTAL";
+      totals["Billed ($)"] = Math.round(rows.reduce((s,r)=>s+(r.billed||0),0) * 100) / 100;
+      totals["Paid ($)"]   = Math.round(rows.reduce((s,r)=>s+(r.paid||0),0) * 100) / 100;
+      totals["Variance ($)"] = Math.round(rows.reduce((s,r)=>s+(r.variance||0),0) * 100) / 100;
+      data.push(totals);
+      const ws = window.XLSX.utils.json_to_sheet(data);
+      // Column widths — pick something reasonable for the main columns
+      ws["!cols"] = [
+        { wch: 12 }, // PRO
+        { wch: 24 }, // Customer
+        { wch: 11 }, { wch: 11 }, // dates
+        { wch: 16 }, { wch: 4 }, { wch: 7 }, // city/st/zip
+        { wch: 10 }, { wch: 8 }, { wch: 8 }, { wch: 12 }, // service/code/weight/order
+        { wch: 11 }, { wch: 10 }, { wch: 12 }, { wch: 10 }, // billed/paid/variance/pct
+        { wch: 9 }, { wch: 16 }, { wch: 14 }, // age/category/status
+      ];
+      const wb = window.XLSX.utils.book_new();
+      window.XLSX.utils.book_append_sheet(wb, ws, "Uline Audit");
+      window.XLSX.writeFile(wb, exportFilename("xlsx"));
+      setExportStatus(`✓ Exported ${rows.length} items to XLSX (${scopeLabel})`);
+      setExportOpen(false);
+    } catch (e) {
+      console.error("exportXLSX failed:", e);
+      setExportStatus(`✗ XLSX export failed: ${e.message}`);
+    }
+    setExportBusy(false);
+  };
+
+  const exportPDF = async () => {
+    const { rows, scopeLabel } = getExportScope();
+    if (rows.length === 0) { setExportStatus("✗ Nothing to export."); return; }
+    setExportBusy(true);
+    setExportStatus("Generating PDF…");
+    try {
+      // Reuse the dispute-pdf endpoint but label recipient as Uline. This is
+      // intentionally NOT tied to a dispute record — it's a discovery export.
+      const resp = await fetch("/.netlify/functions/marginiq-dispute-pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: rows,
+          customer: "Uline",
+          ap_contact: { billing_email: "APFreight@uline.com", ap_contact_name: "Uline AP", ap_contact_phone: "" },
+        }),
+      });
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+      const link = document.createElement("a");
+      link.href = "data:application/pdf;base64," + data.data;
+      link.download = data.filename || exportFilename("pdf");
+      link.click();
+      setExportStatus(`✓ Exported ${rows.length} items to PDF (${scopeLabel}, $${(data.total_claim||0).toFixed(2)} claim)`);
+      setExportOpen(false);
+    } catch (e) {
+      console.error("exportPDF failed:", e);
+      setExportStatus(`✗ PDF export failed: ${e.message}`);
+    }
+    setExportBusy(false);
   };
 
   // Generate dispute PDF for selected or single item
@@ -7365,16 +7577,16 @@ function Audit({ reconWeekly, weeklyRollups }) {
                 </div>
                 <button
                   onClick={rebuildAuditItems}
-                  disabled={rebuilding}
+                  disabled={rebuilding || purging}
                   style={{
                     padding: "9px 16px",
                     borderRadius: 8,
                     border: "none",
-                    background: rebuilding ? T.bgSurface : `linear-gradient(135deg,${T.brand},${T.brandLight})`,
-                    color: rebuilding ? T.text : "#fff",
+                    background: (rebuilding || purging) ? T.bgSurface : `linear-gradient(135deg,${T.brand},${T.brandLight})`,
+                    color: (rebuilding || purging) ? T.text : "#fff",
                     fontSize: 12,
                     fontWeight: 700,
-                    cursor: rebuilding ? "wait" : "pointer",
+                    cursor: (rebuilding || purging) ? "wait" : "pointer",
                     whiteSpace: "nowrap",
                   }}
                 >
@@ -7433,6 +7645,45 @@ function Audit({ reconWeekly, weeklyRollups }) {
                   )}
                 </div>
               )}
+              {/* v2.40.18: Danger-zone purge. Below the rebuild UI, visually separated. */}
+              <div style={{marginTop:14,paddingTop:12,borderTop:`1px dashed ${T.border}`}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
+                  <div style={{flex:"1 1 260px"}}>
+                    <div style={{fontSize:11,fontWeight:700,color:T.red,marginBottom:2}}>⚠️ Purge audit queue</div>
+                    <div style={{fontSize:10,color:T.textMuted,lineHeight:1.5}}>
+                      Nukes all <code>{itemsWithFreshAge.length.toLocaleString()}</code> audit items. Use this to clean up stale data from pre-v2.40.18 rebuilds (which didn't delete ghost items). A fresh Rebuild after purging will start from the current <code>unpaid_stops</code> ↔ <code>ddis_payments</code> truth.
+                    </div>
+                  </div>
+                  <button
+                    onClick={purgeAuditItems}
+                    disabled={purging || rebuilding || itemsWithFreshAge.length === 0}
+                    style={{
+                      padding: "7px 14px",
+                      borderRadius: 8,
+                      border: `1px solid ${T.red}`,
+                      background: (purging || rebuilding) ? T.bgSurface : "transparent",
+                      color: (purging || rebuilding || itemsWithFreshAge.length === 0) ? T.textMuted : T.red,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: (purging || rebuilding || itemsWithFreshAge.length === 0) ? "not-allowed" : "pointer",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {purging ? "⏳ Purging…" : "🗑️ Purge All"}
+                  </button>
+                </div>
+                {purgeResult?.error && (
+                  <div style={{marginTop:8,padding:"8px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText}}>
+                    ✗ {purgeResult.error}
+                  </div>
+                )}
+                {purgeResult?.ok && (
+                  <div style={{marginTop:8,padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
+                    ✓ Deleted {purgeResult.deleted?.toLocaleString()} audit items in {purgeResult.elapsed_s}s
+                    {purgeResult.failed > 0 && ` (${purgeResult.failed} failed)`}. Click Rebuild Now to regenerate from current data.
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Aging buckets */}
@@ -7525,7 +7776,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
             </select>
             <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
               <option value="all">All statuses</option>
-              {["new","queued","sent","won","lost","partial","written_off"].map(s => <option key={s} value={s}>{s}</option>)}
+              {["new","queued","sent","won","lost","partial","written_off","recovered_paid"].map(s => <option key={s} value={s}>{s}</option>)}
             </select>
             <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
               <option value="variance">Sort: $ owed</option>
@@ -7538,6 +7789,64 @@ function Audit({ reconWeekly, weeklyRollups }) {
             Showing {filteredItems.length} items • Min variance ${filterMinVar}
             {Object.keys(selectedIds).filter(k=>selectedIds[k]).length > 0 && ` • ${selectedItems.length} selected`}
           </div>
+        </div>
+
+        {/* v2.40.18: Uline export panel — dumps selected (or filtered if nothing selected)
+            items to CSV / XLSX / PDF for sending to Uline AP. Unlike the bulk-actions
+            "Generate Dispute PDF" below, this is a discovery-stage export: no dispute
+            record is created, no item statuses are changed. */}
+        <div style={{...cardStyle, padding:"10px 12px", marginBottom:8}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+            <div style={{flex:"1 1 200px"}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.text,marginBottom:2}}>📤 Export for Uline</div>
+              <div style={{fontSize:10,color:T.textMuted,lineHeight:1.5}}>
+                {selectedItems.length > 0
+                  ? <>Will export <strong>{selectedItems.length}</strong> selected item{selectedItems.length===1?"":"s"} ({fmtK(selectedItems.reduce((s,i)=>s+(i.variance||0),0))} variance).</>
+                  : <>Will export <strong>{filteredItems.length}</strong> filtered item{filteredItems.length===1?"":"s"} ({fmtK(filteredItems.reduce((s,i)=>s+(i.variance||0),0))} variance). Select rows to narrow.</>}
+              </div>
+            </div>
+            <button
+              onClick={() => setExportOpen(v => !v)}
+              disabled={exportBusy || (filteredItems.length === 0 && selectedItems.length === 0)}
+              style={{
+                padding: "7px 14px",
+                borderRadius: 8,
+                border: `1px solid ${T.brand}`,
+                background: exportOpen ? T.brand : "transparent",
+                color: exportOpen ? "#fff" : T.brand,
+                fontSize: 11,
+                fontWeight: 700,
+                cursor: (exportBusy || (filteredItems.length === 0 && selectedItems.length === 0)) ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {exportOpen ? "▼ Hide formats" : "📤 Export…"}
+            </button>
+          </div>
+          {exportOpen && (
+            <div style={{marginTop:10,paddingTop:10,borderTop:`1px dashed ${T.border}`,display:"flex",gap:8,flexWrap:"wrap"}}>
+              <button onClick={exportCSV} disabled={exportBusy}
+                style={{padding:"8px 14px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,color:T.text,cursor:exportBusy?"wait":"pointer",flex:"1 1 140px"}}>
+                📄 CSV
+                <div style={{fontSize:9,color:T.textMuted,fontWeight:500,marginTop:2}}>Universal, opens in Excel</div>
+              </button>
+              <button onClick={exportXLSX} disabled={exportBusy}
+                style={{padding:"8px 14px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${T.green}`,background:T.greenBg,color:T.greenText,cursor:exportBusy?"wait":"pointer",flex:"1 1 140px"}}>
+                📊 Excel (.xlsx)
+                <div style={{fontSize:9,color:T.textMuted,fontWeight:500,marginTop:2}}>Formatted + totals row</div>
+              </button>
+              <button onClick={exportPDF} disabled={exportBusy}
+                style={{padding:"8px 14px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${T.brand}`,background:T.brandPale,color:T.brand,cursor:exportBusy?"wait":"pointer",flex:"1 1 140px"}}>
+                📕 PDF
+                <div style={{fontSize:9,color:T.textMuted,fontWeight:500,marginTop:2}}>Letter-style, send to APFreight@uline.com</div>
+              </button>
+            </div>
+          )}
+          {exportStatus && (
+            <div style={{marginTop:8,fontSize:11,color:exportStatus.startsWith("✓")?T.greenText:exportStatus.startsWith("✗")?T.redText:T.textMuted}}>
+              {exportStatus}
+            </div>
+          )}
         </div>
 
         {/* Bulk actions */}

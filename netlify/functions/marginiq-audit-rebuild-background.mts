@@ -325,6 +325,38 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
       unpaid_stops_read: stopDocs.length,
     });
 
+    // v2.40.18: Read existing audit_items so we can:
+    //   (a) preserve human-set fields (dispute_status, notes, original_variance,
+    //       recovered_at/recovered_amount) through rebuilds
+    //   (b) detect PROs that were in the queue before but have now been paid
+    //       (they don't generate a new item this pass) → transition those to
+    //       status="recovered_paid" with recovered_amount = prior variance
+    const priorAuditDocs = await listAllDocsMask(
+      "audit_items",
+      ["pro", "variance", "billed", "paid", "dispute_status", "notes",
+       "recovered_at", "recovered_amount", "original_variance",
+       "first_seen_at", "created_at", "week_ending"],
+    );
+    const priorByPro = new Map<string, any>();
+    for (const pdoc of priorAuditDocs) {
+      const f = pdoc.fields || {};
+      const pro = f.pro?.stringValue || pdoc.name?.split("/").pop();
+      if (!pro) continue;
+      priorByPro.set(pro, {
+        variance: Number(f.variance?.doubleValue ?? f.variance?.integerValue ?? 0),
+        billed: Number(f.billed?.doubleValue ?? f.billed?.integerValue ?? 0),
+        paid: Number(f.paid?.doubleValue ?? f.paid?.integerValue ?? 0),
+        dispute_status: f.dispute_status?.stringValue || "new",
+        notes: f.notes?.arrayValue?.values || [],
+        recovered_at: f.recovered_at?.stringValue || null,
+        recovered_amount: Number(f.recovered_amount?.doubleValue ?? f.recovered_amount?.integerValue ?? 0) || null,
+        original_variance: Number(f.original_variance?.doubleValue ?? f.original_variance?.integerValue ?? 0) || null,
+        first_seen_at: f.first_seen_at?.stringValue || f.created_at?.stringValue || null,
+        week_ending: f.week_ending?.stringValue || null,
+      });
+    }
+    console.log(`audit-rebuild: ${priorByPro.size} prior audit_items loaded (for history/recovered-paid tracking)`);
+
     // v2.40.12: recent-week cutoff. Stops with week_ending within the last
     // RECENT_DAYS days are exempt from the audit queue regardless of DDIS
     // match — the DDIS file for that week may not have arrived yet.
@@ -378,7 +410,18 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
       const ageDays = daysBetween(pu_date, today) || 0;
       const category = categorize(billed, paid, false, 0, ageDays);
       const variance_pct = billed > 0 ? (variance / billed * 100) : null;
-      const item = {
+      // v2.40.18: preserve human-set fields across rebuilds.
+      const prior = priorByPro.get(pro);
+      const priorStatus = prior?.dispute_status || "new";
+      // Dispute status: never downgrade a human-set status back to "new".
+      // If user had marked this "queued"/"sent"/etc, keep it.
+      const keepStatuses = new Set(["queued", "sent", "won", "lost", "partial", "written_off", "recovered_paid"]);
+      const dispute_status = keepStatuses.has(priorStatus) ? priorStatus : "new";
+      // If an item was previously recovered_paid and variance reappeared,
+      // something changed (maybe Uline clawed back? or new DDIS revealed they
+      // didn't pay it all). Reset to "new" so it gets triaged fresh.
+      const effectiveStatus = (priorStatus === "recovered_paid" && variance > 1) ? "new" : dispute_status;
+      const item: any = {
         pro,
         customer,
         customer_key: customerKey(customer),
@@ -401,12 +444,22 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
         age_days: ageDays,
         age_bucket: ageBucket(ageDays),
         category,
-        dispute_status: "new",
-        notes: [] as any[],
+        dispute_status: effectiveStatus,
+        notes: prior?.notes || [],
+        // v2.40.18: track original variance (first time we saw this PRO owe money)
+        // so a later recovered_paid event can show how much we actually recovered.
+        original_variance: prior?.original_variance || variance,
+        first_seen_at: prior?.first_seen_at || new Date().toISOString(),
         rebuilt_from_firestore: true,
-        rebuild_source: "background_v2.40.14",
+        rebuild_source: "background_v2.40.18",
         updated_at: new Date().toISOString(),
       };
+      // If item had been recovered_paid but variance reappeared, clear those fields
+      // so they don't show phantom recovered data in the UI.
+      if (priorStatus === "recovered_paid" && variance > 1) {
+        item.recovered_at = null;
+        item.recovered_amount = null;
+      }
       totalVariance += variance;
       items.push({ docId: pro, item });
     }
@@ -443,6 +496,101 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
     });
 
     // 4) Convert items to Firestore field shape and batch-write
+    // v2.40.18: before converting, walk priorByPro for PROs that did NOT
+    // produce a new item this pass. Possibilities:
+    //   (a) Still has variance > 1 but got sidelined (recent/awaiting-DDIS/no-week)
+    //       → keep the prior doc as-is so dispute tracking isn't lost. We
+    //         just upsert the prior fields back (no-op effectively, but
+    //         guarantees the doc stays present).
+    //   (b) Variance dropped to ≤ 1 (Uline finally paid)
+    //       → transition to recovered_paid with recovered_amount = prior variance
+    //         UNLESS the prior status was already in a terminal state
+    //         (won/lost/partial/written_off/recovered_paid) — then preserve.
+    const newProSet = new Set(items.map(i => i.docId));
+    const stopsByPro = new Map<string, any>();
+    for (const sd of stopDocs) {
+      const pro = sd.fields?.pro?.stringValue;
+      if (pro) stopsByPro.set(pro, sd);
+    }
+    let recoveredCount = 0;
+    let recoveredAmount = 0;
+    let preservedCount = 0;
+    const nowIso = new Date().toISOString();
+    for (const [pro, prior] of priorByPro) {
+      if (newProSet.has(pro)) continue; // already handled by normal loop
+      const terminalStatuses = new Set(["won", "lost", "partial", "written_off"]);
+      if (terminalStatuses.has(prior.dispute_status)) {
+        // Already finalized — preserve exactly. We don't write these back at
+        // all (they stay in Firestore untouched). Skip to next.
+        preservedCount++;
+        continue;
+      }
+      if (prior.dispute_status === "recovered_paid") {
+        // Already marked recovered. Don't rewrite — it stays as-is.
+        preservedCount++;
+        continue;
+      }
+      // Did we see this PRO in unpaid_stops this run? If yes, the reason it
+      // didn't produce an item is sidelining or variance ≤ 1 (paid up).
+      const stopDoc = stopsByPro.get(pro);
+      if (stopDoc) {
+        const sf = stopDoc.fields || {};
+        const billed = Number(sf.billed?.doubleValue ?? sf.billed?.integerValue ?? 0);
+        const paid = hasPerProPayments ? (paymentByPro[pro] || 0) : 0;
+        const variance = billed - paid;
+        if (variance <= 1 && prior.variance > 1) {
+          // Uline paid. Transition to recovered_paid.
+          const recoveredItem: any = {
+            pro,
+            customer: sf.customer?.stringValue || "Unknown",
+            customer_key: customerKey(sf.customer?.stringValue || "Unknown"),
+            city: sf.city?.stringValue || null,
+            state: sf.state?.stringValue || null,
+            zip: sf.zip?.stringValue || null,
+            pu_date: sf.pu_date?.stringValue || null,
+            week_ending: sf.week_ending?.stringValue || prior.week_ending || null,
+            month: sf.month?.stringValue || null,
+            billed,
+            paid,
+            variance: 0,
+            variance_pct: 0,
+            accessorial_amount: 0,
+            base_cost: 0,
+            code: sf.code?.stringValue || null,
+            weight: Number(sf.weight?.doubleValue ?? sf.weight?.integerValue ?? 0) || null,
+            order: sf.order?.stringValue || null,
+            service_type: sf.service_type?.stringValue || "delivery",
+            age_days: daysBetween(sf.pu_date?.stringValue || null, today) || 0,
+            age_bucket: ageBucket(daysBetween(sf.pu_date?.stringValue || null, today) || 0),
+            category: "recovered",
+            dispute_status: "recovered_paid",
+            notes: prior.notes || [],
+            original_variance: prior.original_variance || prior.variance,
+            first_seen_at: prior.first_seen_at || nowIso,
+            recovered_at: nowIso,
+            recovered_amount: prior.variance,
+            rebuilt_from_firestore: true,
+            rebuild_source: "background_v2.40.18",
+            updated_at: nowIso,
+          };
+          items.push({ docId: pro, item: recoveredItem });
+          recoveredCount++;
+          recoveredAmount += prior.variance;
+        }
+        // else: still has variance but was sidelined — prior doc stays
+        // untouched. Don't write it back.
+      }
+      // else: prior PRO not in unpaid_stops at all (stop was deleted/pruned).
+      // Leave prior doc alone — it either shows the user a historical record
+      // or a stale pointer they can manually clean up.
+    }
+    if (recoveredCount > 0) {
+      console.log(`audit-rebuild: ${recoveredCount} PROs transitioned to recovered_paid ($${recoveredAmount.toFixed(2)} recovered)`);
+    }
+    if (preservedCount > 0) {
+      console.log(`audit-rebuild: ${preservedCount} prior items preserved in terminal status (won/lost/partial/written_off/recovered_paid)`);
+    }
+
     const toWrite = items.map(({ docId, item }) => ({
       docId,
       fields: toFsValue(item).mapValue.fields,
@@ -453,13 +601,19 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
     const sidelineNote = (skippedRecent || skippedNoDdis || skippedNoWeek)
       ? ` · sidelined: ${skippedRecent} recent, ${skippedNoDdis} awaiting DDIS, ${skippedNoWeek} no-week`
       : "";
+    const recoveredNote = recoveredCount > 0
+      ? ` · 🏆 ${recoveredCount} newly recovered ($${Math.round(recoveredAmount).toLocaleString()})`
+      : "";
     await writeStatus({
       state: "complete",
       completed_at: new Date().toISOString(),
       phase: "done",
-      progress_text: `✓ Rebuilt ${result.ok.toLocaleString()} audit items ($${Math.round(totalVariance).toLocaleString()} variance) from ${payDocs.length.toLocaleString()} payment rows × ${stopDocs.length.toLocaleString()} unpaid stops${sidelineNote}`,
+      progress_text: `✓ Rebuilt ${result.ok.toLocaleString()} audit items ($${Math.round(totalVariance).toLocaleString()} variance) from ${payDocs.length.toLocaleString()} payment rows × ${stopDocs.length.toLocaleString()} unpaid stops${sidelineNote}${recoveredNote}`,
       items_written: result.ok,
       with_payments: hasPerProPayments,
+      newly_recovered_count: recoveredCount,
+      newly_recovered_amount: recoveredAmount,
+      preserved_terminal_count: preservedCount,
     });
 
     return {
