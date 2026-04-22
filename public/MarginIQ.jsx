@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.15";
+const APP_VERSION = "2.40.16";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -6843,6 +6843,11 @@ function Audit({ reconWeekly, weeklyRollups }) {
   const [sortBy, setSortBy] = useState("variance");
   // v2.40.14: service_type filter — "all" | "delivery" | "truckload" | "accessorial"
   const [filterService, setFilterService] = useState("all");
+  // v2.40.16: date-range filter — scopes the WHOLE Audit dashboard (tiles + items)
+  // rangePreset: "all" | "this_month" | "30d" | "90d" | "ytd" | "custom"
+  const [rangePreset, setRangePreset] = useState("all");
+  const [customFrom, setCustomFrom] = useState(""); // YYYY-MM-DD
+  const [customTo, setCustomTo] = useState("");     // YYYY-MM-DD
   const [selectedIds, setSelectedIds] = useState({}); // pro -> true
 
   // PDF generation state
@@ -6965,9 +6970,51 @@ function Audit({ reconWeekly, weeklyRollups }) {
     });
   }, [auditItems]);
 
+  // v2.40.16: resolve the active date range → { from, to } ISO strings, or null = unbounded.
+  // Used by rangedItems below to scope the ENTIRE audit dashboard (KPIs, aging, by-customer,
+  // by-category, filtered list). Chad confirmed whole-dashboard scoping.
+  const rangeBounds = useMemo(() => {
+    const pad = (n) => String(n).padStart(2, "0");
+    const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+    const today = new Date();
+    if (rangePreset === "all") return null;
+    if (rangePreset === "this_month") {
+      const from = iso(new Date(today.getFullYear(), today.getMonth(), 1));
+      return { from, to: iso(today) };
+    }
+    if (rangePreset === "30d") {
+      const d = new Date(today); d.setDate(d.getDate() - 30);
+      return { from: iso(d), to: iso(today) };
+    }
+    if (rangePreset === "90d") {
+      const d = new Date(today); d.setDate(d.getDate() - 90);
+      return { from: iso(d), to: iso(today) };
+    }
+    if (rangePreset === "ytd") {
+      return { from: `${today.getFullYear()}-01-01`, to: iso(today) };
+    }
+    if (rangePreset === "custom") {
+      if (!customFrom && !customTo) return null;
+      return { from: customFrom || "0000-01-01", to: customTo || "9999-12-31" };
+    }
+    return null;
+  }, [rangePreset, customFrom, customTo]);
+
+  // v2.40.16: items scoped to the selected date range. Falls back to pu_date when week_ending
+  // is missing (older audit rows written before v2.40.9 week-derivation logic).
+  const rangedItems = useMemo(() => {
+    if (!rangeBounds) return itemsWithFreshAge;
+    const { from, to } = rangeBounds;
+    return itemsWithFreshAge.filter(i => {
+      const d = i.week_ending || i.pu_date;
+      if (!d) return false;
+      return d >= from && d <= to;
+    });
+  }, [itemsWithFreshAge, rangeBounds]);
+
   // Dashboard stats
   const stats = useMemo(() => {
-    const active = itemsWithFreshAge.filter(i => i.dispute_status !== "written_off" && i.dispute_status !== "won");
+    const active = rangedItems.filter(i => i.dispute_status !== "written_off" && i.dispute_status !== "won");
     const outstanding = active.reduce((s,i) => s + (i.variance||0), 0);
     const outstandingCount = active.length;
     const thisMonth = new Date().toISOString().slice(0,7);
@@ -6982,13 +7029,13 @@ function Audit({ reconWeekly, weeklyRollups }) {
       .map(d => daysBetween(d.submitted_date.slice(0,10), d.response_date.slice(0,10)) || 0);
     const avgTurnaround = turnarounds.length > 0 ? Math.round(turnarounds.reduce((s,t)=>s+t,0)/turnarounds.length) : null;
     return { outstanding, outstandingCount, recovered, wonThisMonthCount: wonThisMonth.length, winRate, avgTurnaround };
-  }, [itemsWithFreshAge, disputes]);
+  }, [rangedItems, disputes]);
 
   // Aging bucket breakdown (active only)
   const agingBuckets = useMemo(() => {
     const buckets = {};
     for (const b of AGE_BUCKETS) buckets[b] = { bucket: b, count: 0, amount: 0 };
-    for (const i of itemsWithFreshAge) {
+    for (const i of rangedItems) {
       if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
       const b = i.age_bucket || "unknown";
       if (!buckets[b]) buckets[b] = { bucket: b, count: 0, amount: 0 };
@@ -6996,12 +7043,12 @@ function Audit({ reconWeekly, weeklyRollups }) {
       buckets[b].amount += i.variance || 0;
     }
     return AGE_BUCKETS.map(b => buckets[b]).filter(b => b.count > 0);
-  }, [itemsWithFreshAge]);
+  }, [rangedItems]);
 
   // Top customers by outstanding
   const topCustomers = useMemo(() => {
     const byC = {};
-    for (const i of itemsWithFreshAge) {
+    for (const i of rangedItems) {
       if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
       const c = i.customer || "Unknown";
       if (!byC[c]) byC[c] = { customer: c, customer_key: i.customer_key, count: 0, amount: 0, oldest_age: 0 };
@@ -7010,13 +7057,13 @@ function Audit({ reconWeekly, weeklyRollups }) {
       if ((i.age_days||0) > byC[c].oldest_age) byC[c].oldest_age = i.age_days || 0;
     }
     return Object.values(byC).sort((a,b) => b.amount - a.amount).slice(0, 15);
-  }, [itemsWithFreshAge]);
+  }, [rangedItems]);
 
   // Category breakdown
   const byCategory = useMemo(() => {
     const out = {};
     for (const c of CATEGORIES) out[c] = { category: c, count: 0, amount: 0 };
-    for (const i of itemsWithFreshAge) {
+    for (const i of rangedItems) {
       if (i.dispute_status === "written_off" || i.dispute_status === "won") continue;
       const c = i.category || "short_paid";
       if (!out[c]) out[c] = { category: c, count: 0, amount: 0 };
@@ -7024,11 +7071,11 @@ function Audit({ reconWeekly, weeklyRollups }) {
       out[c].amount += i.variance || 0;
     }
     return CATEGORIES.map(c => out[c]).filter(x => x.count > 0);
-  }, [itemsWithFreshAge]);
+  }, [rangedItems]);
 
   // Filtered item list
   const filteredItems = useMemo(() => {
-    let arr = itemsWithFreshAge;
+    let arr = rangedItems;
     if (filterCategory !== "all") arr = arr.filter(i => i.category === filterCategory);
     if (filterAge !== "all") arr = arr.filter(i => i.age_bucket === filterAge);
     if (filterStatus !== "all") arr = arr.filter(i => (i.dispute_status || "new") === filterStatus);
@@ -7047,7 +7094,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
       return 0;
     });
     return arr;
-  }, [itemsWithFreshAge, filterCategory, filterAge, filterStatus, filterService, filterCustomer, filterMinVar, sortBy]);
+  }, [rangedItems, filterCategory, filterAge, filterStatus, filterService, filterCustomer, filterMinVar, sortBy]);
 
   // Selected items for bulk actions
   const selectedItems = useMemo(() =>
@@ -7142,7 +7189,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
     <SectionTitle icon="🧾" text="Audit — Revenue Recovery" right={
-      <div style={{fontSize:10,color:T.textDim}}>{itemsWithFreshAge.length} items tracked</div>
+      <div style={{fontSize:10,color:T.textDim}}>{rangedItems.length} items tracked</div>
     } />
 
     {pdfStatus && (
@@ -7164,6 +7211,39 @@ function Audit({ reconWeekly, weeklyRollups }) {
       )}
     </div>
 
+    {/* v2.40.16: Date range filter — scopes the WHOLE audit dashboard (tiles + items). */}
+    {/* Lives above the items filter bar per spec, but is visible on every Audit sub-view    */}
+    {/* so users on the Dashboard tab can see + change what their KPIs are scoped to.        */}
+    <div style={{...cardStyle, padding:"10px 12px", marginBottom:8}}>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+        <div style={{fontSize:11,fontWeight:700,color:T.textMuted,marginRight:4}}>📅 Range:</div>
+        {[
+          ["all","All time"],
+          ["this_month","This month"],
+          ["30d","Last 30d"],
+          ["90d","Last 90d"],
+          ["ytd","YTD"],
+          ["custom","Custom"],
+        ].map(([id,l]) =>
+          <TabButton key={id} active={rangePreset===id} label={l} onClick={()=>setRangePreset(id)} />
+        )}
+        {rangePreset === "custom" && (
+          <>
+            <input type="date" value={customFrom} onChange={e=>setCustomFrom(e.target.value)}
+              style={{...inputStyle,fontSize:12,width:"auto"}} />
+            <span style={{fontSize:11,color:T.textMuted}}>→</span>
+            <input type="date" value={customTo} onChange={e=>setCustomTo(e.target.value)}
+              style={{...inputStyle,fontSize:12,width:"auto"}} />
+          </>
+        )}
+      </div>
+      {rangeBounds && (
+        <div style={{fontSize:10,color:T.textMuted,marginTop:6}}>
+          Showing items with week_ending (or pu_date) between <b>{rangeBounds.from}</b> and <b>{rangeBounds.to}</b> • {rangedItems.length} of {itemsWithFreshAge.length} items in scope
+        </div>
+      )}
+    </div>
+
     {/* ─── DASHBOARD ─── */}
     {view === "dashboard" && (
       <>
@@ -7174,7 +7254,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
           <KPI icon="⏱" label="Avg Days to Recover" value={stats.avgTurnaround==null?"—":`${stats.avgTurnaround} days`} sub="submission → payment" />
         </div>
 
-        {itemsWithFreshAge.length === 0 ? (
+        {rangedItems.length === 0 ? (
           <div style={cardStyle}>
             <EmptyState icon="🧾" title="No Audit Data Yet" sub="Audit tracks billed-vs-paid discrepancies. The button below reads existing Uline + DDIS data from Firestore and builds the audit queue — no re-ingest needed." />
             <div style={{marginTop:14,padding:"12px 14px",background:T.brandPale,borderRadius:8,border:`1px solid ${T.brand}30`}}>
