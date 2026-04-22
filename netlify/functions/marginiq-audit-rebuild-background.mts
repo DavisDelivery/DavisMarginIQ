@@ -108,7 +108,7 @@ async function batchWriteDocs(
     }
     return { ok, failed };
   }
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default):batchWrite?key=${FIREBASE_API_KEY}`;
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:batchWrite?key=${FIREBASE_API_KEY}`;
   const writes = docs.map(d => ({
     update: {
       name: `projects/${PROJECT_ID}/databases/(default)/documents/${collection}/${d.docId}`,
@@ -133,8 +133,15 @@ async function batchWriteDocs(
   const writeResults = data.writeResults || [];
   const statuses = data.status || [];
   let explicitFailed = 0;
+  let firstErrLogged = false;
   for (const s of statuses) {
-    if (s && s.code && s.code !== 0) explicitFailed++;
+    if (s && s.code && s.code !== 0) {
+      explicitFailed++;
+      if (!firstErrLogged) {
+        console.error(`batchWrite ${collection}: first rpc.Status code=${s.code} message="${s.message || ""}"`);
+        firstErrLogged = true;
+      }
+    }
   }
   // If we have writeResults, use that as the source of truth. Otherwise,
   // fall back to statuses (older API surface or partial responses).
