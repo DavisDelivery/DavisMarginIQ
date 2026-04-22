@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.19";
+const APP_VERSION = "2.40.20";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -6988,11 +6988,6 @@ function Audit({ reconWeekly, weeklyRollups }) {
               sidelinedAwaitingBilled: st.sidelined_awaiting_billed || 0,
               sidelinedAwaitingWeeks: st.sidelined_awaiting_weeks || [],
               sidelinedNoWeekStops: st.sidelined_noweek_stops || 0,
-              // v2.40.19 truckload sideline
-              sidelinedTruckloadStops: st.sidelined_truckload_stops || 0,
-              sidelinedTruckloadBilled: st.sidelined_truckload_billed || 0,
-              sidelinedTruckloadWeeks: st.sidelined_truckload_weeks || [],
-              sidelinedTkTransitions: st.sidelined_tk_transitions || 0,
               coveredWeeksCount: st.covered_weeks_count || 0,
               recentCutoffISO: st.recent_cutoff_iso || null,
             });
@@ -7110,14 +7105,13 @@ function Audit({ reconWeekly, weeklyRollups }) {
 
   // Dashboard stats
   const stats = useMemo(() => {
-    // v2.40.18/19: exclude recovered_paid (Uline paid after we saw the variance)
-    // and sidelined_tk (truckload rows that can't be audited against DDIS) from
-    // Outstanding.
+    // v2.40.18: exclude recovered_paid (Uline paid after we saw the variance)
+    // from Outstanding. v2.40.20 note: TK (ULI-) shipments are now included in
+    // the main queue and matched via numeric-core join in the rebuild.
     const active = rangedItems.filter(i =>
       i.dispute_status !== "written_off" &&
       i.dispute_status !== "won" &&
-      i.dispute_status !== "recovered_paid" &&
-      i.dispute_status !== "sidelined_tk"
+      i.dispute_status !== "recovered_paid"
     );
     const outstanding = active.reduce((s,i) => s + (i.variance||0), 0);
     const outstandingCount = active.length;
@@ -7150,7 +7144,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
     const buckets = {};
     for (const b of AGE_BUCKETS) buckets[b] = { bucket: b, count: 0, amount: 0 };
     for (const i of rangedItems) {
-      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid" || i.dispute_status === "sidelined_tk") continue;
+      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid") continue;
       const b = i.age_bucket || "unknown";
       if (!buckets[b]) buckets[b] = { bucket: b, count: 0, amount: 0 };
       buckets[b].count++;
@@ -7163,7 +7157,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
   const topCustomers = useMemo(() => {
     const byC = {};
     for (const i of rangedItems) {
-      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid" || i.dispute_status === "sidelined_tk") continue;
+      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid") continue;
       const c = i.customer || "Unknown";
       if (!byC[c]) byC[c] = { customer: c, customer_key: i.customer_key, count: 0, amount: 0, oldest_age: 0 };
       byC[c].count++;
@@ -7178,7 +7172,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
     const out = {};
     for (const c of CATEGORIES) out[c] = { category: c, count: 0, amount: 0 };
     for (const i of rangedItems) {
-      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid" || i.dispute_status === "sidelined_tk") continue;
+      if (i.dispute_status === "written_off" || i.dispute_status === "won" || i.dispute_status === "recovered_paid") continue;
       const c = i.category || "short_paid";
       if (!out[c]) out[c] = { category: c, count: 0, amount: 0 };
       out[c].count++;
@@ -7613,7 +7607,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
                     {!rebuildResult.withPayments && <div style={{marginTop:4,fontSize:10}}>Note: no PRO-level payment matching — re-ingest a DDIS file to enable.</div>}
                   </div>
                   {/* v2.40.12: sideline summary — stops exempted from the audit queue */}
-                  {(rebuildResult.sidelinedRecentStops > 0 || rebuildResult.sidelinedAwaitingStops > 0 || rebuildResult.sidelinedTruckloadStops > 0) && (
+                  {(rebuildResult.sidelinedRecentStops > 0 || rebuildResult.sidelinedAwaitingStops > 0) && (
                     <div style={{marginTop:6,padding:"8px 12px",background:T.bgSurface,borderRadius:6,border:`1px solid ${T.border}`,fontSize:11,color:T.textMuted}}>
                       <div style={{fontWeight:700,color:T.text,marginBottom:4}}>ℹ️ Sidelined from audit queue</div>
                       {rebuildResult.sidelinedRecentStops > 0 && (
@@ -7646,24 +7640,6 @@ function Audit({ reconWeekly, weeklyRollups }) {
                       {rebuildResult.sidelinedNoWeekStops > 0 && (
                         <div style={{marginTop:6,fontSize:10,color:T.textDim}}>
                           {rebuildResult.sidelinedNoWeekStops} stops have no week_ending field set (re-ingest the source DAS file to fix).
-                        </div>
-                      )}
-                      {/* v2.40.19: truckload sideline — TK doesn't settle through DDIS */}
-                      {rebuildResult.sidelinedTruckloadStops > 0 && (
-                        <div style={{marginTop:rebuildResult.sidelinedRecentStops>0||rebuildResult.sidelinedAwaitingStops>0?6:0}}>
-                          <strong style={{color:T.text}}>🚛 {rebuildResult.sidelinedTruckloadStops.toLocaleString()} stops</strong>
-                          {" "}({fmtK(rebuildResult.sidelinedTruckloadBilled)}) truckload — Uline settles TK separately from DDIS, so these can't be audited until a TK payment feed is wired.
-                          {rebuildResult.sidelinedTruckloadWeeks.length > 0 && (
-                            <div style={{fontSize:10,marginTop:2,color:T.textDim}}>
-                              {rebuildResult.sidelinedTruckloadWeeks.slice(0,6).map(w => `${w.week} (${w.stops})`).join(" · ")}
-                              {rebuildResult.sidelinedTruckloadWeeks.length > 6 ? ` · +${rebuildResult.sidelinedTruckloadWeeks.length-6} more` : ""}
-                            </div>
-                          )}
-                          {rebuildResult.sidelinedTkTransitions > 0 && (
-                            <div style={{fontSize:10,marginTop:4,fontStyle:"italic",color:T.brand}}>
-                              Also transitioned {rebuildResult.sidelinedTkTransitions} prior audit items → <code>sidelined_tk</code> status.
-                            </div>
-                          )}
                         </div>
                       )}
                     </div>
@@ -7801,7 +7777,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
             </select>
             <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
               <option value="all">All statuses</option>
-              {["new","queued","sent","won","lost","partial","written_off","recovered_paid","sidelined_tk"].map(s => <option key={s} value={s}>{s}</option>)}
+              {["new","queued","sent","won","lost","partial","written_off","recovered_paid"].map(s => <option key={s} value={s}>{s}</option>)}
             </select>
             <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
               <option value="variance">Sort: $ owed</option>
