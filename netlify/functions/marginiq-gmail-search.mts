@@ -26,6 +26,14 @@ const VENDOR_QUERIES: Record<string, string> = {
   // Quick Fuel: weekly fuel card invoice from Flyers Energy
   // Locked to sender only — loose text matching pulls unrelated docs
   quickfuel: 'from:ebilling@4flyers.com has:attachment',
+
+  // v2.40.1: billing@davisdelivery.com outbox — dedicated "what did I send out"
+  // view. Excludes DAS files (those are owned by the uline vendor already) so
+  // this surfaces dispute letters, POD requests, correction notices, and any
+  // other non-DAS outbound with attachments. UI pins this to billing@'s own
+  // inbox via account_email filter, which means Gmail returns billing@'s Sent
+  // folder items (that's where from:billing@ mail lives on billing@'s side).
+  billing_sent: 'from:billing@davisdelivery.com has:attachment -filename:das',
 };
 
 // v2.40: a connected Gmail account with enough info to run a search on its behalf.

@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.0";
+const APP_VERSION = "2.40.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1481,16 +1481,20 @@ function GmailSync({ onRefresh }) {
     return labels[rangePreset] || rangePreset;
   };
 
-  const searchVendor = async (vendor) => {
+  const searchVendor = async (vendor, accountFilter = "") => {
     setLoading(prev => ({...prev, [vendor]: true}));
     try {
       const { afterDate, beforeDate } = resolveDateRange();
       // Longer ranges likely need higher maxResults. Let the server cap at 200.
       const maxResults = rangePreset === "all" || rangePreset === "12mo" || rangePreset === "custom" ? 100 : 50;
+      // v2.40.1: accountFilter pins the search to a single connected inbox
+      // (useful for "Billing@ Outbox" which should only show billing@'s sent).
+      const body = { vendor, afterDate, beforeDate, maxResults };
+      if (accountFilter) body.account_email = accountFilter;
       const resp = await fetch("/.netlify/functions/marginiq-gmail-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ vendor, afterDate, beforeDate, maxResults }),
+        body: JSON.stringify(body),
       });
       const data = await resp.json();
       if (data.error) {
@@ -2025,6 +2029,7 @@ function GmailSync({ onRefresh }) {
           { key:"ddis", icon:"💰", label:"Uline DDIS Payments", desc:"Payment remittance CSVs from APFreight@uline.com (paid PROs for reconciliation)", color:T.green, mode:"per-attachment" },
           { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
           { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from ebilling@4flyers.com", color:"#2563eb", mode:"quickfuel" },
+          { key:"billing_sent", icon:"📤", label:"Billing@ Outbox", desc:"Everything billing@davisdelivery.com has sent out (excluding DAS files, which are covered by the Uline card). Surfaces dispute letters, POD requests, correction notices.", color:"#8b5cf6", mode:"per-attachment", accountFilter:"billing@davisdelivery.com" },
         ].map(v => {
           const r = results[v.key];
           const isLoading = loading[v.key];
@@ -2035,10 +2040,11 @@ function GmailSync({ onRefresh }) {
                   <div style={{fontSize:14,fontWeight:700}}>
                     {v.icon} {v.label}
                     {v.comingSoon && <span style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:T.bgSurface,color:T.textDim,marginLeft:8}}>parser pending</span>}
+                    {v.accountFilter && <span style={{fontSize:9,fontWeight:700,padding:"2px 6px",borderRadius:4,background:T.brandPale,color:T.brand,marginLeft:8}}>pinned to {v.accountFilter}</span>}
                   </div>
                   <div style={{fontSize:11,color:T.textMuted,marginTop:2}}>{v.desc}</div>
                 </div>
-                <PrimaryBtn text={isLoading ? "Searching..." : `Search · ${rangeLabel()}`} onClick={() => searchVendor(v.key)} loading={isLoading} />
+                <PrimaryBtn text={isLoading ? "Searching..." : `Search · ${rangeLabel()}`} onClick={() => searchVendor(v.key, v.accountFilter || "")} loading={isLoading} />
               </div>
 
               {r?.error && <div style={{fontSize:12,color:T.redText,background:T.redBg,padding:"8px 10px",borderRadius:6,marginTop:8}}>✗ {r.error}</div>}
