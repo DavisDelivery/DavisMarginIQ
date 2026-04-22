@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.12";
+const APP_VERSION = "2.40.13";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -8027,6 +8027,8 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
   const [ddisStats, setDdisStats] = useState(null);
   const [ddisAmbiguous, setDdisAmbiguous] = useState([]);
   const [ddisNeedingBackfill, setDdisNeedingBackfill] = useState(0);
+  // v2.40.13: explicit missing-week lists for the gaps card
+  const [dataGaps, setDataGaps] = useState(null); // { dasMissing: [], ddisMissing: [], window: {from, to} }
   useEffect(() => {
     (async () => {
       if (!hasFirebase) return;
@@ -8037,22 +8039,29 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
         const weeks = new Set();
         const ambiguous = [];
         let needBackfill = 0;
+        // v2.40.12 covers_weeks — union across all files, used for gap detection below
+        const ddisCoveredWeeks = new Set();
         for (const f of files) {
           totalPaid += Number(f.total_paid || 0);
           rows += Number(f.record_count || 0);
           const eb = f.earliest_bill_date, lb = f.latest_bill_date;
           if (eb && (!earliest || eb < earliest)) earliest = eb;
           if (lb && (!latest || lb > latest)) latest = lb;
-          // v2.40.9: each file contributes ONE week (its bill_week_ending),
-          // computed at ingestion as the Fri-envelope of the top-5 most-common
-          // bill_dates. Ambiguous ties get surfaced for user resolution.
           if (f.week_ambiguous) {
             ambiguous.push(f);
+            for (const c of (f.ambiguous_candidates || [])) {
+              if (c?.friday) ddisCoveredWeeks.add(c.friday);
+            }
           } else if (f.bill_week_ending) {
             weeks.add(f.bill_week_ending);
           } else {
-            // Pre-v2.40.9 file — needs backfill run
             needBackfill += 1;
+          }
+          // Prefer covers_weeks when present (handles Thanksgiving-style double-weeks)
+          if (Array.isArray(f.covers_weeks) && f.covers_weeks.length > 0) {
+            for (const w of f.covers_weeks) ddisCoveredWeeks.add(w);
+          } else if (f.bill_week_ending) {
+            ddisCoveredWeeks.add(f.bill_week_ending);
           }
         }
         setDdisStats({
@@ -8067,9 +8076,45 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
         });
         setDdisAmbiguous(ambiguous);
         setDdisNeedingBackfill(needBackfill);
+
+        // v2.40.13: compute missing-week sets (DAS + DDIS) for the gaps card.
+        // Window: from earliest week we have ANY data for, through the most
+        // recent complete Friday that's older than 21 days (so we don't flag
+        // the current week as missing while files are still en route).
+        const dasWeeks = new Set((weeklyRollups || []).map(r => r.week_ending).filter(Boolean));
+        if (dasWeeks.size === 0 && ddisCoveredWeeks.size === 0) {
+          setDataGaps(null);
+          return;
+        }
+        const allKnown = [...dasWeeks, ...ddisCoveredWeeks].sort();
+        const fromDate = allKnown[0];
+        // Cutoff: last Friday ≥ 21 days ago (align with audit rebuild cutoff)
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - 21);
+        const cutoffDay = cutoff.getDay();
+        const daysBackToFri = cutoffDay >= 5 ? cutoffDay - 5 : cutoffDay + 2;
+        cutoff.setDate(cutoff.getDate() - daysBackToFri);
+        const toDate = cutoff.toISOString().slice(0, 10);
+        // Build expected Friday sequence fromDate → toDate
+        const expected = [];
+        let d = new Date(fromDate + "T00:00:00");
+        const end = new Date(toDate + "T00:00:00");
+        while (d <= end) {
+          expected.push(d.toISOString().slice(0, 10));
+          d.setDate(d.getDate() + 7);
+        }
+        const dasMissing = expected.filter(w => !dasWeeks.has(w));
+        const ddisMissing = expected.filter(w => !ddisCoveredWeeks.has(w));
+        setDataGaps({
+          dasMissing, ddisMissing,
+          window: { from: fromDate, to: toDate },
+          totalWeeks: expected.length,
+          dasCoveredCount: dasWeeks.size,
+          ddisCoveredCount: ddisCoveredWeeks.size,
+        });
       } catch(e) { console.error("DDIS stats load failed:", e); }
     })();
-  }, []);
+  }, [weeklyRollups]);
 
   const loadBackups = async () => {
     setBackupsLoading(true);
@@ -8324,6 +8369,69 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
             ✗ {resolveMsg.error}
           </div>
         )}
+      </div>
+    )}
+
+    {/* v2.40.13: Data Gaps card — explicit list of weeks missing DAS or DDIS files */}
+    {dataGaps && (dataGaps.dasMissing.length > 0 || dataGaps.ddisMissing.length > 0) && (
+      <div style={{...cardStyle, border:`1px solid ${T.red}60`}}>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>🚨 Data Coverage Gaps</div>
+        <div style={{fontSize:11,color:T.textMuted,marginBottom:12,lineHeight:1.5}}>
+          Weeks between <strong>{dataGaps.window.from}</strong> and <strong>{dataGaps.window.to}</strong> (cutoff is 21 days ago to avoid flagging files still in transit) that are missing a DAS billing file, a DDIS payment file, or both. These gaps make audit math incomplete — fill them in and rebuild.
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+          <div style={{flex:1,minWidth:180,padding:"8px 10px",background:T.bgSurface,borderRadius:6,fontSize:11}}>
+            <div style={{color:T.textMuted,marginBottom:2}}>Total expected weeks</div>
+            <div style={{fontSize:14,fontWeight:700}}>{dataGaps.totalWeeks}</div>
+          </div>
+          <div style={{flex:1,minWidth:180,padding:"8px 10px",background:T.bgSurface,borderRadius:6,fontSize:11}}>
+            <div style={{color:T.textMuted,marginBottom:2}}>DAS coverage</div>
+            <div style={{fontSize:14,fontWeight:700,color:dataGaps.dasMissing.length===0?T.greenText:T.text}}>
+              {dataGaps.dasCoveredCount}/{dataGaps.totalWeeks} ({Math.round(dataGaps.dasCoveredCount/Math.max(1,dataGaps.totalWeeks)*100)}%)
+            </div>
+          </div>
+          <div style={{flex:1,minWidth:180,padding:"8px 10px",background:T.bgSurface,borderRadius:6,fontSize:11}}>
+            <div style={{color:T.textMuted,marginBottom:2}}>DDIS coverage</div>
+            <div style={{fontSize:14,fontWeight:700,color:dataGaps.ddisMissing.length===0?T.greenText:T.text}}>
+              {dataGaps.ddisCoveredCount}/{dataGaps.totalWeeks} ({Math.round(dataGaps.ddisCoveredCount/Math.max(1,dataGaps.totalWeeks)*100)}%)
+            </div>
+          </div>
+        </div>
+
+        {dataGaps.ddisMissing.length > 0 && (
+          <div style={{padding:"10px 12px",background:T.yellowBg||T.bgSurface,borderRadius:6,border:`1px solid ${T.yellow}40`,marginBottom:8}}>
+            <div style={{fontSize:12,fontWeight:700,marginBottom:6,color:"#78350f"}}>💰 Missing DDIS (payment) files — {dataGaps.ddisMissing.length} week{dataGaps.ddisMissing.length===1?"":"s"}</div>
+            <div style={{fontSize:10,color:T.textMuted,marginBottom:8,lineHeight:1.5}}>
+              No ingested DDIS file covers these Fridays. Stops for these weeks can't be scored by the audit rebuild (they sideline as "awaiting DDIS"). Try: Gmail Sync → Uline DDIS Payments → &quot;Show missing only&quot; → Import All.
+            </div>
+            <div style={{fontFamily:"monospace",fontSize:10,lineHeight:1.6,color:"#78350f",display:"flex",flexWrap:"wrap",gap:6}}>
+              {dataGaps.ddisMissing.slice(0, 30).map(w => <span key={w} style={{padding:"2px 8px",background:"#fff",borderRadius:4,border:"1px solid #fde68a"}}>{w}</span>)}
+              {dataGaps.ddisMissing.length > 30 && <span style={{color:T.textMuted}}>+{dataGaps.ddisMissing.length-30} more</span>}
+            </div>
+          </div>
+        )}
+
+        {dataGaps.dasMissing.length > 0 && (
+          <div style={{padding:"10px 12px",background:T.bgSurface,borderRadius:6,border:`1px solid ${T.blue}40`}}>
+            <div style={{fontSize:12,fontWeight:700,marginBottom:6,color:T.text}}>📦 Missing DAS (billing) files — {dataGaps.dasMissing.length} week{dataGaps.dasMissing.length===1?"":"s"}</div>
+            <div style={{fontSize:10,color:T.textMuted,marginBottom:8,lineHeight:1.5}}>
+              No uline_weekly rollup exists for these Fridays. Unpaid stops from these weeks never got ingested, so they aren't in the audit at all (can't even sideline them — they don't exist). Try: Gmail Sync → Uline Weekly Billing → check billing@ for DAS files for these dates.
+            </div>
+            <div style={{fontFamily:"monospace",fontSize:10,lineHeight:1.6,color:T.text,display:"flex",flexWrap:"wrap",gap:6}}>
+              {dataGaps.dasMissing.slice(0, 30).map(w => <span key={w} style={{padding:"2px 8px",background:"#fff",borderRadius:4,border:`1px solid ${T.borderLight}`}}>{w}</span>)}
+              {dataGaps.dasMissing.length > 30 && <span style={{color:T.textMuted}}>+{dataGaps.dasMissing.length-30} more</span>}
+            </div>
+          </div>
+        )}
+      </div>
+    )}
+
+    {/* v2.40.13: all-clear banner when nothing is missing in the covered window */}
+    {dataGaps && dataGaps.dasMissing.length === 0 && dataGaps.ddisMissing.length === 0 && dataGaps.totalWeeks > 0 && (
+      <div style={{...cardStyle, border:`1px solid ${T.green}60`, background:T.greenBg}}>
+        <div style={{fontSize:12,fontWeight:700,color:T.greenText}}>
+          ✅ Data Coverage Complete — {dataGaps.totalWeeks} weeks of DAS + DDIS, no gaps between {dataGaps.window.from} and {dataGaps.window.to}.
+        </div>
       </div>
     )}
 
