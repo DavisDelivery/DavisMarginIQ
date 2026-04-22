@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.2";
+const APP_VERSION = "2.40.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1351,6 +1351,42 @@ function redistributeFuelFoxOverhead(serviceRows, overhead) {
 }
 
 
+// ─── Attachment dedup key (v2.40.3) ─────────────────────────
+// Uline DAS filenames carry a date range + a variant (main weekly billing
+// or the tiny accessorials companion). Re-forwarded / re-saved copies often
+// get a suffix appended (e.g. `-JO`, someone's initials) so a literal
+// filename match lets them import twice. Key on the structural signature
+// instead — same date range + same variant = same billing record.
+//
+// Examples that collide (correctly) under this scheme:
+//   das 20251124-20251128.xlsx
+//   das 20251124-20251128-JO.xlsx
+//   das 20251124-20251128 -JO.xlsx
+//   das 20251124-20251128.xls.xlsx   (occasional double-extension bug)
+//     → all "das_20251124_20251128_main"
+//
+// Accessorials get their own variant bucket so the main file and the
+// accessorials file for the same week remain distinct and both import.
+//   das 20251124-20251128 accessorials.xlsx
+//     → "das_20251124_20251128_accessorials"
+//
+// Anything that doesn't match the DAS pattern falls back to the raw
+// lowercase filename — same behavior as pre-v2.40.3 for FuelFox PDFs,
+// DDIS CSVs, NuVizz stops, etc.
+function parseDasFilename(filename) {
+  const fn = (filename || "").toLowerCase().trim();
+  // das + 8-digit start date + separator + 8-digit end date + anything + .xls(x)
+  const m = fn.match(/^das[\s_-]*(\d{8})[\s_-]+(\d{8})(.*)\.xlsx?$/);
+  if (!m) return { ok: false };
+  const [, start, end, rest] = m;
+  const variant = /accessorial/i.test(rest) ? "accessorials" : "main";
+  return { ok: true, start, end, variant, key: `das_${start}_${end}_${variant}` };
+}
+function dedupKey(filename) {
+  const p = parseDasFilename(filename);
+  return p.ok ? p.key : (filename || "").toLowerCase();
+}
+
 function GmailSync({ onRefresh }) {
   // v2.40: multi-account Gmail. `gmailAccounts` is the array of all connected
   // inboxes (legacy singleton counts as one). `gmailConn` kept as a derived
@@ -1383,7 +1419,7 @@ function GmailSync({ onRefresh }) {
       const log = await FS.getFileLog(2000);
       const set = new Set();
       for (const l of log) {
-        if (l.filename) set.add(l.filename.toLowerCase());
+        if (l.filename) set.add(dedupKey(l.filename));
       }
       setAlreadyImportedFilenames(set);
     } catch(e) { console.error("loadImportedFilenames err:", e); }
@@ -1593,7 +1629,7 @@ function GmailSync({ onRefresh }) {
       setImportStatus(`✓ Imported ${attachment.filename}`);
       // Update the in-memory dedupe set so the UI reflects this file as a
       // duplicate on the next search without waiting for a full file_log reload.
-      setAlreadyImportedFilenames(prev => new Set([...prev, attachment.filename.toLowerCase()]));
+      setAlreadyImportedFilenames(prev => new Set([...prev, dedupKey(attachment.filename)]));
       if (onRefresh) onRefresh();
     } catch(e) {
       setImported(prev => ({...prev, [refKey]: { error: e.message }}));
@@ -1708,7 +1744,7 @@ function GmailSync({ onRefresh }) {
       // when ALL its PDFs are flagged, so adding both here handles it.
       setAlreadyImportedFilenames(prev => {
         const next = new Set(prev);
-        for (const a of pdfs) next.add(a.filename.toLowerCase());
+        for (const a of pdfs) next.add(dedupKey(a.filename));
         return next;
       });
       if (onRefresh) onRefresh();
@@ -1801,7 +1837,7 @@ function GmailSync({ onRefresh }) {
 
       setImported(prev => ({...prev, [refKey]: { ok: true, trucks: data.rows.length, total: grandTotal, rate: avgRate }}));
       setImportStatus(`✓ Quick Fuel ${invBase}: ${data.rows.length} trucks, $${grandTotal.toFixed(2)} @ $${avgRate?.toFixed(4)}/gal${invoiceFees > 0 ? ` (includes $${invoiceFees.toFixed(2)} redistributed fees)` : ""}`);
-      setAlreadyImportedFilenames(prev => new Set([...prev, attachment.filename.toLowerCase()]));
+      setAlreadyImportedFilenames(prev => new Set([...prev, dedupKey(attachment.filename)]));
       if (onRefresh) onRefresh();
     } catch(e) {
       setImported(prev => ({...prev, [refKey]: { error: e.message }}));
@@ -1836,7 +1872,7 @@ function GmailSync({ onRefresh }) {
           const pdfs = (em.attachments || []).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
           if (pdfs.length < 2) { skipped++; continue; }
           // Check if ALL attachments already imported
-          const allDone = pdfs.every(p => alreadyImportedFilenames.has(p.filename.toLowerCase()));
+          const allDone = pdfs.every(p => alreadyImportedFilenames.has(dedupKey(p.filename)));
           if (allDone) { skipped++; continue; }
           setImportStatus(`[${current}/${total}] ${em.emailSubject || "FuelFox"}...`);
           await importFuelFoxPair(em);
@@ -1847,8 +1883,9 @@ function GmailSync({ onRefresh }) {
           if (atts.length === 0) { skipped++; continue; }
           for (const a of atts) {
             const lcName = a.filename.toLowerCase();
-            // Skip if already imported
-            if (alreadyImportedFilenames.has(lcName)) { skipped++; continue; }
+            const dk = dedupKey(a.filename);
+            // Skip if already imported (structural dedup — same week same variant)
+            if (alreadyImportedFilenames.has(dk)) { skipped++; continue; }
             // Only handle data file types the vendor parses
             const isData = lcName.endsWith(".xlsx") || lcName.endsWith(".xls") || lcName.endsWith(".csv") || lcName.endsWith(".pdf");
             if (!isData) { skipped++; continue; }
@@ -1860,7 +1897,7 @@ function GmailSync({ onRefresh }) {
               else await importAttachment(em, a);
               imported++;
               // Remember for subsequent iterations in this run
-              setAlreadyImportedFilenames(prev => new Set([...prev, lcName]));
+              setAlreadyImportedFilenames(prev => new Set([...prev, dk]));
             } catch(e) {
               console.error("Import All: attachment failed", a.filename, e);
               failed++;
@@ -2065,7 +2102,7 @@ function GmailSync({ onRefresh }) {
                     const pdfs = (em.attachments||[]).filter(a => a.filename.toLowerCase().endsWith(".pdf"));
                     if (pdfs.length > 0) {
                       totalData++;
-                      if (pdfs.every(p => alreadyImportedFilenames.has(p.filename.toLowerCase()))) {
+                      if (pdfs.every(p => alreadyImportedFilenames.has(dedupKey(p.filename)))) {
                         alreadyDone++;
                         duplicateFiles.push(pdfs.map(p => p.filename).join(" + "));
                       }
@@ -2075,7 +2112,7 @@ function GmailSync({ onRefresh }) {
                       const lc = a.filename.toLowerCase();
                       if (!(lc.endsWith(".xlsx") || lc.endsWith(".xls") || lc.endsWith(".csv") || lc.endsWith(".pdf"))) continue;
                       totalData++;
-                      if (alreadyImportedFilenames.has(lc)) {
+                      if (alreadyImportedFilenames.has(dedupKey(a.filename))) {
                         alreadyDone++;
                         duplicateFiles.push(a.filename);
                       }
@@ -2153,7 +2190,7 @@ function GmailSync({ onRefresh }) {
                       // of the two showed up before (rare partial-import
                       // scenario), allow a normal import rather than blocking.
                       const isDuplicate = pdfs.length > 0 && pdfs.every(p =>
-                        alreadyImportedFilenames.has(p.filename.toLowerCase())
+                        alreadyImportedFilenames.has(dedupKey(p.filename))
                       );
                       return (
                         <div key={em.emailId} style={{padding:"8px 10px",borderTop:idx>0?`1px solid ${T.borderLight}`:"none"}}>
@@ -2228,11 +2265,14 @@ function GmailSync({ onRefresh }) {
                               const isQuickFuelPdf = v.mode === "quickfuel" && a.filename.toLowerCase().endsWith(".pdf");
                               // Detect if this filename has already been ingested in a prior session.
                               // Gmail message IDs aren't stored in file_log, so filename is the
-                              // practical dedupe key. Case-insensitive to match the normalization
-                              // used elsewhere. v2.25 max-merge makes accidental re-import
-                              // non-destructive, but surfacing this visibly gives the user
-                              // confidence that nothing was double-entered.
-                              const isDuplicate = alreadyImportedFilenames.has(a.filename.toLowerCase());
+                              // practical dedupe key. v2.40.3 uses a structural
+                              // key (das_<start>_<end>_<variant>) for DAS files
+                              // so -JO and other re-forwarded variants collapse
+                              // correctly. v2.25 max-merge makes accidental
+                              // re-import non-destructive, but surfacing this
+                              // visibly gives the user confidence that nothing
+                              // was double-entered.
+                              const isDuplicate = alreadyImportedFilenames.has(dedupKey(a.filename));
                               return (
                                 <div key={a.attachmentId} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,padding:"4px 8px",background:isDuplicate?"#fef9c3":T.bgSurface,borderRadius:6,border:isDuplicate?`1px solid ${T.yellow}40`:"1px solid transparent"}}>
                                   <div style={{flex:1,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:6}}>
