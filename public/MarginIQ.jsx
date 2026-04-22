@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.20";
+const APP_VERSION = "2.40.21";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -8151,6 +8151,39 @@ function DisputeActions({ dispute, onUpdate }) {
 
 function AuditItemDetail({ item, contact, onClose, onGeneratePdf, onUpdateStatus }) {
   const catColor = CATEGORY_COLORS[item.category] || T.textMuted;
+  // v2.40.21: DDIS payment trace — diagnostic breakdown of why this PRO is
+  // showing up as paid/unpaid/awaiting. Loads lazily on tap so we don't pay
+  // a Firestore round trip every time the detail modal opens.
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceData, setTraceData] = useState(null);
+  const [traceError, setTraceError] = useState(null);
+  const [traceOpen, setTraceOpen] = useState(false);
+  const loadTrace = async () => {
+    if (traceLoading) return;
+    setTraceOpen(true);
+    if (traceData) return; // already loaded
+    setTraceLoading(true);
+    setTraceError(null);
+    try {
+      const resp = await fetch(`/.netlify/functions/marginiq-audit-trace?pro=${encodeURIComponent(item.pro)}`);
+      if (!resp.ok) {
+        const t = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${t.slice(0, 200)}`);
+      }
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+      setTraceData(data);
+    } catch (e) {
+      console.error("trace failed:", e);
+      setTraceError(e.message);
+    }
+    setTraceLoading(false);
+  };
+  const verdictColor = (v) =>
+    v === "paid" || v === "paid_under_core" ? T.green :
+    v === "short_paid" ? T.yellow :
+    v === "unpaid_ddis_present" ? T.red :
+    v === "awaiting_ddis" ? T.blue : T.textMuted;
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}} onClick={onClose}>
       <div style={{background:T.bgWhite,borderRadius:12,padding:20,maxWidth:600,width:"100%",maxHeight:"90vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
@@ -8197,6 +8230,141 @@ function AuditItemDetail({ item, contact, onClose, onGeneratePdf, onUpdateStatus
             {contact.ap_contact_phone && <div>📞 {contact.ap_contact_phone}</div>}
           </div>
         )}
+
+        {/* v2.40.21: DDIS Payment Trace — on-demand diagnostic for billed-vs-paid */}
+        <div style={{padding:"10px",background:T.bgSurface,borderRadius:8,marginBottom:12,border:`1px solid ${T.border}`}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
+            <div style={{fontSize:12,fontWeight:700,color:T.text}}>🔍 DDIS Payment Trace</div>
+            <button onClick={loadTrace} disabled={traceLoading}
+              style={{padding:"6px 12px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${T.brand}`,
+                background: traceOpen ? T.brand : "transparent",
+                color: traceOpen ? "#fff" : T.brand,
+                cursor: traceLoading ? "wait" : "pointer"}}>
+              {traceLoading ? "⏳ Running…" : traceOpen ? "▼ Loaded" : "Run trace"}
+            </button>
+          </div>
+          {traceOpen && (
+            <div style={{marginTop:10,paddingTop:10,borderTop:`1px dashed ${T.border}`,fontSize:11,color:T.text,lineHeight:1.6}}>
+              {traceError && (
+                <div style={{padding:"8px 10px",background:T.redBg,color:T.redText,borderRadius:6,fontSize:11}}>
+                  ✗ {traceError}
+                </div>
+              )}
+              {traceData && (
+                <>
+                  {/* Verdict banner */}
+                  <div style={{padding:"8px 10px",background:verdictColor(traceData.verdict)+"18",borderRadius:6,border:`1px solid ${verdictColor(traceData.verdict)}55`,marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:700,color:verdictColor(traceData.verdict),textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:3}}>
+                      Verdict: {traceData.verdict.replace(/_/g, " ")}
+                    </div>
+                    <div style={{fontSize:11,color:T.text,lineHeight:1.5}}>{traceData.explanation}</div>
+                  </div>
+
+                  {/* Lookup keys */}
+                  <div style={{marginBottom:10,padding:"6px 8px",background:T.bgWhite,borderRadius:6,border:`1px solid ${T.border}`,fontSize:10,fontFamily:"monospace",color:T.textMuted}}>
+                    Tried PRO: <span style={{color:T.text}}>{traceData.pro}</span>
+                    {traceData.numeric_core && <> · numeric core: <span style={{color:T.text}}>{traceData.numeric_core}</span></>}
+                  </div>
+
+                  {/* Direct payments */}
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:700,marginBottom:4}}>
+                      Direct matches in <code>ddis_payments</code>: {traceData.direct_payments.length} · total ${(traceData.total_paid||0).toFixed(2)}
+                    </div>
+                    {traceData.direct_payments.length === 0 ? (
+                      <div style={{fontSize:10,color:T.textMuted,fontStyle:"italic"}}>No payment rows found for either key.</div>
+                    ) : (
+                      <div style={{overflowX:"auto"}}>
+                        <table style={{width:"100%",fontSize:10,borderCollapse:"collapse"}}>
+                          <thead><tr style={{background:T.bgSurface}}>
+                            {["PRO","Paid","Bill Date","Check","Voucher","Source File"].map(h =>
+                              <th key={h} style={{textAlign:"left",padding:"4px 6px",fontWeight:600,color:T.textDim,fontSize:9,textTransform:"uppercase"}}>{h}</th>
+                            )}
+                          </tr></thead>
+                          <tbody>
+                            {traceData.direct_payments.map((p,i) =>
+                              <tr key={i} style={{borderBottom:`1px solid ${T.border}`}}>
+                                <td style={{padding:"4px 6px",fontFamily:"monospace"}}>{p.pro}</td>
+                                <td style={{padding:"4px 6px",color:T.green,fontWeight:600}}>${Number(p.paid_amount||0).toFixed(2)}</td>
+                                <td style={{padding:"4px 6px"}}>{p.bill_date || "—"}</td>
+                                <td style={{padding:"4px 6px",fontFamily:"monospace",fontSize:9}}>{p.check || "—"}</td>
+                                <td style={{padding:"4px 6px",fontFamily:"monospace",fontSize:9}}>{p.voucher || "—"}</td>
+                                <td style={{padding:"4px 6px",fontSize:9,color:T.textMuted}}>{p.source_file || "—"}</td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Candidate files */}
+                  <div style={{marginBottom:10}}>
+                    <div style={{fontSize:11,fontWeight:700,marginBottom:4}}>
+                      DDIS files checked: {traceData.candidate_files.length}
+                    </div>
+                    {traceData.candidate_files.length === 0 ? (
+                      <div style={{fontSize:10,color:T.redText,fontStyle:"italic"}}>
+                        ⚠️ No DDIS files ingested cover this stop's week or pickup date. Import the remit via Gmail Sync → DDIS.
+                      </div>
+                    ) : (
+                      <div style={{maxHeight:160,overflowY:"auto"}}>
+                        {traceData.candidate_files.slice(0, 10).map((f,i) =>
+                          <div key={i} style={{fontSize:10,padding:"4px 6px",borderBottom:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",gap:6}}>
+                            <div style={{fontFamily:"monospace",flex:"1 1 auto",minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                              {f.covers_this_week && <span style={{color:T.green,marginRight:4}}>✓</span>}
+                              {f.filename}
+                            </div>
+                            <div style={{color:T.textMuted,fontSize:9,whiteSpace:"nowrap"}}>
+                              bwe {f.bill_week_ending || "?"} · {f.earliest_bill_date || "?"}→{f.latest_bill_date || "?"}
+                            </div>
+                          </div>
+                        )}
+                        {traceData.candidate_files.length > 10 && (
+                          <div style={{fontSize:9,color:T.textDim,padding:"4px 6px",fontStyle:"italic"}}>
+                            +{traceData.candidate_files.length - 10} more files in range…
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Near misses */}
+                  {traceData.near_misses.length > 0 && (
+                    <div style={{marginBottom:4}}>
+                      <div style={{fontSize:11,fontWeight:700,marginBottom:4,color:T.yellow}}>
+                        ⚠️ Near-miss payments in same files (amount ±$5 of billed, different PRO):
+                      </div>
+                      <div style={{overflowX:"auto"}}>
+                        <table style={{width:"100%",fontSize:10,borderCollapse:"collapse"}}>
+                          <thead><tr style={{background:T.bgSurface}}>
+                            {["PRO","Amount","Δ","Bill Date","File"].map(h =>
+                              <th key={h} style={{textAlign:"left",padding:"4px 6px",fontWeight:600,color:T.textDim,fontSize:9,textTransform:"uppercase"}}>{h}</th>
+                            )}
+                          </tr></thead>
+                          <tbody>
+                            {traceData.near_misses.map((n,i) =>
+                              <tr key={i} style={{borderBottom:`1px solid ${T.border}`}}>
+                                <td style={{padding:"4px 6px",fontFamily:"monospace"}}>{n.pro}</td>
+                                <td style={{padding:"4px 6px"}}>${Number(n.paid_amount||0).toFixed(2)}</td>
+                                <td style={{padding:"4px 6px",color:T.yellow}}>±${n.delta.toFixed(2)}</td>
+                                <td style={{padding:"4px 6px"}}>{n.bill_date || "—"}</td>
+                                <td style={{padding:"4px 6px",fontSize:9,color:T.textMuted}}>{n.source_file || "—"}</td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div style={{fontSize:9,color:T.textDim,marginTop:3,fontStyle:"italic"}}>
+                        Could indicate a PRO-number encoding difference or data-entry error at Uline. Worth a look.
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
 
         <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:16}}>
           <PrimaryBtn text="📄 Generate Dispute PDF" onClick={onGeneratePdf} />
