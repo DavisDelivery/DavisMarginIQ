@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.13";
+const APP_VERSION = "2.40.14";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -319,7 +319,8 @@ async function ingestFiles(files, onStatus = () => {}) {
         unpaidStops.push({
           pro: s.pro, customer: s.customer, city: s.city, state: s.state, zip: s.zip,
           pu_date: s.pu_date, week_ending: s.week_ending, month: s.month, billed: billed,
-          code: s.code, weight: s.weight, order: s.order
+          code: s.code, weight: s.weight, order: s.order,
+          service_type: s.service_type || "delivery", // v2.40.14: carry service_type for TK filter
         });
       }
     }
@@ -342,6 +343,7 @@ async function ingestFiles(files, onStatus = () => {}) {
           accessorial_amount: s.extra_cost || 0,
           base_cost: s.cost || 0,
           code: s.code, weight: s.weight, order: s.order,
+          service_type: s.service_type || "delivery", // v2.40.14
           age_days: ageDays,
           age_bucket: ageBucket(ageDays),
           category,
@@ -6144,7 +6146,8 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
           unpaidStops.push({
             pro: s.pro, customer: s.customer, city: s.city, state: s.state, zip: s.zip,
             pu_date: s.pu_date, week_ending: s.week_ending, month: s.month, billed: s.new_cost,
-            code: s.code, weight: s.weight, order: s.order
+            code: s.code, weight: s.weight, order: s.order,
+            service_type: s.service_type || "delivery", // v2.40.14: carry service_type for TK filter
           });
         }
       }
@@ -6821,6 +6824,8 @@ function Audit({ reconWeekly, weeklyRollups }) {
   const [filterCustomer, setFilterCustomer] = useState("");
   const [filterMinVar, setFilterMinVar] = useState(10);
   const [sortBy, setSortBy] = useState("variance");
+  // v2.40.14: service_type filter — "all" | "delivery" | "truckload" | "accessorial"
+  const [filterService, setFilterService] = useState("all");
   const [selectedIds, setSelectedIds] = useState({}); // pro -> true
 
   // PDF generation state
@@ -7010,6 +7015,8 @@ function Audit({ reconWeekly, weeklyRollups }) {
     if (filterCategory !== "all") arr = arr.filter(i => i.category === filterCategory);
     if (filterAge !== "all") arr = arr.filter(i => i.age_bucket === filterAge);
     if (filterStatus !== "all") arr = arr.filter(i => (i.dispute_status || "new") === filterStatus);
+    // v2.40.14: service_type filter (delivery / truckload / accessorial)
+    if (filterService !== "all") arr = arr.filter(i => (i.service_type || "delivery") === filterService);
     if (filterCustomer.trim()) {
       const q = filterCustomer.toLowerCase();
       arr = arr.filter(i => (i.customer||"").toLowerCase().includes(q) || (i.pro||"").toLowerCase().includes(q));
@@ -7023,7 +7030,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
       return 0;
     });
     return arr;
-  }, [itemsWithFreshAge, filterCategory, filterAge, filterStatus, filterCustomer, filterMinVar, sortBy]);
+  }, [itemsWithFreshAge, filterCategory, filterAge, filterStatus, filterService, filterCustomer, filterMinVar, sortBy]);
 
   // Selected items for bulk actions
   const selectedItems = useMemo(() =>
@@ -7352,6 +7359,13 @@ function Audit({ reconWeekly, weeklyRollups }) {
             <select value={filterCategory} onChange={e=>setFilterCategory(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
               <option value="all">All categories</option>
               {CATEGORIES.map(c => <option key={c} value={c}>{CATEGORY_LABELS[c]}</option>)}
+            </select>
+            {/* v2.40.14: service_type filter — TK / delivery / accessorial */}
+            <select value={filterService} onChange={e=>setFilterService(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
+              <option value="all">All services</option>
+              <option value="delivery">🚚 Delivery only</option>
+              <option value="truckload">📦 Truckload only</option>
+              <option value="accessorial">➕ Accessorial only</option>
             </select>
             <select value={filterAge} onChange={e=>setFilterAge(e.target.value)} style={{...inputStyle,fontSize:12,width:"auto"}}>
               <option value="all">All ages</option>
@@ -7997,7 +8011,7 @@ function Drivers() {
   </div>;
 }
 
-function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onRefresh }) {
+function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onRefresh, setTab }) {
   const [purgeConfirmText, setPurgeConfirmText] = useState("");
   const [purgeToken, setPurgeToken] = useState("");
   const [purging, setPurging] = useState(false);
@@ -8400,9 +8414,21 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
 
         {dataGaps.ddisMissing.length > 0 && (
           <div style={{padding:"10px 12px",background:T.yellowBg||T.bgSurface,borderRadius:6,border:`1px solid ${T.yellow}40`,marginBottom:8}}>
-            <div style={{fontSize:12,fontWeight:700,marginBottom:6,color:"#78350f"}}>💰 Missing DDIS (payment) files — {dataGaps.ddisMissing.length} week{dataGaps.ddisMissing.length===1?"":"s"}</div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:6}}>
+              <div style={{fontSize:12,fontWeight:700,color:"#78350f"}}>💰 Missing DDIS (payment) files — {dataGaps.ddisMissing.length} week{dataGaps.ddisMissing.length===1?"":"s"}</div>
+              {setTab && (
+                <button
+                  onClick={() => setTab("gmail")}
+                  style={{
+                    padding:"6px 14px",borderRadius:6,border:"none",
+                    background:T.green,color:"#fff",
+                    fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",
+                  }}
+                >🚀 Fetch Missing DDIS →</button>
+              )}
+            </div>
             <div style={{fontSize:10,color:T.textMuted,marginBottom:8,lineHeight:1.5}}>
-              No ingested DDIS file covers these Fridays. Stops for these weeks can't be scored by the audit rebuild (they sideline as "awaiting DDIS"). Try: Gmail Sync → Uline DDIS Payments → &quot;Show missing only&quot; → Import All.
+              No ingested DDIS file covers these Fridays. Stops for these weeks can't be scored by the audit rebuild (they sideline as &quot;awaiting DDIS&quot;). The button above jumps to Gmail Sync — hit <strong>Uline DDIS Payments</strong>, set the range to <strong>All time</strong>, toggle <strong>Show missing only</strong>, then <strong>Import All</strong>.
             </div>
             <div style={{fontFamily:"monospace",fontSize:10,lineHeight:1.6,color:"#78350f",display:"flex",flexWrap:"wrap",gap:6}}>
               {dataGaps.ddisMissing.slice(0, 30).map(w => <span key={w} style={{padding:"2px 8px",background:"#fff",borderRadius:4,border:"1px solid #fde68a"}}>{w}</span>)}
@@ -8413,9 +8439,21 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
 
         {dataGaps.dasMissing.length > 0 && (
           <div style={{padding:"10px 12px",background:T.bgSurface,borderRadius:6,border:`1px solid ${T.blue}40`}}>
-            <div style={{fontSize:12,fontWeight:700,marginBottom:6,color:T.text}}>📦 Missing DAS (billing) files — {dataGaps.dasMissing.length} week{dataGaps.dasMissing.length===1?"":"s"}</div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,marginBottom:6}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.text}}>📦 Missing DAS (billing) files — {dataGaps.dasMissing.length} week{dataGaps.dasMissing.length===1?"":"s"}</div>
+              {setTab && (
+                <button
+                  onClick={() => setTab("gmail")}
+                  style={{
+                    padding:"6px 14px",borderRadius:6,border:"none",
+                    background:T.blue,color:"#fff",
+                    fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",
+                  }}
+                >🚀 Fetch Missing DAS →</button>
+              )}
+            </div>
             <div style={{fontSize:10,color:T.textMuted,marginBottom:8,lineHeight:1.5}}>
-              No uline_weekly rollup exists for these Fridays. Unpaid stops from these weeks never got ingested, so they aren't in the audit at all (can't even sideline them — they don't exist). Try: Gmail Sync → Uline Weekly Billing → check billing@ for DAS files for these dates.
+              No uline_weekly rollup exists for these Fridays. Unpaid stops from these weeks never got ingested, so they aren't in the audit at all. The button above jumps to Gmail Sync — hit <strong>Uline Weekly Billing</strong>, set range to <strong>All time</strong>, toggle <strong>Show missing only</strong>, then <strong>Import All</strong>.
             </div>
             <div style={{fontFamily:"monospace",fontSize:10,lineHeight:1.6,color:T.text,display:"flex",flexWrap:"wrap",gap:6}}>
               {dataGaps.dasMissing.slice(0, 30).map(w => <span key={w} style={{padding:"2px 8px",background:"#fff",borderRadius:4,border:`1px solid ${T.borderLight}`}}>{w}</span>)}
@@ -9486,7 +9524,7 @@ function MarginIQ() {
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
-    {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} onRefresh={refreshData} />}
+    {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} onRefresh={refreshData} setTab={setTab} />}
   </div>;
 }
 

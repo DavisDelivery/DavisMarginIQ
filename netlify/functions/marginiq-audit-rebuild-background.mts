@@ -298,7 +298,7 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
     // 2) Read all unpaid_stops
     const stopDocs = await listAllDocsMask(
       "unpaid_stops",
-      ["pro", "billed", "customer", "city", "state", "zip", "pu_date", "week_ending", "month", "code", "weight", "order"],
+      ["pro", "billed", "customer", "city", "state", "zip", "pu_date", "week_ending", "month", "code", "weight", "order", "service_type"],
     );
     console.log(`audit-rebuild: ${stopDocs.length} unpaid_stops read`);
     await writeStatus({
@@ -379,13 +379,14 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
         code: f.code?.stringValue || null,
         weight: Number(f.weight?.doubleValue ?? f.weight?.integerValue ?? 0) || null,
         order: f.order?.stringValue || null,
+        service_type: f.service_type?.stringValue || "delivery", // v2.40.14: for TK filter
         age_days: ageDays,
         age_bucket: ageBucket(ageDays),
         category,
         dispute_status: "new",
         notes: [] as any[],
         rebuilt_from_firestore: true,
-        rebuild_source: "background_v2.40.12",
+        rebuild_source: "background_v2.40.14",
         updated_at: new Date().toISOString(),
       };
       totalVariance += variance;
