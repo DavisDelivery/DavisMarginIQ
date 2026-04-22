@@ -108,7 +108,12 @@ async function batchWriteDocs(
     }
     return { ok, failed };
   }
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:batchWrite?key=${FIREBASE_API_KEY}`;
+  // v2.40.28: :batchWrite requires full IAM auth and 403s with just an API key
+  // (it bypasses security rules). :commit runs under security rules, which
+  // allow API-key writes for this project. Drop-in swap — same writes[] body
+  // format, same 500-write limit, returns writeResults[] (no status[], since
+  // it's transactional). Existing parse logic handles both shapes.
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:commit?key=${FIREBASE_API_KEY}`;
   const writes = docs.map(d => ({
     update: {
       name: `projects/${PROJECT_ID}/databases/(default)/documents/${collection}/${d.docId}`,
