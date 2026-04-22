@@ -212,6 +212,50 @@ async function batchWriteDocs(
   return { ok, failed };
 }
 
+// Batch delete up to 500 docs in one REST call via batchWrite endpoint.
+// v2.40.4: previously we did sequential DELETEs which, with 50+ chunks to
+// purge when re-running the same day's backup, blew past Netlify's 10s
+// sync-function timeout.
+async function batchDeleteDocs(
+  collection: string,
+  docIds: string[],
+): Promise<{ ok: number; failed: number }> {
+  if (docIds.length === 0) return { ok: 0, failed: 0 };
+  if (docIds.length > 500) {
+    let ok = 0, failed = 0;
+    for (let i = 0; i < docIds.length; i += 500) {
+      const slice = docIds.slice(i, i + 500);
+      const r = await batchDeleteDocs(collection, slice);
+      ok += r.ok; failed += r.failed;
+    }
+    return { ok, failed };
+  }
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default):batchWrite?key=${FIREBASE_API_KEY}`;
+  const writes = docIds.map(id => ({
+    delete: `projects/${PROJECT_ID}/databases/(default)/documents/${collection}/${id}`,
+  }));
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ writes }),
+  });
+  if (!resp.ok) {
+    // Fall back to per-doc deletes so one bad doc doesn't fail the whole batch
+    let ok = 0, failed = 0;
+    for (const id of docIds) {
+      const r = await deleteDocument(collection, id);
+      if (r) ok++; else failed++;
+    }
+    return { ok, failed };
+  }
+  const data: any = await resp.json();
+  let ok = 0, failed = 0;
+  for (const status of (data.status || [])) {
+    if (!status.code || status.code === 0) ok++; else failed++;
+  }
+  return { ok, failed };
+}
+
 // Firestore REST value wrappers
 function toFirestoreStringField(s: string) { return { stringValue: s }; }
 function toFirestoreIntField(n: number) { return { integerValue: String(n) }; }
@@ -444,12 +488,11 @@ async function performRestore(dateKey: string): Promise<any> {
 async function deleteBackupChunks(dateKey: string): Promise<number> {
   const allIds = await listDocumentIds("backups_chunks");
   const matching = allIds.filter(id => id.startsWith(dateKey + "__"));
-  let deleted = 0;
-  for (const id of matching) {
-    const ok = await deleteDocument("backups_chunks", id);
-    if (ok) deleted++;
-  }
-  return deleted;
+  if (matching.length === 0) return 0;
+  // v2.40.4: batched delete (was sequential, caused timeouts when re-running
+  // same day's backup with 50+ existing chunks to purge).
+  const result = await batchDeleteDocs("backups_chunks", matching);
+  return result.ok;
 }
 
 async function pruneOldBackups() {

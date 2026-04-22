@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.3";
+const APP_VERSION = "2.40.4";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7800,7 +7800,21 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
     setBackupMsg(null);
     try {
       const resp = await fetch(`/.netlify/functions/marginiq-backup`);
-      const data = await resp.json();
+      // v2.40.4: Netlify returns a 502 with empty body when the function
+      // times out. The old code called resp.json() on that empty string,
+      // which threw a cryptic DOMException ("The string did not match the
+      // expected pattern"). Parse defensively and give the user something
+      // actionable.
+      const text = await resp.text();
+      if (!text) {
+        if (resp.status === 502 || resp.status === 504) {
+          throw new Error("Backup timed out on the server. It may still be finishing in the background — refresh this page in a minute and check the snapshots list.");
+        }
+        throw new Error(`Empty response (HTTP ${resp.status})`);
+      }
+      let data;
+      try { data = JSON.parse(text); }
+      catch { throw new Error(`HTTP ${resp.status}: ${text.substring(0, 200)}`); }
       if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
       setBackupMsg({ ok: true, text: `✓ Backup created: ${data.manifest.total_docs} docs across ${data.manifest.collections_captured} collections (${Math.round(data.manifest.compressed_bytes/1024)} KB compressed)` });
       await loadBackups();
