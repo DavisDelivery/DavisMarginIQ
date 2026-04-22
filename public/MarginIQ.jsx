@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.39.4";
+const APP_VERSION = "2.40.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1352,7 +1352,11 @@ function redistributeFuelFoxOverhead(serviceRows, overhead) {
 
 
 function GmailSync({ onRefresh }) {
-  const [gmailConn, setGmailConn] = useState(null);
+  // v2.40: multi-account Gmail. `gmailAccounts` is the array of all connected
+  // inboxes (legacy singleton counts as one). `gmailConn` kept as a derived
+  // alias of the first account so the existing render paths stay simple.
+  const [gmailAccounts, setGmailAccounts] = useState([]);
+  const gmailConn = gmailAccounts.length > 0 ? gmailAccounts[0] : null;
   const [loadingConn, setLoadingConn] = useState(true);
   const [results, setResults] = useState({}); // vendor -> emails array
   const [loading, setLoading] = useState({}); // vendor -> bool
@@ -1406,22 +1410,36 @@ function GmailSync({ onRefresh }) {
     (async () => {
       if (!hasFirebase) { setLoadingConn(false); return; }
       try {
-        const d = await window.db.collection("marginiq_config").doc("gmail_tokens").get();
-        if (d.exists) {
-          const data = d.data();
-          setGmailConn({ email: data.email, connected_at: data.connected_at });
-        }
+        // v2.40: scan marginiq_config for all gmail_tokens* docs. Per-account
+        // doc (gmail_tokens_{slug}) wins over legacy singleton when both exist
+        // for the same email.
+        const snap = await window.db.collection("marginiq_config").get();
+        const byEmail = {};
+        snap.forEach((d) => {
+          const id = d.id;
+          if (id !== "gmail_tokens" && !id.startsWith("gmail_tokens_")) return;
+          const data = d.data() || {};
+          if (!data.refresh_token && !data.email) return; // skip empty shells
+          const email = data.email || "unknown";
+          const entry = { docId: id, email, connected_at: data.connected_at };
+          const existing = byEmail[email];
+          if (!existing || (existing.docId === "gmail_tokens" && id !== "gmail_tokens")) {
+            byEmail[email] = entry;
+          }
+        });
+        setGmailAccounts(Object.values(byEmail));
       } catch(e) {
-        setOauthMsg({ kind: "error", text: "Could not read Gmail token from Firestore: " + e.message });
+        setOauthMsg({ kind: "error", text: "Could not read Gmail tokens from Firestore: " + e.message });
       }
       setLoadingConn(false);
     })();
   }, []);
 
-  const disconnect = async () => {
-    if (!confirm("Disconnect Gmail? You'll need to reconnect to pull new reports.")) return;
-    try { await window.db.collection("marginiq_config").doc("gmail_tokens").delete(); } catch(e) {}
-    setGmailConn(null);
+  const disconnect = async (docId = "gmail_tokens", email = "") => {
+    const who = email || "this Gmail account";
+    if (!confirm(`Disconnect ${who}? You'll need to reconnect to pull new reports from it.`)) return;
+    try { await window.db.collection("marginiq_config").doc(docId).delete(); } catch(e) {}
+    setGmailAccounts(prev => prev.filter(a => a.docId !== docId));
     setResults({});
   };
 
@@ -1489,9 +1507,12 @@ function GmailSync({ onRefresh }) {
   // Shared helper — download a Gmail attachment with retry + clearer error surfacing.
   // Common failure modes on mobile: Netlify cold-start timeout, 5G flakiness,
   // brief Gmail API hiccup. A single retry with a short backoff clears most.
-  const downloadGmailAttachment = async (emailId, attachmentId, filenameForLogs) => {
+  const downloadGmailAttachment = async (email, attachmentId, filenameForLogs) => {
     const MAX_ATTEMPTS = 3;
     let lastErr = null;
+    const emailId = email?.emailId || email; // backward-compat if a plain id is passed
+    const accountDocId = email?.account_doc_id || "";
+    const accountEmail = email?.account_email || "";
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         // AbortController with 45s timeout — long enough for Netlify function
@@ -1502,7 +1523,12 @@ function GmailSync({ onRefresh }) {
         const resp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messageId: emailId, attachmentId }),
+          body: JSON.stringify({
+            messageId: emailId,
+            attachmentId,
+            account_doc_id: accountDocId,
+            account_email: accountEmail,
+          }),
           signal: ctrl.signal,
         });
         clearTimeout(timeoutId);
@@ -1534,7 +1560,7 @@ function GmailSync({ onRefresh }) {
     setImportStatus(`Downloading ${attachment.filename}...`);
     try {
       // 1. Download attachment bytes (with retry)
-      const dlData = await downloadGmailAttachment(email.emailId, attachment.attachmentId, attachment.filename);
+      const dlData = await downloadGmailAttachment(email, attachment.attachmentId, attachment.filename);
 
       // 2. Base64 → File
       const binary = atob(dlData.data);
@@ -1595,7 +1621,12 @@ function GmailSync({ onRefresh }) {
       const dl = async (a) => {
         const r = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messageId: email.emailId, attachmentId: a.attachmentId }),
+          body: JSON.stringify({
+            messageId: email.emailId,
+            attachmentId: a.attachmentId,
+            account_doc_id: email.account_doc_id || "",
+            account_email: email.account_email || "",
+          }),
         });
         const d = await r.json();
         if (d.error) throw new Error(d.error);
@@ -1693,7 +1724,12 @@ function GmailSync({ onRefresh }) {
     try {
       const dlResp = await fetch("/.netlify/functions/marginiq-gmail-attachment", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageId: email.emailId, attachmentId: attachment.attachmentId }),
+        body: JSON.stringify({
+          messageId: email.emailId,
+          attachmentId: attachment.attachmentId,
+          account_doc_id: email.account_doc_id || "",
+          account_email: email.account_email || "",
+        }),
       });
       const dlData = await dlResp.json();
       if (dlData.error) throw new Error(dlData.error);
@@ -1876,11 +1912,13 @@ function GmailSync({ onRefresh }) {
       </div>
     )}
 
-    {!gmailConn ? (
+    {gmailAccounts.length === 0 ? (
       <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
         <div style={{fontSize:13,fontWeight:700,marginBottom:8,color:T.brand}}>Connect Gmail</div>
         <div style={{fontSize:12,color:T.text,lineHeight:1.6,marginBottom:12}}>
           Auto-import weekly reports directly from your inbox. MarginIQ will search your Gmail (read-only) for attachments from known vendors and route them through the same parsers as manual upload.
+          <br/><br/>
+          <strong>Tip:</strong> connect <code>billing@davisdelivery.com</code> in addition to <code>chad@</code> to see every accessorial + TK file Uline sends, even when chad@ wasn't CC'd.
           <br/><br/>
           <strong>What we search for:</strong>
           <ul style={{marginTop:6,marginLeft:20}}>
@@ -1895,13 +1933,25 @@ function GmailSync({ onRefresh }) {
     ) : (
       <>
         <div style={{...cardStyle, background:T.greenBg, borderColor:T.green}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
-            <div>
-              <div style={{fontSize:12,fontWeight:700,color:T.greenText}}>✓ Connected</div>
-              <div style={{fontSize:13,fontWeight:600,marginTop:2}}>{gmailConn.email}</div>
-              {gmailConn.connected_at && <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>Connected {new Date(gmailConn.connected_at).toLocaleString()}</div>}
+          <div style={{fontSize:12,fontWeight:700,color:T.greenText,marginBottom:8}}>
+            ✓ Connected ({gmailAccounts.length} {gmailAccounts.length === 1 ? "account" : "accounts"})
+          </div>
+          {gmailAccounts.map((acct) => (
+            <div key={acct.docId} style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8,padding:"6px 0",borderTop:`1px solid ${T.borderLight}`}}>
+              <div>
+                <div style={{fontSize:13,fontWeight:600}}>{acct.email}</div>
+                {acct.connected_at && <div style={{fontSize:10,color:T.textMuted,marginTop:2}}>Connected {new Date(acct.connected_at).toLocaleString()}</div>}
+              </div>
+              <button onClick={() => disconnect(acct.docId, acct.email)} style={{padding:"6px 12px",borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,fontSize:11,cursor:"pointer"}}>Disconnect</button>
             </div>
-            <button onClick={disconnect} style={{padding:"6px 12px",borderRadius:6,border:`1px solid ${T.border}`,background:T.bgWhite,fontSize:11,cursor:"pointer"}}>Disconnect</button>
+          ))}
+          <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.borderLight}`}}>
+            <a href="/.netlify/functions/marginiq-gmail-auth" style={{display:"inline-block",padding:"6px 12px",background:T.brand,color:"#fff",borderRadius:6,textDecoration:"none",fontSize:11,fontWeight:700}}>
+              + Add another account
+            </a>
+            <span style={{marginLeft:10,fontSize:10,color:T.textMuted}}>
+              Sign into the other Gmail in a new tab first, then click this.
+            </span>
           </div>
         </div>
 

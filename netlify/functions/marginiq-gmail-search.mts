@@ -28,83 +28,71 @@ const VENDOR_QUERIES: Record<string, string> = {
   quickfuel: 'from:ebilling@4flyers.com has:attachment',
 };
 
-export default async (req: Request, context: Context) => {
-  if (req.method !== "POST") {
-    return json({ error: "POST required" }, 405);
+// v2.40: a connected Gmail account with enough info to run a search on its behalf.
+type TokenDoc = { docId: string; email: string; refresh_token: string };
+
+// List every connected Gmail account stored in marginiq_config. Accepts both
+// the legacy singleton (`gmail_tokens`) and per-account docs (`gmail_tokens_*`).
+// If the same email has both, the per-account doc wins.
+async function listConnectedAccounts(projectId: string, apiKey: string): Promise<TokenDoc[]> {
+  const accounts: Record<string, TokenDoc> = {};
+  const listResp = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/marginiq_config?key=${apiKey}&pageSize=100`
+  );
+  if (!listResp.ok) return [];
+  const listData = await listResp.json();
+  for (const d of (listData.documents || [])) {
+    const docId = (d.name || "").split("/").pop() || "";
+    if (docId !== "gmail_tokens" && !docId.startsWith("gmail_tokens_")) continue;
+    const fields = d.fields || {};
+    const refreshToken = fields.refresh_token?.stringValue;
+    const email = fields.email?.stringValue || "unknown";
+    if (!refreshToken) continue;
+    const existing = accounts[email];
+    // Prefer per-account doc over legacy singleton when both exist for same email.
+    if (!existing || (existing.docId === "gmail_tokens" && docId !== "gmail_tokens")) {
+      accounts[email] = { docId, email, refresh_token: refreshToken };
+    }
   }
+  return Object.values(accounts);
+}
 
-  const CLIENT_ID = process.env["GOOGLE_CLIENT_ID"];
-  const CLIENT_SECRET = process.env["GOOGLE_CLIENT_SECRET"];
-  const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
-  const PROJECT_ID = "davismarginiq";
-
-  if (!CLIENT_ID || !CLIENT_SECRET || !FIREBASE_API_KEY) {
-    return json({ error: "OAuth not configured" }, 500);
+async function getFreshAccessToken(
+  clientId: string, clientSecret: string, refreshToken: string
+): Promise<{ accessToken?: string; error?: string }> {
+  const refreshResp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data = await refreshResp.json();
+  if (!refreshResp.ok || !data.access_token) {
+    return { error: "Token refresh failed: " + JSON.stringify(data).substring(0, 300) };
   }
+  return { accessToken: data.access_token };
+}
 
+// Run a vendor search against a single inbox. Each returned result is tagged
+// with account_email + account_doc_id so the dedup pass and the attachment
+// fetcher can route correctly.
+async function searchOneInbox(
+  account: TokenDoc, accessToken: string, query: string, maxResults: number
+): Promise<{ account: string; results: any[]; error?: string }> {
   try {
-    const body = await req.json();
-    const vendor: string = (body.vendor || "").toLowerCase();
-    const afterDate: string = body.afterDate || ""; // YYYY/MM/DD
-    const beforeDate: string = body.beforeDate || ""; // YYYY/MM/DD
-    const maxResults: number = Math.min(body.maxResults || 20, 200);
-
-    if (!vendor || !VENDOR_QUERIES[vendor]) {
-      return json({ error: `Unknown vendor. Supported: ${Object.keys(VENDOR_QUERIES).join(", ")}` }, 400);
-    }
-
-    // Load refresh token from Firestore
-    const tokDocResp = await fetch(
-      `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/gmail_tokens?key=${FIREBASE_API_KEY}`
-    );
-    if (!tokDocResp.ok) {
-      return json({ error: "Gmail not connected. Go to Settings → Gmail → Connect." }, 400);
-    }
-    const tokDoc = await tokDocResp.json();
-    const refreshToken = tokDoc?.fields?.refresh_token?.stringValue;
-    if (!refreshToken) {
-      return json({ error: "No refresh_token stored. Reconnect Gmail." }, 400);
-    }
-
-    // Get fresh access token
-    const refreshResp = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        refresh_token: refreshToken,
-        grant_type: "refresh_token",
-      }),
-    });
-
-    const refreshData = await refreshResp.json();
-    if (!refreshResp.ok || !refreshData.access_token) {
-      return json({ error: "Token refresh failed: " + JSON.stringify(refreshData).substring(0, 300) }, 500);
-    }
-
-    const accessToken = refreshData.access_token;
-
-    // Build query
-    let query = VENDOR_QUERIES[vendor];
-    if (afterDate) query += ` after:${afterDate}`;
-    if (beforeDate) query += ` before:${beforeDate}`;
-
-    // Search messages
     const searchUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`;
     const searchResp = await fetch(searchUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
     const searchData = await searchResp.json();
-
     if (!searchResp.ok) {
-      return json({ error: "Gmail search failed: " + JSON.stringify(searchData).substring(0, 300) }, 500);
+      return { account: account.email, results: [], error: "Gmail search failed: " + JSON.stringify(searchData).substring(0, 300) };
     }
-
     const messages = searchData.messages || [];
-    if (messages.length === 0) {
-      return json({ results: [], query });
-    }
+    if (messages.length === 0) return { account: account.email, results: [] };
 
-    // Fetch details for each message in parallel
     const results = await Promise.all(messages.map(async (msg: any) => {
       try {
         const fullResp = await fetch(
@@ -148,16 +136,121 @@ export default async (req: Request, context: Context) => {
           from: getHeader("From"),
           snippet: (full.snippet || "").substring(0, 200),
           attachments: dataAttachments,
+          // v2.40: account routing metadata
+          account_email: account.email,
+          account_doc_id: account.docId,
         };
       } catch (e: any) {
-        return { emailId: msg.id, error: e.message || "Failed to fetch details" };
+        return {
+          emailId: msg.id,
+          error: e.message || "Failed to fetch details",
+          account_email: account.email,
+          account_doc_id: account.docId,
+        };
       }
     }));
 
-    // Sort newest first
-    results.sort((a: any, b: any) => (b.emailDate || "").localeCompare(a.emailDate || ""));
+    return { account: account.email, results };
+  } catch (e: any) {
+    return { account: account.email, results: [], error: e.message || "Proxy error" };
+  }
+}
 
-    return json({ results, query, count: results.length });
+// Cross-account dedup. The same email thread can appear in both the sender's
+// Sent folder (e.g. billing@) and the recipient's Inbox (e.g. chad@) when
+// both are connected. Key by minute-bucket + sorted filename set. Prefer the
+// result whose From: header matches the connected account (the sender's own
+// copy is the canonical one — same bytes, simpler attribution).
+function dedupeResults(results: any[]): any[] {
+  const byKey: Record<string, any> = {};
+  for (const r of results) {
+    if (!r.attachments?.length) {
+      // No attachments → can't collide on filename set; key uniquely per account.
+      byKey[`noatt|${r.account_email}|${r.emailId}`] = r;
+      continue;
+    }
+    const minuteBucket = (r.emailDate || "").slice(0, 16); // YYYY-MM-DDTHH:MM
+    const filenames = r.attachments
+      .map((a: any) => (a.filename || "").toLowerCase())
+      .sort().join("|");
+    const key = `${minuteBucket}|${filenames}`;
+    const existing = byKey[key];
+    if (!existing) { byKey[key] = r; continue; }
+    const fromMatches = (c: any) => {
+      if (!c.from || !c.account_email) return false;
+      return c.from.toLowerCase().includes(c.account_email.toLowerCase());
+    };
+    if (fromMatches(r) && !fromMatches(existing)) byKey[key] = r;
+  }
+  return Object.values(byKey);
+}
+
+export default async (req: Request, context: Context) => {
+  if (req.method !== "POST") {
+    return json({ error: "POST required" }, 405);
+  }
+
+  const CLIENT_ID = process.env["GOOGLE_CLIENT_ID"];
+  const CLIENT_SECRET = process.env["GOOGLE_CLIENT_SECRET"];
+  const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
+  const PROJECT_ID = "davismarginiq";
+
+  if (!CLIENT_ID || !CLIENT_SECRET || !FIREBASE_API_KEY) {
+    return json({ error: "OAuth not configured" }, 500);
+  }
+
+  try {
+    const body = await req.json();
+    const vendor: string = (body.vendor || "").toLowerCase();
+    const afterDate: string = body.afterDate || ""; // YYYY/MM/DD
+    const beforeDate: string = body.beforeDate || ""; // YYYY/MM/DD
+    const maxResults: number = Math.min(body.maxResults || 20, 200);
+    const accountFilter: string = (body.account_email || "").toLowerCase();
+
+    if (!vendor || !VENDOR_QUERIES[vendor]) {
+      return json({ error: `Unknown vendor. Supported: ${Object.keys(VENDOR_QUERIES).join(", ")}` }, 400);
+    }
+
+    // v2.40: enumerate all connected accounts (legacy singleton + per-account)
+    const accounts = await listConnectedAccounts(PROJECT_ID, FIREBASE_API_KEY);
+    if (!accounts.length) {
+      return json({ error: "No Gmail accounts connected. Go to Settings → Gmail → Connect." }, 400);
+    }
+
+    // Optional single-account filter — caller can pin a search to one inbox.
+    const targets = accountFilter
+      ? accounts.filter(a => a.email.toLowerCase() === accountFilter)
+      : accounts;
+    if (!targets.length) {
+      return json({ error: `No connected account matches ${accountFilter}` }, 400);
+    }
+
+    // Build query (shared across all target inboxes)
+    let query = VENDOR_QUERIES[vendor];
+    if (afterDate) query += ` after:${afterDate}`;
+    if (beforeDate) query += ` before:${beforeDate}`;
+
+    // Fan out across inboxes in parallel
+    const accountResults = await Promise.all(targets.map(async (acct) => {
+      const { accessToken, error: authErr } = await getFreshAccessToken(CLIENT_ID, CLIENT_SECRET, acct.refresh_token);
+      if (authErr || !accessToken) {
+        return { account: acct.email, results: [], error: authErr || "no_access_token" };
+      }
+      return await searchOneInbox(acct, accessToken, query, maxResults);
+    }));
+
+    const flatResults = accountResults.flatMap(r => r.results);
+    const deduped = dedupeResults(flatResults);
+    deduped.sort((a: any, b: any) => (b.emailDate || "").localeCompare(a.emailDate || ""));
+
+    return json({
+      results: deduped,
+      query,
+      count: deduped.length,
+      raw_count: flatResults.length,
+      accounts_searched: targets.map(t => t.email),
+      account_errors: accountResults.filter(r => r.error).map(r => ({ account: r.account, error: r.error })),
+    });
   } catch (err: any) {
     return json({ error: err.message || "Proxy error" }, 500);
   }

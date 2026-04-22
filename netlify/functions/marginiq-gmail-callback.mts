@@ -1,5 +1,15 @@
 import type { Context, Config } from "@netlify/functions";
 
+// Slugify an email address into a valid Firestore doc ID suffix.
+// chad@davisdelivery.com → chad_at_davisdelivery_com
+function emailSlug(email: string): string {
+  return String(email || "unknown")
+    .toLowerCase()
+    .replace(/@/g, "_at_")
+    .replace(/[^a-z0-9_]/g, "_")
+    .slice(0, 100);
+}
+
 export default async (req: Request, context: Context) => {
   const url = new URL(req.url);
   const code = url.searchParams.get("code");
@@ -56,9 +66,14 @@ export default async (req: Request, context: Context) => {
       userEmail = profile.emailAddress || "unknown";
     } catch {}
 
-    // Store in Firestore at marginiq_config/gmail_tokens
+    // v2.40+ per-account token storage at marginiq_config/gmail_tokens_{slug}.
+    // Lets us fan out Gmail searches across chad@ + billing@ + any additional
+    // inbox the user connects, instead of overwriting a singleton. Legacy
+    // marginiq_config/gmail_tokens doc is left alone — the search function
+    // picks it up automatically as one more account.
+    const docId = `gmail_tokens_${emailSlug(userEmail)}`;
     const firestoreResp = await fetch(
-      `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/gmail_tokens?key=${FIREBASE_API_KEY}`,
+      `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/${docId}?key=${FIREBASE_API_KEY}`,
       {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -86,3 +101,4 @@ export default async (req: Request, context: Context) => {
 };
 // env: GOOGLE_CLIENT_SECRET set 2026-04-20T18:01:38Z
 // env vars updated 2026-04-20T18:03:27Z — force fresh function build
+// v2.40.0: per-account token storage (gmail_tokens_{slug})
