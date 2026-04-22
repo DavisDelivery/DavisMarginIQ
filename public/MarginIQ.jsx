@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.16";
+const APP_VERSION = "2.40.17";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -379,13 +379,68 @@ async function ingestFiles(files, onStatus = () => {}) {
     r => FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()}),
     25, "Saving reconciliation");
   await batchWrite(ddisFileRecords, f => FS.saveDDISFile(f.file_id, f), 25);
-  // Persist per-PRO payments so audit queue rebuild can do real matching.
-  // Cap at 10K rows — DDIS files rarely exceed this, and keeps write time
-  // under control if someone ingests a year's worth at once.
+  // v2.40.17: ddis_payments persistence moved to background function.
+  // Phone was stalling on 3000-row CSVs because the JS SDK wrote 25/batch
+  // sequentially from mobile — ~120 round trips of latency. We now hand the
+  // file records + payment rows to marginiq-ddis-ingest (dispatcher) which
+  // forwards to marginiq-ddis-ingest-background, and poll for status.
+  //
+  // Note: we still call the client batchWrite for ddis_files above as a
+  // defense-in-depth — the background path also writes them. Both paths use
+  // Firestore merge semantics so double-write is idempotent and ensures the
+  // UI's local ddis_files read is hot immediately even if the background
+  // worker lags a few seconds. The "big" write (payments) is server-only.
   if (ddisPayments.length > 0) {
     const toSave = ddisPayments.slice(0, 10000);
-    onStatus({ phase:"save", message:`Saving ${toSave.length} DDIS payments...` });
-    await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments");
+    onStatus({ phase:"save", message:`Dispatching ${toSave.length} DDIS payments to background...` });
+    try {
+      const dispatchResp = await fetch("/.netlify/functions/marginiq-ddis-ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ddisFileRecords,     // background will upsert these too (idempotent)
+          ddisPayments: toSave,
+        }),
+      });
+      if (!dispatchResp.ok) {
+        // Fall back to the old client-side path so a background outage
+        // doesn't break ingest. Log the reason so we know.
+        const errText = await dispatchResp.text().catch(() => "");
+        console.warn(`ddis-ingest dispatch failed (HTTP ${dispatchResp.status}): ${errText}. Falling back to client writes.`);
+        onStatus({ phase:"save", message:`Dispatch failed, saving ${toSave.length} DDIS payments from browser (slower)...` });
+        await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments");
+      } else {
+        // Poll status until state != "running". Cap at ~5 min real-time to
+        // avoid blocking the ingest UI forever if the background hangs.
+        const startedPoll = Date.now();
+        const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+        const POLL_INTERVAL_MS = 2000;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+          if (Date.now() - startedPoll > POLL_TIMEOUT_MS) {
+            onStatus({ phase:"save", message:`DDIS background still running past 5 min — continuing rest of ingest (payments will finish on server)` });
+            break;
+          }
+          let statusJson = null;
+          try {
+            const sResp = await fetch("/.netlify/functions/marginiq-ddis-ingest?action=status");
+            if (sResp.ok) statusJson = await sResp.json();
+          } catch (e) {
+            // Transient network hiccup — try again next tick.
+            continue;
+          }
+          const st = statusJson?.status;
+          if (!st) continue;
+          onStatus({ phase:"save", message: st.progress_text || "Saving DDIS payments..." });
+          if (st.state === "complete" || st.state === "failed") break;
+        }
+      }
+    } catch (e) {
+      console.warn("ddis-ingest dispatch threw, falling back to client writes:", e);
+      onStatus({ phase:"save", message:`Dispatch threw, saving ${toSave.length} DDIS payments from browser...` });
+      await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments");
+    }
   }
   // Without DDIS payment data, every stop looks unpaid — cap hard to avoid
   // writing 500 meaningless rows. With payment data, keep full 500 for audit.
