@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.14";
+const APP_VERSION = "2.40.15";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2197,7 +2197,23 @@ function GmailSync({ onRefresh }) {
                   if (atts.length === 0) return false;
                   return atts.every(a => alreadyImportedFilenames.has(dedupKey(a.filename)));
                 };
-                const displayList = missingOnly ? r.list.filter(em => !emailIsFullyImported(em)) : r.list;
+                // v2.40.15: hide emails with ZERO data attachments from the
+                // list. Gmail's has:attachment matches inline images/sigs, so
+                // with 1000 results per search (post-v2.40.11 pagination) the
+                // tail is a wall of "No data attachments" rows that add
+                // nothing. Count how many we're hiding so the user knows.
+                const hasDataAttachment = (em) => {
+                  if (v.mode === "pair") {
+                    return (em.attachments||[]).some(a => a.filename.toLowerCase().endsWith(".pdf"));
+                  }
+                  return (em.attachments||[]).some(a => {
+                    const lc = a.filename.toLowerCase();
+                    return lc.endsWith(".xlsx") || lc.endsWith(".xls") || lc.endsWith(".csv") || lc.endsWith(".pdf");
+                  });
+                };
+                const emptyEmailCount = r.list.filter(em => !hasDataAttachment(em)).length;
+                let displayList = r.list.filter(hasDataAttachment);
+                if (missingOnly) displayList = displayList.filter(em => !emailIsFullyImported(em));
 
                 return (
                   <div style={{marginTop:8}}>
@@ -2208,6 +2224,7 @@ function GmailSync({ onRefresh }) {
                         <span>{totalData} {v.mode === "pair" ? "pair(s)" : "file(s)"}</span>
                         {alreadyDone > 0 && <span style={{color:T.greenText}}> · {alreadyDone} already imported</span>}
                         {pending > 0 && <span style={{color:T.brand,fontWeight:600}}> · {pending} pending</span>}
+                        {emptyEmailCount > 0 && <span style={{color:T.textMuted}}> · {emptyEmailCount} hidden (no data attachment)</span>}
                         {missingOnly && <span style={{color:T.textMuted}}> · showing {displayList.length} missing</span>}
                       </div>
                       <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>

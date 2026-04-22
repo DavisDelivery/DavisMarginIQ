@@ -125,12 +125,30 @@ async function batchWriteDocs(
     return { ok: 0, failed: docs.length };
   }
   const data: any = await resp.json();
+  // v2.40.15: Firestore REST batchWrite returns writeResults[] + status[].
+  // When everything succeeds, status may be empty/missing — only populated
+  // for failures. Prior logic counted only status entries with code===0,
+  // which meant all-success returned ok=0 (and the dashboard never updated).
+  // Fix: ground truth is writeResults.length; subtract explicit failures.
+  const writeResults = data.writeResults || [];
   const statuses = data.status || [];
-  let ok = 0, failed = 0;
+  let explicitFailed = 0;
   for (const s of statuses) {
-    if (!s.code || s.code === 0) ok++; else failed++;
+    if (s && s.code && s.code !== 0) explicitFailed++;
   }
-  return { ok, failed };
+  // If we have writeResults, use that as the source of truth. Otherwise,
+  // fall back to statuses (older API surface or partial responses).
+  if (writeResults.length > 0) {
+    return { ok: writeResults.length - explicitFailed, failed: explicitFailed };
+  }
+  // No writeResults AND no statuses — unclear, assume no-op
+  if (statuses.length === 0) return { ok: docs.length, failed: 0 };
+  // Only statuses populated — count OK from those
+  let okFromStatus = 0;
+  for (const s of statuses) {
+    if (!s || !s.code || s.code === 0) okFromStatus++;
+  }
+  return { ok: okFromStatus, failed: statuses.length - okFromStatus };
 }
 
 function toFsValue(v: any): any {
