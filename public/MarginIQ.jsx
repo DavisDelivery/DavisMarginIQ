@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.7";
+const APP_VERSION = "2.40.8";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7089,6 +7089,52 @@ function Audit({ reconWeekly, weeklyRollups }) {
           </div>
         ) : (
           <>
+            {/* v2.40.8: Rebuild Audit Queue banner — visible even when items
+                already exist. Previously this was only shown on an empty
+                queue, which meant users who'd imported more DDIS data after
+                the first build had no obvious way to refresh the variance
+                numbers. Most common reason to click this: you just imported
+                more DDIS files and want audit_items re-computed. */}
+            <div style={{...cardStyle, marginBottom:12, background:T.brandPale, borderColor:T.brand}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
+                <div style={{flex:"1 1 260px"}}>
+                  <div style={{fontSize:12,fontWeight:700,color:T.brand,marginBottom:2}}>🔄 Rebuild audit queue</div>
+                  <div style={{fontSize:11,color:T.text,lineHeight:1.5}}>
+                    Recomputes every audit item from the current <code>unpaid_stops</code> ↔ <code>ddis_payments</code> join. Click this after importing new DDIS files or if variance numbers look stale.
+                  </div>
+                </div>
+                <button
+                  onClick={rebuildAuditItems}
+                  disabled={rebuilding}
+                  style={{
+                    padding: "9px 16px",
+                    borderRadius: 8,
+                    border: "none",
+                    background: rebuilding ? T.bgSurface : `linear-gradient(135deg,${T.brand},${T.brandLight})`,
+                    color: rebuilding ? T.text : "#fff",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: rebuilding ? "wait" : "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {rebuilding ? "⏳ Rebuilding…" : "🔄 Rebuild Now"}
+                </button>
+              </div>
+              {rebuildStatus && <div style={{marginTop:8,fontSize:11,color:T.textMuted}}>{rebuildStatus}</div>}
+              {rebuildResult?.error && (
+                <div style={{marginTop:10,padding:"8px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText}}>
+                  ✗ {rebuildResult.error}
+                </div>
+              )}
+              {rebuildResult?.ok && (
+                <div style={{marginTop:10,padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
+                  ✓ Rebuilt {rebuildResult.generated} audit items ({fmtK(rebuildResult.totalVariance)} total variance) from {rebuildResult.ddisFiles} DDIS files
+                  {!rebuildResult.withPayments && <div style={{marginTop:4,fontSize:10}}>Note: no PRO-level payment matching — re-ingest a DDIS file to enable.</div>}
+                </div>
+              )}
+            </div>
+
             {/* Aging buckets */}
             <div style={{...cardStyle, marginBottom:12}}>
               <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Aging — Outstanding by Age</div>
@@ -7825,6 +7871,51 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
   const [restoreConfirm, setRestoreConfirm] = useState("");
   const [adminToken, setAdminToken] = useState("");
 
+  // v2.40.8: Live DDIS stats pulled from the ddis_files collection itself.
+  // Previous versions read reconMeta.files_count, a counter kept in a side
+  // doc inside marginiq_config that got out of sync with reality (user had
+  // 42 real files but the counter read 1). Ground-truthing against the
+  // collection avoids that drift entirely.
+  const [ddisStats, setDdisStats] = useState(null);
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) return;
+      try {
+        const files = await FS.getDDISFiles();
+        if (!files || files.length === 0) { setDdisStats({ count: 0, totalPaid: 0, rows: 0 }); return; }
+        let totalPaid = 0, rows = 0, earliest = null, latest = null;
+        const weeks = new Set();
+        for (const f of files) {
+          totalPaid += Number(f.total_paid || 0);
+          rows += Number(f.record_count || 0);
+          const eb = f.earliest_bill_date, lb = f.latest_bill_date;
+          if (eb && (!earliest || eb < earliest)) earliest = eb;
+          if (lb && (!latest || lb > latest)) latest = lb;
+          // Weeks covered — one file typically spans one payment cycle
+          // (roughly a week). Use earliest_bill_date bucketed to ISO week.
+          if (eb) {
+            // Friday-ending week key — same convention as Uline weekly rollups
+            const d = new Date(eb + "T00:00:00Z");
+            if (!isNaN(d.getTime())) {
+              const day = d.getUTCDay(); // 0=Sun..6=Sat
+              const diffToFri = (5 - day + 7) % 7;
+              d.setUTCDate(d.getUTCDate() + diffToFri);
+              weeks.add(d.toISOString().slice(0, 10));
+            }
+          }
+        }
+        setDdisStats({
+          count: files.length,
+          totalPaid,
+          rows,
+          earliest,
+          latest,
+          weeksCovered: weeks.size,
+        });
+      } catch(e) { console.error("DDIS stats load failed:", e); }
+    })();
+  }, []);
+
   const loadBackups = async () => {
     setBackupsLoading(true);
     try {
@@ -7960,9 +8051,28 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
     </div>
     <div style={cardStyle}>
       <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>System Info</div>
-      {[["Firebase","davismarginiq"],["Netlify","davis-marginiq.netlify.app"],["Version",APP_VERSION],["Weekly Rollups",weeklyRollups.length],["DDIS Files Loaded",reconMeta?reconMeta.files_count:0],["Last Upload",reconMeta?.last_upload?new Date(reconMeta.last_upload).toLocaleString():"Never"]].map(([l,v])=>
-        <DataRow key={l} label={l} value={String(v)} />
-      )}
+      {(() => {
+        // v2.40.8: Live-count DDIS stats from the actual ddis_files collection
+        // (not the stale reconMeta.files_count which drifts).
+        const ddisCount  = ddisStats ? ddisStats.count : "—";
+        const ddisWeeks  = ddisStats?.count ? `${ddisStats.weeksCovered} weeks` : "—";
+        const ddisPaid   = ddisStats?.count ? `$${(ddisStats.totalPaid || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—";
+        const ddisRange  = ddisStats?.earliest && ddisStats?.latest ? `${ddisStats.earliest} → ${ddisStats.latest}` : "—";
+        const ddisRows   = ddisStats?.count ? `${(ddisStats.rows || 0).toLocaleString()} payment rows` : "—";
+        const lastUpload = reconMeta?.last_upload ? new Date(reconMeta.last_upload).toLocaleString() : "Never";
+        return [
+          ["Firebase", "davismarginiq"],
+          ["Netlify", "davis-marginiq.netlify.app"],
+          ["Version", APP_VERSION],
+          ["Weekly Rollups", String(weeklyRollups.length)],
+          ["DDIS Files Loaded", String(ddisCount)],
+          ["DDIS Coverage", ddisWeeks],
+          ["DDIS Total Paid", ddisPaid],
+          ["DDIS Date Range", ddisRange],
+          ["DDIS Payment Rows", ddisRows],
+          ["Last DDIS Upload", lastUpload],
+        ].map(([l, v]) => <DataRow key={l} label={l} value={v} />);
+      })()}
     </div>
 
     {/* DAILY BACKUPS */}
