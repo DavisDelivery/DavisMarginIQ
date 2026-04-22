@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.5";
+const APP_VERSION = "2.40.6";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1351,34 +1351,63 @@ function redistributeFuelFoxOverhead(serviceRows, overhead) {
 }
 
 
-// ─── Attachment dedup key (v2.40.3) ─────────────────────────
+// ─── Attachment dedup key (v2.40.3, revised v2.40.6) ────────
 // Uline DAS filenames carry a date range + a variant (main weekly billing
 // or the tiny accessorials companion). Re-forwarded / re-saved copies often
 // get a suffix appended (e.g. `-JO`, someone's initials) so a literal
 // filename match lets them import twice. Key on the structural signature
 // instead — same date range + same variant = same billing record.
 //
-// Examples that collide (correctly) under this scheme:
-//   das 20251124-20251128.xlsx
-//   das 20251124-20251128-JO.xlsx
-//   das 20251124-20251128 -JO.xlsx
-//   das 20251124-20251128.xls.xlsx   (occasional double-extension bug)
-//     → all "das_20251124_20251128_main"
+// v2.40.6: Uline ALSO sends the same week's file under two different date
+// formats depending on which of their internal systems generated it:
+//   YYYYMMDD-YYYYMMDD   (ISO, e.g. "das 20260216-20260220.xlsx")
+//   MMDDYYYY-MMDDYYYY   (US,  e.g. "das 02162026-02202026.xlsx")
+// Both describe the exact same billing period. Canonicalize every 8-digit
+// chunk into YYYYMMDD before building the key so the two formats collapse.
 //
-// Accessorials get their own variant bucket so the main file and the
-// accessorials file for the same week remain distinct and both import.
-//   das 20251124-20251128 accessorials.xlsx
-//     → "das_20251124_20251128_accessorials"
+// Examples that collide (correctly) under this scheme:
+//   das 20260216-20260220.xlsx
+//   das 02162026-02202026.xlsx
+//   das 20260216-20260220-JO.xlsx
+//   das 02162026 - 02202026.xlsx        (spaces around dash)
+//   das 20260216-20260220.xls.xlsx      (double-extension bug)
+//     → all "das_20260216_20260220_main"
+//
+// Accessorials get their own variant bucket so 'das YYYYMMDD-YYYYMMDD
+// accessorials.xlsx' is still distinct from the main file of the same
+// week and both continue to import.
 //
 // Anything that doesn't match the DAS pattern falls back to the raw
 // lowercase filename — same behavior as pre-v2.40.3 for FuelFox PDFs,
 // DDIS CSVs, NuVizz stops, etc.
+function toCanonicalDate(s) {
+  if (!s || s.length !== 8 || !/^\d{8}$/.test(s)) return null;
+  // Try YYYYMMDD first (ISO). Year must plausibly be within our operating
+  // range — Uline DAS files started ~2023 and we're in 2026 now.
+  const y1 = parseInt(s.slice(0, 4), 10);
+  const m1 = parseInt(s.slice(4, 6), 10);
+  const d1 = parseInt(s.slice(6, 8), 10);
+  if (y1 >= 2000 && y1 <= 2099 && m1 >= 1 && m1 <= 12 && d1 >= 1 && d1 <= 31) {
+    return s;
+  }
+  // Try MMDDYYYY (US). Convert to canonical YYYYMMDD.
+  const m2 = parseInt(s.slice(0, 2), 10);
+  const d2 = parseInt(s.slice(2, 4), 10);
+  const y2 = parseInt(s.slice(4, 8), 10);
+  if (y2 >= 2000 && y2 <= 2099 && m2 >= 1 && m2 <= 12 && d2 >= 1 && d2 <= 31) {
+    return String(y2) + String(m2).padStart(2, "0") + String(d2).padStart(2, "0");
+  }
+  return null;
+}
 function parseDasFilename(filename) {
   const fn = (filename || "").toLowerCase().trim();
   // das + 8-digit start date + separator + 8-digit end date + anything + .xls(x)
   const m = fn.match(/^das[\s_-]*(\d{8})[\s_-]+(\d{8})(.*)\.xlsx?$/);
   if (!m) return { ok: false };
-  const [, start, end, rest] = m;
+  const [, raw1, raw2, rest] = m;
+  const start = toCanonicalDate(raw1);
+  const end = toCanonicalDate(raw2);
+  if (!start || !end) return { ok: false };
   const variant = /accessorial/i.test(rest) ? "accessorials" : "main";
   return { ok: true, start, end, variant, key: `das_${start}_${end}_${variant}` };
 }
