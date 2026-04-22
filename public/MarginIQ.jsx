@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.25";
+const APP_VERSION = "2.40.26";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -198,6 +198,10 @@ async function ingestFiles(files, onStatus = () => {}) {
   const fileWeekImpact = [];
 
   for (let i=0; i<files.length; i++) {
+    // v2.40.26: yield between files so the UI stays responsive during bulk
+    // imports (22 DDIS files × 3K rows each would otherwise block Safari's
+    // main thread long enough to trigger the "unresponsive page" prompt)
+    if (i > 0) await new Promise(r => setTimeout(r, 0));
     const file = files[i];
     onStatus({ phase:"read", current:i+1, total:files.length, name:file.name });
     const fileId = file.name.replace(/[^a-z0-9._-]/gi,"_").slice(0,140);
@@ -378,6 +382,14 @@ async function ingestFiles(files, onStatus = () => {}) {
   savedRecon = await batchWrite(Object.values(reconByWeek),
     r => FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()}),
     25, "Saving reconciliation");
+  // v2.40.26: Yield helper — releases the main thread so the UI can repaint.
+  // Mobile Safari will mark a tab unresponsive and prompt to close it if the
+  // main thread is busy for ~10+ seconds. Inserting these between hot loops
+  // keeps the phone responsive even on large DDIS ingests.
+  const yieldToUI = () => new Promise(r => setTimeout(r, 0));
+
+  await yieldToUI();
+  onStatus({ phase:"save", message:`Saving DDIS file records (${ddisFileRecords.length})...` });
   await batchWrite(ddisFileRecords, f => FS.saveDDISFile(f.file_id, f), 25);
   // v2.40.25: REVERTED v2.40.17 server-side dispatch. Root cause: Firestore
   // security rules block REST API writes with just FIREBASE_API_KEY (403
@@ -387,17 +399,21 @@ async function ingestFiles(files, onStatus = () => {}) {
   //
   // Client-side writes work fine (Firebase SDK auth). The original mobile
   // stall v2.40.17 tried to solve was caused by 25-at-a-time Promise.all
-  // batching. Use db.batch() atomic commits at 500/batch instead — the same
-  // pattern the v2.40.24 client-side purge uses, which flies through 2K
-  // docs in a couple seconds.
+  // batching. Use db.batch() atomic commits — the same pattern the v2.40.24
+  // client-side purge uses, which flies through 2K docs in a couple seconds.
+  //
+  // v2.40.26: reduced batch size 500→200, added yieldToUI between batches,
+  // per-batch try/catch so one bad commit doesn't wedge the whole import.
   if (ddisPayments.length > 0) {
     const toSave = ddisPayments.slice(0, 10000);
-    onStatus({ phase:"save", message:`Saving ${toSave.length} DDIS payments...` });
-    try {
-      let written = 0;
-      const BATCH_SIZE = 500; // Firestore atomic batch cap
-      for (let i = 0; i < toSave.length; i += BATCH_SIZE) {
-        const chunk = toSave.slice(i, i + BATCH_SIZE);
+    onStatus({ phase:"save", message:`Saving ${toSave.length} DDIS payments (0 done)...` });
+    let written = 0;
+    let batchesFailed = 0;
+    const BATCH_SIZE = 200;
+    for (let i = 0; i < toSave.length; i += BATCH_SIZE) {
+      await yieldToUI();
+      const chunk = toSave.slice(i, i + BATCH_SIZE);
+      try {
         const batch = window.db.batch();
         for (const p of chunk) {
           batch.set(window.db.collection("ddis_payments").doc(String(p.id)), p, { merge: true });
@@ -405,12 +421,20 @@ async function ingestFiles(files, onStatus = () => {}) {
         await batch.commit();
         written += chunk.length;
         onStatus({ phase:"save", message:`Saving DDIS payments (${written}/${toSave.length})...` });
+      } catch(e) {
+        console.error(`DDIS batch ${i}-${i+BATCH_SIZE} failed:`, e);
+        batchesFailed++;
+        // One-by-one fallback for this chunk ONLY — don't kill the whole ingest
+        for (const p of chunk) {
+          try {
+            await window.db.collection("ddis_payments").doc(String(p.id)).set(p, { merge: true });
+            written++;
+          } catch(_) { /* skip bad row, keep going */ }
+        }
+        onStatus({ phase:"save", message:`DDIS payments recovering batch ${i}-${i+BATCH_SIZE} (${written}/${toSave.length})...` });
       }
-    } catch(e) {
-      console.error("DDIS payment batch write failed:", e);
-      // Final fallback: one-at-a-time. Slower but robust if a batch rejects.
-      await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments (one by one after batch failure)");
     }
+    if (batchesFailed > 0) console.warn(`DDIS ingest: ${batchesFailed} batch(es) fell back to one-by-one writes`);
   }
   // Without DDIS payment data, every stop looks unpaid — cap hard to avoid
   // writing 500 meaningless rows. With payment data, keep full 500 for audit.
