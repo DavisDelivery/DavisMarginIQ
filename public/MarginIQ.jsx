@@ -379,67 +379,37 @@ async function ingestFiles(files, onStatus = () => {}) {
     r => FS.saveReconWeekly(r.week_ending, {...r, updated_at:new Date().toISOString()}),
     25, "Saving reconciliation");
   await batchWrite(ddisFileRecords, f => FS.saveDDISFile(f.file_id, f), 25);
-  // v2.40.17: ddis_payments persistence moved to background function.
-  // Phone was stalling on 3000-row CSVs because the JS SDK wrote 25/batch
-  // sequentially from mobile — ~120 round trips of latency. We now hand the
-  // file records + payment rows to marginiq-ddis-ingest (dispatcher) which
-  // forwards to marginiq-ddis-ingest-background, and poll for status.
+  // v2.40.25: REVERTED v2.40.17 server-side dispatch. Root cause: Firestore
+  // security rules block REST API writes with just FIREBASE_API_KEY (403
+  // PERMISSION_DENIED, verified live). The v2.40.17 dispatch returned 202
+  // from the dispatcher but the background function silently failed every
+  // write. Net effect: ZERO ddis_payments rows landed for weeks.
   //
-  // Note: we still call the client batchWrite for ddis_files above as a
-  // defense-in-depth — the background path also writes them. Both paths use
-  // Firestore merge semantics so double-write is idempotent and ensures the
-  // UI's local ddis_files read is hot immediately even if the background
-  // worker lags a few seconds. The "big" write (payments) is server-only.
+  // Client-side writes work fine (Firebase SDK auth). The original mobile
+  // stall v2.40.17 tried to solve was caused by 25-at-a-time Promise.all
+  // batching. Use db.batch() atomic commits at 500/batch instead — the same
+  // pattern the v2.40.24 client-side purge uses, which flies through 2K
+  // docs in a couple seconds.
   if (ddisPayments.length > 0) {
     const toSave = ddisPayments.slice(0, 10000);
-    onStatus({ phase:"save", message:`Dispatching ${toSave.length} DDIS payments to background...` });
+    onStatus({ phase:"save", message:`Saving ${toSave.length} DDIS payments...` });
     try {
-      const dispatchResp = await fetch("/.netlify/functions/marginiq-ddis-ingest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ddisFileRecords,     // background will upsert these too (idempotent)
-          ddisPayments: toSave,
-        }),
-      });
-      if (!dispatchResp.ok) {
-        // Fall back to the old client-side path so a background outage
-        // doesn't break ingest. Log the reason so we know.
-        const errText = await dispatchResp.text().catch(() => "");
-        console.warn(`ddis-ingest dispatch failed (HTTP ${dispatchResp.status}): ${errText}. Falling back to client writes.`);
-        onStatus({ phase:"save", message:`Dispatch failed, saving ${toSave.length} DDIS payments from browser (slower)...` });
-        await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments");
-      } else {
-        // Poll status until state != "running". Cap at ~5 min real-time to
-        // avoid blocking the ingest UI forever if the background hangs.
-        const startedPoll = Date.now();
-        const POLL_TIMEOUT_MS = 5 * 60 * 1000;
-        const POLL_INTERVAL_MS = 2000;
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-          if (Date.now() - startedPoll > POLL_TIMEOUT_MS) {
-            onStatus({ phase:"save", message:`DDIS background still running past 5 min — continuing rest of ingest (payments will finish on server)` });
-            break;
-          }
-          let statusJson = null;
-          try {
-            const sResp = await fetch("/.netlify/functions/marginiq-ddis-ingest?action=status");
-            if (sResp.ok) statusJson = await sResp.json();
-          } catch (e) {
-            // Transient network hiccup — try again next tick.
-            continue;
-          }
-          const st = statusJson?.status;
-          if (!st) continue;
-          onStatus({ phase:"save", message: st.progress_text || "Saving DDIS payments..." });
-          if (st.state === "complete" || st.state === "failed") break;
+      let written = 0;
+      const BATCH_SIZE = 500; // Firestore atomic batch cap
+      for (let i = 0; i < toSave.length; i += BATCH_SIZE) {
+        const chunk = toSave.slice(i, i + BATCH_SIZE);
+        const batch = window.db.batch();
+        for (const p of chunk) {
+          batch.set(window.db.collection("ddis_payments").doc(String(p.id)), p, { merge: true });
         }
+        await batch.commit();
+        written += chunk.length;
+        onStatus({ phase:"save", message:`Saving DDIS payments (${written}/${toSave.length})...` });
       }
-    } catch (e) {
-      console.warn("ddis-ingest dispatch threw, falling back to client writes:", e);
-      onStatus({ phase:"save", message:`Dispatch threw, saving ${toSave.length} DDIS payments from browser...` });
-      await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments");
+    } catch(e) {
+      console.error("DDIS payment batch write failed:", e);
+      // Final fallback: one-at-a-time. Slower but robust if a batch rejects.
+      await batchWrite(toSave, p => FS.saveDDISPayment(p.id, p), 25, "Saving DDIS payments (one by one after batch failure)");
     }
   }
   // Without DDIS payment data, every stop looks unpaid — cap hard to avoid
@@ -7628,10 +7598,28 @@ function Audit({ reconWeekly, weeklyRollups }) {
               )}
               {rebuildResult?.ok && (
                 <div style={{marginTop:10}}>
-                  <div style={{padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
-                    ✓ Rebuilt {rebuildResult.generated} audit items ({fmtK(rebuildResult.totalVariance)} total variance)
-                    {!rebuildResult.withPayments && <div style={{marginTop:4,fontSize:10}}>Note: no PRO-level payment matching — re-ingest a DDIS file to enable.</div>}
-                  </div>
+                  {/* v2.40.25: if the background computed items but wrote zero, surface that
+                      as an error, not a success. The audit-rebuild background function's writes
+                      are blocked by Firestore security rules (403 PERMISSION_DENIED via REST API
+                      key). Until we wire a service account / firebase-admin auth path, items
+                      generated here are not being persisted to audit_items. */}
+                  {rebuildResult.generated > 0 && rebuildResult.saved === 0 ? (
+                    <div style={{padding:"10px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}`,fontSize:11,color:T.redText}}>
+                      <div style={{fontWeight:700,marginBottom:4}}>⚠️ Rebuild computed {rebuildResult.generated} items but wrote 0 to Firestore.</div>
+                      <div style={{lineHeight:1.5,fontSize:10}}>
+                        The background function's write permissions are blocked (403 PERMISSION_DENIED).
+                        Your audit queue still shows the pre-existing stale data. Chad: this is a known issue
+                        being tracked — tell Claude "fix audit-rebuild writes" in next session. For now, DDIS
+                        import IS working (writes happen client-side), so import your remits normally and
+                        the payment matching will activate once rebuild writes are fixed.
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{padding:"8px 12px",background:T.greenBg,borderRadius:6,border:`1px solid ${T.green}40`,fontSize:11,color:T.greenText}}>
+                      ✓ Rebuilt {rebuildResult.saved || rebuildResult.generated} audit items ({fmtK(rebuildResult.totalVariance)} total variance)
+                      {!rebuildResult.withPayments && <div style={{marginTop:4,fontSize:10}}>Note: no PRO-level payment matching — re-ingest a DDIS file to enable.</div>}
+                    </div>
+                  )}
                   {/* v2.40.12: sideline summary — stops exempted from the audit queue */}
                   {(rebuildResult.sidelinedRecentStops > 0 || rebuildResult.sidelinedAwaitingStops > 0) && (
                     <div style={{marginTop:6,padding:"8px 12px",background:T.bgSurface,borderRadius:6,border:`1px solid ${T.border}`,fontSize:11,color:T.textMuted}}>
