@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.23";
+const APP_VERSION = "2.40.24";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7024,6 +7024,7 @@ function Audit({ reconWeekly, weeklyRollups }) {
   const [purgeResult, setPurgeResult] = useState(null);
   const purgeAuditItems = async () => {
     if (purging || rebuilding) return;
+    if (!hasFirebase || !window.db) { alert("Firebase not connected"); return; }
     const count = itemsWithFreshAge.length;
     const confirmed = window.confirm(
       `Purge will DELETE all ${count.toLocaleString()} audit items.\n\n` +
@@ -7035,19 +7036,44 @@ function Audit({ reconWeekly, weeklyRollups }) {
     if (typed !== "PURGE") { alert("Cancelled — confirmation phrase didn't match."); return; }
     setPurging(true);
     setPurgeResult(null);
+    const t0 = Date.now();
     try {
-      const resp = await fetch("/.netlify/functions/marginiq-audit-purge", { method: "POST" });
-      if (!resp.ok) {
-        const t = await resp.text();
-        throw new Error(`HTTP ${resp.status}: ${t.slice(0, 200)}`);
+      // v2.40.24: Purge runs client-side, not via a Netlify function.
+      // Firestore security rules allow authenticated client deletes (proved
+      // by the existing working delete at marginiq_config/{docId} in this
+      // same file) but block deletes via REST API key. The server-side purge
+      // kept returning 403 PERMISSION_DENIED — confirmed via direct probe.
+      // Client SDK uses the user's Firebase auth context, so it just works.
+      //
+      // Pagination: Firestore client .get() on a collection returns at most
+      // 10K docs by default and slows down on large reads. We page through
+      // with .orderBy(...).startAfter(lastDoc).limit(500) so arbitrarily
+      // large audit_items collections still work.
+      let totalDeleted = 0;
+      let lastDoc = null;
+      const BATCH_SIZE = 500; // Firestore batch() cap
+      while (true) {
+        let q = window.db.collection("audit_items").orderBy(firebase.firestore.FieldPath.documentId()).limit(BATCH_SIZE);
+        if (lastDoc) q = q.startAfter(lastDoc);
+        const snap = await q.get();
+        if (snap.empty) break;
+        const batch = window.db.batch();
+        for (const doc of snap.docs) batch.delete(doc.ref);
+        await batch.commit();
+        totalDeleted += snap.docs.length;
+        lastDoc = snap.docs[snap.docs.length - 1];
+        setPurgeResult({ ok: null, in_progress: true, deleted: totalDeleted });
+        // Safety bound — if a collection somehow had 50K+ docs we stop.
+        if (totalDeleted >= 100000) { console.warn("purge: hit 100K safety bound"); break; }
+        if (snap.docs.length < BATCH_SIZE) break; // last page
       }
-      const body = await resp.json();
-      setPurgeResult({ ok: true, deleted: body.deleted, failed: body.failed, elapsed_s: body.elapsed_s });
+      const elapsed_s = Math.round((Date.now() - t0) / 1000);
+      setPurgeResult({ ok: true, deleted: totalDeleted, failed: 0, elapsed_s });
       // Reload audit data so the UI reflects the empty state.
       await loadData();
     } catch(e) {
       console.error("purgeAuditItems failed:", e);
-      setPurgeResult({ error: e.message });
+      setPurgeResult({ error: e.message || String(e) });
     }
     setPurging(false);
   };
@@ -7670,9 +7696,14 @@ function Audit({ reconWeekly, weeklyRollups }) {
                       whiteSpace: "nowrap",
                     }}
                   >
-                    {purging ? "⏳ Purging…" : "🗑️ Purge All"}
+                    {purging ? `⏳ Purging… ${purgeResult?.in_progress ? purgeResult.deleted?.toLocaleString() : ""}` : "🗑️ Purge All"}
                   </button>
                 </div>
+                {purgeResult?.in_progress && (
+                  <div style={{marginTop:8,padding:"8px 12px",background:T.bgSurface,borderRadius:6,border:`1px solid ${T.border}`,fontSize:11,color:T.textMuted}}>
+                    Deleted {purgeResult.deleted?.toLocaleString()} so far…
+                  </div>
+                )}
                 {purgeResult?.error && (
                   <div style={{marginTop:8,padding:"8px 12px",background:T.redBg,borderRadius:6,border:`1px solid ${T.red}40`,fontSize:11,color:T.redText}}>
                     ✗ {purgeResult.error}
