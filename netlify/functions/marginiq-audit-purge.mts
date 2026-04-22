@@ -33,10 +33,6 @@ async function listAllDocIds(collection: string): Promise<string[]> {
       key: FIREBASE_API_KEY || "",
       pageSize: "300",
     });
-    // Mask to `__name__` only — we just need the IDs. Firestore REST uses
-    // an empty mask (no fieldPaths) as "give me all fields", so we pass a
-    // single non-existent field to get empty-fields documents + their name.
-    params.append("mask.fieldPaths", "__does_not_exist__");
     if (pageToken) params.set("pageToken", pageToken);
     const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${collection}?${params.toString()}`;
     const resp = await fetch(url);
