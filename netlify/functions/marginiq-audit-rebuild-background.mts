@@ -372,14 +372,40 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
     let skippedRecent = 0;       // exempted — within last RECENT_DAYS
     let skippedNoDdis = 0;       // no matching DDIS file for this week
     let skippedNoWeek = 0;       // unpaid_stop has no week_ending at all
+    let skippedTruckload = 0;    // v2.40.19: TK stops don't settle through DDIS
     const awaitingWeeks = new Map<string, { stops: number; billed: number }>(); // per-week sideline
     const recentWeeks = new Map<string, { stops: number; billed: number }>();
+    const truckloadWeeks = new Map<string, { stops: number; billed: number }>();
+    const truckloadPros = new Set<string>(); // track which PROs were sidelined as TK
+
+    // v2.40.19: A stop is considered a truckload if its PRO has the Uline
+    // truckload prefix (ULI-) OR its service_type was tagged "truckload" at
+    // ingest time. Uline settles LTL and TK through separate payment streams
+    // — ddis_payments only covers LTL. Until we ingest a TK payment feed,
+    // TK stops cannot be audited against DDIS and must be sidelined.
+    const isTruckload = (pro: string, serviceType: string | null) =>
+      /^ULI-/i.test(pro) || serviceType === "truckload";
+
     for (const sdoc of stopDocs) {
       const f = sdoc.fields || {};
       const pro = f.pro?.stringValue;
       if (!pro) continue;
       const billed = Number(f.billed?.doubleValue ?? f.billed?.integerValue ?? 0);
       if (billed <= 0) continue;
+      const serviceType = f.service_type?.stringValue || null;
+      // v2.40.19: TK sideline first — takes priority over all other reasons.
+      // Even if the TK stop is in a recent or uncovered week, we still mark it
+      // TK-sidelined rather than recent/awaiting, because the blocking issue
+      // is the payment-stream gap, not the DDIS file timing.
+      if (isTruckload(pro, serviceType)) {
+        skippedTruckload += 1;
+        truckloadPros.add(pro);
+        const weekKey = f.week_ending?.stringValue || "(no-week)";
+        const agg = truckloadWeeks.get(weekKey) || { stops: 0, billed: 0 };
+        agg.stops += 1; agg.billed += billed;
+        truckloadWeeks.set(weekKey, agg);
+        continue;
+      }
       const weekEnding = f.week_ending?.stringValue || null;
       // v2.40.12 filters —
       if (!weekEnding) {
@@ -476,6 +502,7 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
       `audit-rebuild: ${items.length} audit items, $${totalVariance.toFixed(2)} variance | ` +
       `sidelined — recent:${skippedRecent} stops across ${recentWeeksArr.length}wks ($${recentTotalBilled.toFixed(0)}) · ` +
       `awaiting-ddis:${skippedNoDdis} stops across ${awaitingWeeksArr.length}wks ($${awaitingTotalBilled.toFixed(0)}) · ` +
+      `truckload:${skippedTruckload} stops across ${truckloadWeeks.size}wks · ` +
       `no-week:${skippedNoWeek}`
     );
     await writeStatus({
@@ -491,6 +518,8 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
       sidelined_awaiting_billed: awaitingTotalBilled,
       sidelined_awaiting_weeks: awaitingWeeksArr,
       sidelined_noweek_stops: skippedNoWeek,
+      // v2.40.19: truckload sideline counts (early preview for UI progress)
+      sidelined_truckload_stops: skippedTruckload,
       recent_cutoff_iso: recentCutoffISO,
       covered_weeks_count: coveredWeeks.size,
     });
@@ -515,7 +544,9 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
     let recoveredCount = 0;
     let recoveredAmount = 0;
     let preservedCount = 0;
+    let sidelinedTkCount = 0;  // v2.40.19: prior items transitioned to sidelined_tk
     const nowIso = new Date().toISOString();
+    const sidelinedTkItems: Array<{ docId: string; item: any }> = [];
     for (const [pro, prior] of priorByPro) {
       if (newProSet.has(pro)) continue; // already handled by normal loop
       const terminalStatuses = new Set(["won", "lost", "partial", "written_off"]);
@@ -530,9 +561,56 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
         preservedCount++;
         continue;
       }
+      // v2.40.19: if this prior item's PRO is TK-shaped OR the underlying
+      // stop was sidelined as TK this run, transition it to sidelined_tk.
+      // This cleans up pre-v2.40.19 TK items that leaked into the LTL queue.
+      const stopDoc = stopsByPro.get(pro);
+      const sf0 = stopDoc?.fields || {};
+      const priorIsTk = isTruckload(pro, sf0.service_type?.stringValue || null) || truckloadPros.has(pro);
+      if (priorIsTk && prior.dispute_status !== "sidelined_tk") {
+        const sidelinedItem: any = {
+          pro,
+          customer: sf0.customer?.stringValue || "Unknown",
+          customer_key: customerKey(sf0.customer?.stringValue || "Unknown"),
+          city: sf0.city?.stringValue || null,
+          state: sf0.state?.stringValue || null,
+          zip: sf0.zip?.stringValue || null,
+          pu_date: sf0.pu_date?.stringValue || null,
+          week_ending: sf0.week_ending?.stringValue || prior.week_ending || null,
+          month: sf0.month?.stringValue || null,
+          billed: Number(sf0.billed?.doubleValue ?? sf0.billed?.integerValue ?? 0) || prior.billed,
+          paid: 0,
+          variance: 0,  // zero out — TK payment stream not wired yet
+          variance_pct: null,
+          accessorial_amount: 0,
+          base_cost: 0,
+          code: sf0.code?.stringValue || null,
+          weight: Number(sf0.weight?.doubleValue ?? sf0.weight?.integerValue ?? 0) || null,
+          order: sf0.order?.stringValue || null,
+          service_type: "truckload",
+          age_days: daysBetween(sf0.pu_date?.stringValue || null, today) || 0,
+          age_bucket: ageBucket(daysBetween(sf0.pu_date?.stringValue || null, today) || 0),
+          category: "truckload_sidelined",
+          dispute_status: "sidelined_tk",
+          notes: prior.notes || [],
+          original_variance: prior.original_variance || prior.variance,
+          first_seen_at: prior.first_seen_at || nowIso,
+          rebuilt_from_firestore: true,
+          rebuild_source: "background_v2.40.19",
+          updated_at: nowIso,
+          sidelined_reason: "truckload_payments_not_wired",
+        };
+        sidelinedTkItems.push({ docId: pro, item: sidelinedItem });
+        sidelinedTkCount++;
+        continue;
+      }
+      if (prior.dispute_status === "sidelined_tk") {
+        // Already sidelined — preserve.
+        preservedCount++;
+        continue;
+      }
       // Did we see this PRO in unpaid_stops this run? If yes, the reason it
       // didn't produce an item is sidelining or variance ≤ 1 (paid up).
-      const stopDoc = stopsByPro.get(pro);
       if (stopDoc) {
         const sf = stopDoc.fields || {};
         const billed = Number(sf.billed?.doubleValue ?? sf.billed?.integerValue ?? 0);
@@ -588,32 +666,52 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
       console.log(`audit-rebuild: ${recoveredCount} PROs transitioned to recovered_paid ($${recoveredAmount.toFixed(2)} recovered)`);
     }
     if (preservedCount > 0) {
-      console.log(`audit-rebuild: ${preservedCount} prior items preserved in terminal status (won/lost/partial/written_off/recovered_paid)`);
+      console.log(`audit-rebuild: ${preservedCount} prior items preserved in terminal status (won/lost/partial/written_off/recovered_paid/sidelined_tk)`);
+    }
+    if (sidelinedTkCount > 0) {
+      console.log(`audit-rebuild: ${sidelinedTkCount} prior items transitioned to sidelined_tk (truckload payments not wired)`);
     }
 
-    const toWrite = items.map(({ docId, item }) => ({
+    // v2.40.19: merge sidelined_tk transitions into the write batch so they
+    // get persisted alongside the regular + recovered items.
+    const allItems = items.concat(sidelinedTkItems);
+    const toWrite = allItems.map(({ docId, item }) => ({
       docId,
       fields: toFsValue(item).mapValue.fields,
     }));
     const result = await batchWriteDocs("audit_items", toWrite);
     console.log(`audit-rebuild: wrote ${result.ok} / ${toWrite.length} items (${result.failed} failed)`);
 
-    const sidelineNote = (skippedRecent || skippedNoDdis || skippedNoWeek)
-      ? ` · sidelined: ${skippedRecent} recent, ${skippedNoDdis} awaiting DDIS, ${skippedNoWeek} no-week`
+    // v2.40.19: flatten truckload sideline map for the status doc
+    const truckloadWeeksArr = [...truckloadWeeks.entries()]
+      .map(([wk, v]) => ({ week: wk, stops: v.stops, billed: Math.round(v.billed * 100) / 100 }))
+      .sort((a, b) => (a.week < b.week ? 1 : -1));
+    const truckloadTotalBilled = truckloadWeeksArr.reduce((s, r) => s + r.billed, 0);
+
+    const sidelineNote = (skippedRecent || skippedNoDdis || skippedNoWeek || skippedTruckload)
+      ? ` · sidelined: ${skippedRecent} recent, ${skippedNoDdis} awaiting DDIS, ${skippedNoWeek} no-week, ${skippedTruckload} TK`
       : "";
     const recoveredNote = recoveredCount > 0
       ? ` · 🏆 ${recoveredCount} newly recovered ($${Math.round(recoveredAmount).toLocaleString()})`
+      : "";
+    const tkNote = sidelinedTkCount > 0
+      ? ` · 🚛 ${sidelinedTkCount} prior items auto-sidelined as TK`
       : "";
     await writeStatus({
       state: "complete",
       completed_at: new Date().toISOString(),
       phase: "done",
-      progress_text: `✓ Rebuilt ${result.ok.toLocaleString()} audit items ($${Math.round(totalVariance).toLocaleString()} variance) from ${payDocs.length.toLocaleString()} payment rows × ${stopDocs.length.toLocaleString()} unpaid stops${sidelineNote}${recoveredNote}`,
+      progress_text: `✓ Rebuilt ${result.ok.toLocaleString()} audit items ($${Math.round(totalVariance).toLocaleString()} variance) from ${payDocs.length.toLocaleString()} payment rows × ${stopDocs.length.toLocaleString()} unpaid stops${sidelineNote}${recoveredNote}${tkNote}`,
       items_written: result.ok,
       with_payments: hasPerProPayments,
       newly_recovered_count: recoveredCount,
       newly_recovered_amount: recoveredAmount,
       preserved_terminal_count: preservedCount,
+      // v2.40.19: truckload sideline reporting
+      sidelined_truckload_stops: skippedTruckload,
+      sidelined_truckload_billed: truckloadTotalBilled,
+      sidelined_truckload_weeks: truckloadWeeksArr,
+      sidelined_tk_transitions: sidelinedTkCount,
     });
 
     return {
