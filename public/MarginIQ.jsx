@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.9";
+const APP_VERSION = "2.40.10";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -6787,107 +6787,59 @@ function Audit({ reconWeekly, weeklyRollups }) {
     if (!hasFirebase) { alert("Firebase not connected"); return; }
     setRebuilding(true);
     setRebuildResult(null);
-    setRebuildStatus("Loading data from Firestore…");
+    setRebuildStatus("Queuing rebuild…");
     try {
-      // 1) Pull DDIS payment records — iterate all ddis_files docs and
-      //    build a PRO → total-paid map. Each DDIS row is a payment
-      //    against a specific PRO; multiple rows can share a PRO.
-      const ddisFiles = await FS.getDDISFiles();
-      if (ddisFiles.length === 0) {
-        setRebuildResult({ error: "No DDIS payment files in Firestore. Ingest one first via Data Ingest or Gmail Sync." });
-        setRebuilding(false);
-        return;
+      // v2.40.10: The rebuild moved server-side. Old client path was reading
+      // only 20K of 122K ddis_payments rows and 2K of 3K unpaid_stops, so
+      // every PRO whose payment row was beyond row 20K got variance=billed
+      // (looked fully unpaid even when paid). That's fixed by the background
+      // function which pages through everything with no caps.
+      const resp = await fetch("/.netlify/functions/marginiq-audit-rebuild", { method: "POST" });
+      if (resp.status !== 202 && !resp.ok) {
+        const body = await resp.text();
+        throw new Error(`Dispatch failed: HTTP ${resp.status} ${body.slice(0, 200)}`);
       }
-      setRebuildStatus(`Reading ${ddisFiles.length} DDIS file(s)…`);
-
-      // DDIS payment records sit in a `ddis_payments` subcollection per file
-      // OR as flat top-level rows depending on ingest version. Try flat first.
-      const paymentByPro = {};
-      try {
-        const snap = await window.db.collection("ddis_payments").limit(20000).get();
-        snap.forEach(doc => {
-          const d = doc.data();
-          if (!d.pro) return;
-          const amt = Number(d.paid_amount || d.paid || 0);
-          if (amt > 0) paymentByPro[d.pro] = (paymentByPro[d.pro] || 0) + amt;
-        });
-      } catch(e) { /* collection may not exist in some versions */ }
-
-      // If ddis_payments collection didn't yield, fall back to file-level
-      // totals which at least let us compute week-level variances.
-      const hasPerProPayments = Object.keys(paymentByPro).length > 0;
-
-      // 2) Pull unpaid_stops (billed amounts per PRO, already keyed by PRO)
-      setRebuildStatus("Reading unpaid_stops…");
-      const unpaidStops = await FS.getUnpaidStops(2000);
-      if (unpaidStops.length === 0) {
-        setRebuildResult({ error: "No unpaid_stops in Firestore. Re-ingest Uline weekly files to populate them." });
-        setRebuilding(false);
-        return;
+      // Poll status every 5s for up to 10 minutes.
+      const deadline = Date.now() + 10 * 60 * 1000;
+      let lastPhase = "";
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+          const sresp = await fetch("/.netlify/functions/marginiq-audit-rebuild?action=status");
+          const sbody = await sresp.json();
+          const st = sbody?.status;
+          if (!st) { setRebuildStatus("Starting…"); continue; }
+          setRebuildStatus(st.progress_text || `Working (${st.phase || "unknown phase"})…`);
+          if (st.phase && st.phase !== lastPhase) {
+            console.log(`audit-rebuild phase: ${st.phase}`);
+            lastPhase = st.phase;
+          }
+          if (st.state === "complete") {
+            setRebuildResult({
+              ok: true,
+              generated: st.items_generated || 0,
+              saved: st.items_written || 0,
+              withPayments: !!st.with_payments,
+              ddisFiles: null, // not tracked separately by bg function; shown in dashboard elsewhere
+              totalVariance: st.total_variance || 0,
+            });
+            await loadData();
+            setRebuilding(false);
+            setRebuildStatus("");
+            return;
+          }
+          if (st.state === "failed") {
+            setRebuildResult({ error: st.error || "Rebuild failed" });
+            setRebuilding(false);
+            setRebuildStatus("");
+            return;
+          }
+        } catch (pollErr) {
+          // Transient poll error — keep trying.
+          console.warn("status poll failed:", pollErr);
+        }
       }
-
-      // 3) For each unpaid stop, compute variance = billed - paid.
-      //    If per-PRO payments are known, subtract them. Otherwise variance
-      //    equals billed (true "unpaid" state since we have no PRO-level match).
-      const today = new Date().toISOString().slice(0,10);
-      const items = [];
-      for (const s of unpaidStops) {
-        if (!s.pro) continue;
-        const billed = Number(s.billed || 0);
-        if (billed <= 0) continue;
-        const paid = hasPerProPayments ? (paymentByPro[s.pro] || 0) : 0;
-        const variance = billed - paid;
-        if (variance <= 1) continue; // ignore dust / fully-paid
-        const ageDays = daysBetween(s.pu_date, today) || 0;
-        const category = categorize(billed, paid, false, 0, ageDays);
-        items.push({
-          pro: s.pro,
-          customer: s.customer || "Unknown",
-          customer_key: customerKey(s.customer),
-          city: s.city, state: s.state, zip: s.zip,
-          pu_date: s.pu_date, week_ending: s.week_ending, month: s.month,
-          billed, paid, variance,
-          variance_pct: billed > 0 ? (variance / billed * 100) : null,
-          accessorial_amount: 0,
-          base_cost: 0,
-          code: s.code, weight: s.weight, order: s.order,
-          age_days: ageDays,
-          age_bucket: ageBucket(ageDays),
-          category,
-          dispute_status: "new",
-          notes: [],
-          rebuilt_from_firestore: true,
-          updated_at: new Date().toISOString(),
-        });
-      }
-
-      if (items.length === 0) {
-        setRebuildResult({ error: "No variance items to write — every unpaid stop has paid === billed after matching." });
-        setRebuilding(false);
-        return;
-      }
-
-      // 4) Write in parallel batches of 25 (same cadence as ingest pipeline)
-      setRebuildStatus(`Writing ${items.length} audit items to Firestore…`);
-      let saved = 0;
-      const batchSize = 25;
-      for (let i = 0; i < items.length; i += batchSize) {
-        const batch = items.slice(i, i + batchSize);
-        const results = await Promise.all(batch.map(a => FS.saveAuditItem(a.pro, a)));
-        saved += results.filter(r => r).length;
-        setRebuildStatus(`Writing audit items… ${Math.min(i+batchSize, items.length)}/${items.length}`);
-      }
-
-      setRebuildResult({
-        ok: true,
-        generated: items.length,
-        saved,
-        withPayments: hasPerProPayments,
-        ddisFiles: ddisFiles.length,
-        totalVariance: items.reduce((s, i) => s + i.variance, 0),
-      });
-      // Reload to populate the dashboard
-      await loadData();
+      setRebuildResult({ error: "Rebuild timed out after 10 minutes. Check Netlify logs — it may still be running in the background." });
     } catch(e) {
       console.error("rebuildAuditItems failed:", e);
       setRebuildResult({ error: e.message });
