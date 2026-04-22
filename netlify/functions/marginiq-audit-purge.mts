@@ -65,7 +65,7 @@ async function batchDelete(collection: string, ids: string[]): Promise<{ ok: num
     }
     return { ok, failed };
   }
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default):batchWrite?key=${FIREBASE_API_KEY}`;
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:batchWrite?key=${FIREBASE_API_KEY}`;
   const writes = ids.map(id => ({
     delete: `projects/${PROJECT_ID}/databases/(default)/documents/${collection}/${id}`,
   }));
@@ -82,8 +82,17 @@ async function batchDelete(collection: string, ids: string[]): Promise<{ ok: num
   const writeResults = data.writeResults || [];
   const statuses = data.status || [];
   let explicitFailed = 0;
+  // v2.40.23: log the first failure so the next bug is diagnosable. The
+  // previous silent "2004 failed" message cost Chad a whole round trip.
+  let firstErrLogged = false;
   for (const s of statuses) {
-    if (s && s.code && s.code !== 0) explicitFailed++;
+    if (s && s.code && s.code !== 0) {
+      explicitFailed++;
+      if (!firstErrLogged) {
+        console.error(`batchDelete ${collection}: rpc.Status code=${s.code} message="${s.message || ""}"`);
+        firstErrLogged = true;
+      }
+    }
   }
   if (writeResults.length > 0) {
     return { ok: writeResults.length - explicitFailed, failed: explicitFailed };
