@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.4";
+const APP_VERSION = "2.40.5";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7800,24 +7800,45 @@ function Settings({ qboConnected, motiveConnected, reconMeta, weeklyRollups, onR
     setBackupMsg(null);
     try {
       const resp = await fetch(`/.netlify/functions/marginiq-backup`);
-      // v2.40.4: Netlify returns a 502 with empty body when the function
-      // times out. The old code called resp.json() on that empty string,
-      // which threw a cryptic DOMException ("The string did not match the
-      // expected pattern"). Parse defensively and give the user something
-      // actionable.
+      // v2.40.5: the backup function now dispatches to a background function
+      // and returns 202 immediately. 200 is the legacy synchronous response
+      // (keeps this code backward-compatible if the old behavior ever comes
+      // back). v2.40.4-style empty-body 502/504 still possible on dispatcher
+      // errors so we keep the defensive parsing.
       const text = await resp.text();
       if (!text) {
         if (resp.status === 502 || resp.status === 504) {
-          throw new Error("Backup timed out on the server. It may still be finishing in the background — refresh this page in a minute and check the snapshots list.");
+          throw new Error("Backup dispatcher timed out. Try again in a minute.");
         }
         throw new Error(`Empty response (HTTP ${resp.status})`);
       }
       let data;
       try { data = JSON.parse(text); }
       catch { throw new Error(`HTTP ${resp.status}: ${text.substring(0, 200)}`); }
-      if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
-      setBackupMsg({ ok: true, text: `✓ Backup created: ${data.manifest.total_docs} docs across ${data.manifest.collections_captured} collections (${Math.round(data.manifest.compressed_bytes/1024)} KB compressed)` });
-      await loadBackups();
+      if (!resp.ok && resp.status !== 202) throw new Error(data.error || `HTTP ${resp.status}`);
+      if (data.error) throw new Error(data.error);
+
+      if (data.queued) {
+        // Background function is doing the work. Poll the snapshot list a
+        // couple of times with backoff so the user sees the new snapshot
+        // appear without a manual refresh.
+        setBackupMsg({ ok: true, text: data.message || "✓ Backup queued — running in the background." });
+        const poll = async (delaySec) => {
+          await new Promise(r => setTimeout(r, delaySec * 1000));
+          await loadBackups();
+        };
+        // 30s, 60s, 120s — covers typical backup wall time (~20-60s)
+        await poll(30);
+        await poll(30);
+        await poll(60);
+      } else if (data.manifest) {
+        // Legacy synchronous response path
+        setBackupMsg({ ok: true, text: `✓ Backup created: ${data.manifest.total_docs} docs across ${data.manifest.collections_captured} collections (${Math.round(data.manifest.compressed_bytes/1024)} KB compressed)` });
+        await loadBackups();
+      } else {
+        setBackupMsg({ ok: true, text: "✓ Backup requested. Check the snapshots list." });
+        await loadBackups();
+      }
     } catch(e) {
       setBackupMsg({ error: e.message });
     }

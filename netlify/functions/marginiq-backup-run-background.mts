@@ -547,86 +547,44 @@ async function listBackups() {
   return backups;
 }
 
-// ─── Main handler ──────────────────────────────────────────────────────────
+// ─── Main handler (background function) ───────────────────────────────────
+//
+// v2.40.5: converted from synchronous to background function. File suffix
+// `-background` gives us a 15-minute wall-clock budget (vs 30s for scheduled
+// functions invoked via HTTP). Returns 202 immediately to the caller; all
+// work happens asynchronously. Netlify ignores any body we return, so we
+// log for visibility instead.
 
 export default async (req: Request, _context: Context) => {
   if (!FIREBASE_API_KEY) {
-    return new Response(JSON.stringify({ error: "missing FIREBASE_API_KEY env var" }), {
-      status: 500, headers: { "Content-Type": "application/json" },
-    });
+    console.error("backup-run-background: missing FIREBASE_API_KEY env var");
+    return;
   }
 
-  const url = new URL(req.url);
-  const action = url.searchParams.get("action");
-  const token = url.searchParams.get("token");
-
-  const requiresToken = action === "restore" || action === "prune";
-  if (requiresToken) {
-    if (!ADMIN_TOKEN) {
-      return new Response(JSON.stringify({ error: "MARGINIQ_ADMIN_TOKEN not configured — set it in Netlify env vars to use restore/prune" }), {
-        status: 500, headers: { "Content-Type": "application/json" },
-      });
-    }
-    if (token !== ADMIN_TOKEN) {
-      return new Response(JSON.stringify({ error: "invalid or missing admin token (required for restore/prune)" }), {
-        status: 403, headers: { "Content-Type": "application/json" },
-      });
-    }
-  }
+  const invocationSource = req.method === "POST" ? "dispatcher" : "scheduler";
+  const t0 = Date.now();
+  console.log(`backup-run-background: start (${invocationSource})`);
 
   try {
-    if (action === "list") {
-      const backups = await listBackups();
-      return Response.json({ ok: true, backups });
-    }
-
-    if (action === "restore") {
-      const body = await req.json().catch(() => ({}));
-      const date = body.date || url.searchParams.get("date");
-      if (!date) return Response.json({ error: "date param required" }, { status: 400 });
-      const result = await performRestore(date);
-      return Response.json(result);
-    }
-
-    if (action === "prune") {
-      const result = await pruneOldBackups();
-      return Response.json({ ok: true, ...result });
-    }
-
-    // Default action: run a backup. v2.40.5 — dispatch to the background
-    // function and return 202 immediately. The sync-function 30s timeout
-    // can't cover a full backup over 21 Firestore collections (nuvizz_stops
-    // alone has ~40k docs = 130+ paged GETs). The background function has
-    // a 15-minute budget and returns 202 to the caller instantly, so the
-    // UI gets a fast ack and the user refreshes the snapshot list when
-    // the backup lands (typically ~30-60s later).
-    const siteOrigin = url.origin;
-    fetch(`${siteOrigin}/.netlify/functions/marginiq-backup-run-background`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ triggered_by: "dispatcher", at: new Date().toISOString() }),
-    }).catch((err) => {
-      // Fire-and-forget. Log but don't fail the dispatch — Netlify's
-      // background function invocation accepts the request before the
-      // promise settles on our side.
-      console.error("dispatcher: background fetch error (non-fatal):", err?.message);
-    });
-
-    return Response.json(
-      {
-        ok: true,
-        queued: true,
-        message: "Backup is running in the background. Refresh the snapshots list in ~30-60 seconds to see it.",
-      },
-      { status: 202 }
+    const manifest = await performBackup();
+    console.log(
+      `backup-run-background: manifest written for ${manifest.date} — ` +
+      `${manifest.total_docs} docs across ${manifest.collections_captured} collections ` +
+      `(${Math.round(manifest.compressed_bytes / 1024)} KB compressed, ` +
+      `${Math.round((Date.now() - t0) / 1000)}s)`
+    );
+    const pruneResult = await pruneOldBackups();
+    console.log(
+      `backup-run-background: prune complete — kept ${pruneResult.kept_dates.length}, ` +
+      `deleted ${pruneResult.deleted_dates.length}, total ${Math.round((Date.now() - t0) / 1000)}s`
     );
   } catch (e: any) {
-    console.error("backup error:", e);
-    return Response.json({ error: e.message || String(e) }, { status: 500 });
+    console.error("backup-run-background: FAILED", e?.message || String(e));
   }
 };
 
-// v2.40.5: schedule moved to marginiq-backup-run-background.mts. This
-// dispatcher no longer needs a cron — it only handles synchronous
-// list/restore/prune requests, and hands off backup runs to the
-// background function.
+// Schedule: 07:00 UTC daily = 03:00 EDT / 02:00 EST. Ownership of the cron
+// moved here from marginiq-backup.mts in v2.40.5.
+export const config: Config = {
+  schedule: "0 7 * * *",
+};
