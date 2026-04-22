@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.26";
+const APP_VERSION = "2.40.27";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -388,6 +388,19 @@ async function ingestFiles(files, onStatus = () => {}) {
   // keeps the phone responsive even on large DDIS ingests.
   const yieldToUI = () => new Promise(r => setTimeout(r, 0));
 
+  // v2.40.27: Per-operation timeout. Firebase SDK on mobile Safari has a
+  // known failure mode where a batch.commit() promise neither resolves nor
+  // rejects — the request vanishes into the SDK's internal queue and the
+  // await hangs forever. This blocked 3 of Chad's 4 most recent DDIS imports
+  // (175/3272, 200/3064, 335/3815 payments landed before each hung). A
+  // 30s race unsticks us: if the commit hasn't come back by then, we throw
+  // and let the outer catch fall through so importing[refKey] clears and
+  // the UI stops showing "..." eternally.
+  const withTimeout = (promise, ms, label) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+
   await yieldToUI();
   onStatus({ phase:"save", message:`Saving DDIS file records (${ddisFileRecords.length})...` });
   await batchWrite(ddisFileRecords, f => FS.saveDDISFile(f.file_id, f), 25);
@@ -404,11 +417,15 @@ async function ingestFiles(files, onStatus = () => {}) {
   //
   // v2.40.26: reduced batch size 500→200, added yieldToUI between batches,
   // per-batch try/catch so one bad commit doesn't wedge the whole import.
+  // v2.40.27: wrapped every commit in a 30s timeout because partial writes
+  // (3 of 4 recent imports hung after 1-2 batches) proved the SDK itself
+  // can silently stall on mobile.
   if (ddisPayments.length > 0) {
     const toSave = ddisPayments.slice(0, 10000);
     onStatus({ phase:"save", message:`Saving ${toSave.length} DDIS payments (0 done)...` });
     let written = 0;
     let batchesFailed = 0;
+    let batchesTimedOut = 0;
     const BATCH_SIZE = 200;
     for (let i = 0; i < toSave.length; i += BATCH_SIZE) {
       await yieldToUI();
@@ -418,23 +435,55 @@ async function ingestFiles(files, onStatus = () => {}) {
         for (const p of chunk) {
           batch.set(window.db.collection("ddis_payments").doc(String(p.id)), p, { merge: true });
         }
-        await batch.commit();
+        await withTimeout(batch.commit(), 30000, `DDIS batch ${i}-${i+chunk.length}`);
         written += chunk.length;
         onStatus({ phase:"save", message:`Saving DDIS payments (${written}/${toSave.length})...` });
       } catch(e) {
-        console.error(`DDIS batch ${i}-${i+BATCH_SIZE} failed:`, e);
-        batchesFailed++;
-        // One-by-one fallback for this chunk ONLY — don't kill the whole ingest
+        const isTimeout = /timed out/i.test(e.message || "");
+        console.error(`DDIS batch ${i}-${i+BATCH_SIZE} ${isTimeout?"TIMED OUT":"failed"}:`, e);
+        if (isTimeout) batchesTimedOut++; else batchesFailed++;
+        // After a timeout, the SDK's internal write queue may still be
+        // processing. Give it a short breather before trying the next batch
+        // instead of piling on another 200 ops. Moving to one-by-one writes
+        // for THIS chunk ONLY — with per-write timeout so one stuck doc
+        // can't hang another 200 seconds.
+        onStatus({ phase:"save", message:`Batch ${i}-${i+BATCH_SIZE} stalled, recovering...` });
         for (const p of chunk) {
           try {
-            await window.db.collection("ddis_payments").doc(String(p.id)).set(p, { merge: true });
+            await withTimeout(
+              window.db.collection("ddis_payments").doc(String(p.id)).set(p, { merge: true }),
+              5000,
+              `set ${p.id}`,
+            );
             written++;
-          } catch(_) { /* skip bad row, keep going */ }
+          } catch(_) { /* skip bad/stuck row, keep going */ }
         }
-        onStatus({ phase:"save", message:`DDIS payments recovering batch ${i}-${i+BATCH_SIZE} (${written}/${toSave.length})...` });
+        onStatus({ phase:"save", message:`Recovered from stall (${written}/${toSave.length})...` });
       }
     }
-    if (batchesFailed > 0) console.warn(`DDIS ingest: ${batchesFailed} batch(es) fell back to one-by-one writes`);
+    if (batchesFailed > 0 || batchesTimedOut > 0) {
+      console.warn(`DDIS ingest: ${batchesFailed} failed, ${batchesTimedOut} timed out out of ${Math.ceil(toSave.length/BATCH_SIZE)} batches`);
+    }
+    // v2.40.27: Write file_log for successfully imported DDIS files HERE,
+    // not at the bottom of ingestFiles. If something downstream hangs (NuVizz,
+    // audit build, etc.), the dedup state still reflects that the DDIS file
+    // IS imported, so Chad isn't tricked into re-importing it next session.
+    if (written > 0 && ddisFileRecords.length > 0) {
+      try {
+        for (const rec of ddisFileRecords) {
+          const matchingLog = fileLogs.find(l => l.filename === rec.filename);
+          if (matchingLog) {
+            await withTimeout(
+              FS.saveFileLog(matchingLog.file_id, { ...matchingLog, payments_written: written, total_payments: toSave.length }),
+              10000,
+              `file_log ${matchingLog.filename}`,
+            );
+          }
+        }
+      } catch(e) {
+        console.warn("Early file_log write failed (will retry at end):", e.message);
+      }
+    }
   }
   // Without DDIS payment data, every stop looks unpaid — cap hard to avoid
   // writing 500 meaningless rows. With payment data, keep full 500 for audit.
