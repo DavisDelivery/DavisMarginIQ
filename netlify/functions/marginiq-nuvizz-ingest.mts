@@ -125,4 +125,3 @@ export default async (req: Request, context: Context) => {
   return json({ run_id: runId, stop_count: stops.length, state: "queued" }, 202);
 };
 
-export const config = { path: "/api/nuvizz-ingest" };
