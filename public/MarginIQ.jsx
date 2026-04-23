@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.28";
+const APP_VERSION = "2.40.29";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -704,7 +704,7 @@ async function ingestFiles(files, onStatus = () => {}) {
 // all fees/taxes/delivery. True rate = (fuel + taxes + delivery) / gallons.
 const FUEL_VENDORS = [
   { key: "fuelfox", label: "FuelFox", color: "#dc2626", supported: true },
-  { key: "quickfuel", label: "Quick Fuel", color: "#2563eb", supported: false },
+  { key: "quickfuel", label: "Quick Fuel", color: "#2563eb", supported: true },
 ];
 
 function Fuel() {
@@ -1370,23 +1370,63 @@ async function scanPdfWithVision(pngPages, prompt) {
 
 const QUICK_FUEL_PROMPT = `Parse this Quick Fuel (Flyers Energy) weekly fuel-card invoice and return JSON.
 
+v2.40.29 — Three-section extraction: truck recap (backward compat), card→driver map, transaction-level detail rows.
+
 RULES FOR QUICK FUEL / FLYERS ENERGY:
-- Vendor should be "Quick Fuel". Invoice number starts with "CFS-" (e.g. "CFS-4582698").
-- Find the section titled "Recap by Additional Info 2" — this is your CRITICAL data. Do NOT confuse with "Recap by Card" which lists per-driver totals (wrong data).
-- In the "Recap by Additional Info 2" table, each row has: [Truck#] [Units/gallons] [Amount pre-tax] [Taxes] [Total]. Truck numbers can be 3-5 digits (preserve as-is, keep leading zeros). A row with truck "0" means unassigned fuel — use truckId "INVENTORY".
-- EVERY row in that Recap table becomes ONE object in output array. If table has 11 rows, return 11 objects. DO NOT merge, summarize, or skip.
-- For each row:
-  - truckId: the truck # (or "INVENTORY" for "0" bucket)
-  - gallons: Units column (REQUIRED)
-  - total: Total column — THIS INCLUDES TAX (REQUIRED)
+- Vendor is "Quick Fuel". Invoice number starts with "CFS-" (e.g. "CFS-4582698").
+
+SECTION 1 — "Recap by Additional Info 2" (truck-level rollup, REQUIRED):
+- Each row: [Truck#] [Units] [Amount] [Taxes] [Total]. Truck "0" means unassigned — use truckId "INVENTORY".
+- Emit ONE object per row into rows[]:
+  - truckId: the truck # (or "INVENTORY"), preserve leading zeros as string
+  - gallons: Units column
+  - total: Total column (INCLUDES tax)
   - pricePerGallon: total / gallons, rounded to 4 decimals
-  - invoiceNum: "<base invoice>-<truckId>" e.g. "CFS-4582698-0294"
+  - invoiceNum: "<base>-<truckId>" e.g. "CFS-4582698-0294"
   - date: invoice date YYYY-MM-DD
-  - notes: "Weekly fuel card - Truck X" or "Unassigned fuel" for INVENTORY
-- ALSO CAPTURE INVOICE-LEVEL FEES: Look for a section titled "Invoice Fees Total" or similar. Fees like "Regulatory Compliance Fee" are NOT per-truck — they appear as an invoice-level total. Extract as invoice_fees (number, 0 if none).
-- INVOICE_TOTAL: the grand total shown at the bottom of the invoice (e.g. "15,736.44"). This should equal (sum of row totals) + invoice_fees.
-- Return ONLY JSON: {"vendor":"Quick Fuel","invoice_number":"CFS-xxx","invoice_date":"YYYY-MM-DD","invoice_total":N,"invoice_fees":N,"rows":[...]}
-- NO markdown fences, NO explanation, JUST the JSON.`;
+  - notes: "Weekly fuel card - Truck X" or "Unassigned fuel"
+
+SECTION 2 — "Recap by Card" (card→driver map, REQUIRED):
+- Each row looks like: "1194374 - STEVIE ROBINSON 144.52 736.64 36.05 772.69"
+- Emit into card_drivers[] as { card: "1194374", driver: "STEVIE ROBINSON" }.
+- Strip whitespace, preserve full driver name as shown (all caps is fine).
+
+SECTION 3 — Transaction detail rows (each card swipe, REQUIRED):
+- Found at the top of the invoice BEFORE the recap sections. Grouped by truck# (the truck subheaders like "1478", "1606" etc).
+- Each row format (columns): [MM/DD/YY H:MMa/p] [Card#] [Site: "City, ST - SiteNum"] [Product] [Veh] [Manual] [Odometer] [MPG] [Units] [UnitPrice] [Amount]
+- Emit ONE object per row into transactions[]:
+  - date: "YYYY-MM-DD" (convert MM/DD/YY)
+  - time: "HH:MM" 24-hour (convert from 12-hour)
+  - card: card number string (e.g. "5493550")
+  - site_city: e.g. "Hoschton, GA"
+  - site_number: e.g. "756498"
+  - product_raw: exactly as shown, e.g. "ULSD #2", "DEF", "REG CONV GAS", "PREM CONV GAS", "MID CONV GAS"
+  - product_category: classify as EXACTLY one of: "diesel" (ULSD #2 or any ULSD), "def" (DEF), "gas" (any CONV GAS)
+  - truck_id: the parent truck grouping (from subheader row like "1478"). For rows under the "0" group, use "INVENTORY".
+  - odometer: number (strip commas)
+  - gallons: number
+  - unit_price: number (posted/rack, before invoice-level tax)
+  - amount: number (gallons × unit_price)
+- INCLUDE EVERY detail row. A typical invoice has 40-100+ rows. DO NOT skip, merge, or summarize.
+- If a row's card# doesn't appear in card_drivers, driver will be resolved client-side as "Unknown".
+
+SECTION 4 — Invoice fees:
+- "Invoice Fees Total" section (e.g. "Regulatory Compliance Fee"). Sum these into invoice_fees (number, 0 if absent).
+
+SECTION 5 — Grand total:
+- invoice_total = the amount at "Invoice Total" / balance due at bottom.
+
+Return ONLY JSON (no markdown, no prose):
+{
+  "vendor": "Quick Fuel",
+  "invoice_number": "CFS-xxx",
+  "invoice_date": "YYYY-MM-DD",
+  "invoice_total": N,
+  "invoice_fees": N,
+  "rows": [...],
+  "card_drivers": [{"card":"xxx","driver":"NAME"}, ...],
+  "transactions": [...]
+}`;
 
 const FUELFOX_SERVICE_LOG_PROMPT = `Parse this FuelFox Atlanta SERVICE LOG PDF and return JSON.
 
@@ -1988,6 +2028,55 @@ function GmailSync({ onRefresh }) {
           week_id: weekRollupId, vendor: "quickfuel", week_ending: weekKey,
           gallons: totalGal, spend: grandTotal, true_rate: avgRate, invoice_count: 1,
         });
+      }
+
+      // v2.40.29: Save per-transaction rows with driver names joined from Recap by Card.
+      // This enables the "Rebuild Invoice" view and proper DEF/diesel/gas breakout.
+      // Each transaction gets its invoice-level fee share by gallons, same as fuel_by_truck.
+      const txns = Array.isArray(data.transactions) ? data.transactions : [];
+      const cardDrivers = Array.isArray(data.card_drivers) ? data.card_drivers : [];
+      if (txns.length > 0) {
+        const driverByCard = {};
+        for (const cd of cardDrivers) {
+          if (cd?.card) driverByCard[String(cd.card)] = cd.driver || "Unknown";
+        }
+        setImportStatus(`Saving ${txns.length} transactions (${cardDrivers.length} drivers)...`);
+        let txnIdx = 0;
+        for (const t of txns) {
+          txnIdx++;
+          const gal = Number(t.gallons) || 0;
+          const unitPrice = Number(t.unit_price) || 0;
+          const amount = Number(t.amount) || 0;
+          const feeShare = gal * feePerGal;
+          const trueAmt = Math.round((amount + feeShare) * 100) / 100;
+          const trueCpg = gal > 0 ? Math.round((trueAmt / gal) * 10000) / 10000 : null;
+          // Stable doc ID: invoice + index (transactions come in order from the PDF)
+          const txnId = `quickfuel_${invBase}_${String(txnIdx).padStart(4, "0")}`;
+          const card = String(t.card || "");
+          await FS.saveFuelTransaction(txnId, {
+            txn_id: txnId,
+            vendor: "quickfuel",
+            invoice_id: `quickfuel_${invBase}`,
+            invoice_number: invBase,
+            week_ending: weekKey,
+            txn_date: t.date || isoDate,
+            txn_time: t.time || null,
+            card: card,
+            driver: driverByCard[card] || "Unknown",
+            site_city: t.site_city || null,
+            site_number: t.site_number || null,
+            product_raw: t.product_raw || null,
+            product_category: t.product_category || "unknown",  // diesel | def | gas
+            truck_id: String(t.truck_id || "INVENTORY"),
+            odometer: Number(t.odometer) || null,
+            gallons: gal,
+            unit_price: unitPrice,
+            amount: amount,
+            fee_share: Math.round(feeShare * 10000) / 10000,
+            true_amount: trueAmt,
+            true_cpg: trueCpg,
+          });
+        }
       }
 
       setImported(prev => ({...prev, [refKey]: { ok: true, trucks: data.rows.length, total: grandTotal, rate: avgRate }}));
@@ -2727,6 +2816,10 @@ const FS = {
   async saveFuelByTruck(id, data) { if (!hasFirebase) return false; try { await window.db.collection("fuel_by_truck").doc(String(id)).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getFuelWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("fuel_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveFuelWeekly(id, data) { if (!hasFirebase) return false; try { await window.db.collection("fuel_weekly").doc(String(id)).set({...data, updated_at:new Date().toISOString()}, {merge:true}); return true; } catch(e) { return false; } },
+  // v2.40.29: transaction-level storage for per-card / per-driver / per-product (diesel/DEF/gas) analysis
+  async getFuelTransactions(limit=5000) { if (!hasFirebase) return []; try { const s=await window.db.collection("fuel_transactions").orderBy("txn_date","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async getFuelTransactionsByInvoice(invoiceId) { if (!hasFirebase) return []; try { const s=await window.db.collection("fuel_transactions").where("invoice_id","==",invoiceId).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
+  async saveFuelTransaction(id, data) { if (!hasFirebase) return false; try { await window.db.collection("fuel_transactions").doc(String(id)).set(data, {merge:true}); return true; } catch(e) { return false; } },
 };
 
 // ─── File Type Detection ────────────────────────────────────
