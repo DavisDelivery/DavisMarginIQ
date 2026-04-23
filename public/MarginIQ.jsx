@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.29";
+const APP_VERSION = "2.40.30";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -529,40 +529,149 @@ async function ingestFiles(files, onStatus = () => {}) {
   // NuVizz
   let nvWeeksSaved = 0, nvStopsSaved = 0;
   if (nuvizzStops.length > 0) {
-    onStatus({ phase:"save", message:`Saving NuVizz (${nuvizzStops.length} stops)...` });
+    // v2.40.30: FULLY INSTRUMENTED NUVIZZ INGEST
+    // Previously this path silently dropped rows — 49K-row CSV landed only
+    // ~27% of stops in Firestore and we had no idea where the loss happened.
+    // Now every stage is counted and a diagnostic doc is written to
+    // nuvizz_ingest_logs after each run so we can verify post-hoc via probe.
+    const ingestRunId = `nuvizz_${new Date().toISOString().replace(/[:.]/g,"-")}`;
+    const ingestStart = Date.now();
+    const diag = {
+      run_id: ingestRunId,
+      started_at: new Date().toISOString(),
+      parsed_stops: nuvizzStops.length,
+      // Filter drops
+      filter_dropped: 0,
+      filter_reasons: { no_pro_and_no_stop_number: 0, no_delivery_date: 0, both: 0 },
+      // Save stats
+      to_save: 0,
+      saved_ok: 0,
+      saved_failed: 0,
+      // Per-batch tracking
+      batches_total: 0,
+      batches_all_ok: 0,
+      batches_with_failures: 0,
+      batches_timed_out: 0,
+      // Sample of first 5 failure reasons (errors from saveNuVizzStop)
+      failure_samples: [],
+      // Prefix distribution of what we attempted to save
+      prefix_counts_to_save: {},
+      prefix_counts_saved_ok: {},
+    };
 
-    // STEP 1: Save every individual stop first (nuvizz_stops collection).
-    // Keyed by PRO → same PRO re-uploaded just overwrites itself, idempotent.
-    // Cap raised to the full batch — capping at 2000 meant weekly rebuilds
-    // below would miss historical PROs that fell out of the window.
-    const toSave = nuvizzStops.filter(s => (s.pro || s.stop_number) && s.delivery_date);
-    nvStopsSaved = await batchWrite(toSave,
-      s => FS.saveNuVizzStop(s.pro || s.stop_number, s),
-      25, "Saving NuVizz stops");
+    // Per-row filter with explicit reason tracking (replaces the terse one-line filter)
+    const toSave = [];
+    const dropSamples = [];
+    for (const s of nuvizzStops) {
+      const hasId = !!(s.pro || s.stop_number);
+      const hasDate = !!s.delivery_date;
+      if (hasId && hasDate) {
+        toSave.push(s);
+        continue;
+      }
+      diag.filter_dropped++;
+      if (!hasId && !hasDate) diag.filter_reasons.both++;
+      else if (!hasId) diag.filter_reasons.no_pro_and_no_stop_number++;
+      else diag.filter_reasons.no_delivery_date++;
+      if (dropSamples.length < 5) {
+        dropSamples.push({
+          stop_number: s.stop_number || null, pro: s.pro || null,
+          delivery_date: s.delivery_date || null, driver_name: s.driver_name || null,
+          ship_to: s.ship_to || null,
+        });
+      }
+    }
+    diag.to_save = toSave.length;
+    diag.drop_samples = dropSamples;
 
-    // STEP 2: Identify which weeks this batch touched, then rebuild each
-    // affected weekly rollup from the UNION of (existing Firestore stops +
-    // new stops). This avoids the double-count bug where a partial file
-    // overwrote a complete rollup via shallow merge. PRO-level dedup is
-    // implicit because stops are keyed by PRO — we read distinct PROs back
-    // from Firestore.
-    const touchedWeeks = new Set(nuvizzStops.map(s => s.week_ending).filter(Boolean));
+    // Tally prefix distribution of the to_save batch (so we can verify which
+    // customers are represented on the way in)
+    for (const s of toSave) {
+      const id = String(s.pro || s.stop_number || "");
+      const pm = id.match(/^([A-Za-z][A-Za-z\-_]*)/);
+      const prefix = pm ? pm[1].toUpperCase() : (id[0] >= "0" && id[0] <= "9" ? "(numeric)" : "(other)");
+      diag.prefix_counts_to_save[prefix] = (diag.prefix_counts_to_save[prefix] || 0) + 1;
+    }
+
+    onStatus({ phase:"save", message:`Saving NuVizz (${toSave.length}/${nuvizzStops.length} stops — ${diag.filter_dropped} filtered)...` });
+
+    // STEP 1: Save every individual stop. Instrumented batch writer that
+    // captures per-write errors, yields to UI between batches (so mobile
+    // Safari doesn't freeze), and races each batch against a 30s timeout
+    // (same hang-avoidance pattern as v2.40.27 DDIS fix).
+    const BATCH_SIZE = 25;
+    const BATCH_TIMEOUT_MS = 30000;
+    const startSave = Date.now();
+    for (let i = 0; i < toSave.length; i += BATCH_SIZE) {
+      const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+      diag.batches_total++;
+      const batch = toSave.slice(i, i + BATCH_SIZE);
+      const batchStart = Date.now();
+      // Wrap each saveNuVizzStop so an individual error returns {ok, err}
+      // rather than bubbling up and killing the whole batch.
+      const batchPromise = Promise.all(batch.map(async s => {
+        try {
+          const ok = await FS.saveNuVizzStop(s.pro || s.stop_number, s);
+          return { ok: !!ok, id: s.pro || s.stop_number };
+        } catch (e) {
+          return { ok: false, id: s.pro || s.stop_number, err: e?.message || String(e) };
+        }
+      }));
+      let results;
+      try {
+        results = await withTimeout(batchPromise, BATCH_TIMEOUT_MS, `NuVizz batch ${batchNum}`);
+      } catch (e) {
+        diag.batches_timed_out++;
+        if (diag.failure_samples.length < 5) {
+          diag.failure_samples.push({ batch: batchNum, timeout: true, error: e.message });
+        }
+        // Don't abort entire ingest — just skip this batch, count items as failed
+        diag.saved_failed += batch.length;
+        nvStopsSaved += 0;
+        continue;
+      }
+      let batchFailures = 0;
+      for (const r of results) {
+        if (r.ok) {
+          diag.saved_ok++;
+          nvStopsSaved++;
+          // Record prefix for saved-ok so we know what landed
+          const id = String(r.id || "");
+          const pm = id.match(/^([A-Za-z][A-Za-z\-_]*)/);
+          const prefix = pm ? pm[1].toUpperCase() : (id[0] >= "0" && id[0] <= "9" ? "(numeric)" : "(other)");
+          diag.prefix_counts_saved_ok[prefix] = (diag.prefix_counts_saved_ok[prefix] || 0) + 1;
+        } else {
+          diag.saved_failed++;
+          batchFailures++;
+          if (diag.failure_samples.length < 5 && r.err) {
+            diag.failure_samples.push({ batch: batchNum, id: r.id, error: r.err });
+          }
+        }
+      }
+      if (batchFailures === 0) diag.batches_all_ok++;
+      else diag.batches_with_failures++;
+
+      // Yield to UI every batch so mobile Safari repaints and doesn't mark
+      // the tab unresponsive. Same pattern as v2.40.26.
+      onStatus({ phase:"save", message:`Saving NuVizz stops (${Math.min(i+BATCH_SIZE, toSave.length)}/${toSave.length}) — ${diag.saved_ok} ok, ${diag.saved_failed} failed` });
+      await yieldToUI();
+    }
+    diag.save_elapsed_ms = Date.now() - startSave;
+
+    // STEP 2: Rebuild weekly rollups (unchanged from prior version).
+    const touchedWeeks = new Set(toSave.map(s => s.week_ending).filter(Boolean));
     onStatus({ phase:"save", message:`Rebuilding ${touchedWeeks.size} NuVizz weekly rollup(s) from merged PRO set...` });
 
     for (const weekEnding of touchedWeeks) {
       try {
-        // Pull every stop Firestore has for this week (now includes the ones
-        // we just wrote). nuvizz_stops has week_ending on each doc.
         const snap = await window.db.collection("nuvizz_stops")
           .where("week_ending", "==", weekEnding)
-          .limit(10000) // safety — a single week shouldn't exceed this
+          .limit(10000)
           .get();
         const weekStops = snap.docs.map(d => d.data());
         if (weekStops.length === 0) continue;
-        // Rebuild this week's rollup from the full deduplicated set
         const weeklyArr = buildNuVizzWeekly(weekStops);
         if (weeklyArr.length > 0) {
-          // buildNuVizzWeekly returns an array; for a single week it's length 1
           const w = weeklyArr[0];
           await FS.saveNuVizzWeekly(weekEnding, { ...w, updated_at: new Date().toISOString(), rebuilt_from_stops: true });
           nvWeeksSaved++;
@@ -571,6 +680,23 @@ async function ingestFiles(files, onStatus = () => {}) {
         console.error("NuVizz weekly rebuild failed for", weekEnding, e);
       }
     }
+    diag.weeks_rebuilt = nvWeeksSaved;
+    diag.total_elapsed_ms = Date.now() - ingestStart;
+    diag.completed_at = new Date().toISOString();
+
+    // Write diagnostic log to Firestore for post-hoc analysis via probe.
+    try {
+      await FS.saveNuVizzIngestLog(ingestRunId, diag);
+    } catch (e) {
+      console.error("Failed to save NuVizz ingest log:", e);
+    }
+
+    // Surface a final summary the user actually sees.
+    const pctSaved = toSave.length > 0 ? Math.round(100 * diag.saved_ok / toSave.length) : 0;
+    onStatus({
+      phase: "save",
+      message: `✓ NuVizz: parsed ${diag.parsed_stops}, filtered ${diag.filter_dropped}, attempted ${diag.to_save} saves — ${diag.saved_ok} ok (${pctSaved}%), ${diag.saved_failed} failed, ${diag.batches_timed_out} batches timed out. Log: ${ingestRunId}`,
+    });
   }
 
   // Time Clock
@@ -2773,6 +2899,9 @@ const FS = {
 
   // ─── v2.3 Multi-source helpers ───────────────────────────────
   async saveNuVizzStop(proKey, data) { if (!hasFirebase) return false; try { await window.db.collection("nuvizz_stops").doc(String(proKey)).set(data, {merge:true}); return true; } catch(e) { return false; } },
+  // v2.40.30: per-ingest diagnostic log so we can see exactly where rows drop
+  async saveNuVizzIngestLog(runId, data) { if (!hasFirebase) return false; try { await window.db.collection("nuvizz_ingest_logs").doc(String(runId)).set(data, {merge:true}); return true; } catch(e) { console.error("saveNuVizzIngestLog failed:", e); return false; } },
+  async getNuVizzIngestLogs(limit=10) { if (!hasFirebase) return []; try { const s=await window.db.collection("nuvizz_ingest_logs").orderBy("started_at","desc").limit(limit).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveNuVizzWeekly(weekId, data) { if (!hasFirebase) return false; try { await window.db.collection("nuvizz_weekly").doc(weekId).set(data, {merge:true}); return true; } catch(e) { return false; } },
   async getNuVizzWeekly() { if (!hasFirebase) return []; try { const s=await window.db.collection("nuvizz_weekly").orderBy("week_ending","desc").limit(260).get(); return s.docs.map(d=>({id:d.id,...d.data()})); } catch(e) { return []; } },
   async saveTimeClockDaily(id, data) { if (!hasFirebase) return false; try { await window.db.collection("timeclock_daily").doc(id).set(data, {merge:true}); return true; } catch(e) { console.error("saveTimeClockDaily failed:", id, e); return false; } },
@@ -6391,20 +6520,104 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
     // ─── NuVizz: rollups + cross-ref stops ───
     let nvWeeksSaved = 0, nvStopsSaved = 0;
     if (nuvizzStops.length > 0) {
-      // STEP 1: Save individual stops first — keyed by PRO for natural dedupe
-      setStatus(`Saving ${nuvizzStops.length} NuVizz stops...`);
-      const toSave = nuvizzStops.filter(s => (s.pro || s.stop_number) && s.delivery_date);
-      for (const s of toSave) {
-        const key = s.pro || s.stop_number;
-        if (!key) continue;
-        const ok = await FS.saveNuVizzStop(key, s);
-        if (ok) nvStopsSaved++;
+      // v2.40.30: Instrumented path — mirrors ingestFiles(). Prior version
+      // was a sequential for-await on ALL stops with no yielding, no timeout,
+      // no per-row error capture. A 49K-row CSV would freeze mobile Safari
+      // around stop ~13K which is exactly what we saw in Firestore.
+      const ingestRunId = `nuvizz_direct_${new Date().toISOString().replace(/[:.]/g,"-")}`;
+      const ingestStart = Date.now();
+      const diag = {
+        run_id: ingestRunId, source: "direct_upload",
+        started_at: new Date().toISOString(),
+        parsed_stops: nuvizzStops.length,
+        filter_dropped: 0,
+        filter_reasons: { no_pro_and_no_stop_number: 0, no_delivery_date: 0, both: 0 },
+        to_save: 0, saved_ok: 0, saved_failed: 0,
+        batches_total: 0, batches_all_ok: 0, batches_with_failures: 0, batches_timed_out: 0,
+        failure_samples: [],
+        prefix_counts_to_save: {}, prefix_counts_saved_ok: {},
+      };
+
+      const _yieldToUI = () => new Promise(r => setTimeout(r, 0));
+      const _withTimeout = (promise, ms, label) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+      ]);
+
+      const toSave = [];
+      const dropSamples = [];
+      for (const s of nuvizzStops) {
+        const hasId = !!(s.pro || s.stop_number);
+        const hasDate = !!s.delivery_date;
+        if (hasId && hasDate) { toSave.push(s); continue; }
+        diag.filter_dropped++;
+        if (!hasId && !hasDate) diag.filter_reasons.both++;
+        else if (!hasId) diag.filter_reasons.no_pro_and_no_stop_number++;
+        else diag.filter_reasons.no_delivery_date++;
+        if (dropSamples.length < 5) dropSamples.push({
+          stop_number: s.stop_number || null, pro: s.pro || null,
+          delivery_date: s.delivery_date || null, driver_name: s.driver_name || null,
+        });
       }
+      diag.to_save = toSave.length;
+      diag.drop_samples = dropSamples;
+
+      for (const s of toSave) {
+        const id = String(s.pro || s.stop_number || "");
+        const pm = id.match(/^([A-Za-z][A-Za-z\-_]*)/);
+        const prefix = pm ? pm[1].toUpperCase() : (id[0] >= "0" && id[0] <= "9" ? "(numeric)" : "(other)");
+        diag.prefix_counts_to_save[prefix] = (diag.prefix_counts_to_save[prefix] || 0) + 1;
+      }
+
+      setStatus(`Saving NuVizz (${toSave.length}/${nuvizzStops.length} stops — ${diag.filter_dropped} filtered)...`);
+
+      const BATCH_SIZE = 25;
+      const BATCH_TIMEOUT_MS = 30000;
+      for (let i = 0; i < toSave.length; i += BATCH_SIZE) {
+        const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+        diag.batches_total++;
+        const batch = toSave.slice(i, i + BATCH_SIZE);
+        const batchPromise = Promise.all(batch.map(async s => {
+          try {
+            const ok = await FS.saveNuVizzStop(s.pro || s.stop_number, s);
+            return { ok: !!ok, id: s.pro || s.stop_number };
+          } catch (e) {
+            return { ok: false, id: s.pro || s.stop_number, err: e?.message || String(e) };
+          }
+        }));
+        let results;
+        try {
+          results = await _withTimeout(batchPromise, BATCH_TIMEOUT_MS, `NuVizz direct batch ${batchNum}`);
+        } catch (e) {
+          diag.batches_timed_out++;
+          if (diag.failure_samples.length < 5) diag.failure_samples.push({ batch: batchNum, timeout: true, error: e.message });
+          diag.saved_failed += batch.length;
+          continue;
+        }
+        let batchFailures = 0;
+        for (const r of results) {
+          if (r.ok) {
+            diag.saved_ok++; nvStopsSaved++;
+            const id = String(r.id || "");
+            const pm = id.match(/^([A-Za-z][A-Za-z\-_]*)/);
+            const prefix = pm ? pm[1].toUpperCase() : (id[0] >= "0" && id[0] <= "9" ? "(numeric)" : "(other)");
+            diag.prefix_counts_saved_ok[prefix] = (diag.prefix_counts_saved_ok[prefix] || 0) + 1;
+          } else {
+            diag.saved_failed++; batchFailures++;
+            if (diag.failure_samples.length < 5 && r.err) diag.failure_samples.push({ batch: batchNum, id: r.id, error: r.err });
+          }
+        }
+        if (batchFailures === 0) diag.batches_all_ok++;
+        else diag.batches_with_failures++;
+        setStatus(`Saving NuVizz stops (${Math.min(i+BATCH_SIZE, toSave.length)}/${toSave.length}) — ${diag.saved_ok} ok, ${diag.saved_failed} failed`);
+        await _yieldToUI();
+      }
+      diag.save_elapsed_ms = Date.now() - ingestStart;
 
       // STEP 2: Rebuild every week this batch touched from the full Firestore
       // stop set, so overlapping uploads don't double-count (PRO-level dedup
       // is handled by the stop doc being keyed by PRO).
-      const touchedWeeks = new Set(nuvizzStops.map(s => s.week_ending).filter(Boolean));
+      const touchedWeeks = new Set(toSave.map(s => s.week_ending).filter(Boolean));
       setStatus(`Rebuilding ${touchedWeeks.size} NuVizz weekly rollup(s)...`);
       for (const weekEnding of touchedWeeks) {
         try {
@@ -6423,6 +6636,13 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
           console.error("NuVizz weekly rebuild failed for", weekEnding, e);
         }
       }
+      diag.weeks_rebuilt = nvWeeksSaved;
+      diag.total_elapsed_ms = Date.now() - ingestStart;
+      diag.completed_at = new Date().toISOString();
+      try { await FS.saveNuVizzIngestLog(ingestRunId, diag); } catch (e) { console.error("Failed to save NuVizz ingest log:", e); }
+
+      const pctSaved = toSave.length > 0 ? Math.round(100 * diag.saved_ok / toSave.length) : 0;
+      setStatus(`✓ NuVizz: parsed ${diag.parsed_stops}, filtered ${diag.filter_dropped}, attempted ${diag.to_save} — ${diag.saved_ok} ok (${pctSaved}%), ${diag.saved_failed} failed, ${diag.batches_timed_out} timeouts. Log: ${ingestRunId}`);
     }
 
     // ─── Time Clock: weekly rollups ───
