@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.32";
+const APP_VERSION = "2.40.33";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -840,6 +840,8 @@ function Fuel() {
   const [weekly, setWeekly] = useState([]);
   const [byTruck, setByTruck] = useState([]);
   const [refreshTick, setRefreshTick] = useState(0);
+  const invSort = useSortable(invoices, "invoice_date", "desc");
+  const trSort = useSortable(byTruck, "service_date", "desc");
 
   // Upload state (FuelFox pair)
   const [summaryPdf, setSummaryPdf] = useState(null);
@@ -1193,15 +1195,18 @@ function Fuel() {
       ) : (
         <div style={{...cardStyle, padding:0}}>
           <div style={{overflowX:"auto",maxHeight:500}}>
+            {/* v2.40.33: sortable invoices table */}
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
               <thead>
                 <tr style={{background:T.bgSurface,position:"sticky",top:0}}>
-                  {["Date","Vendor","Invoice #","Gallons","Fuel","Tax","Delivery","Grand Total","True $/Gal","Trucks"].map(h =>
-                    <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                  {[["Date","invoice_date"],["Vendor","vendor"],["Invoice #","invoice_number"],["Gallons","total_gallons"],["Fuel","fuel_cost"],["Tax","tax"],["Delivery","delivery_fee"],["Grand Total","grand_total"],["True $/Gal","true_rate"],["Trucks","truck_count"]].map(([label,key]) => (
+                    <SortableTh key={key} label={label} col={key} sortKey={invSort.sortKey} sortDir={invSort.sortDir} onSort={invSort.toggleSort}
+                      style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:invSort.sortKey===key?T.brand:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",background:T.bgSurface}} />
+                  ))}
                 </tr>
               </thead>
               <tbody>
-                {invoices.map(inv => {
+                {invSort.sorted.map(inv => {
                   const v = FUEL_VENDORS.find(x => x.key === inv.vendor) || FUEL_VENDORS[0];
                   return (
                     <tr key={inv.id} style={{borderBottom:`1px solid ${T.borderLight}`}}>
@@ -1220,6 +1225,7 @@ function Fuel() {
                 })}
               </tbody>
             </table>
+          ); })()}
           </div>
         </div>
       )
@@ -1235,15 +1241,18 @@ function Fuel() {
             Per-Truck Fuel History — Last {Math.min(byTruck.length, 500)} fill-ups
           </div>
           <div style={{overflowX:"auto",maxHeight:500}}>
+            {/* v2.40.33: sortable by-truck table */}
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
               <thead>
                 <tr style={{background:T.bgSurface,position:"sticky",top:0}}>
-                  {["Service Date","Unit","Gallons","Posted $","True $","Uplift","Vendor","Invoice"].map(h =>
-                    <th key={h} style={{textAlign:"left",padding:"6px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:9,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                  {[["Service Date","service_date"],["Unit","unit"],["Gallons","gallons"],["Posted $","posted_charge"],["True $","true_cost"],["Uplift","uplift"],["Vendor","vendor"],["Invoice","invoice_number"]].map(([label,key]) => (
+                    <SortableTh key={key} label={label} col={key} sortKey={trSort.sortKey} sortDir={trSort.sortDir} onSort={trSort.toggleSort}
+                      style={{textAlign:"left",padding:"6px 10px",borderBottom:`1px solid ${T.border}`,color:trSort.sortKey===key?T.brand:T.textDim,fontSize:9,fontWeight:600,textTransform:"uppercase",background:T.bgSurface}} />
+                  ))}
                 </tr>
               </thead>
               <tbody>
-                {byTruck.slice(0, 500).map(t => {
+                {trSort.sorted.slice(0, 500).map(t => {
                   const v = FUEL_VENDORS.find(x => x.key === t.vendor) || FUEL_VENDORS[0];
                   return (
                     <tr key={t.id} style={{borderBottom:`1px solid ${T.borderLight}`}}>
@@ -1260,6 +1269,7 @@ function Fuel() {
                 })}
               </tbody>
             </table>
+          ); })()}
           </div>
         </div>
       )
@@ -5984,9 +5994,14 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
               <div style={{fontSize:12,color:T.textMuted,marginBottom:12}}>These weeks have far fewer stops than your average of <strong>{fmtNum(avgStops)}</strong>. Tap a row to see what files are loaded for that week.</div>
               <div style={{overflowX:"auto"}}>
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead><tr>{["Week Ending","Stops","Revenue","Expected Stops","Gap",""].map(h=>
-                    <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>
-                  )}</tr></thead>
+                  <thead><tr>
+                    <th style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgSurface}}>Week Ending</th>
+                    <th style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgSurface}}>Stops</th>
+                    <th style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgSurface}}>Revenue</th>
+                    <th style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgSurface}}>Expected Stops</th>
+                    <th style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgSurface}}>Gap</th>
+                    <th style={{padding:"8px 10px",borderBottom:`1px solid ${T.border}`}}></th>
+                  </tr></thead>
                   <tbody>
                     {sparseWeeks.map((w,i) => {
                       const isOpen = inspectingWeek === w.week_ending;
@@ -6148,9 +6163,12 @@ function DataCompleteness({ weeklyRollups, completeness, fileLog }) {
         <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>Upload Log (last {Math.min(fileLog.length,50)})</div>
         <div style={{overflowX:"auto",maxHeight:400}}>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-            <thead><tr>{["Filename","Type","Rows","Uploaded"].map(h=>
-              <th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>{h}</th>
-            )}</tr></thead>
+            <thead><tr>
+              <th style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>Filename</th>
+              <th style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>Type</th>
+              <th style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>Rows</th>
+              <th style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase",position:"sticky",top:0,background:T.bgWhite}}>Uploaded</th>
+            </tr></thead>
             <tbody>
               {fileLog.slice(0,50).map((f,i) => (
                 <tr key={i}>
@@ -7242,6 +7260,8 @@ function Audit({ reconWeekly, weeklyRollups }) {
   const [apContacts, setApContacts] = useState({}); // key -> contact doc
   const [disputes, setDisputes] = useState([]);
   const [view, setView] = useState("dashboard"); // dashboard | items | contacts | disputes | weekly
+  const dispSort = useSortable(disputes, "submitted_date", "desc");
+  const custSort = useSortable(topCustomers, "amount", "desc");
   const [detailItem, setDetailItem] = useState(null);
   const [editingContact, setEditingContact] = useState(null);
 
@@ -7578,9 +7598,23 @@ function Audit({ reconWeekly, weeklyRollups }) {
     arr = arr.filter(i => (i.variance||0) >= filterMinVar);
     arr = arr.slice().sort((a,b) => {
       if (sortBy === "variance") return (b.variance||0) - (a.variance||0);
+      if (sortBy === "-variance") return (a.variance||0) - (b.variance||0);
       if (sortBy === "age") return (b.age_days||0) - (a.age_days||0);
+      if (sortBy === "-age") return (a.age_days||0) - (b.age_days||0);
       if (sortBy === "date") return (b.pu_date||"").localeCompare(a.pu_date||"");
+      if (sortBy === "-date") return (a.pu_date||"").localeCompare(b.pu_date||"");
       if (sortBy === "customer") return (a.customer||"").localeCompare(b.customer||"");
+      if (sortBy === "-customer") return (b.customer||"").localeCompare(a.customer||"");
+      if (sortBy === "billed") return (b.billed||0) - (a.billed||0);
+      if (sortBy === "-billed") return (a.billed||0) - (b.billed||0);
+      if (sortBy === "paid") return (b.paid||0) - (a.paid||0);
+      if (sortBy === "-paid") return (a.paid||0) - (b.paid||0);
+      if (sortBy === "pro") return (a.pro||"").localeCompare(b.pro||"", undefined, {numeric:true});
+      if (sortBy === "-pro") return (b.pro||"").localeCompare(a.pro||"", undefined, {numeric:true});
+      if (sortBy === "status") return (a.dispute_status||"").localeCompare(b.dispute_status||"");
+      if (sortBy === "-status") return (b.dispute_status||"").localeCompare(a.dispute_status||"");
+      if (sortBy === "category") return (a.category||"").localeCompare(b.category||"");
+      if (sortBy === "-category") return (b.category||"").localeCompare(a.category||"");
       return 0;
     });
     return arr;
@@ -8139,12 +8173,14 @@ function Audit({ reconWeekly, weeklyRollups }) {
               <div style={{overflowX:"auto"}}>
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
                   <thead>
-                    <tr>{["Customer","Items","Outstanding","Oldest Age",""].map(h =>
-                      <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                    <tr>{[["Customer","customer"],["Items","count"],["Outstanding","amount"],["Oldest Age","oldest_age"],["",""]].map(([label,key]) => key ? (
+                      <SortableTh key={key} label={label} col={key} sortKey={custSort.sortKey} sortDir={custSort.sortDir} onSort={custSort.toggleSort}
+                        style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:custSort.sortKey===key?T.brand:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}} />
+                    ) : <th key="actions" style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600}}></th>)}
                     </tr>
                   </thead>
                   <tbody>
-                    {topCustomers.map(c => (
+                    {custSort.sorted.map(c => (
                       <tr key={c.customer}>
                         <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`,fontWeight:600}}>{c.customer}</td>
                         <td style={{padding:"8px 10px",borderBottom:`1px solid ${T.borderLight}`}}>{c.count}</td>
@@ -8334,8 +8370,23 @@ function Audit({ reconWeekly, weeklyRollups }) {
                     <input type="checkbox" checked={filteredItems.length > 0 && filteredItems.every(i => selectedIds[i.pro])}
                       onChange={e => e.target.checked ? selectAll() : clearSelect()} />
                   </th>
-                  {["PRO","Customer","Billed","Paid","Variance","Age","Category","Status"].map(h =>
-                    <th key={h} style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:9,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                  {[
+                    ["PRO","pro"],["Customer","customer"],["Billed","billed"],
+                    ["Paid","paid"],["Variance","variance"],["Age","age"],
+                    ["Category","category"],["Status","status"],
+                  ].map(([label, key]) => {
+                    const active = sortBy === key || sortBy === "-" + key;
+                    const asc = sortBy === key;
+                    const chevron = active ? (asc ? " ↑" : " ↓") : " ↕";
+                    return (
+                      <th key={key} onClick={() => setSortBy(sortBy === key ? "-"+key : key)}
+                        style={{textAlign:"left",padding:"6px 8px",borderBottom:`1px solid ${T.border}`,
+                          color: active ? T.brand : T.textDim,fontSize:9,fontWeight:600,
+                          textTransform:"uppercase",cursor:"pointer",userSelect:"none",whiteSpace:"nowrap"}}>
+                        {label}<span style={{opacity:active?1:0.35,fontSize:"0.8em",marginLeft:2}}>{chevron}</span>
+                      </th>
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody>
@@ -8433,12 +8484,14 @@ function Audit({ reconWeekly, weeklyRollups }) {
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
                 <thead>
                   <tr style={{background:T.bgSurface}}>
-                    {["Customer","Items","Claimed","Recovered","Submitted","Outcome","Actions"].map(h =>
-                      <th key={h} style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}}>{h}</th>)}
+                    {[["Customer","customer"],["Items","count"],["Claimed","total_claimed"],["Recovered","total_recovered"],["Submitted","submitted_date"],["Outcome","outcome"],["Actions",""]].map(([label,key]) => key ? (
+                      <SortableTh key={key} label={label} col={key} sortKey={dispSort.sortKey} sortDir={dispSort.sortDir} onSort={dispSort.toggleSort}
+                        style={{textAlign:"left",padding:"8px 10px",borderBottom:`1px solid ${T.border}`,color:dispSort.sortKey===key?T.brand:T.textDim,fontSize:10,fontWeight:600,textTransform:"uppercase"}} />
+                    ) : <th key="act" style={{padding:"8px 10px",borderBottom:`1px solid ${T.border}`}}></th>)}
                   </tr>
                 </thead>
                 <tbody>
-                  {disputes.map(d => {
+                  {dispSort.sorted.map(d => {
                     const outcomeColor = d.outcome === "won" ? T.green : d.outcome === "lost" ? T.red : d.outcome === "partial" ? T.yellow : T.textMuted;
                     return (
                       <tr key={d.id}>
@@ -8910,6 +8963,7 @@ function Drivers() {
   const [saving, setSaving] = useState({}); // key -> bool
   const [filter, setFilter] = useState("all"); // all | unknown | w2 | 1099
   const [search, setSearch] = useState("");
+  const drvSort = useSortable([], "nv_stops", "desc");
 
   useEffect(() => {
     (async () => {
@@ -8971,6 +9025,7 @@ function Drivers() {
     };
   }).sort((a,b) => b.nv_stops - a.nv_stops), [drivers, classifications]);
 
+  // v2.40.33: sortable by column click via drvSort
   const filtered = useMemo(() => {
     let arr = classified;
     if (filter !== "all") arr = arr.filter(d => d.classification === filter);
@@ -8978,8 +9033,20 @@ function Drivers() {
       const q = search.toLowerCase();
       arr = arr.filter(d => d.name.toLowerCase().includes(q));
     }
-    return arr;
-  }, [classified, filter, search]);
+    // Apply manual sort (drvSort.sorted only works when rows are passed at init;
+    // here we sort the already-filtered arr inline using drvSort's state)
+    const { sortKey, sortDir } = drvSort;
+    if (!sortKey) return arr;
+    return [...arr].sort((a, b) => {
+      const av = sortKey === "sources" ? a.sources.length : a[sortKey];
+      const bv = sortKey === "sources" ? b.sources.length : b[sortKey];
+      if (av == null) return 1; if (bv == null) return -1;
+      const cmp = typeof av === "string"
+        ? av.localeCompare(bv, undefined, { numeric: true, sensitivity: "base" })
+        : av - bv;
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+  }, [classified, filter, search, drvSort.sortKey, drvSort.sortDir]);
 
   const setClass = async (key, name, newClass) => {
     setSaving(prev => ({...prev, [key]:true}));
@@ -9039,8 +9106,10 @@ function Drivers() {
       <table style={{width:"100%",fontSize:12,borderCollapse:"collapse"}}>
         <thead>
           <tr style={{background:T.bgSurface,borderBottom:`1px solid ${T.border}`}}>
-            {["Driver","Stops","Pay Base (SealNbr)","@40% (if 1099)","Payroll $","Sources","Last Seen","Classification"].map(h =>
-              <th key={h} style={{textAlign:"left",padding:"8px 10px",fontWeight:700,color:T.textMuted,fontSize:11}}>{h}</th>)}
+            {[["Driver","name"],["Stops","nv_stops"],["Pay Base","nv_pay_base"],["@40%","nv_pay_at_40"],["Payroll $","pay_gross"],["Sources","sources"],["Last Seen","last_seen"],["Classification","classification"]].map(([label,key]) => (
+              <SortableTh key={key} label={label} col={key} sortKey={drvSort.sortKey} sortDir={drvSort.sortDir} onSort={drvSort.toggleSort}
+                style={{textAlign:"left",padding:"8px 10px",fontWeight:700,color:drvSort.sortKey===key?T.brand:T.textMuted,fontSize:11,background:T.bgSurface}} />
+            ))}
           </tr>
         </thead>
         <tbody>
