@@ -581,8 +581,25 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
         const corePaid = hasPerProPayments && /^ULI-/i.test(pro) ? (paymentByPro[numericCore(pro)] || 0) : 0;
         const paid = rawPaid > 0 ? rawPaid : corePaid;
         const variance = billed - paid;
-        if (variance <= 1 && prior.variance > 1) {
-          // Uline paid. Transition to recovered_paid.
+        // v2.40.32: Two conditions must BOTH hold to credit as "recovered":
+        //   1) Variance dropped from >$1 to ≤$1 this pass (Uline paid)
+        //   2) User had previously engaged with the item (status !== "new")
+        //
+        // Previously only (1) was checked, which mis-credited 296 items as
+        // "Recovered this month" on Chad's first rebuild: every PRO that was
+        // first ingested pre-DDIS (paid=0, so prior.variance = billed) and
+        // later got normally paid hit this branch. These were never disputes,
+        // never short-pays — just AR timing. Chad hadn't recovered anything
+        // and the KPI showed $50.4K / 305 "disputes won".
+        //
+        // "Engaged" = item was triaged into the pipeline: queued, sent, or
+        // the user explicitly marked it recovered_paid. An item that was
+        // never touched (status="new") and then Uline paid it in normal
+        // course is not a recovery — it's just a shipment that cycled
+        // through AR. We drop it from audit_items entirely (no writeback).
+        const priorEngaged = prior.dispute_status && prior.dispute_status !== "new";
+        if (variance <= 1 && prior.variance > 1 && priorEngaged) {
+          // Uline paid AFTER user engaged — legit recovery. Transition to recovered_paid.
           const recoveredItem: any = {
             pro,
             customer: sf.customer?.stringValue || "Unknown",
@@ -613,15 +630,18 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
             recovered_at: nowIso,
             recovered_amount: prior.variance,
             rebuilt_from_firestore: true,
-            rebuild_source: "background_v2.40.18",
+            rebuild_source: "background_v2.40.32",
             updated_at: nowIso,
           };
           items.push({ docId: pro, item: recoveredItem });
           recoveredCount++;
           recoveredAmount += prior.variance;
         }
-        // else: still has variance but was sidelined — prior doc stays
-        // untouched. Don't write it back.
+        // else: still has variance but was sidelined, OR paid up without
+        // user engagement. In either case, prior doc stays untouched
+        // (sidelined) OR we implicitly let it drop out of audit_items
+        // (paid-up-with-no-engagement case). Note: the existing prior doc
+        // is still in Firestore; it'll need the cleanup backfill to go away.
       }
       // else: prior PRO not in unpaid_stops at all (stop was deleted/pruned).
       // Leave prior doc alone — it either shows the user a historical record
