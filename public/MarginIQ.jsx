@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.30";
+const APP_VERSION = "2.40.31";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -7862,11 +7862,19 @@ function Audit({ reconWeekly, weeklyRollups }) {
     </div>
 
     {/* v2.40.16: Date range filter — scopes the WHOLE audit dashboard (tiles + items). */}
-    {/* Lives above the items filter bar per spec, but is visible on every Audit sub-view    */}
-    {/* so users on the Dashboard tab can see + change what their KPIs are scoped to.        */}
-    <div style={{...cardStyle, padding:"10px 12px", marginBottom:8}}>
+    {/* v2.40.31: Strengthened visibility. Desktop screenshot showed it blending into     */}
+    {/* page background to the point users thought it was missing. Brand-pale bg +       */}
+    {/* left border accent + larger label make it unmissable.                             */}
+    <div style={{
+      background: T.brandPale,
+      border: `1px solid ${T.brand}33`,
+      borderLeft: `4px solid ${T.brand}`,
+      borderRadius: 8,
+      padding: "12px 14px",
+      marginBottom: 12,
+    }}>
       <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
-        <div style={{fontSize:11,fontWeight:700,color:T.textMuted,marginRight:4}}>📅 Range:</div>
+        <div style={{fontSize:13,fontWeight:700,color:T.brand,marginRight:8}}>📅 Date Range</div>
         {[
           ["all","All time"],
           ["this_month","This month"],
@@ -7888,8 +7896,8 @@ function Audit({ reconWeekly, weeklyRollups }) {
         )}
       </div>
       {rangeBounds && (
-        <div style={{fontSize:10,color:T.textMuted,marginTop:6}}>
-          Showing items with week_ending (or pu_date) between <b>{rangeBounds.from}</b> and <b>{rangeBounds.to}</b> • {rangedItems.length} of {itemsWithFreshAge.length} items in scope
+        <div style={{fontSize:11,color:T.brand,marginTop:8,fontWeight:600}}>
+          Scoped to <b>{rangeBounds.from}</b> → <b>{rangeBounds.to}</b> • <span style={{color:T.text}}>{rangedItems.length}</span> of {itemsWithFreshAge.length} items
         </div>
       )}
     </div>
@@ -8191,10 +8199,40 @@ function Audit({ reconWeekly, weeklyRollups }) {
               <option value="customer">Sort: customer</option>
             </select>
           </div>
-          <div style={{fontSize:10,color:T.textMuted,marginTop:6}}>
-            Showing {filteredItems.length} items • Min variance ${filterMinVar}
-            {Object.keys(selectedIds).filter(k=>selectedIds[k]).length > 0 && ` • ${selectedItems.length} selected`}
-          </div>
+          {/* v2.40.31: Totals strip. Prior version only showed a count. For the
+              "how much am I owed right now?" question this page exists to answer,
+              the user needed to eyeball 53+ variance cells and do the arithmetic
+              in their head. The three sums below collapse that to one glance and
+              update live as filters change. */}
+          {(() => {
+            const totBilled = filteredItems.reduce((s, i) => s + (i.billed || 0), 0);
+            const totPaid = filteredItems.reduce((s, i) => s + (i.paid || 0), 0);
+            const totVar = filteredItems.reduce((s, i) => s + (i.variance || 0), 0);
+            const selCount = Object.keys(selectedIds).filter(k => selectedIds[k]).length;
+            const selTot = selCount > 0 ? selectedItems.reduce((s, i) => s + (i.variance || 0), 0) : 0;
+            return (
+              <div style={{display:"flex",flexWrap:"wrap",gap:16,marginTop:10,paddingTop:10,borderTop:`1px solid ${T.borderLight}`,alignItems:"baseline"}}>
+                <div style={{fontSize:11,color:T.textMuted}}>
+                  <strong style={{color:T.text,fontSize:13}}>{filteredItems.length}</strong> items
+                  {filterMinVar > 0 && <span style={{color:T.textDim}}> (min ${filterMinVar})</span>}
+                </div>
+                <div style={{fontSize:11,color:T.textMuted}}>
+                  Billed <strong style={{color:T.text,fontSize:13}}>{fmt(totBilled)}</strong>
+                </div>
+                <div style={{fontSize:11,color:T.textMuted}}>
+                  Paid <strong style={{color:T.textDim,fontSize:13}}>{fmt(totPaid)}</strong>
+                </div>
+                <div style={{fontSize:11,color:T.textMuted}}>
+                  Owed <strong style={{color:T.red,fontSize:15,fontWeight:800}}>{fmt(totVar)}</strong>
+                </div>
+                {selCount > 0 && (
+                  <div style={{fontSize:11,color:T.textMuted,marginLeft:"auto",padding:"2px 10px",background:T.brandPale,borderRadius:4}}>
+                    <strong style={{color:T.brand,fontSize:12}}>{selCount}</strong> selected • <strong style={{color:T.brand}}>{fmt(selTot)}</strong> owed
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
 
         {/* v2.40.18: Uline export panel — dumps selected (or filtered if nothing selected)
