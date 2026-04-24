@@ -72,11 +72,19 @@ export default async (req: Request, context: Context) => {
     y -= 13;
     page.drawText(apContact.ap_contact_name || "Accounts Payable", { x: margin + 15, y, size: 10, font, color: DARK });
     y -= 12;
-    page.drawText(customer, { x: margin + 15, y, size: 10, font, color: DARK });
+    // The dispute goes to Uline AP — the end customer is the delivery recipient,
+    // not the party being billed. "customer" here is the end customer name which
+    // belongs in the line item detail, not the addressee block.
+    page.drawText("Uline", { x: margin + 15, y, size: 10, font, color: DARK });
+    y -= 12;
+    page.drawText("Attn: AP / Carrier Remittance", { x: margin + 15, y, size: 9, font, color: MUTED });
     if (apContact.billing_email) {
       y -= 12;
       page.drawText(apContact.billing_email, { x: margin + 15, y, size: 9, font, color: MUTED });
     }
+    y -= 12;
+    // Show what Uline customer this claim covers
+    page.drawText(`Re: Deliveries to ${customer}`, { x: margin + 15, y, size: 9, font, color: MUTED });
     y -= 24;
 
     // Summary
