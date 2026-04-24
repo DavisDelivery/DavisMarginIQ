@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.38";
+const APP_VERSION = "2.40.39";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -8116,17 +8116,9 @@ function Audit({ reconWeekly, weeklyRollups }) {
               </div>
               <div style={{display:"flex",gap:6}}>
                 <button onClick={() => {
-                  // Group by customer, one PDF per customer
-                  const byCust = {};
-                  for (const i of selectedItems) {
-                    const k = i.customer || "Unknown";
-                    if (!byCust[k]) byCust[k] = [];
-                    byCust[k].push(i);
-                  }
-                  const customers = Object.entries(byCust);
-                  if (customers.length > 1 && !confirm(`Generate ${customers.length} separate PDFs (one per customer)?`)) return;
+                  // All disputes go to Uline — generate ONE combined PDF
                   (async () => {
-                    for (const [cust, arr] of customers) await generateDisputePdf(arr, cust);
+                    await generateDisputePdf(selectedItems, "Uline");
                   })();
                 }} disabled={generatingPdf}
                   style={{padding:"6px 12px",fontSize:11,fontWeight:700,borderRadius:6,border:`1px solid ${T.brand}`,background:generatingPdf?T.bgSurface:T.brand,color:generatingPdf?T.text:"#fff",cursor:generatingPdf?"wait":"pointer"}}>
