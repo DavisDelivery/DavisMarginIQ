@@ -288,6 +288,35 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
       }
       if (amt > 0) paymentByPro[pro] = (paymentByPro[pro] || 0) + amt;
     }
+    // v2.40.36: Uline DAS bills under 7-digit PRO (e.g. "6968069"), but DDIS
+    // sometimes remits under the same PRO with a trailing check-digit
+    // appended (e.g. "69680691" = $211.29 for 6968069). Without aliasing,
+    // the audit rebuild thinks these stops were never paid — Chad found
+    // 33 of 55 "new" items in the queue were actually fully paid.
+    //
+    // Fix: for each DDIS PRO of length ≥8 that matches pattern <7-digit>+<extra>,
+    // also index it under the 7-digit prefix — UNLESS that 7-digit prefix
+    // already exists as an independent DDIS payment (collision case — the
+    // longer PRO is a distinct shipment, not a check-digit variant).
+    //
+    // 3 collision pairs exist in current data (374111491/37411149,
+    // 236911581/23691158, 68813171/6881317). Those stay unaliased.
+    const aliasedCount = { added: 0, skipped: 0 };
+    const ddisKeys = Object.keys(paymentByPro);
+    for (const longPro of ddisKeys) {
+      if (longPro.length < 8 || !/^\d+$/.test(longPro)) continue;
+      const shorter = longPro.slice(0, -1); // strip trailing char
+      if (shorter.length < 7) continue;
+      if (paymentByPro[shorter] !== undefined) {
+        // Real collision — don't alias
+        aliasedCount.skipped++;
+        continue;
+      }
+      // Safe to alias
+      paymentByPro[shorter] = paymentByPro[longPro];
+      aliasedCount.added++;
+    }
+    console.log(`audit-rebuild v2.40.36: aliased ${aliasedCount.added} payment PROs under 7-digit prefix (${aliasedCount.skipped} collisions preserved)`);
     const prosWithPayments = Object.keys(paymentByPro).length;
     const hasPerProPayments = prosWithPayments > 0;
     console.log(`audit-rebuild: ${payDocs.length} payment rows read, ${prosWithPayments} unique PROs with payments`);
@@ -483,7 +512,7 @@ async function rebuild(): Promise<{ ok: true; generated: number; written: number
         original_variance: prior?.original_variance || variance,
         first_seen_at: prior?.first_seen_at || new Date().toISOString(),
         rebuilt_from_firestore: true,
-        rebuild_source: "background_v2.40.18",
+        rebuild_source: "background_v2.40.36",
         updated_at: new Date().toISOString(),
       };
       // If item had been recovered_paid but variance reappeared, clear those fields
