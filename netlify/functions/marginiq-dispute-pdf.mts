@@ -101,9 +101,10 @@ export default async (req: Request, context: Context) => {
     page.drawText("LINE ITEM DETAIL", { x: margin, y, size: 11, font: fontBold, color: BRAND });
     y -= 18;
 
-    // Table header
-    const colX = [margin, margin + 85, margin + 175, margin + 285, margin + 345, margin + 410, margin + 470];
-    const headers = ["PRO", "Pickup Date", "Category", "Billed", "Paid", "Variance", "Age"];
+    // Columns match the Items tab view in MarginIQ:
+    // PRO | Customer | Billed | Paid | Variance | Age | Category
+    const colX = [margin, margin + 90, margin + 295, margin + 355, margin + 415, margin + 468, margin + 502];
+    const headers = ["PRO", "Customer", "Billed", "Paid", "Variance", "Age", "Category"];
     page.drawRectangle({ x: margin - 5, y: y - 4, width: width - margin * 2 + 10, height: 16, color: rgb(0.95, 0.97, 1) });
     for (let i = 0; i < headers.length; i++) {
       page.drawText(headers[i], { x: colX[i], y, size: 8, font: fontBold, color: BRAND });
@@ -115,23 +116,29 @@ export default async (req: Request, context: Context) => {
       if (y < 80) {
         page = pdf.addPage([612, 792]);
         y = height - 60;
+        // Repeat header on new page
+        page.drawRectangle({ x: margin - 5, y: y - 4, width: width - margin * 2 + 10, height: 16, color: rgb(0.95, 0.97, 1) });
+        for (let i = 0; i < headers.length; i++) {
+          page.drawText(headers[i], { x: colX[i], y, size: 8, font: fontBold, color: BRAND });
+        }
+        y -= 16;
       }
-      const pro = truncate(String(item.pro || ""), 12);
-      const pu = item.pu_date || "";
-      const cat = truncate(CATEGORY_LABELS[item.category] || item.category || "", 16);
+      const pro = truncate(String(item.pro || ""), 14);
+      const customer = truncate(String(item.customer || ""), 24);
       const billed = "$" + fmt(item.billed || 0);
       const paid = "$" + fmt(item.paid || 0);
       const variance = "$" + fmt((item.billed || 0) - (item.paid || 0));
       const age = item.age_days != null ? `${item.age_days}d` : "—";
+      const cat = truncate(CATEGORY_LABELS[item.category] || item.category || "", 12);
 
-      page.drawText(pro, { x: colX[0], y, size: 8, font, color: DARK });
-      page.drawText(pu, { x: colX[1], y, size: 8, font, color: DARK });
-      page.drawText(cat, { x: colX[2], y, size: 8, font, color: DARK });
-      page.drawText(billed, { x: colX[3], y, size: 8, font, color: DARK });
-      page.drawText(paid, { x: colX[4], y, size: 8, font, color: DARK });
-      page.drawText(variance, { x: colX[5], y, size: 8, font: fontBold, color: RED });
-      page.drawText(age, { x: colX[6], y, size: 8, font, color: MUTED });
-      y -= 12;
+      page.drawText(pro,      { x: colX[0], y, size: 8, font, color: DARK });
+      page.drawText(customer, { x: colX[1], y, size: 8, font, color: DARK });
+      page.drawText(billed,   { x: colX[2], y, size: 8, font, color: DARK });
+      page.drawText(paid,     { x: colX[3], y, size: 8, font, color: DARK });
+      page.drawText(variance, { x: colX[4], y, size: 8, font: fontBold, color: RED });
+      page.drawText(age,      { x: colX[5], y, size: 8, font, color: MUTED });
+      page.drawText(cat,      { x: colX[6], y, size: 8, font, color: DARK });
+      y -= 13;
     }
 
     y -= 15;
