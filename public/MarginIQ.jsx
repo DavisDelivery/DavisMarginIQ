@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.40";
+const APP_VERSION = "2.40.41";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3319,7 +3319,8 @@ function auditFilenames(files) {
       // classify the file.
       const hasDdisName = /^ddis820|\bddis\b/i.test(lower);
       const hasDisputeName = /dispute/i.test(name);
-      if (hasDdisName || hasDisputeName || isPdf) parseStatus = "no-date-ok";
+      const hasNuVizzName = /nuvizz|driver.?stops/i.test(name);
+      if (hasDdisName || hasDisputeName || hasNuVizzName || isPdf) parseStatus = "no-date-ok";
       else parseStatus = "unparsed";
     }
 
