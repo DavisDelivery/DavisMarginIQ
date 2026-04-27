@@ -146,5 +146,23 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // ─── Data Hub master collections (v2.41) ───
+    // Canonical employee roster — single source of truth across all Davis apps.
+    // SENTINEL, Fleet Mgmt, Dispatch, MarginIQ all read from here. Writes go
+    // through DataHubTab.jsx UI or ingestion functions.
+    match /employees/{employeeId} {
+      allow read, write: if true;
+    }
+
+    // Canonical vehicle roster (trucks, trailers, forklifts).
+    match /vehicles/{vehicleId} {
+      allow read, write: if true;
+    }
+
+    // Canonical customer master. Replaces customer_ap_contacts long-term.
+    match /customers/{customerId} {
+      allow read, write: if true;
+    }
+
   }
 }

@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.40.41";
+const APP_VERSION = "2.41.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10324,6 +10324,15 @@ function MarginIQ() {
     return "command";
   })();
   const [tab, setTab] = useState(initialTab);
+
+  // Expose setTab globally so DataHubTab.jsx (and other sister tabs) can navigate
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.__marginiqSetTab = setTab;
+    }
+    return () => { if (typeof window !== "undefined") window.__marginiqSetTab = null; };
+  }, []);
+
   const [costs, setCosts] = useState(DEFAULT_COSTS);
   const [weeklyRollups, setWeeklyRollups] = useState([]);
   const [reconWeekly, setReconWeekly] = useState([]);
@@ -10396,6 +10405,7 @@ function MarginIQ() {
     { id:"timeclock", icon:"⏰", label:"Time Clock" },
     { id:"fuel", icon:"⛽", label:"Fuel" },
     { id:"completeness", icon:"✅", label:"Data Health" },
+    { id:"datahub", icon:"🗄️", label:"Data Hub" },
     { id:"ingest", icon:"📤", label:"Data Ingest" },
     { id:"gmail", icon:"📧", label:"Gmail Sync" },
     { id:"runsheet", icon:"📋", label:"Run Sheet" },
@@ -10434,6 +10444,7 @@ function MarginIQ() {
     {!loading && tab==="timeclock" && (typeof window !== "undefined" && window.TimeClockTab ? React.createElement(window.TimeClockTab) : <EmptyState icon="⏰" title="Time Clock module not loaded" sub="TimeClockTab.jsx did not load. Check console." />)}
     {!loading && tab==="fuel" && <Fuel />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
+    {!loading && tab==="datahub" && (typeof window !== "undefined" && window.DataHubTab ? React.createElement(window.DataHubTab) : <EmptyState icon="🗄️" title="Data Hub module not loaded" sub="DataHubTab.jsx did not load. Check console." />)}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
