@@ -38,7 +38,7 @@ async function getKv(key: string, apiKey: string): Promise<any | null> {
   }
 }
 
-async function listAssignmentKeys(apiKey: string, limit = 8): Promise<string[]> {
+async function listAssignmentKeys(apiKey: string, limit = 4): Promise<string[]> {
   // Pull the most recent N weekly assignment docs.
   const url = `${FS_BASE}/kv?key=${apiKey}&pageSize=300`;
   const r = await fetch(url);
@@ -54,11 +54,14 @@ async function listAssignmentKeys(apiKey: string, limit = 8): Promise<string[]> 
 }
 
 async function getRecentTrucksAndAssignments(apiKey: string): Promise<{ trucks: string[]; assignments: Record<string, string> }> {
-  const keys = await listAssignmentKeys(apiKey, 8);
+  const keys = await listAssignmentKeys(apiKey, 4);
+  // Fetch all weeks in parallel (was sequential — caused 503 timeout)
+  const docs = await Promise.all(keys.map(k => getKv(k, apiKey)));
   const truckSet = new Set<string>();
   const assignments: Record<string, string> = {};
-  for (const key of [...keys].reverse()) {
-    const data = await getKv(key, apiKey);
+  // keys came back most-recent-first; iterate oldest-first so newest overwrites
+  for (let i = docs.length - 1; i >= 0; i--) {
+    const data = docs[i];
     if (!data || typeof data !== "object") continue;
     for (const [driverDay, truck] of Object.entries(data)) {
       if (!truck || typeof truck !== "string") continue;
@@ -76,6 +79,7 @@ async function getRecentTrucksAndAssignments(apiKey: string): Promise<{ trucks: 
 export default async (req: Request, _context: Context) => {
   const apiKey = getApiKey();
   if (!apiKey) {
+    console.error("[fleet-management] FLEET_MGMT_FIREBASE_KEY env var not set");
     return new Response(
       JSON.stringify({ error: "FLEET_MGMT_FIREBASE_KEY not configured on Netlify" }),
       { status: 500, headers: { "Content-Type": "application/json" } }
@@ -84,11 +88,12 @@ export default async (req: Request, _context: Context) => {
 
   const url = new URL(req.url);
   const action = url.searchParams.get("action") || "all";
+  const startedAt = Date.now();
 
   try {
     if (action === "drivers") {
       const drivers = (await getKv("fl-drivers", apiKey)) || [];
-      return new Response(JSON.stringify({ drivers, count: drivers.length }), {
+      return new Response(JSON.stringify({ drivers, count: drivers.length, ms: Date.now() - startedAt }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Cache-Control": "private, max-age=300" },
       });
@@ -96,7 +101,7 @@ export default async (req: Request, _context: Context) => {
 
     if (action === "trucks") {
       const { trucks, assignments } = await getRecentTrucksAndAssignments(apiKey);
-      return new Response(JSON.stringify({ trucks, assignments, truckCount: trucks.length }), {
+      return new Response(JSON.stringify({ trucks, assignments, truckCount: trucks.length, ms: Date.now() - startedAt }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Cache-Control": "private, max-age=300" },
       });
@@ -114,6 +119,7 @@ export default async (req: Request, _context: Context) => {
           trucks: trucksData.trucks,
           truckCount: trucksData.trucks.length,
           assignments: trucksData.assignments,
+          ms: Date.now() - startedAt,
         }),
         { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "private, max-age=300" } }
       );
@@ -124,7 +130,8 @@ export default async (req: Request, _context: Context) => {
       headers: { "Content-Type": "application/json" },
     });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: String(e?.message || e) }), {
+    console.error("[fleet-management] Error:", e?.message || e, e?.stack);
+    return new Response(JSON.stringify({ error: String(e?.message || e), action }), {
       status: 500,
       headers: { "Content-Type": "application/json" },
     });
