@@ -11,15 +11,21 @@
 //
 //   GET /api/fleet-management?action=all
 //     → both drivers and trucks in one round trip (used by Data Hub bootstrap)
+//
+// Required env var on Netlify: FLEET_MGMT_FIREBASE_KEY
+//   = the davisfleetmanagement project's web API key
 
 import type { Context, Config } from "@netlify/functions";
 
 const PROJECT = "davisfleetmanagement";
-const API_KEY = "AIzaSyCaaHZ0GuBoxl696-PzlgBQLPEad1xyiqw";
 const FS_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
 
-async function getKv(key: string): Promise<any | null> {
-  const url = `${FS_BASE}/kv/${encodeURIComponent(key)}?key=${API_KEY}`;
+function getApiKey(): string | null {
+  return process.env["FLEET_MGMT_FIREBASE_KEY"] || null;
+}
+
+async function getKv(key: string, apiKey: string): Promise<any | null> {
+  const url = `${FS_BASE}/kv/${encodeURIComponent(key)}?key=${apiKey}`;
   const r = await fetch(url);
   if (!r.ok) return null;
   const j: any = await r.json();
@@ -32,11 +38,9 @@ async function getKv(key: string): Promise<any | null> {
   }
 }
 
-async function listAssignmentKeys(limit = 8): Promise<string[]> {
+async function listAssignmentKeys(apiKey: string, limit = 8): Promise<string[]> {
   // Pull the most recent N weekly assignment docs.
-  // Firestore REST API supports collection listing only, not prefix filter,
-  // so we fetch the full kv collection and filter by id prefix.
-  const url = `${FS_BASE}/kv?key=${API_KEY}&pageSize=300`;
+  const url = `${FS_BASE}/kv?key=${apiKey}&pageSize=300`;
   const r = await fetch(url);
   if (!r.ok) return [];
   const j: any = await r.json();
@@ -45,24 +49,22 @@ async function listAssignmentKeys(limit = 8): Promise<string[]> {
     .map((d: any) => d.name.split("/").pop())
     .filter((k: string) => k.startsWith("fl-asgn-"))
     .sort()
-    .reverse(); // most recent first
+    .reverse();
   return keys.slice(0, limit);
 }
 
-async function getRecentTrucksAndAssignments(): Promise<{ trucks: string[]; assignments: Record<string, string> }> {
-  const keys = await listAssignmentKeys(8);
+async function getRecentTrucksAndAssignments(apiKey: string): Promise<{ trucks: string[]; assignments: Record<string, string> }> {
+  const keys = await listAssignmentKeys(apiKey, 8);
   const truckSet = new Set<string>();
-  const assignments: Record<string, string> = {}; // driverName -> most recent truck
-  // Process oldest-first so most recent overwrites older
+  const assignments: Record<string, string> = {};
   for (const key of [...keys].reverse()) {
-    const data = await getKv(key);
+    const data = await getKv(key, apiKey);
     if (!data || typeof data !== "object") continue;
     for (const [driverDay, truck] of Object.entries(data)) {
       if (!truck || typeof truck !== "string") continue;
       const t = String(truck).trim();
       if (!t) continue;
       truckSet.add(t);
-      // driverDay is "Allen Council-Mon" — pull driver name out
       const m = driverDay.match(/^(.+)-(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/);
       if (m) assignments[m[1]] = t;
     }
@@ -72,12 +74,20 @@ async function getRecentTrucksAndAssignments(): Promise<{ trucks: string[]; assi
 }
 
 export default async (req: Request, _context: Context) => {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    return new Response(
+      JSON.stringify({ error: "FLEET_MGMT_FIREBASE_KEY not configured on Netlify" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   const url = new URL(req.url);
   const action = url.searchParams.get("action") || "all";
 
   try {
     if (action === "drivers") {
-      const drivers = (await getKv("fl-drivers")) || [];
+      const drivers = (await getKv("fl-drivers", apiKey)) || [];
       return new Response(JSON.stringify({ drivers, count: drivers.length }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Cache-Control": "private, max-age=300" },
@@ -85,7 +95,7 @@ export default async (req: Request, _context: Context) => {
     }
 
     if (action === "trucks") {
-      const { trucks, assignments } = await getRecentTrucksAndAssignments();
+      const { trucks, assignments } = await getRecentTrucksAndAssignments(apiKey);
       return new Response(JSON.stringify({ trucks, assignments, truckCount: trucks.length }), {
         status: 200,
         headers: { "Content-Type": "application/json", "Cache-Control": "private, max-age=300" },
@@ -94,8 +104,8 @@ export default async (req: Request, _context: Context) => {
 
     if (action === "all") {
       const [drivers, trucksData] = await Promise.all([
-        getKv("fl-drivers").then(d => d || []),
-        getRecentTrucksAndAssignments(),
+        getKv("fl-drivers", apiKey).then(d => d || []),
+        getRecentTrucksAndAssignments(apiKey),
       ]);
       return new Response(
         JSON.stringify({
