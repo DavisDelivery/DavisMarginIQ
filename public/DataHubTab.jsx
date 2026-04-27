@@ -652,6 +652,8 @@ async function ensurePdfJs() {
 
 // Extract text from PDF preserving column alignment (parsePayroll.mjs needs
 // layout-aware text — items at similar y get joined into the same line).
+// Uses 2pt y-bucketing to handle small font-baseline differences within a
+// row (CyberPay PDFs often render labels and values 0.1-0.5pt apart vertically).
 async function pdfFileToLayoutText(file) {
   const pdfjs = await ensurePdfJs();
   const buffer = await file.arrayBuffer();
@@ -660,10 +662,10 @@ async function pdfFileToLayoutText(file) {
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
     const tc = await page.getTextContent();
-    // Group items by y-coordinate, then sort within line by x
+    // Group items by y-coordinate (round to nearest 2pt).
     const rowsByY = new Map();
     for (const it of tc.items) {
-      const y = Math.round((it.transform?.[5] ?? 0) * 10) / 10;
+      const y = Math.round((it.transform?.[5] ?? 0) / 2) * 2;
       if (!rowsByY.has(y)) rowsByY.set(y, []);
       rowsByY.get(y).push(it);
     }
@@ -677,7 +679,7 @@ async function pdfFileToLayoutText(file) {
         const x = it.transform?.[4] ?? 0;
         if (line.length > 0) {
           const gap = x - prevEndX;
-          // Roughly: pdfunits/3 ~ 1 space character for our payroll PDFs
+          // Roughly: 3 PDF units ~ 1 space character for our payroll PDFs
           const spaces = Math.max(1, Math.round(gap / 3));
           line += " ".repeat(Math.min(spaces, 12));
         }
@@ -722,29 +724,25 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
   const [progress, setProgress] = useState("");
 
   // Extract per-employee payroll ID from raw text using SSN as anchor.
-  // The PDFs lay out as:  "<SSN>:\nSS#:\n<...>:\n<NUMBER>\nID#:"
-  // so we scan for "<SSN>" then look ahead a few lines for "<digits>\s*ID#:"
+  // - 1099 PDF: data row format is "<payrollId> xxx-xx-NNNN ..." (ID may differ
+  //   from SSN last-4, e.g. "37 xxx-xx-7893" for George Leonard).
+  // - W2 PDF: data row format is "xxx-xx-NNNN ..." (no separate ID column);
+  //   we use SSN last-4 as the effective payroll ID.
   function extractPayrollIds(rawText) {
     const map = {}; // ssn -> payroll_id
     const lines = rawText.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const ssnMatch = lines[i].match(/xxx-xx-(\d{4})/);
-      if (!ssnMatch) continue;
-      const ssn = `xxx-xx-${ssnMatch[1]}`;
-      // Look ahead up to 12 lines for the ID# anchor
-      for (let j = i + 1; j < Math.min(i + 14, lines.length); j++) {
-        const idLine = lines[j].match(/^\s*([A-Za-z0-9-]+)\s*$/);
-        const nextLine = lines[j + 1] || "";
-        if (idLine && /^\s*ID#:/.test(nextLine)) {
-          map[ssn] = idLine[1];
-          break;
-        }
-        // Alternative format: same-line "<id>\s+ID#:"
-        const inlineMatch = lines[j].match(/^\s*([A-Za-z0-9-]+)\s+ID#:/);
-        if (inlineMatch) {
-          map[ssn] = inlineMatch[1];
-          break;
-        }
+    for (const line of lines) {
+      // 1099 form: "<id> xxx-xx-NNNN ..."
+      const m1099 = line.match(/^\s*([A-Za-z0-9-]+)\s+xxx-xx-(\d{4})/);
+      if (m1099 && !/^xxx-xx-/.test(m1099[1])) {
+        map[`xxx-xx-${m1099[2]}`] = m1099[1];
+        continue;
+      }
+      // W2 form: "xxx-xx-NNNN ..." (no ID column) — use SSN last-4
+      const mW2 = line.match(/^\s*xxx-xx-(\d{4})/);
+      if (mW2) {
+        const ssn = `xxx-xx-${mW2[1]}`;
+        if (!(ssn in map)) map[ssn] = mW2[1];
       }
     }
     return map;
