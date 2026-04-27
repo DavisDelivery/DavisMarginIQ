@@ -333,7 +333,7 @@ function DataHubTab() {
       })
     ),
     // ── Main content ──
-    React.createElement("main", { style: { flex: 1, padding: 20, maxWidth: 1100, overflow: "auto" } },
+    React.createElement("main", { style: { flex: 1, padding: 20, overflow: "auto", minWidth: 0 } },
       loading
         ? React.createElement(LoadingState)
         : section === "dashboard" ? React.createElement(IngestionStatus, { sources, data, onRefresh: refresh })
@@ -1147,20 +1147,20 @@ function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onC
     React.createElement("div", {
       style: { background: DH_T.bgCard, border: `1px solid ${DH_T.border}`, borderRadius: DH_T.radius, overflow: "auto", maxHeight: "calc(100vh - 320px)" }
     },
-      React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", minWidth: 1300 } },
+      React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", minWidth: 1500 } },
         React.createElement("thead", null,
           React.createElement("tr", null,
             React.createElement("th", { style: { ...headStyle, minWidth: 60 } }, "Src"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 170 } }, "Payee on Check"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 170 } }, "Driver / Person Name"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 110 } }, "Role"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 80, textAlign: "right" } }, "Pay"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 80, textAlign: "right" } }, "YTD"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 70 } }, "Payroll"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "B600"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "NuVizz"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 90 } }, "Motive"),
-            React.createElement("th", { style: { ...headStyle, minWidth: 80 } }, "Truck"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 200 } }, "Payee on Check"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 200 } }, "Driver / Person Name"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 120 } }, "Role"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 90, textAlign: "right" } }, "Pay"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 90, textAlign: "right" } }, "YTD"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 80 } }, "Payroll"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 180 } }, "B600"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 180 } }, "NuVizz"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "Motive"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 100 } }, "Truck"),
             React.createElement("th", { style: { ...headStyle, minWidth: 32 } }, "")
           )
         ),
@@ -1470,17 +1470,17 @@ function SpreadsheetTable({ employees, harvested, claimed, updateField, updateEx
       overflow: "auto", maxHeight: "calc(100vh - 280px)",
     }
   },
-    React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", minWidth: 1100 } },
+    React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", minWidth: 1300 } },
       React.createElement("thead", null,
         React.createElement("tr", null,
-          React.createElement("th", { style: { ...headStyle, minWidth: 160 } }, "Driver / Employee"),
-          React.createElement("th", { style: { ...headStyle, minWidth: 110 } }, "Role"),
-          React.createElement("th", { style: { ...headStyle, minWidth: 100 } }, "Payroll"),
-          React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "B600"),
-          React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "NuVizz"),
-          React.createElement("th", { style: { ...headStyle, minWidth: 90 } }, "Motive"),
-          React.createElement("th", { style: { ...headStyle, minWidth: 90 } }, "Truck #"),
-          React.createElement("th", { style: { ...headStyle, minWidth: 70 } }, "Status")
+          React.createElement("th", { style: { ...headStyle, minWidth: 200 } }, "Driver / Employee"),
+          React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "Role"),
+          React.createElement("th", { style: { ...headStyle, minWidth: 110 } }, "Payroll"),
+          React.createElement("th", { style: { ...headStyle, minWidth: 180 } }, "B600"),
+          React.createElement("th", { style: { ...headStyle, minWidth: 180 } }, "NuVizz"),
+          React.createElement("th", { style: { ...headStyle, minWidth: 120 } }, "Motive"),
+          React.createElement("th", { style: { ...headStyle, minWidth: 100 } }, "Truck #"),
+          React.createElement("th", { style: { ...headStyle, minWidth: 90 } }, "Status")
         )
       ),
       React.createElement("tbody", null,
@@ -1682,7 +1682,7 @@ function TypeaheadCell({ value, employeeId, options, displayMap, claimed, onChan
         }),
         React.createElement("div", {
           style: {
-            position: "absolute", top: "100%", left: 0, marginTop: 2, minWidth: 200, maxWidth: 280, maxHeight: 240,
+            position: "absolute", top: "100%", left: 0, marginTop: 2, minWidth: 240, maxWidth: 360, maxHeight: 280,
             overflowY: "auto", background: "#fff", border: `1px solid ${DH_T.border}`, borderRadius: 6,
             boxShadow: "0 8px 24px rgba(0,0,0,0.12)", zIndex: 50,
           }
