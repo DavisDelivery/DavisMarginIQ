@@ -784,11 +784,13 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
     setPhase("parsing");
     setParseError(null);
     const candidates = [];
+    const diagnostics = [];
     try {
       for (const [file, label] of [[w2File, "W2"], [p1099File, "1099"]]) {
         if (!file) continue;
-        setProgress(`Reading ${label} PDF…`);
+        setProgress(`Reading ${label} PDF (${file.name})…`);
         const rawText = await pdfFileToLayoutText(file);
+        diagnostics.push(`${label}: extracted ${rawText.length.toLocaleString()} chars from ${file.name}`);
         setProgress(`Parsing ${label} payroll structure…`);
         const resp = await fetch("/api/scan-payroll", {
           method: "POST",
@@ -801,19 +803,24 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
         }
         const result = await resp.json();
         const company = result.company;
-        const employees = result.employees || [];
+        const parsedEmployees = result.employees || [];
+        diagnostics.push(`${label}: parser returned company=${company || "?"}, employees=${parsedEmployees.length}`);
+        if (parsedEmployees.length === 0) {
+          diagnostics.push(`${label}: ⚠ Zero employees extracted — likely PDF format mismatch. Check console for raw text dump.`);
+          // eslint-disable-next-line no-console
+          console.warn(`[BootstrapPanel] ${label} PDF returned 0 employees. First 1500 chars of extracted text:\n` + rawText.slice(0, 1500));
+        }
         const idMap = extractPayrollIds(rawText);
 
-        for (const e of employees) {
+        for (const e of parsedEmployees) {
           const name = dhNormalizeName(e.rawName || e.name);
           if (!name) continue;
           const id = dhKey(name);
-          const payrollId = idMap[e.ssn] || "";
+          const payrollId = idMap[e.ssn] || (e.ssn ? e.ssn.replace("xxx-xx-", "") : "");
           const payInfo = inferPayInfo(e, company);
           let role = "unknown";
 
           if (company === "0189") {
-            // 1099 — owner-op or contractor; payee may be LLC name
             role = "owner_op";
             const isLLC = /LLC|INC|CORP|TRANSPORTATION|DELIVERY|EXPRESS|LOGISTICS|FREIGHT|TRANSPORT|INVESTORS|NETWORK|ENTERPRISE|SERVICES?|DBA/i.test(name);
             candidates.push({
@@ -829,7 +836,6 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
               actualDriverName: isLLC ? null : name,
             });
           } else {
-            // 0190 W2 — guess role from pay info + known business knowledge
             const rate = payInfo.payRate;
             if (payInfo.payType === "salary" && rate >= 1500) role = "management";
             else if (payInfo.payType === "salary" && rate >= 1100) role = "driver";
@@ -853,8 +859,10 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
           }
         }
       }
+      // eslint-disable-next-line no-console
+      console.log("[BootstrapPanel] " + diagnostics.join(" · "));
       if (candidates.length === 0) {
-        throw new Error("No employees extracted. Make sure these are CyberPay payroll PDFs from Southern Payroll Services.");
+        throw new Error("No employees extracted. " + diagnostics.join("; ") + ". Make sure these are CyberPay payroll PDFs from Southern Payroll Services.");
       }
       setRows(candidates);
       setPhase("review");
@@ -874,6 +882,14 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
       for (const row of rows) {
         if (!row.actualDriverName) continue; // skip unresolved LLCs
         const id = dhKey(row.actualDriverName);
+        const aliases = [];
+        if (row.isLLC && row.llcName) aliases.push(row.llcName);
+        if (row.externalIds?.b600 && row.externalIds.b600 !== row.actualDriverName) {
+          aliases.push(row.externalIds.b600);
+        }
+        if (row.externalIds?.nuvizz && row.externalIds.nuvizz !== row.actualDriverName) {
+          aliases.push(row.externalIds.nuvizz);
+        }
         await DH.saveEmployee(id, {
           fullName: row.actualDriverName,
           firstName: row.actualDriverName.split(" ")[0],
@@ -883,7 +899,8 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
           payRate: row.payRate || 0,
           payType: row.payType,
           externalIds: row.externalIds || {},
-          aliases: row.isLLC && row.llcName ? [row.llcName] : [],
+          defaultTruck: row.defaultTruck || null,
+          aliases: [...new Set(aliases)],
           source: row.source,
           ytdGross: row.ytdGross,
           createdAt: new Date().toISOString(),
@@ -945,7 +962,7 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
     ),
 
     phase === "review" && React.createElement(BootstrapReview, {
-      rows, updateRow, removeRow,
+      data, rows, updateRow, removeRow,
       onSave: saveAll,
       onBack: () => setPhase("upload"),
       onCancel,
@@ -994,87 +1011,285 @@ function PdfDropzone({ label, file, onChange, hint }) {
   );
 }
 
-function BootstrapReview({ rows, updateRow, removeRow, onSave, onBack, onCancel }) {
+function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onCancel }) {
   const w2Count = rows.filter(r => r.source === "W2").length;
   const llcUnresolved = rows.filter(r => r.isLLC && !r.actualDriverName).length;
-  const cellStyle = { padding: "6px 8px", fontSize: 11, borderBottom: `1px solid ${DH_T.borderLight}`, verticalAlign: "middle" };
-  const headStyle = { padding: "6px 10px", fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: DH_T.textMuted, background: DH_T.bgSurface, textAlign: "left", borderBottom: `1px solid ${DH_T.border}`, position: "sticky", top: 0, zIndex: 1 };
+
+  // Harvest distinct values from real source collections
+  const harvested = useMemo(() => harvestSourceValues(data), [data]);
+
+  // Track what's claimed across pending rows (so dropdowns graylist correctly).
+  // Build claim maps from the rows themselves (not from the saved employees,
+  // because nothing's saved yet during bootstrap).
+  const claimed = useMemo(() => {
+    const c = { payroll: new Map(), b600: new Map(), nuvizz: new Map(), motive: new Map(), samsara: new Map(), truck: new Map() };
+    for (const r of rows) {
+      const ext = r.externalIds || {};
+      if (ext.payroll) c.payroll.set(String(ext.payroll), r.id);
+      if (ext.b600) c.b600.set(String(ext.b600), r.id);
+      if (ext.nuvizz) c.nuvizz.set(String(ext.nuvizz), r.id);
+      if (ext.motive) c.motive.set(String(ext.motive), r.id);
+      if (r.defaultTruck) c.truck.set(String(r.defaultTruck), r.id);
+    }
+    return c;
+  }, [rows]);
+
+  // Auto-match name -> source values (one-shot on mount; manual edits override)
+  const [autoMatched, setAutoMatched] = useState(false);
+  React.useEffect(() => {
+    if (autoMatched) return;
+    if (rows.length === 0) return;
+
+    const nameKey = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const lastTokens = s => {
+      const k = nameKey(s);
+      const parts = k.split(" ");
+      return { full: k, last: parts[parts.length - 1], first: parts[0] };
+    };
+
+    // Build searchable indexes for each source
+    const buildIndex = (set) => {
+      const list = [...set];
+      return list.map(v => ({ raw: v, ...lastTokens(v) }));
+    };
+    const b600Index = buildIndex(harvested.b600);
+    const nuvizzIndex = buildIndex(harvested.nuvizz);
+
+    const findMatch = (driverName, index, alreadyClaimed) => {
+      if (!driverName) return null;
+      const t = lastTokens(driverName);
+      // 1. exact full-name match
+      let m = index.find(o => o.full === t.full);
+      if (m && !alreadyClaimed.has(m.raw)) return m.raw;
+      // 2. last name + first initial
+      const firstInitial = t.first.charAt(0);
+      m = index.find(o => o.last === t.last && o.first.charAt(0) === firstInitial);
+      if (m && !alreadyClaimed.has(m.raw)) return m.raw;
+      // 3. last name only (only if unique)
+      const lastMatches = index.filter(o => o.last === t.last);
+      if (lastMatches.length === 1 && !alreadyClaimed.has(lastMatches[0].raw)) return lastMatches[0].raw;
+      return null;
+    };
+
+    const claimedB600 = new Set();
+    const claimedNuvizz = new Set();
+    let anyChange = false;
+    rows.forEach((r, i) => {
+      const driver = r.actualDriverName;
+      if (!driver) return;
+      const ext = r.externalIds || {};
+      const patch = { externalIds: { ...ext } };
+      if (!ext.b600) {
+        const m = findMatch(driver, b600Index, claimedB600);
+        if (m) { patch.externalIds.b600 = m; claimedB600.add(m); anyChange = true; }
+      } else { claimedB600.add(ext.b600); }
+      if (!ext.nuvizz) {
+        const m = findMatch(driver, nuvizzIndex, claimedNuvizz);
+        if (m) { patch.externalIds.nuvizz = m; claimedNuvizz.add(m); anyChange = true; }
+      } else { claimedNuvizz.add(ext.nuvizz); }
+      if (anyChange) updateRow(i, patch);
+    });
+    setAutoMatched(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows.length, harvested]);
 
   const willSave = rows.filter(r => r.actualDriverName).length;
+  const matchStats = useMemo(() => {
+    let b600 = 0, nuvizz = 0;
+    for (const r of rows) {
+      if (r.actualDriverName) {
+        if (r.externalIds?.b600) b600++;
+        if (r.externalIds?.nuvizz) nuvizz++;
+      }
+    }
+    return { b600, nuvizz };
+  }, [rows]);
+
+  const headStyle = {
+    padding: "6px 10px", fontSize: 9, fontWeight: 700, textTransform: "uppercase",
+    letterSpacing: "0.05em", color: DH_T.textMuted, background: DH_T.bgSurface,
+    textAlign: "left", borderBottom: `1px solid ${DH_T.border}`,
+    position: "sticky", top: 0, zIndex: 2, whiteSpace: "nowrap",
+  };
+  const cellStyle = {
+    padding: "5px 8px", fontSize: 11, borderBottom: `1px solid ${DH_T.borderLight}`,
+    verticalAlign: "middle",
+  };
+  const numStyle = { ...cellStyle, fontFamily: "ui-monospace, monospace", fontSize: 10, color: DH_T.textMuted, textAlign: "right" };
+
+  const updateExt = (i, system, value) => {
+    const r = rows[i];
+    const newExt = { ...(r.externalIds || {}), [system]: value || null };
+    updateRow(i, { externalIds: newExt });
+  };
 
   return React.createElement("div", null,
+    // Header summary
     React.createElement("div", {
-      style: { background: DH_T.brandPale, border: `1px solid ${DH_T.brand}`, borderRadius: DH_T.radius, padding: 14, marginBottom: 12, display: "flex", gap: 12, alignItems: "center" }
+      style: { background: DH_T.brandPale, border: `1px solid ${DH_T.brand}`, borderRadius: DH_T.radius, padding: 14, marginBottom: 12, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }
     },
       React.createElement("div", { style: { fontSize: 24 } }, "🔍"),
-      React.createElement("div", { style: { flex: 1 } },
+      React.createElement("div", { style: { flex: 1, minWidth: 240 } },
         React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: DH_T.text } },
           `Extracted ${rows.length} entries · ${w2Count} W2 · ${rows.length - w2Count} 1099`),
         React.createElement("div", { style: { fontSize: 11, color: DH_T.textMuted, marginTop: 2 } },
-          llcUnresolved > 0
-            ? `⚠️ ${llcUnresolved} LLC payees need a driver name before they can be saved.`
-            : "Review roles, set driver names for any LLC payees, then save."
-        )
+          `Auto-matched ${matchStats.b600} B600 · ${matchStats.nuvizz} NuVizz from real data sources.`,
+          llcUnresolved > 0 ? ` ⚠️ ${llcUnresolved} LLC payees still need driver names.` : "")
+      ),
+      React.createElement("div", { style: { display: "flex", gap: 12, fontSize: 10, color: DH_T.textMuted } },
+        React.createElement(StatPill, { label: "B600 source", value: harvested.b600.size }),
+        React.createElement(StatPill, { label: "NuVizz source", value: harvested.nuvizz.size }),
+        React.createElement(StatPill, { label: "Trucks source", value: harvested.truck.size }),
       )
     ),
 
-    React.createElement("div", { style: { background: DH_T.bgCard, border: `1px solid ${DH_T.border}`, borderRadius: DH_T.radius, overflow: "hidden", maxHeight: 540, overflowY: "auto" } },
-      React.createElement("table", { style: { width: "100%", borderCollapse: "collapse" } },
+    // Big table
+    React.createElement("div", {
+      style: { background: DH_T.bgCard, border: `1px solid ${DH_T.border}`, borderRadius: DH_T.radius, overflow: "auto", maxHeight: "calc(100vh - 320px)" }
+    },
+      React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", minWidth: 1300 } },
         React.createElement("thead", null,
           React.createElement("tr", null,
-            React.createElement("th", { style: headStyle }, "Source"),
-            React.createElement("th", { style: headStyle }, "Payee on Check"),
-            React.createElement("th", { style: headStyle }, "Driver / Person Name"),
-            React.createElement("th", { style: headStyle }, "Role"),
-            React.createElement("th", { style: headStyle }, "Pay"),
-            React.createElement("th", { style: headStyle }, "YTD"),
-            React.createElement("th", { style: headStyle }, "Payroll ID"),
-            React.createElement("th", { style: headStyle }, "")
+            React.createElement("th", { style: { ...headStyle, minWidth: 60 } }, "Src"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 170 } }, "Payee on Check"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 170 } }, "Driver / Person Name"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 110 } }, "Role"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 80, textAlign: "right" } }, "Pay"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 80, textAlign: "right" } }, "YTD"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 70 } }, "Payroll"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "B600"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "NuVizz"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 90 } }, "Motive"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 80 } }, "Truck"),
+            React.createElement("th", { style: { ...headStyle, minWidth: 32 } }, "")
           )
         ),
         React.createElement("tbody", null,
-          rows.map((r, i) => React.createElement("tr", { key: i, style: r.isLLC && !r.actualDriverName ? { background: DH_T.yellowBg + "40" } : {} },
-            React.createElement("td", { style: cellStyle },
-              React.createElement("span", {
-                style: { fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: r.source === "W2" ? DH_T.blueBg : DH_T.purpleBg, color: r.source === "W2" ? DH_T.blueText : DH_T.purpleText }
-              }, r.source)
-            ),
-            React.createElement("td", { style: { ...cellStyle, fontWeight: 600, color: r.isLLC ? DH_T.purpleText : DH_T.text } }, r.fullName),
-            React.createElement("td", { style: cellStyle },
-              r.isLLC
-                ? React.createElement("input", {
-                    type: "text", value: r.actualDriverName || "", placeholder: "Enter driver name…",
-                    onChange: e => updateRow(i, { actualDriverName: e.target.value }),
-                    style: { padding: "3px 7px", fontSize: 11, border: `1px solid ${r.actualDriverName ? DH_T.border : DH_T.yellow}`, borderRadius: 4, fontFamily: "inherit", width: "100%", outline: "none", background: r.actualDriverName ? "#fff" : DH_T.yellowBg }
-                  })
-                : React.createElement("span", { style: { color: DH_T.text } }, r.actualDriverName)
-            ),
-            React.createElement("td", { style: cellStyle },
-              React.createElement("select", {
-                value: r.role, onChange: e => updateRow(i, { role: e.target.value }),
-                style: { padding: "3px 5px", fontSize: 10, border: `1px solid ${DH_T.border}`, borderRadius: 4, fontFamily: "inherit", background: "#fff" }
-              }, ROLE_OPTIONS.map(o => React.createElement("option", { key: o.id, value: o.id }, o.label)))
-            ),
-            React.createElement("td", { style: { ...cellStyle, fontFamily: "ui-monospace, monospace", fontSize: 10 } },
-              `$${r.payRate.toFixed(r.payType === "hourly" ? 2 : 0)} ${r.payType === "hourly" ? "/hr" : "/wk"}`),
-            React.createElement("td", { style: { ...cellStyle, fontFamily: "ui-monospace, monospace", fontSize: 10, color: DH_T.textMuted } },
-              "$" + (r.ytdGross || 0).toLocaleString()),
-            React.createElement("td", { style: { ...cellStyle, fontFamily: "ui-monospace, monospace", fontSize: 10 } },
-              r.externalIds?.payroll || "—"),
-            React.createElement("td", { style: cellStyle },
-              React.createElement("button", {
-                onClick: () => removeRow(i),
-                style: { padding: "2px 6px", fontSize: 10, color: DH_T.textMuted, background: "transparent", border: "none", cursor: "pointer", fontFamily: "inherit" }
-              }, "✕")
-            )
-          ))
+          rows.map((r, i) => {
+            const ext = r.externalIds || {};
+            const needsName = r.isLLC && !r.actualDriverName;
+            return React.createElement("tr", {
+              key: i,
+              style: needsName ? { background: DH_T.yellowBg + "40" } : {}
+            },
+              // Source badge
+              React.createElement("td", { style: cellStyle },
+                React.createElement("span", {
+                  style: { fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: r.source === "W2" ? DH_T.blueBg : DH_T.purpleBg, color: r.source === "W2" ? DH_T.blueText : DH_T.purpleText }
+                }, r.source)
+              ),
+              // Payee on Check (read-only label)
+              React.createElement("td", {
+                style: { ...cellStyle, fontWeight: 600, color: r.isLLC ? DH_T.purpleText : DH_T.text }
+              }, r.fullName),
+              // Driver / Person Name (editable for LLCs)
+              React.createElement("td", { style: cellStyle },
+                r.isLLC
+                  ? React.createElement("input", {
+                      type: "text", value: r.actualDriverName || "", placeholder: "Driver name…",
+                      onChange: e => updateRow(i, { actualDriverName: e.target.value }),
+                      style: { padding: "3px 7px", fontSize: 11, border: `1px solid ${r.actualDriverName ? DH_T.border : DH_T.yellow}`, borderRadius: 4, fontFamily: "inherit", width: "100%", outline: "none", background: r.actualDriverName ? "#fff" : DH_T.yellowBg }
+                    })
+                  : React.createElement("span", { style: { color: DH_T.text } }, r.actualDriverName)
+              ),
+              // Role
+              React.createElement("td", { style: cellStyle },
+                React.createElement("select", {
+                  value: r.role, onChange: e => updateRow(i, { role: e.target.value }),
+                  style: { padding: "3px 5px", fontSize: 10, border: `1px solid ${DH_T.border}`, borderRadius: 4, fontFamily: "inherit", background: "#fff" }
+                }, ROLE_OPTIONS.map(o => React.createElement("option", { key: o.id, value: o.id }, o.label)))
+              ),
+              // Pay
+              React.createElement("td", { style: numStyle },
+                r.payRate
+                  ? `$${r.payRate.toFixed(r.payType === "hourly" ? 2 : 0)}${r.payType === "hourly" ? "/hr" : "/wk"}`
+                  : "—"
+              ),
+              // YTD
+              React.createElement("td", { style: numStyle },
+                r.ytdGross ? "$" + Math.round(r.ytdGross).toLocaleString() : "—"
+              ),
+              // Payroll ID (read-only — comes from PDF)
+              React.createElement("td", { style: { ...cellStyle, fontFamily: "ui-monospace, monospace", fontSize: 10, color: DH_T.text } },
+                ext.payroll || "—"
+              ),
+              // B600 typeahead
+              React.createElement("td", { style: cellStyle },
+                React.createElement(TypeaheadCell, {
+                  value: ext.b600, employeeId: r.id,
+                  options: harvested.b600, displayMap: harvested.b600Names,
+                  claimed: claimed.b600,
+                  onChange: v => updateExt(i, "b600", v),
+                  placeholder: "—",
+                })
+              ),
+              // NuVizz typeahead
+              React.createElement("td", { style: cellStyle },
+                React.createElement(TypeaheadCell, {
+                  value: ext.nuvizz, employeeId: r.id,
+                  options: harvested.nuvizz, displayMap: harvested.nuvizzDisplay,
+                  claimed: claimed.nuvizz,
+                  onChange: v => updateExt(i, "nuvizz", v),
+                  placeholder: "—",
+                })
+              ),
+              // Motive typeahead (lazy-loaded)
+              React.createElement("td", { style: cellStyle },
+                React.createElement(TypeaheadCell, {
+                  value: ext.motive, employeeId: r.id,
+                  options: harvested.motive, displayMap: harvested.motiveNames,
+                  claimed: claimed.motive,
+                  onChange: v => updateExt(i, "motive", v),
+                  placeholder: "—", monoFont: true,
+                  loadOptions: async () => {
+                    try {
+                      const resp = await fetch("/.netlify/functions/marginiq-motive?action=drivers");
+                      if (!resp.ok) return null;
+                      const j = await resp.json();
+                      const drivers = j.drivers || [];
+                      const opts = new Set();
+                      const names = new Map();
+                      for (const d of drivers) {
+                        const id = String(d.id || "");
+                        const nm = d.first_name && d.last_name ? `${d.first_name} ${d.last_name}` : "";
+                        if (id) {
+                          opts.add(id);
+                          if (nm) names.set(id, nm);
+                        }
+                      }
+                      return { options: opts, displayMap: names };
+                    } catch { return null; }
+                  },
+                })
+              ),
+              // Truck typeahead
+              React.createElement("td", { style: cellStyle },
+                React.createElement(TypeaheadCell, {
+                  value: r.defaultTruck, employeeId: r.id,
+                  options: harvested.truck, displayMap: new Map(),
+                  claimed: claimed.truck,
+                  onChange: v => updateRow(i, { defaultTruck: v }),
+                  placeholder: "—", monoFont: true,
+                })
+              ),
+              // Remove
+              React.createElement("td", { style: cellStyle },
+                React.createElement("button", {
+                  onClick: () => removeRow(i),
+                  title: "Remove this row",
+                  style: { padding: "2px 6px", fontSize: 10, color: DH_T.textMuted, background: "transparent", border: "none", cursor: "pointer", fontFamily: "inherit" }
+                }, "✕")
+              )
+            );
+          })
         )
       )
     ),
 
-    React.createElement("div", { style: { marginTop: 14, display: "flex", justifyContent: "space-between", alignItems: "center" } },
+    React.createElement("div", { style: { marginTop: 14, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 } },
       React.createElement("div", { style: { fontSize: 11, color: DH_T.textMuted } },
-        `Will save ${willSave} of ${rows.length} entries (${rows.length - willSave} skipped due to missing driver names)`),
+        `Will save ${willSave} of ${rows.length} entries`,
+        rows.length - willSave > 0 ? ` (${rows.length - willSave} skipped — set driver names above)` : ""),
       React.createElement("div", { style: { display: "flex", gap: 8 } },
         React.createElement("button", {
           onClick: onBack,
@@ -1086,6 +1301,13 @@ function BootstrapReview({ rows, updateRow, removeRow, onSave, onBack, onCancel 
         }, `Create roster (${willSave}) →`)
       )
     )
+  );
+}
+
+function StatPill({ label, value }) {
+  return React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "end" } },
+    React.createElement("div", { style: { fontSize: 14, fontWeight: 700, color: DH_T.text } }, value),
+    React.createElement("div", { style: { fontSize: 9, color: DH_T.textMuted, textTransform: "uppercase", letterSpacing: "0.05em" } }, label)
   );
 }
 
