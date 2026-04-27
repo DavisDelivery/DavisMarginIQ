@@ -550,23 +550,26 @@ function SourceCard({ src }) {
 // Walk every existing collection once and pull every distinct value
 // each data source has used to identify a person/vehicle. These become
 // the dropdown options for each cell.
-function harvestSourceValues(data) {
+function harvestSourceValues(data, fleetMgmt) {
   const harvested = {
-    payroll: new Set(),    // payroll IDs (e.g. "3953", "9266")
-    payrollNames: new Map(), // id -> latest seen name (for display)
-    b600: new Set(),       // b600 employee IDs or names
-    b600Names: new Map(),  // id -> name
-    nuvizz: new Set(),     // nuvizz driver names (canonical key)
-    nuvizzDisplay: new Map(), // key -> latest display name
-    motive: new Set(),     // motive driver IDs (numeric)
+    payroll: new Set(),
+    payrollNames: new Map(),
+    b600: new Set(),
+    b600Names: new Map(),
+    nuvizz: new Set(),
+    nuvizzDisplay: new Map(),
+    motive: new Set(),
     motiveNames: new Map(),
     samsara: new Set(),
-    truck: new Set(),      // truck numbers from fuel_by_truck + vehicles
+    truck: new Set(),
+    truckAssignments: new Map(), // driverName -> latest truck (from Fleet Mgmt)
+    fleetDrivers: [],           // [{ name, role, category }] — definitive role list
   };
 
-  // Payroll — IDs from payroll_weekly.employees[].payroll_id
-  for (const wk of data.payroll) {
-    for (const e of (wk.employees || [])) {
+  // Payroll — IDs from payroll_weekly.employees[].payroll_id (or top_employees fallback)
+  for (const wk of (data.payroll || [])) {
+    const list = wk.employees || wk.top_employees || [];
+    for (const e of list) {
       const id = e.payroll_id || e.id || e.employee_id;
       if (id) {
         harvested.payroll.add(String(id));
@@ -575,23 +578,22 @@ function harvestSourceValues(data) {
     }
   }
 
-  // B600 — from timeclock_weekly.employees[].employee_id and .name
-  for (const wk of data.timeclock) {
-    for (const e of (wk.employees || [])) {
-      const id = e.employee_id || e.b600_id;
-      const nm = e.name;
-      // We use the NAME as the displayable value (B600 punches list names),
-      // but store the id alongside if available.
-      const key = nm || id;
-      if (key) {
-        harvested.b600.add(String(key));
-        if (id && nm) harvested.b600Names.set(String(key), `id ${id}`);
+  // B600 — from timeclock_weekly.top_employees[].name (the actual stored shape)
+  for (const wk of (data.timeclock || [])) {
+    const list = wk.top_employees || wk.employees || [];
+    for (const e of list) {
+      const nm = e.name || e.employee_name;
+      if (nm) {
+        const key = String(nm).trim();
+        harvested.b600.add(key);
+        // No separate ID in current schema — display the name itself
+        harvested.b600Names.set(key, key);
       }
     }
   }
 
   // NuVizz — driver names from nuvizz_weekly.top_drivers[].name
-  for (const wk of data.nuvizz) {
+  for (const wk of (data.nuvizz || [])) {
     for (const d of (wk.top_drivers || [])) {
       if (d.name) {
         const key = String(d.name).trim();
@@ -603,18 +605,66 @@ function harvestSourceValues(data) {
     }
   }
 
-  // Trucks — from fuel_by_truck and vehicles
-  for (const r of data.fuelByTruck) {
-    if (r.truck_number) harvested.truck.add(String(r.truck_number));
+  // Trucks — fuel_by_truck uses truck_id, NOT truck_number
+  for (const r of (data.fuelByTruck || [])) {
+    const t = r.truck_id || r.truck_number;
+    if (t && t !== "INVENTORY") harvested.truck.add(String(t));
   }
-  for (const v of data.vehicles) {
-    if (v.truckNumber) harvested.truck.add(String(v.truckNumber));
+  for (const v of (data.vehicles || [])) {
+    const t = v.truckNumber || v.truck_id;
+    if (t) harvested.truck.add(String(t));
   }
 
-  // Motive — pulled from a separate live API call (see useMotiveDrivers)
+  // Fleet Management — definitive truck list + driver→truck assignments + driver roles
+  if (fleetMgmt) {
+    for (const t of (fleetMgmt.trucks || [])) {
+      harvested.truck.add(String(t));
+    }
+    for (const [driver, truck] of Object.entries(fleetMgmt.assignments || {})) {
+      harvested.truckAssignments.set(driver, String(truck));
+    }
+    harvested.fleetDrivers = fleetMgmt.drivers || [];
+  }
+
+  // Motive — populated lazily via /api/marginiq-motive?action=drivers
   // Samsara — future
-
   return harvested;
+}
+
+// Map Fleet Management role string -> our canonical role id
+function fleetMgmtRoleToCanonical(role) {
+  if (!role) return null;
+  const r = String(role).toLowerCase();
+  if (r.includes("uline") && r.includes("shuttle")) return "shuttle_driver";
+  if (r.includes("owner")) return "owner_op";
+  if (r.includes("tractor") || r.includes("straight")) return "driver";
+  return null;
+}
+
+// Find the Fleet Management entry that best matches a driver name
+function matchFleetDriver(name, fleetDrivers) {
+  if (!name || !fleetDrivers || fleetDrivers.length === 0) return null;
+  const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const target = norm(name);
+  // 1. exact match
+  let m = fleetDrivers.find(d => norm(d.name) === target);
+  if (m) return m;
+  // 2. last-name + first-initial match
+  const targetParts = target.split(" ");
+  const targetLast = targetParts[targetParts.length - 1];
+  const targetFI = targetParts[0]?.charAt(0);
+  m = fleetDrivers.find(d => {
+    const p = norm(d.name).split(" ");
+    return p[p.length - 1] === targetLast && p[0]?.charAt(0) === targetFI;
+  });
+  if (m) return m;
+  // 3. unique last name
+  const lastMatches = fleetDrivers.filter(d => {
+    const p = norm(d.name).split(" ");
+    return p[p.length - 1] === targetLast;
+  });
+  if (lastMatches.length === 1) return lastMatches[0];
+  return null;
 }
 
 // Index claimed values per source: { payroll: Map<id, employeeId>, ... }
@@ -722,6 +772,31 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
   const [parseError, setParseError] = useState(null);
   const [rows, setRows] = useState([]); // parsed employee candidates
   const [progress, setProgress] = useState("");
+  const [fleetMgmt, setFleetMgmt] = useState(null);   // { drivers, trucks, assignments }
+  const [motiveDrivers, setMotiveDrivers] = useState(null); // [{ id, first_name, last_name }]
+
+  // Pre-load Fleet Management + Motive on mount so dropdowns are populated
+  // immediately (don't wait for click).
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/fleet-management?action=all");
+        if (r.ok && !cancelled) {
+          const j = await r.json();
+          setFleetMgmt(j);
+        }
+      } catch (e) { /* silent */ }
+      try {
+        const r = await fetch("/.netlify/functions/marginiq-motive?action=drivers");
+        if (r.ok && !cancelled) {
+          const j = await r.json();
+          setMotiveDrivers(j.drivers || []);
+        }
+      } catch (e) { /* silent */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Extract per-employee payroll ID from raw text using SSN as anchor.
   // - 1099 PDF: data row format is "<payrollId> xxx-xx-NNNN ..." (ID may differ
@@ -820,8 +895,16 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
           const payInfo = inferPayInfo(e, company);
           let role = "unknown";
 
+          // First try Fleet Management — it's the truth list for drivers/contractors
+          const fleetMatch = matchFleetDriver(name, fleetMgmt?.drivers);
+          const fleetRole = fleetMatch ? fleetMgmtRoleToCanonical(fleetMatch.role) : null;
+          // Pre-assigned truck from Fleet Management's most-recent weekly assignment
+          const fleetTruck = fleetMatch
+            ? (fleetMgmt?.assignments?.[fleetMatch.name] || null)
+            : (fleetMgmt?.assignments?.[name] || null);
+
           if (company === "0189") {
-            role = "owner_op";
+            role = fleetRole || "owner_op"; // Fleet Mgmt may say "Owner Tractor Driver"
             const isLLC = /LLC|INC|CORP|TRANSPORTATION|DELIVERY|EXPRESS|LOGISTICS|FREIGHT|TRANSPORT|INVESTORS|NETWORK|ENTERPRISE|SERVICES?|DBA/i.test(name);
             candidates.push({
               id, fullName: name,
@@ -830,20 +913,27 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
               role, payType: payInfo.payType, payRate: payInfo.payRate,
               ytdGross: payInfo.ytdGross,
               externalIds: { payroll: payrollId },
+              defaultTruck: fleetTruck,
               source: "1099",
               isLLC,
               llcName: isLLC ? name : null,
               actualDriverName: isLLC ? null : name,
+              fleetRoleString: fleetMatch?.role || null,
             });
           } else {
-            const rate = payInfo.payRate;
-            if (payInfo.payType === "salary" && rate >= 1500) role = "management";
-            else if (payInfo.payType === "salary" && rate >= 1100) role = "driver";
-            else if (payInfo.payType === "salary") role = "office";
-            else if (rate >= 30) role = "mechanic";
-            else if (rate >= 22) role = "driver";
-            else if (rate >= 18) role = "warehouse";
-            else role = "warehouse";
+            // W2 — Fleet Management role wins; otherwise fall back to pay heuristic
+            if (fleetRole) {
+              role = fleetRole;
+            } else {
+              const rate = payInfo.payRate;
+              if (payInfo.payType === "salary" && rate >= 1500) role = "management";
+              else if (payInfo.payType === "salary" && rate >= 1100) role = "driver";
+              else if (payInfo.payType === "salary") role = "office";
+              else if (rate >= 30) role = "mechanic";
+              else if (rate >= 22) role = "driver";
+              else if (rate >= 18) role = "warehouse";
+              else role = "warehouse";
+            }
 
             candidates.push({
               id, fullName: name,
@@ -852,9 +942,11 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
               role, payType: payInfo.payType, payRate: payInfo.payRate,
               ytdGross: payInfo.ytdGross,
               externalIds: { payroll: payrollId },
+              defaultTruck: fleetTruck,
               source: "W2",
               isLLC: false,
               actualDriverName: name,
+              fleetRoleString: fleetMatch?.role || null,
             });
           }
         }
@@ -963,6 +1055,7 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
 
     phase === "review" && React.createElement(BootstrapReview, {
       data, rows, updateRow, removeRow,
+      fleetMgmt, motiveDrivers,
       onSave: saveAll,
       onBack: () => setPhase("upload"),
       onCancel,
@@ -1011,12 +1104,26 @@ function PdfDropzone({ label, file, onChange, hint }) {
   );
 }
 
-function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onCancel }) {
+function BootstrapReview({ data, rows, updateRow, removeRow, fleetMgmt, motiveDrivers, onSave, onBack, onCancel }) {
   const w2Count = rows.filter(r => r.source === "W2").length;
   const llcUnresolved = rows.filter(r => r.isLLC && !r.actualDriverName).length;
 
-  // Harvest distinct values from real source collections
-  const harvested = useMemo(() => harvestSourceValues(data), [data]);
+  // Harvest distinct values from real source collections + Fleet Management
+  const harvested = useMemo(() => {
+    const h = harvestSourceValues(data, fleetMgmt);
+    // Eagerly populate Motive options from preloaded driver list
+    if (motiveDrivers && motiveDrivers.length > 0) {
+      for (const d of motiveDrivers) {
+        const id = String(d.id || "");
+        const nm = d.first_name && d.last_name ? `${d.first_name} ${d.last_name}` : "";
+        if (id) {
+          h.motive.add(id);
+          if (nm) h.motiveNames.set(id, nm);
+        }
+      }
+    }
+    return h;
+  }, [data, fleetMgmt, motiveDrivers]);
 
   // Track what's claimed across pending rows (so dropdowns graylist correctly).
   // Build claim maps from the rows themselves (not from the saved employees,
@@ -1048,12 +1155,17 @@ function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onC
     };
 
     // Build searchable indexes for each source
-    const buildIndex = (set) => {
+    const buildIndex = (set, displayMap) => {
       const list = [...set];
-      return list.map(v => ({ raw: v, ...lastTokens(v) }));
+      // For sources where the value is an ID (Motive), match against the display name
+      return list.map(v => {
+        const display = displayMap?.get(v) || v;
+        return { raw: v, ...lastTokens(display) };
+      });
     };
-    const b600Index = buildIndex(harvested.b600);
-    const nuvizzIndex = buildIndex(harvested.nuvizz);
+    const b600Index = buildIndex(harvested.b600, harvested.b600Names);
+    const nuvizzIndex = buildIndex(harvested.nuvizz, harvested.nuvizzDisplay);
+    const motiveIndex = buildIndex(harvested.motive, harvested.motiveNames);
 
     const findMatch = (driverName, index, alreadyClaimed) => {
       if (!driverName) return null;
@@ -1073,21 +1185,27 @@ function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onC
 
     const claimedB600 = new Set();
     const claimedNuvizz = new Set();
+    const claimedMotive = new Set();
     let anyChange = false;
     rows.forEach((r, i) => {
       const driver = r.actualDriverName;
       if (!driver) return;
       const ext = r.externalIds || {};
       const patch = { externalIds: { ...ext } };
+      let rowChanged = false;
       if (!ext.b600) {
         const m = findMatch(driver, b600Index, claimedB600);
-        if (m) { patch.externalIds.b600 = m; claimedB600.add(m); anyChange = true; }
+        if (m) { patch.externalIds.b600 = m; claimedB600.add(m); rowChanged = true; }
       } else { claimedB600.add(ext.b600); }
       if (!ext.nuvizz) {
         const m = findMatch(driver, nuvizzIndex, claimedNuvizz);
-        if (m) { patch.externalIds.nuvizz = m; claimedNuvizz.add(m); anyChange = true; }
+        if (m) { patch.externalIds.nuvizz = m; claimedNuvizz.add(m); rowChanged = true; }
       } else { claimedNuvizz.add(ext.nuvizz); }
-      if (anyChange) updateRow(i, patch);
+      if (!ext.motive) {
+        const m = findMatch(driver, motiveIndex, claimedMotive);
+        if (m) { patch.externalIds.motive = m; claimedMotive.add(m); rowChanged = true; }
+      } else { claimedMotive.add(ext.motive); }
+      if (rowChanged) { updateRow(i, patch); anyChange = true; }
     });
     setAutoMatched(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1095,14 +1213,16 @@ function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onC
 
   const willSave = rows.filter(r => r.actualDriverName).length;
   const matchStats = useMemo(() => {
-    let b600 = 0, nuvizz = 0;
+    let b600 = 0, nuvizz = 0, motive = 0, truck = 0;
     for (const r of rows) {
       if (r.actualDriverName) {
         if (r.externalIds?.b600) b600++;
         if (r.externalIds?.nuvizz) nuvizz++;
+        if (r.externalIds?.motive) motive++;
+        if (r.defaultTruck) truck++;
       }
     }
-    return { b600, nuvizz };
+    return { b600, nuvizz, motive, truck };
   }, [rows]);
 
   const headStyle = {
@@ -1133,12 +1253,13 @@ function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onC
         React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: DH_T.text } },
           `Extracted ${rows.length} entries · ${w2Count} W2 · ${rows.length - w2Count} 1099`),
         React.createElement("div", { style: { fontSize: 11, color: DH_T.textMuted, marginTop: 2 } },
-          `Auto-matched ${matchStats.b600} B600 · ${matchStats.nuvizz} NuVizz from real data sources.`,
+          `Auto-matched ${matchStats.b600} B600 · ${matchStats.nuvizz} NuVizz · ${matchStats.motive} Motive · ${matchStats.truck} Trucks (from Fleet Mgmt).`,
           llcUnresolved > 0 ? ` ⚠️ ${llcUnresolved} LLC payees still need driver names.` : "")
       ),
       React.createElement("div", { style: { display: "flex", gap: 12, fontSize: 10, color: DH_T.textMuted } },
         React.createElement(StatPill, { label: "B600 source", value: harvested.b600.size }),
         React.createElement(StatPill, { label: "NuVizz source", value: harvested.nuvizz.size }),
+        React.createElement(StatPill, { label: "Motive source", value: harvested.motive.size }),
         React.createElement(StatPill, { label: "Trucks source", value: harvested.truck.size }),
       )
     ),
@@ -1233,7 +1354,7 @@ function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onC
                   placeholder: "—",
                 })
               ),
-              // Motive typeahead (lazy-loaded)
+              // Motive typeahead (preloaded eagerly on mount)
               React.createElement("td", { style: cellStyle },
                 React.createElement(TypeaheadCell, {
                   value: ext.motive, employeeId: r.id,
@@ -1241,25 +1362,6 @@ function BootstrapReview({ data, rows, updateRow, removeRow, onSave, onBack, onC
                   claimed: claimed.motive,
                   onChange: v => updateExt(i, "motive", v),
                   placeholder: "—", monoFont: true,
-                  loadOptions: async () => {
-                    try {
-                      const resp = await fetch("/.netlify/functions/marginiq-motive?action=drivers");
-                      if (!resp.ok) return null;
-                      const j = await resp.json();
-                      const drivers = j.drivers || [];
-                      const opts = new Set();
-                      const names = new Map();
-                      for (const d of drivers) {
-                        const id = String(d.id || "");
-                        const nm = d.first_name && d.last_name ? `${d.first_name} ${d.last_name}` : "";
-                        if (id) {
-                          opts.add(id);
-                          if (nm) names.set(id, nm);
-                        }
-                      }
-                      return { options: opts, displayMap: names };
-                    } catch { return null; }
-                  },
                 })
               ),
               // Truck typeahead
@@ -1318,8 +1420,41 @@ function EmployeeEditor({ data, unmapped, onRefresh, onBootstrap }) {
   const [pendingChanges, setPendingChanges] = useState({}); // { employeeId: patch }
   const [saving, setSaving] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [fleetMgmt, setFleetMgmt] = useState(null);
+  const [motiveDrivers, setMotiveDrivers] = useState(null);
 
-  const harvested = useMemo(() => harvestSourceValues(data), [data]);
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/fleet-management?action=all");
+        if (r.ok && !cancelled) setFleetMgmt(await r.json());
+      } catch (e) { /* silent */ }
+      try {
+        const r = await fetch("/.netlify/functions/marginiq-motive?action=drivers");
+        if (r.ok && !cancelled) {
+          const j = await r.json();
+          setMotiveDrivers(j.drivers || []);
+        }
+      } catch (e) { /* silent */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const harvested = useMemo(() => {
+    const h = harvestSourceValues(data, fleetMgmt);
+    if (motiveDrivers && motiveDrivers.length > 0) {
+      for (const d of motiveDrivers) {
+        const id = String(d.id || "");
+        const nm = d.first_name && d.last_name ? `${d.first_name} ${d.last_name}` : "";
+        if (id) {
+          h.motive.add(id);
+          if (nm) h.motiveNames.set(id, nm);
+        }
+      }
+    }
+    return h;
+  }, [data, fleetMgmt, motiveDrivers]);
   const claimed = useMemo(() => indexClaimedValues(data.employees), [data.employees]);
 
   // Apply pending edits on top of saved data for instant feedback
@@ -1551,7 +1686,7 @@ function SpreadsheetRow({ emp, harvested, claimed, updateField, updateExternal, 
       })
     ),
 
-    // Motive (typeahead, but options come from /api/marginiq-motive cache)
+    // Motive (preloaded eagerly in EmployeeEditor)
     React.createElement("td", { style: cellStyle },
       React.createElement(TypeaheadCell, {
         value: ext.motive, employeeId: emp.id,
@@ -1559,26 +1694,6 @@ function SpreadsheetRow({ emp, harvested, claimed, updateField, updateExternal, 
         claimed: claimed.motive,
         onChange: v => updateExternal(emp.id, "motive", v),
         placeholder: "—", monoFont: true,
-        loadOptions: async () => {
-          // Lazy-fetch Motive driver list when user clicks the cell
-          try {
-            const r = await fetch("/.netlify/functions/marginiq-motive?action=drivers");
-            if (!r.ok) return null;
-            const j = await r.json();
-            const drivers = j.drivers || [];
-            const opts = new Set();
-            const names = new Map();
-            for (const d of drivers) {
-              const id = String(d.id || "");
-              const nm = d.first_name && d.last_name ? `${d.first_name} ${d.last_name}` : "";
-              if (id) {
-                opts.add(id);
-                if (nm) names.set(id, nm);
-              }
-            }
-            return { options: opts, displayMap: names };
-          } catch { return null; }
-        },
       })
     ),
 
