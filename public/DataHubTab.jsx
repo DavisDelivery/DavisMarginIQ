@@ -1303,13 +1303,28 @@ function BootstrapReview({ data, rows, updateRow, removeRow, fleetMgmt, motiveDr
               React.createElement("td", {
                 style: { ...cellStyle, fontWeight: 600, color: r.isLLC ? DH_T.purpleText : DH_T.text }
               }, r.fullName),
-              // Driver / Person Name (editable for LLCs)
+              // Driver / Person Name
+              //   - W2 / personal-name 1099: read-only label
+              //   - LLC 1099: typeahead pulling from NuVizz drivers (the only
+              //     source that links a contractor LLC to actual stops/pay)
               React.createElement("td", { style: cellStyle },
                 r.isLLC
-                  ? React.createElement("input", {
-                      type: "text", value: r.actualDriverName || "", placeholder: "Driver name…",
-                      onChange: e => updateRow(i, { actualDriverName: e.target.value }),
-                      style: { padding: "3px 7px", fontSize: 11, border: `1px solid ${r.actualDriverName ? DH_T.border : DH_T.yellow}`, borderRadius: 4, fontFamily: "inherit", width: "100%", outline: "none", background: r.actualDriverName ? "#fff" : DH_T.yellowBg }
+                  ? React.createElement(NuVizzNameTypeahead, {
+                      value: r.actualDriverName,
+                      options: harvested.nuvizz,
+                      claimedNames: claimed.nuvizz,
+                      employeeId: r.id,
+                      onChange: nm => {
+                        // Setting the driver name from NuVizz also claims the
+                        // NuVizz column (they're literally the same string).
+                        updateRow(i, {
+                          actualDriverName: nm || null,
+                          externalIds: {
+                            ...(r.externalIds || {}),
+                            nuvizz: nm || null,
+                          },
+                        });
+                      },
                     })
                   : React.createElement("span", { style: { color: DH_T.text } }, r.actualDriverName)
               ),
@@ -1852,6 +1867,113 @@ function TypeaheadCell({ value, employeeId, options, displayMap, claimed, onChan
       }, display || placeholder || "—");
 
   return cellInner;
+}
+
+// ─── NuVizz Name Typeahead ─────────────────────────────────────────
+// Specialized typeahead for the LLC contractor name field. Pulls names
+// from NuVizz (the only source that ties a 1099 LLC to actual stops/pay).
+// Picking a name here ALSO claims the NuVizz column for that row.
+function NuVizzNameTypeahead({ value, options, claimedNames, employeeId, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const cellRef = React.useRef();
+  const inputRef = React.useRef();
+
+  React.useEffect(() => {
+    if (open && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [open]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    const handler = e => {
+      if (cellRef.current && !cellRef.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const filtered = useMemo(() => {
+    const q = query.toLowerCase().trim();
+    const arr = [...options];
+    const matches = q ? arr.filter(o => o.toLowerCase().includes(q)) : arr;
+    // Sort: current value first, unclaimed before claimed, alpha within
+    return matches.sort((a, b) => {
+      if (a === value) return -1;
+      if (b === value) return 1;
+      const aClaimedByOther = claimedNames.has(a) && claimedNames.get(a) !== employeeId;
+      const bClaimedByOther = claimedNames.has(b) && claimedNames.get(b) !== employeeId;
+      if (aClaimedByOther !== bClaimedByOther) return aClaimedByOther ? 1 : -1;
+      return String(a).localeCompare(String(b));
+    });
+  }, [options, query, value, claimedNames, employeeId]);
+
+  if (!open) {
+    const hasValue = !!value;
+    return React.createElement("button", {
+      onClick: () => setOpen(true),
+      style: {
+        width: "100%", padding: "3px 7px", fontSize: 11, fontFamily: "inherit",
+        textAlign: "left",
+        background: hasValue ? "#fff" : DH_T.yellowBg,
+        border: `1px solid ${hasValue ? DH_T.border : DH_T.yellow}`,
+        borderRadius: 4, cursor: "pointer",
+        color: hasValue ? DH_T.text : DH_T.yellowText, fontWeight: hasValue ? 400 : 600,
+      }
+    }, value || "Pick from NuVizz…");
+  }
+
+  return React.createElement("div", { ref: cellRef, style: { position: "relative" } },
+    React.createElement("input", {
+      ref: inputRef, type: "text", value: query,
+      onChange: e => setQuery(e.target.value),
+      placeholder: "Search NuVizz drivers…",
+      style: { width: "100%", padding: "3px 7px", fontSize: 11, border: `1px solid ${DH_T.brand}`, borderRadius: 4, fontFamily: "inherit", outline: "none", background: "#fff" }
+    }),
+    React.createElement("div", {
+      style: {
+        position: "absolute", top: "100%", left: 0, marginTop: 2, minWidth: 240, maxWidth: 360, maxHeight: 280,
+        overflowY: "auto", background: "#fff", border: `1px solid ${DH_T.border}`, borderRadius: 6,
+        boxShadow: "0 8px 24px rgba(0,0,0,0.12)", zIndex: 50,
+      }
+    },
+      filtered.length === 0 && React.createElement("div", {
+        style: { padding: 10, fontSize: 10, color: DH_T.textMuted, textAlign: "center" }
+      }, options.size === 0 ? "No NuVizz drivers loaded" : "No matches"),
+      filtered.slice(0, 100).map(opt => {
+        const claimedBy = claimedNames.get(opt);
+        const claimedByOther = claimedBy && claimedBy !== employeeId;
+        const isCurrent = opt === value;
+        return React.createElement("button", {
+          key: opt,
+          onClick: () => { onChange(opt); setOpen(false); setQuery(""); },
+          style: {
+            display: "block", width: "100%", textAlign: "left",
+            padding: "5px 9px", fontSize: 11, fontFamily: "inherit",
+            background: isCurrent ? DH_T.brandPale : "transparent",
+            color: claimedByOther ? DH_T.textDim : DH_T.text,
+            border: "none", borderBottom: `1px solid ${DH_T.borderLight}`, cursor: "pointer",
+          }
+        },
+          React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
+            React.createElement("div", null,
+              isCurrent && React.createElement("span", { style: { color: DH_T.brand, fontWeight: 700, marginRight: 4 } }, "✓"),
+              opt
+            ),
+            claimedByOther && React.createElement("span", {
+              style: { fontSize: 9, color: DH_T.textDim, fontStyle: "italic" }
+            }, "claimed")
+          )
+        );
+      }),
+      value && React.createElement("button", {
+        onClick: () => { onChange(null); setOpen(false); setQuery(""); },
+        style: { display: "block", width: "100%", textAlign: "left", padding: "5px 9px", fontSize: 10, fontFamily: "inherit", background: DH_T.bgSurface, color: DH_T.redText, border: "none", cursor: "pointer", fontWeight: 600 }
+      }, "× Clear value")
+    )
+  );
 }
 
 // ─── Add Row modal ──────────────────────────────────────────────────
