@@ -1070,7 +1070,8 @@ function BootstrapPanel({ data, onComplete, onCancel }) {
 
 function PdfDropzone({ label, file, onChange, hint }) {
   const [dragOver, setDragOver] = useState(false);
-  const inputRef = React.useRef();
+  // Unique id so each dropzone's <label htmlFor> targets its own input
+  const inputId = React.useMemo(() => `pdf-dz-${Math.random().toString(36).slice(2, 9)}`, []);
 
   const onDrop = e => {
     e.preventDefault(); setDragOver(false);
@@ -1078,27 +1079,47 @@ function PdfDropzone({ label, file, onChange, hint }) {
     if (f) onChange(f);
   };
 
-  return React.createElement("div", {
+  // Use a <label> as the clickable container — when the user taps anywhere
+  // inside the label, the browser natively triggers the input's file picker.
+  // This is the only reliable way to get the picker to open on iOS Safari;
+  // programmatic input.click() from a parent's onClick handler often gets
+  // swallowed by iOS's user-gesture rules.
+  return React.createElement("label", {
+    htmlFor: inputId,
     onDragOver: e => { e.preventDefault(); setDragOver(true); },
     onDragLeave: () => setDragOver(false),
     onDrop,
-    onClick: () => inputRef.current?.click(),
     style: {
+      display: "block",
       background: file ? DH_T.greenBg : DH_T.bgCard,
       border: `2px dashed ${file ? "#a7f3d0" : (dragOver ? DH_T.brand : DH_T.border)}`,
       borderRadius: DH_T.radius, padding: 22, textAlign: "center", cursor: "pointer",
       transition: "all 0.15s",
+      // Prevent iOS callout/long-press menu and ensure tap is responsive
+      WebkitTapHighlightColor: "rgba(30,91,146,0.15)",
+      WebkitTouchCallout: "none",
+      userSelect: "none",
     }
   },
     React.createElement("div", { style: { fontSize: 28, marginBottom: 8 } }, file ? "✅" : "📄"),
     React.createElement("div", { style: { fontSize: 12, fontWeight: 700, color: DH_T.text, marginBottom: 3 } }, label),
     file
       ? React.createElement("div", { style: { fontSize: 11, color: DH_T.greenText, fontWeight: 600 } }, file.name)
-      : React.createElement("div", { style: { fontSize: 10, color: DH_T.textMuted } }, "Drag-drop or click to upload"),
+      : React.createElement("div", { style: { fontSize: 10, color: DH_T.textMuted } }, "Tap to choose · or drag-drop"),
     React.createElement("div", { style: { fontSize: 10, color: DH_T.textDim, marginTop: 4 } }, hint),
+    // Visually hidden but still clickable — using a position-absolute trick
+    // rather than display:none so iOS still treats it as a focusable input.
     React.createElement("input", {
-      ref: inputRef, type: "file", accept: ".pdf,application/pdf",
-      style: { display: "none" },
+      id: inputId,
+      type: "file",
+      accept: "application/pdf,.pdf",
+      style: {
+        position: "absolute",
+        width: 1, height: 1,
+        opacity: 0,
+        overflow: "hidden",
+        pointerEvents: "none",
+      },
       onChange: e => { const f = e.target.files?.[0]; if (f) onChange(f); }
     })
   );
