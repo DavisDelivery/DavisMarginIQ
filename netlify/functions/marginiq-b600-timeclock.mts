@@ -409,11 +409,16 @@ export default async (_req: Request, _context: Context) => {
   }
 };
 
-// Schedule: every Sunday at 04:00 UTC = Saturday 11pm EST / Saturday midnight EDT.
-// This runs after the warehouse closes for the just-completed Sun-Sat work week,
-// so all punch-outs are captured before the rollup writes to Firestore.
-// previousWeekSunToSat() handles the timezone math correctly (UTC dow=0 at this
-// hour both EST and EDT, returning the Sun-Sat week that just ended).
+// Schedule: every Sunday at 03:00 AND 04:00 UTC, which corresponds to:
+//   - 03:00 UTC = Saturday 11pm EDT (Mar–Nov, daylight time)
+//   - 04:00 UTC = Saturday 11pm EST (Nov–Mar, standard time)
+// Cron doesn't know about DST, so we fire at both hours; the duplicate run is
+// harmless because Firestore writes are idempotent (PATCH overwrites the same
+// week-ending doc with identical data). The off-season run produces a no-op
+// since the data hasn't changed since the prior run an hour earlier.
+//
+// previousWeekSunToSat() resolves to the just-completed Sun-Sat week at both
+// of these hours year-round (UTC dow=0 in both cases).
 export const config: Config = {
-  schedule: "0 4 * * 0",
+  schedule: "0 3,4 * * 0",
 };
