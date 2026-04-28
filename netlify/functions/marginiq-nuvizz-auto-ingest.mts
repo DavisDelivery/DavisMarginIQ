@@ -140,8 +140,10 @@ async function getFreshAccessToken(clientId: string, clientSecret: string, refre
 // ─── Gmail message search + attachment download ────────────────────────────
 
 async function searchNuvizzMessages(accessToken: string, maxResults: number = 5): Promise<{ id: string }[]> {
-  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(VENDOR_QUERY)}&maxResults=${maxResults}`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+  url.searchParams.set("q", VENDOR_QUERY);
+  url.searchParams.set("maxResults", String(maxResults));
+  const r = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
   if (!r.ok) return [];
   const data: any = await r.json();
   return data.messages || [];
