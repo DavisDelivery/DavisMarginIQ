@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.11";
+const APP_VERSION = "2.42.12";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {

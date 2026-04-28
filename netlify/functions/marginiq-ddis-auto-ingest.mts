@@ -407,21 +407,40 @@ function buildIngestPayload(
 }
 
 // ─── Dispatcher invocation ──────────────────────────────────────────────────
+//
+// IMPORTANT: We call the BG worker DIRECTLY rather than going through
+// marginiq-ddis-ingest. The intermediate dispatcher fires
+// `fetch(bg, {body: payload})` without context.waitUntil, which hits AWS
+// Lambda's 256 KB async-invocation body limit for any DDIS file with
+// more than ~800 payments. Above that, the BG fetch returns HTTP 500
+// silently while the dispatcher returns its happy 202 — same failure
+// mode that broke the NuVizz dispatcher pre-v2.41.17.
+//
+// Since auto-ingest runs server-side anyway, we can call the BG worker
+// directly via its public URL (Netlify exposes background functions
+// for direct POST). The 256 KB limit doesn't apply to direct POSTs
+// because there's no async-invocation hop — it's a normal HTTP request.
+// This sidesteps the bug entirely. Manual ingests from the browser
+// still go through the dispatcher; fixing that is a separate cleanup.
 
 async function dispatchDdisIngest(
   siteOrigin: string,
   payload: DdisIngestPayload,
-): Promise<{ ok: boolean; runId?: string; error?: string }> {
-  const url = `${siteOrigin}/.netlify/functions/marginiq-ddis-ingest`;
+): Promise<{ ok: boolean; queued: boolean; error?: string }> {
+  const url = `${siteOrigin}/.netlify/functions/marginiq-ddis-ingest-background`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  let data: any = null;
-  try { data = await r.json(); } catch {}
-  if (!r.ok) return { ok: false, error: data?.error || `HTTP ${r.status}` };
-  return { ok: true, runId: data?.run_id || data?.status_id };
+  // Netlify background functions return 202 immediately and run async.
+  // Any other status indicates a problem reaching the BG worker.
+  if (r.status === 202 || r.status === 200) {
+    return { ok: true, queued: true };
+  }
+  let errText = "";
+  try { errText = await r.text(); } catch {}
+  return { ok: false, queued: false, error: `HTTP ${r.status}: ${errText.substring(0, 200)}` };
 }
 
 // ─── Main handler ──────────────────────────────────────────────────────────
@@ -591,18 +610,17 @@ export default async (req: Request, _context: Context) => {
       email_date: new Date(bestMsg.internalDate).toISOString(),
       processed_at: new Date().toISOString(),
       auto_ingest_run_id: runId,
-      dispatcher_run_id: dispatch.runId || "",
       payments_parsed: payments.length,
       attachment_filename: att.filename,
       bill_week_ending: ingestPayload.ddisFileRecords[0].bill_week_ending,
       total_paid: ingestPayload.ddisFileRecords[0].total_paid,
+      bg_dispatched: true,
     }, FIREBASE_API_KEY);
 
     await fsPatchDoc("ddis_auto_ingest_logs", runId, {
       state: "complete",
       completed_at: new Date().toISOString(),
-      progress: `✓ Dispatched ${payments.length.toLocaleString()} payments (bill_week=${ingestPayload.ddisFileRecords[0].bill_week_ending}, total_paid=$${ingestPayload.ddisFileRecords[0].total_paid.toFixed(2)})`,
-      dispatcher_run_id: dispatch.runId || "",
+      progress: `✓ Dispatched ${payments.length.toLocaleString()} payments to BG worker (bill_week=${ingestPayload.ddisFileRecords[0].bill_week_ending}, total_paid=$${ingestPayload.ddisFileRecords[0].total_paid.toFixed(2)})`,
     }, FIREBASE_API_KEY);
 
     return json({
@@ -614,7 +632,6 @@ export default async (req: Request, _context: Context) => {
       payments_parsed: payments.length,
       bill_week_ending: ingestPayload.ddisFileRecords[0].bill_week_ending,
       total_paid: ingestPayload.ddisFileRecords[0].total_paid,
-      dispatcher_run_id: dispatch.runId,
     }, 200);
   } catch (err: any) {
     await fsPatchDoc("ddis_auto_ingest_logs", runId, {
