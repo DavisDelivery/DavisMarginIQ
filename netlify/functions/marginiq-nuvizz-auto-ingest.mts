@@ -42,13 +42,14 @@ import type { Context, Config } from "@netlify/functions";
  */
 
 const PROJECT_ID = "davismarginiq";
-// Tightened from `from:nuvizzapps@nuvizzapps.com has:attachment` to also
-// require the subject prefix that distinguishes the weekly driver_stops
-// CSV from the older "Stop Delivery Notification" event-stream emails
-// (DAVIS####### subjects from 2019-2021). Without this, the 5-message
-// search would eventually pull a 2021-era event email whose attachment
-// has totally different columns and the parser would produce 0 stops.
-const VENDOR_QUERY = 'from:nuvizzapps@nuvizzapps.com subject:"Report:Driver_stops_for_past_week" has:attachment';
+// Filter on subject:Driver_stops (without quotes, no colon, no spaces) to
+// distinguish the weekly driver_stops CSV from older "Stop Delivery
+// Notification" event emails (DAVIS####### subjects from 2019-2021).
+// Avoiding quoted phrases because Gmail's URL-encoded search has trouble
+// with embedded colons and underscores even when quoted. The single term
+// `Driver_stops` is unique enough — that exact substring only appears in
+// the weekly report subject line.
+const VENDOR_QUERY = "from:nuvizzapps@nuvizzapps.com subject:Driver_stops has:attachment";
 const CONTRACTOR_PAY_PCT = 0.40;
 
 function json(data: any, status = 200): Response {
