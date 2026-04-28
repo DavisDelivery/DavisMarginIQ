@@ -55,6 +55,14 @@ function toFsValue(v: any): any {
     return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
   }
   if (typeof v === "string") return { stringValue: v };
+  // v2.42.4: arrays must use arrayValue, not mapValue. Without this check,
+  // typeof v === "object" matches arrays AND objects, so top_drivers (an
+  // array) was being encoded as a map with stringified integer keys ("0",
+  // "1", ...) instead of a proper Firestore array. The data was technically
+  // present but downstream UI (sortable top_drivers list) couldn't read it.
+  if (Array.isArray(v)) {
+    return { arrayValue: { values: v.map(toFsValue) } };
+  }
   if (typeof v === "object") {
     const fields: Record<string, any> = {};
     for (const [k, val] of Object.entries(v)) fields[k] = toFsValue(val);
