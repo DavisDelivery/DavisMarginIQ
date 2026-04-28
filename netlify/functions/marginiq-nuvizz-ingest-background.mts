@@ -121,49 +121,45 @@ async function batchWriteDocs(
 
 async function listWeekStops(weekEnding: string): Promise<any[]> {
   const stops: any[] = [];
-  // Firestore :runQuery returns up to `limit` docs in one call. There's no
-  // pageToken on runQuery, so we paginate via offset+order. For weeks with
-  // ≤1000 stops one call suffices; for the larger weeks we need 4-5 pages.
-  const PAGE = 1000;
-  let offset = 0;
-  let safety = 0;
-  while (true) {
-    const url = `${BASE}:runQuery?key=${FIREBASE_API_KEY}`;
-    const body = {
-      structuredQuery: {
-        from: [{ collectionId: "nuvizz_stops" }],
-        where: { fieldFilter: { field: { fieldPath: "week_ending" }, op: "EQUAL", value: { stringValue: weekEnding } } },
-        orderBy: [{ field: { fieldPath: "pro" }, direction: "ASCENDING" }],
-        offset,
-        limit: PAGE,
-      }
-    };
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) break;
-    const results: any[] = await resp.json();
-    let pageDocs = 0;
-    for (const item of results) {
-      if (!item.document) continue;
-      pageDocs++;
-      const f = item.document.fields || {};
-      const out: Record<string, any> = {};
-      for (const [k, v] of Object.entries(f)) {
-        const vv = v as any;
-        if ("stringValue" in vv) out[k] = vv.stringValue;
-        else if ("integerValue" in vv) out[k] = Number(vv.integerValue);
-        else if ("doubleValue" in vv) out[k] = vv.doubleValue;
-        else if ("booleanValue" in vv) out[k] = vv.booleanValue;
-      }
-      stops.push(out);
+  // NuVizz weeks max out at ~3,500 stops historically. Firestore's runQuery
+  // limit caps at 5000 docs per call. We use 5000 as a generous safety
+  // margin without needing pagination — pagination on runQuery requires a
+  // composite index (week_ending + orderBy field) that we'd have to create.
+  // If a single week ever exceeds 5000 stops, this will silently truncate;
+  // the safety check below catches that case.
+  const url = `${BASE}:runQuery?key=${FIREBASE_API_KEY}`;
+  const body = {
+    structuredQuery: {
+      from: [{ collectionId: "nuvizz_stops" }],
+      where: { fieldFilter: { field: { fieldPath: "week_ending" }, op: "EQUAL", value: { stringValue: weekEnding } } },
+      limit: 5000,
     }
-    if (pageDocs < PAGE) break;       // last page
-    offset += PAGE;
-    safety++;
-    if (safety > 20) break;            // hard guardrail (would mean >20K stops/week)
+  };
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    console.error(`listWeekStops failed for ${weekEnding}: HTTP ${resp.status}`);
+    return [];
+  }
+  const results: any[] = await resp.json();
+  for (const item of results) {
+    if (!item.document) continue;
+    const f = item.document.fields || {};
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(f)) {
+      const vv = v as any;
+      if ("stringValue" in vv) out[k] = vv.stringValue;
+      else if ("integerValue" in vv) out[k] = Number(vv.integerValue);
+      else if ("doubleValue" in vv) out[k] = vv.doubleValue;
+      else if ("booleanValue" in vv) out[k] = vv.booleanValue;
+    }
+    stops.push(out);
+  }
+  if (stops.length === 5000) {
+    console.warn(`listWeekStops(${weekEnding}) hit the 5000-doc cap. Rollup may be incomplete.`);
   }
   return stops;
 }
