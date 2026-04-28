@@ -158,9 +158,16 @@ async function b600FetchCSV(jar: CookieJar, from: Date, to: Date): Promise<strin
   const toStr = formatMDYY(to);
   // ─── URL params (verified working 2026-04-28 against live tunnel) ───
   //   rt=2          → Timecards report
+  //   type=7        → CUSTOM DATE RANGE — without this the B600 SILENTLY
+  //                   IGNORES from/to and dumps the current-week-to-date
+  //                   data. Discovered the hard way: a 'successful' export
+  //                   for 04/19-04/25 was actually returning 04/26-04/28
+  //                   data and the function reported success. type=7 is the
+  //                   internal code for the date scope being driven by
+  //                   user-supplied from/to (vs type=1=Today, type=3=ThisWeek
+  //                   etc., which use server-side stored ranges).
   //   eid=0         → ALL employees (NOT eid=ss — that returns just the
-  //                   previously-selected single employee, which is why this
-  //                   function had been silently broken)
+  //                   previously-selected single employee)
   //   stdexport=1   → STANDARD CSV format. Header row is:
   //                   "Display Name,Display ID,Payroll ID,Date,In Day,In Time,
   //                    Out Day,Out Time,Department,Dept. Code,Lunch,ADJ,REG,
@@ -168,11 +175,9 @@ async function b600FetchCSV(jar: CookieJar, from: Date, to: Date): Promise<strin
   //                   This matches the column names the parser/rollup expects
   //                   (r["display name"], r["date"], r["reg"], r["ot1"], r["ot2"],
   //                   r["total"]). Do NOT switch back to export=1 — that returns
-  //                   the "Extended" format with completely different columns
-  //                   (FirstName,LastName,DisplayAs,InDate,InTime,STD,...) which
-  //                   the parser cannot consume.
+  //                   the "Extended" format with completely different columns.
   //   Referer header is required or the export gates to 0 bytes.
-  const reportPage = `${B600_BASE_URL}/report.html?rt=2&from=${encodeURIComponent(fromStr)}&to=${encodeURIComponent(toStr)}`;
+  const reportPage = `${B600_BASE_URL}/report.html?rt=2&type=7&from=${encodeURIComponent(fromStr)}&to=${encodeURIComponent(toStr)}`;
   const url = `${reportPage}&eid=0&stdexport=1`;
 
   const resp = await fetch(url, {
@@ -332,6 +337,31 @@ export default async (_req: Request, _context: Context) => {
     const jar = await b600Login();
     const csv = await b600FetchCSV(jar, from, to);
     const rows = parseCSV(csv);
+
+    // Sanity check: verify B600 actually honored the requested date window.
+    // Without type=7 the clock silently dumps current-week-to-date data even
+    // when from/to are passed — this guard catches that regression by
+    // rejecting any pull where the parsed dates fall outside the window.
+    if (rows.length > 0) {
+      const winStart = new Date(from); winStart.setHours(0, 0, 0, 0);
+      const winEnd = new Date(to); winEnd.setHours(23, 59, 59, 999);
+      const offRange = rows.filter(r => {
+        const d = parseDateMDY(r["date"]);
+        if (!d) return false;
+        return d < winStart || d > winEnd;
+      });
+      if (offRange.length > rows.length / 2) {
+        // More than half the rows are outside the window — the B600 ignored
+        // the date params and returned a different scope.
+        const sampleDates = [...new Set(rows.slice(0, 5).map(r => r["date"]))].join(", ");
+        throw new Error(
+          `B600 returned data outside requested window ${formatMDYY(from)}-${formatMDYY(to)}; ` +
+          `${offRange.length}/${rows.length} rows off-range, sample dates: ${sampleDates}. ` +
+          `Likely missing type=7 param or session-side scope override.`
+        );
+      }
+    }
+
     const weekly = rollupWeekly(rows);
 
     let saved = 0;
