@@ -121,17 +121,21 @@ async function batchWriteDocs(
 
 async function listWeekStops(weekEnding: string): Promise<any[]> {
   const stops: any[] = [];
-  let pt = "";
-  do {
-    const params = new URLSearchParams({ key: FIREBASE_API_KEY || "", pageSize: "300" });
-    if (pt) params.set("pageToken", pt);
-    // Query nuvizz_stops where week_ending == weekEnding
+  // Firestore :runQuery returns up to `limit` docs in one call. There's no
+  // pageToken on runQuery, so we paginate via offset+order. For weeks with
+  // ≤1000 stops one call suffices; for the larger weeks we need 4-5 pages.
+  const PAGE = 1000;
+  let offset = 0;
+  let safety = 0;
+  while (true) {
     const url = `${BASE}:runQuery?key=${FIREBASE_API_KEY}`;
     const body = {
       structuredQuery: {
         from: [{ collectionId: "nuvizz_stops" }],
         where: { fieldFilter: { field: { fieldPath: "week_ending" }, op: "EQUAL", value: { stringValue: weekEnding } } },
-        limit: 1000,
+        orderBy: [{ field: { fieldPath: "pro" }, direction: "ASCENDING" }],
+        offset,
+        limit: PAGE,
       }
     };
     const resp = await fetch(url, {
@@ -141,8 +145,10 @@ async function listWeekStops(weekEnding: string): Promise<any[]> {
     });
     if (!resp.ok) break;
     const results: any[] = await resp.json();
+    let pageDocs = 0;
     for (const item of results) {
       if (!item.document) continue;
+      pageDocs++;
       const f = item.document.fields || {};
       const out: Record<string, any> = {};
       for (const [k, v] of Object.entries(f)) {
@@ -154,9 +160,11 @@ async function listWeekStops(weekEnding: string): Promise<any[]> {
       }
       stops.push(out);
     }
-    // runQuery doesn't return pageToken — it returns all results up to limit
-    break;
-  } while (pt);
+    if (pageDocs < PAGE) break;       // last page
+    offset += PAGE;
+    safety++;
+    if (safety > 20) break;            // hard guardrail (would mean >20K stops/week)
+  }
   return stops;
 }
 
@@ -196,24 +204,73 @@ function extractPrefix(pro: string): string {
 }
 
 // ─── NuVizz weekly rollup builder ───────────────────────────────────────────
+//
+// v2.41.17: replaced slim 8-field rollup with the full rich schema produced
+// by the client-side buildNuVizzWeekly() in MarginIQ.jsx so downstream UI
+// (top_drivers, unique_customers, stops_completed/manually_completed split,
+// effective-only pay totals) keeps working after server-side ingest. Prior
+// version was overwriting rich rollups with downgraded stops_total/pay
+// only, breaking the weekly summary tab.
 
 function buildWeeklyRollup(stops: any[]): any {
-  let stops_total = 0, pay_base_total = 0, pay_at_40_total = 0;
-  const drivers = new Set<string>();
+  let stops_total = 0;
+  let stops_completed = 0;
+  let stops_manually_completed = 0;
+  let stops_effective = 0;
+  let pay_base_total = 0;
+  let contractor_pay_if_all_1099 = 0;
+  const unique_drivers = new Set<string>();
+  const unique_customers = new Set<string>();
+  const drivers: Record<string, { stops: number; pay_base: number; pay_at_40: number }> = {};
+
   for (const s of stops) {
     stops_total++;
-    pay_base_total += s.contractor_pay_base || 0;
-    pay_at_40_total += s.contractor_pay_at_40 || 0;
-    if (s.driver_name) drivers.add(s.driver_name);
+    const st = String(s.status || "").toLowerCase().trim();
+    const isCompleted = st === "completed";
+    const isManual = st === "manually completed";
+    const isEffective = isCompleted || isManual;
+    if (isCompleted) stops_completed++;
+    if (isManual) stops_manually_completed++;
+    if (isEffective) {
+      stops_effective++;
+      pay_base_total += Number(s.contractor_pay_base) || 0;
+      contractor_pay_if_all_1099 += Number(s.contractor_pay_at_40) || 0;
+      if (s.driver_name) {
+        unique_drivers.add(s.driver_name);
+        if (!drivers[s.driver_name]) {
+          drivers[s.driver_name] = { stops: 0, pay_base: 0, pay_at_40: 0 };
+        }
+        drivers[s.driver_name].stops++;
+        drivers[s.driver_name].pay_base += Number(s.contractor_pay_base) || 0;
+        drivers[s.driver_name].pay_at_40 += Number(s.contractor_pay_at_40) || 0;
+      }
+      if (s.ship_to) unique_customers.add(s.ship_to);
+    }
   }
+
   const week_ending = stops[0]?.week_ending;
+  const top_drivers = Object.entries(drivers)
+    .sort((a, b) => b[1].stops - a[1].stops)
+    .slice(0, 60)
+    .map(([name, v]) => ({
+      name,
+      stops: v.stops,
+      pay_base: Math.round(v.pay_base * 100) / 100,
+      pay_at_40: Math.round(v.pay_at_40 * 100) / 100,
+    }));
+
   return {
     week_ending,
     month: week_ending ? dateToMonth(week_ending) : null,
     stops_total,
+    stops_completed,
+    stops_manually_completed,
+    stops_effective,
     pay_base_total: Math.round(pay_base_total * 100) / 100,
-    pay_at_40_total: Math.round(pay_at_40_total * 100) / 100,
-    driver_count: drivers.size,
+    contractor_pay_if_all_1099: Math.round(contractor_pay_if_all_1099 * 100) / 100,
+    unique_drivers: unique_drivers.size,
+    unique_customers: unique_customers.size,
+    top_drivers,
     rebuilt_from_stops: true,
     updated_at: new Date().toISOString(),
   };
