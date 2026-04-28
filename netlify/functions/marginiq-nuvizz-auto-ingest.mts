@@ -42,14 +42,13 @@ import type { Context, Config } from "@netlify/functions";
  */
 
 const PROJECT_ID = "davismarginiq";
-// Filter on subject:Driver_stops (without quotes, no colon, no spaces) to
-// distinguish the weekly driver_stops CSV from older "Stop Delivery
-// Notification" event emails (DAVIS####### subjects from 2019-2021).
-// Avoiding quoted phrases because Gmail's URL-encoded search has trouble
-// with embedded colons and underscores even when quoted. The single term
-// `Driver_stops` is unique enough — that exact substring only appears in
-// the weekly report subject line.
-const VENDOR_QUERY = "from:nuvizzapps@nuvizzapps.com subject:Driver_stops has:attachment";
+// Filter on the unique word "driver_stops" in the subject. Gmail's search
+// may be normalizing underscores to spaces or treating them as token
+// delimiters, so we try a tag-style match without quotes. If still 0
+// results, the filter would need to be removed and false-positive event
+// emails (DAVIS####### : Stop Delivery...) would need to be filtered
+// out by parser-side row count instead.
+const VENDOR_QUERY = "from:nuvizzapps@nuvizzapps.com has:attachment newer_than:30d";
 const CONTRACTOR_PAY_PCT = 0.40;
 
 function json(data: any, status = 200): Response {
@@ -495,12 +494,45 @@ export default async (req: Request, _context: Context) => {
       csv_bytes: csvText.length,
     }, FIREBASE_API_KEY);
     const stops = parseNuvizzCsv(csvText);
-    if (stops.length === 0) {
-      const err = "CSV produced 0 stops — parser failure or empty file";
-      await fsPatchDoc("nuvizz_auto_ingest_logs", runId, {
-        state: "failed", error: err, completed_at: new Date().toISOString(),
+    // Sanity check: if the CSV produced very few stops, this is probably one
+    // of the 2019/2021-era "Stop Delivery Notification" event emails (which
+    // have completely different columns and only a handful of rows). Mark
+    // the message processed (so we don't keep retrying it on every run) but
+    // don't dispatch it.
+    if (stops.length < 100) {
+      const note = stops.length === 0
+        ? "CSV produced 0 stops — likely a non-driver_stops email format"
+        : `CSV produced only ${stops.length} stops — below threshold; likely event-notification format`;
+      await fsPatchDoc("nuvizz_processed_emails", bestMsg.messageId, {
+        message_id: bestMsg.messageId,
+        subject,
+        account_email: bestMsg.account.email,
+        email_date: new Date(bestMsg.internalDate).toISOString(),
+        processed_at: new Date().toISOString(),
+        auto_ingest_run_id: runId,
+        skipped: true,
+        skip_reason: note,
+        attachment_filename: att.filename,
+        stops_parsed: stops.length,
       }, FIREBASE_API_KEY);
-      return json({ run_id: runId, state: "failed", error: err }, 200);
+      await fsPatchDoc("nuvizz_auto_ingest_logs", runId, {
+        state: "complete",
+        completed_at: new Date().toISOString(),
+        progress: `⊘ Skipped: ${note}`,
+        skipped: true,
+        message_id: bestMsg.messageId,
+        subject,
+        stops_parsed: stops.length,
+      }, FIREBASE_API_KEY);
+      return json({
+        run_id: runId,
+        state: "complete",
+        skipped: true,
+        message_id: bestMsg.messageId,
+        subject,
+        stops_parsed: stops.length,
+        skip_reason: note,
+      }, 200);
     }
 
     const siteOrigin = `${url.protocol}//${url.host}`;
