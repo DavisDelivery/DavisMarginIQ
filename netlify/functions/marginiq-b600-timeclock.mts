@@ -12,12 +12,15 @@ import type { Context, Config } from "@netlify/functions";
  * 1. GET  /login.html               → seed session cookie
  * 2. POST /login.html               body: username=X&password=Y&buttonClicked=Submit
  *                                   → authenticated session, 302 → /index.html
- * 3. GET  /report.html?rt=2&from=MM/DD/YY&to=MM/DD/YY&eid=ss&export=1
- *                                   → returns CSV Extended body (headered, 25 cols)
+ * 3. GET  /report.html?rt=2&from=MM/DD/YY&to=MM/DD/YY&eid=0&stdexport=1
+ *                                   → returns Standard CSV body (headered, 25 cols)
  *
- *   rt=2       → Timecards report
- *   eid=ss     → all employees
- *   export=1   → CSV Extended format (full headers, matches backfill files exactly)
+ *   rt=2          → Timecards report
+ *   eid=0         → all employees (NOT 'ss' — that returns one employee only)
+ *   stdexport=1   → Standard CSV format (matches parser column names exactly)
+ *
+ *   Referer header on the export request must be set or the server gates the
+ *   response body to 0 bytes.
  *
  * ─── Required Netlify env vars ───
  *   FIREBASE_API_KEY    — for Firestore REST writes
@@ -153,11 +156,31 @@ function weekEndingSaturday(d: Date): string {
 async function b600FetchCSV(jar: CookieJar, from: Date, to: Date): Promise<string> {
   const fromStr = formatMDYY(from);
   const toStr = formatMDYY(to);
-  // Note: server expects MM/DD/YY as-is; no URL-encoding beyond what URLSearchParams provides
-  const url = `${B600_BASE_URL}/report.html?rt=2&from=${encodeURIComponent(fromStr)}&to=${encodeURIComponent(toStr)}&eid=ss&export=1`;
+  // ─── URL params (verified working 2026-04-28 against live tunnel) ───
+  //   rt=2          → Timecards report
+  //   eid=0         → ALL employees (NOT eid=ss — that returns just the
+  //                   previously-selected single employee, which is why this
+  //                   function had been silently broken)
+  //   stdexport=1   → STANDARD CSV format. Header row is:
+  //                   "Display Name,Display ID,Payroll ID,Date,In Day,In Time,
+  //                    Out Day,Out Time,Department,Dept. Code,Lunch,ADJ,REG,
+  //                    OT1,OT2,VAC,SICK,PER,HOL,Total,..."
+  //                   This matches the column names the parser/rollup expects
+  //                   (r["display name"], r["date"], r["reg"], r["ot1"], r["ot2"],
+  //                   r["total"]). Do NOT switch back to export=1 — that returns
+  //                   the "Extended" format with completely different columns
+  //                   (FirstName,LastName,DisplayAs,InDate,InTime,STD,...) which
+  //                   the parser cannot consume.
+  //   Referer header is required or the export gates to 0 bytes.
+  const reportPage = `${B600_BASE_URL}/report.html?rt=2&from=${encodeURIComponent(fromStr)}&to=${encodeURIComponent(toStr)}`;
+  const url = `${reportPage}&eid=0&stdexport=1`;
 
   const resp = await fetch(url, {
-    headers: { Cookie: jar.header(), Accept: "text/csv, */*" },
+    headers: {
+      Cookie: jar.header(),
+      Accept: "text/csv, */*",
+      Referer: reportPage,
+    },
   });
 
   if (!resp.ok) {
@@ -165,9 +188,10 @@ async function b600FetchCSV(jar: CookieJar, from: Date, to: Date): Promise<strin
   }
 
   const text = await resp.text();
-  // Guard: verify we got the CSV Extended format, not a login page or error
+  // Empty body = no punches in date range (not an error — just nothing to roll up)
+  if (!text.trim()) return "";
+  // Guard: verify we got the Standard CSV (header starts with "Display Name")
   if (!text.toLowerCase().startsWith("display name")) {
-    // Could be an HTML error page or session-expired redirect
     throw new Error(`Unexpected response body (first 200 chars): ${text.slice(0, 200)}`);
   }
   return text;
@@ -355,8 +379,11 @@ export default async (_req: Request, _context: Context) => {
   }
 };
 
-// Schedule: Mondays at 13:00 UTC (9AM EST / 8AM EDT).
-// Commented out until a successful manual test. To enable, uncomment the line:
+// Schedule: every Sunday at 04:00 UTC = Saturday 11pm EST / Saturday midnight EDT.
+// This runs after the warehouse closes for the just-completed Sun-Sat work week,
+// so all punch-outs are captured before the rollup writes to Firestore.
+// previousWeekSunToSat() handles the timezone math correctly (UTC dow=0 at this
+// hour both EST and EDT, returning the Sun-Sat week that just ended).
 export const config: Config = {
-  // schedule: "0 13 * * 1",
+  schedule: "0 4 * * 0",
 };
