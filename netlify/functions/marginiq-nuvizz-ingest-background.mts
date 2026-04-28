@@ -1,11 +1,18 @@
 import type { Context } from "@netlify/functions";
+import { gunzipSync } from "node:zlib";
 
 /**
- * Davis MarginIQ — NuVizz CSV Ingest Background Worker (v2.40.34)
+ * Davis MarginIQ — NuVizz CSV Ingest Background Worker (v2.40.36)
  *
- * Receives parsed NuVizz stops from the dispatcher and saves them to
- * Firestore in 500-doc batches using the :commit endpoint (same pattern
- * that fixed the audit rebuild in v2.40.28).
+ * Reads NuVizz stops from staged Firestore chunks (written by the dispatcher)
+ * and saves them to Firestore in 500-doc batches using the :commit endpoint
+ * (same pattern that fixed the audit rebuild in v2.40.28).
+ *
+ * v2.40.36 change: chunks are now pulled from nuvizz_ingest_payloads/{run_id}__NNN
+ * instead of being POSTed in the trigger body. This works around Lambda's
+ * 256KB async-invocation body limit that was silently killing every weekly
+ * ingest at HTTP 500. The chunks are gzipped+base64 and decoded here, then
+ * deleted at the end of a successful run.
  *
  * Why this exists:
  *   Client-side ingest was dropping ~73% of stops (13,198 of 49,847 saved).
@@ -212,6 +219,85 @@ function buildWeeklyRollup(stops: any[]): any {
   };
 }
 
+// ─── Payload chunk reader (v2.40.36) ─────────────────────────────────────────
+//
+// Loads all nuvizz_ingest_payloads/{run_id}__NNN chunks staged by the
+// dispatcher, decodes the gzipped base64 data, and reconstructs the full
+// stops array. Returns { stops, chunkDocIds } so caller can delete the
+// chunks after successful processing.
+
+async function loadStagedPayload(runId: string): Promise<{ stops: any[]; chunkDocIds: string[]; chunkCount: number }> {
+  const allStops: any[] = [];
+  const chunkDocIds: string[] = [];
+  let expectedChunkCount: number | null = null;
+
+  // Walk pages of nuvizz_ingest_payloads, filtering by docId prefix in code
+  // (Firestore REST has no docId-prefix query, so we filter client-side).
+  let pageToken: string | undefined;
+  const prefix = `${runId}__`;
+  let safety = 0;
+  do {
+    const params = new URLSearchParams({
+      key: FIREBASE_API_KEY || "",
+      pageSize: "50",
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    const url = `${BASE}/nuvizz_ingest_payloads?${params.toString()}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      throw new Error(`Failed to list payload chunks: HTTP ${resp.status}`);
+    }
+    const data: any = await resp.json();
+    for (const doc of (data.documents || [])) {
+      const id: string = String(doc.name).split("/").pop() || "";
+      if (!id.startsWith(prefix)) continue;
+      chunkDocIds.push(id);
+      const f = doc.fields || {};
+      if (expectedChunkCount === null && f.chunk_count?.integerValue) {
+        expectedChunkCount = Number(f.chunk_count.integerValue);
+      }
+      const b64: string = f.data_b64?.stringValue || "";
+      if (!b64) continue;
+      const gz = Buffer.from(b64, "base64");
+      const raw = gunzipSync(gz).toString("utf8");
+      const chunkStops = JSON.parse(raw);
+      if (Array.isArray(chunkStops)) {
+        for (const s of chunkStops) allStops.push(s);
+      }
+    }
+    pageToken = data.nextPageToken;
+    safety++;
+    if (safety > 200) break; // hard guardrail
+  } while (pageToken);
+
+  // Sort chunkDocIds so deletes happen in order (purely cosmetic for log clarity)
+  chunkDocIds.sort();
+
+  return {
+    stops: allStops,
+    chunkDocIds,
+    chunkCount: expectedChunkCount ?? chunkDocIds.length,
+  };
+}
+
+async function deleteStagedChunks(chunkDocIds: string[]): Promise<{ ok: number; failed: number }> {
+  let ok = 0, failed = 0;
+  // Parallelize 10-at-a-time for speed; chunks are independent
+  const CONC = 10;
+  for (let i = 0; i < chunkDocIds.length; i += CONC) {
+    const batch = chunkDocIds.slice(i, i + CONC);
+    const results = await Promise.all(batch.map(async (id) => {
+      const url = `${BASE}/nuvizz_ingest_payloads/${encodeURIComponent(id)}?key=${FIREBASE_API_KEY}`;
+      const r = await fetch(url, { method: "DELETE" });
+      return r.ok;
+    }));
+    for (const r of results) {
+      if (r) ok++; else failed++;
+    }
+  }
+  return { ok, failed };
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export default async (req: Request, _context: Context) => {
@@ -223,20 +309,42 @@ export default async (req: Request, _context: Context) => {
   try { body = await req.json(); }
   catch { return new Response("Invalid JSON", { status: 400 }); }
 
-  const stops: any[] = body.stops || [];
   const runId: string = body.run_id || `nuvizz_srv_${Date.now()}`;
   const source: string = body.source || "server";
 
+  // v2.40.36: stops are now loaded from Firestore chunks, not the request body.
+  // The dispatcher writes nuvizz_ingest_payloads/{run_id}__NNN chunks before
+  // calling us with just { run_id }. Backward compat: if body.stops is present
+  // (old-style call), use it directly.
+  let stops: any[] = body.stops || [];
+  let chunkDocIds: string[] = [];
+
   if (stops.length === 0) {
-    await writeStatusDoc(runId, { state: "failed", error: "No stops received" });
-    return new Response("No stops", { status: 400 });
+    try {
+      const staged = await loadStagedPayload(runId);
+      stops = staged.stops;
+      chunkDocIds = staged.chunkDocIds;
+      if (stops.length === 0) {
+        await writeStatusDoc(runId, {
+          state: "failed",
+          error: `No stops received and no payload chunks found for run_id=${runId}`,
+        });
+        return new Response("No stops", { status: 400 });
+      }
+    } catch (e: any) {
+      await writeStatusDoc(runId, { state: "failed", error: `Chunk load failed: ${e.message}` });
+      return new Response(`Chunk load failed: ${e.message}`, { status: 500 });
+    }
   }
 
   const startedAt = new Date().toISOString();
   await writeStatusDoc(runId, {
     run_id: runId, source, state: "running",
     started_at: startedAt, stop_count: stops.length,
-    progress_text: `Starting server-side ingest of ${stops.length.toLocaleString()} stops...`,
+    chunk_count: chunkDocIds.length,
+    progress_text: chunkDocIds.length > 0
+      ? `Loaded ${stops.length.toLocaleString()} stops from ${chunkDocIds.length} chunk(s). Filtering...`
+      : `Starting server-side ingest of ${stops.length.toLocaleString()} stops...`,
   });
 
   try {
@@ -329,7 +437,19 @@ export default async (req: Request, _context: Context) => {
       weeksRebuilt++;
     }
 
-    // ── Step 4: Final status ────────────────────────────────────────────────
+    // ── Step 4: Cleanup staged payload chunks ──────────────────────────────
+    // Now that everything is durably written to nuvizz_stops/nuvizz_weekly,
+    // the staged chunks in nuvizz_ingest_payloads can be deleted. Best-effort:
+    // failures here just leave orphan chunks; they're harmless and a future
+    // cleanup pass can remove them.
+    let chunksDeleted = 0, chunksDeleteFailed = 0;
+    if (chunkDocIds.length > 0) {
+      const cleanup = await deleteStagedChunks(chunkDocIds);
+      chunksDeleted = cleanup.ok;
+      chunksDeleteFailed = cleanup.failed;
+    }
+
+    // ── Step 5: Final status ────────────────────────────────────────────────
     const completedAt = new Date().toISOString();
     const pct = toSave.length > 0 ? Math.round(savedOk / toSave.length * 100) : 0;
     await writeStatusDoc(runId, {
@@ -347,6 +467,8 @@ export default async (req: Request, _context: Context) => {
       batches_failed: batchesFailed,
       weeks_rebuilt: weeksRebuilt,
       prefix_counts: prefixCounts,
+      chunks_deleted: chunksDeleted,
+      chunks_delete_failed: chunksDeleteFailed,
       progress_text: `✓ Complete: ${savedOk.toLocaleString()} stops saved (${pct}%), ${savedFailed} failed, ${weeksRebuilt} weeks rebuilt`,
     });
 
