@@ -42,7 +42,13 @@ import type { Context, Config } from "@netlify/functions";
  */
 
 const PROJECT_ID = "davismarginiq";
-const VENDOR_QUERY = "from:nuvizzapps@nuvizzapps.com has:attachment";
+// Tightened from `from:nuvizzapps@nuvizzapps.com has:attachment` to also
+// require the subject prefix that distinguishes the weekly driver_stops
+// CSV from the older "Stop Delivery Notification" event-stream emails
+// (DAVIS####### subjects from 2019-2021). Without this, the 5-message
+// search would eventually pull a 2021-era event email whose attachment
+// has totally different columns and the parser would produce 0 stops.
+const VENDOR_QUERY = 'from:nuvizzapps@nuvizzapps.com subject:"Report:Driver_stops_for_past_week" has:attachment';
 const CONTRACTOR_PAY_PCT = 0.40;
 
 function json(data: any, status = 200): Response {
@@ -298,19 +304,75 @@ function parseNuvizzCsv(csvText: string): ParsedStop[] {
   return stops;
 }
 
-// ─── Dispatcher invocation ──────────────────────────────────────────────────
+// ─── Dispatcher invocation (multi-batch) ────────────────────────────────────
+//
+// Splits the parsed stops into chunks small enough to fit under Netlify's
+// ~4 MB sync POST limit, then dispatches each chunk separately. Each chunk
+// becomes its own dispatcher run_id; we track all of them. Even though
+// each individual dispatcher call still goes through the chunked-payload
+// fix from v2.41.17 (which works fine for any size), the limiting factor
+// here is the function-to-function sync POST size.
+//
+// Empirically (during the 2025 recovery): 10K stops fits in ~3 MB JSON,
+// so we target 10K stops per batch as a safe ceiling. The 2025 weekly CSV
+// was ~13K stops at 2 MB, so most weekly emails will go in one batch.
+// Edge case: the Apr 21 email had 7.5 MB of attachment → ~50K stops →
+// 5 batches.
 
-async function dispatchToIngest(siteOrigin: string, stops: ParsedStop[], source: string): Promise<{ ok: boolean; runId?: string; chunkCount?: number; error?: string }> {
-  const url = `${siteOrigin}/.netlify/functions/marginiq-nuvizz-ingest`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ stops, source }),
-  });
-  let data: any = null;
-  try { data = await r.json(); } catch {}
-  if (!r.ok) return { ok: false, error: data?.error || `HTTP ${r.status}` };
-  return { ok: true, runId: data?.run_id, chunkCount: data?.chunk_count };
+const BATCH_STOP_COUNT = 10000;
+
+async function dispatchToIngest(siteOrigin: string, stops: ParsedStop[], source: string): Promise<{
+  ok: boolean;
+  runIds: string[];
+  totalChunks: number;
+  batchesDispatched: number;
+  batchesFailed: number;
+  error?: string;
+}> {
+  const runIds: string[] = [];
+  let totalChunks = 0;
+  let batchesFailed = 0;
+  const errors: string[] = [];
+
+  // Split stops into batches of BATCH_STOP_COUNT
+  const batches: ParsedStop[][] = [];
+  for (let i = 0; i < stops.length; i += BATCH_STOP_COUNT) {
+    batches.push(stops.slice(i, i + BATCH_STOP_COUNT));
+  }
+
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const batchSource = batches.length > 1 ? `${source}_b${b + 1}of${batches.length}` : source;
+    const url = `${siteOrigin}/.netlify/functions/marginiq-nuvizz-ingest`;
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stops: batch, source: batchSource }),
+      });
+      let data: any = null;
+      try { data = await r.json(); } catch {}
+      if (!r.ok) {
+        batchesFailed++;
+        errors.push(`Batch ${b + 1}: ${data?.error || `HTTP ${r.status}`}`);
+        continue;
+      }
+      if (data?.run_id) runIds.push(data.run_id);
+      if (data?.chunk_count) totalChunks += data.chunk_count;
+    } catch (e: any) {
+      batchesFailed++;
+      errors.push(`Batch ${b + 1}: ${e.message || String(e)}`);
+    }
+  }
+
+  return {
+    ok: batchesFailed === 0,
+    runIds,
+    totalChunks,
+    batchesDispatched: batches.length - batchesFailed,
+    batchesFailed,
+    error: errors.length > 0 ? errors.join("; ") : undefined,
+  };
 }
 
 // ─── Main handler ──────────────────────────────────────────────────────────
@@ -446,7 +508,8 @@ export default async (req: Request, _context: Context) => {
     }, FIREBASE_API_KEY);
 
     const dispatch = await dispatchToIngest(siteOrigin, stops, source);
-    if (!dispatch.ok) {
+    if (!dispatch.ok && dispatch.batchesDispatched === 0) {
+      // Total failure — no batches went through
       const err = `Dispatch failed: ${dispatch.error}`;
       await fsPatchDoc("nuvizz_auto_ingest_logs", runId, {
         state: "failed", error: err, completed_at: new Date().toISOString(),
@@ -454,7 +517,11 @@ export default async (req: Request, _context: Context) => {
       return json({ run_id: runId, state: "failed", error: err }, 200);
     }
 
-    // Mark messageId as processed (idempotency)
+    // Mark messageId as processed (idempotency record). Even if some batches
+    // failed, we mark it processed — the failed batches' stops were never
+    // saved, but PRO-keyed dedup means a future re-run wouldn't help anyway
+    // (would just re-fail the same way). The status doc records partial
+    // failure for visibility.
     await fsPatchDoc("nuvizz_processed_emails", bestMsg.messageId, {
       message_id: bestMsg.messageId,
       subject,
@@ -462,29 +529,40 @@ export default async (req: Request, _context: Context) => {
       email_date: new Date(bestMsg.internalDate).toISOString(),
       processed_at: new Date().toISOString(),
       auto_ingest_run_id: runId,
-      dispatcher_run_id: dispatch.runId || "",
+      dispatcher_run_ids: dispatch.runIds,
       stops_parsed: stops.length,
       attachment_filename: att.filename,
+      batches_dispatched: dispatch.batchesDispatched,
+      batches_failed: dispatch.batchesFailed,
     }, FIREBASE_API_KEY);
 
+    const finalState = dispatch.batchesFailed === 0 ? "complete" : "complete_with_errors";
+    const summary = dispatch.batchesFailed === 0
+      ? `✓ Dispatched ${stops.length.toLocaleString()} stops in ${dispatch.batchesDispatched} batch(es); ${dispatch.totalChunks} chunks total`
+      : `⚠ Dispatched ${dispatch.batchesDispatched}/${dispatch.batchesDispatched + dispatch.batchesFailed} batches; ${dispatch.batchesFailed} failed: ${dispatch.error}`;
+
     await fsPatchDoc("nuvizz_auto_ingest_logs", runId, {
-      state: "complete",
+      state: finalState,
       completed_at: new Date().toISOString(),
-      progress: `✓ Dispatched ${stops.length.toLocaleString()} stops; dispatcher run_id: ${dispatch.runId}`,
-      dispatcher_run_id: dispatch.runId || "",
-      dispatcher_chunk_count: dispatch.chunkCount || 0,
+      progress: summary,
+      dispatcher_run_ids: dispatch.runIds,
+      dispatcher_total_chunks: dispatch.totalChunks,
+      batches_dispatched: dispatch.batchesDispatched,
+      batches_failed: dispatch.batchesFailed,
       stops_parsed: stops.length,
     }, FIREBASE_API_KEY);
 
     return json({
       run_id: runId,
-      state: "complete",
+      state: finalState,
       message_id: bestMsg.messageId,
       account: bestMsg.account.email,
       subject,
       stops_parsed: stops.length,
-      dispatcher_run_id: dispatch.runId,
-      dispatcher_chunk_count: dispatch.chunkCount,
+      dispatcher_run_ids: dispatch.runIds,
+      dispatcher_total_chunks: dispatch.totalChunks,
+      batches_dispatched: dispatch.batchesDispatched,
+      batches_failed: dispatch.batchesFailed,
     }, 200);
   } catch (err: any) {
     await fsPatchDoc("nuvizz_auto_ingest_logs", runId, {
