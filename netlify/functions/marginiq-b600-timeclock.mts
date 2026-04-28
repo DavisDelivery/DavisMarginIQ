@@ -300,6 +300,115 @@ function rollupWeekly(rows: Record<string, string>[]): any[] {
   }));
 }
 
+// ─── Per-employee-per-day rollup (timeclock_daily collection) ────────────────
+// SENTINEL needs daily punches with clockIn/clockOut to cross-reference against
+// Motive driving_periods. The weekly rollup loses that detail. So in addition
+// to writing weekly summaries, we also write one doc per (date, employee).
+//
+// Doc ID format: `{YYYY-MM-DD}_{display_id_sanitized}`
+//   e.g. "2026-04-10_A_Kostner"  for Anthony Kostner
+//
+// Multiple punches per day (lunch breaks, splits) get collapsed into a single
+// doc with a `punches: [{in, out, hours}]` array. Convenience fields
+// `clock_in` and `clock_out` provide earliest-in / latest-out for fast reads.
+
+interface DailyEntry {
+  date: string;          // YYYY-MM-DD
+  display_name: string;
+  display_id: string;
+  payroll_id: string;
+  day_of_week: string;   // "Mon".."Sun"
+  week_ending: string;   // YYYY-MM-DD (Saturday)
+  punches: { in: string; out: string; hours: number }[];
+  clock_in: string;      // earliest "in" across all punches (HH:MM 24h)
+  clock_out: string;     // latest "out" across all punches
+  total_hours: number;
+  reg_hours: number;
+  ot_hours: number;
+  doc_id: string;        // {date}_{sanitized display_id} — Firestore doc ID
+}
+
+// Convert "06:33a" / "11:34p" / "12:00a" → "06:33" / "23:34" / "00:00" (24h HH:MM).
+// Returns "" for empty / unrecognized input.
+function to24h(s: string): string {
+  if (!s) return "";
+  const m = s.match(/^(\d{1,2}):(\d{2})\s*([ap])$/i);
+  if (!m) return s;
+  let hh = parseInt(m[1], 10);
+  const mm = m[2];
+  if (m[3].toLowerCase() === "p" && hh < 12) hh += 12;
+  if (m[3].toLowerCase() === "a" && hh === 12) hh = 0;
+  return `${String(hh).padStart(2, "0")}:${mm}`;
+}
+
+// Sanitize display_id for use in Firestore doc IDs:
+// - replace whitespace and slashes with underscore
+// - drop any other path-unsafe chars
+// Example: "A Kostner" → "A_Kostner",  "B/J" → "B_J"
+function safeDocId(s: string): string {
+  return (s || "")
+    .replace(/[\s/\\]+/g, "_")
+    .replace(/[^A-Za-z0-9_.-]/g, "")
+    .slice(0, 100); // hard cap, Firestore allows up to ~1500 chars but be sane
+}
+
+function rollupDaily(rows: Record<string, string>[]): DailyEntry[] {
+  // Key by (date, display_id) — display_id is unique per employee in B600.
+  // Fall back to display_name if display_id is empty (rare).
+  const map: Record<string, DailyEntry> = {};
+  for (const r of rows) {
+    const dispName = (r["display name"] || "").trim();
+    const dispId = (r["display id"] || "").trim() || dispName;
+    if (!dispName || !dispId) continue;
+    const d = parseDateMDY(r["date"]);
+    if (!d) continue;
+    const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const key = `${dateStr}|${dispId}`;
+    const inT = to24h((r["in time"] || "").trim());
+    const outT = to24h((r["out time"] || "").trim());
+    const reg = parseHours(r["reg"]);
+    const ot = parseHours(r["ot1"]) + parseHours(r["ot2"]);
+    const tot = parseHours(r["total"]) || reg + ot;
+
+    if (!map[key]) {
+      map[key] = {
+        date: dateStr,
+        display_name: dispName,
+        display_id: dispId,
+        payroll_id: (r["payroll id"] || "").trim(),
+        day_of_week: (r["in day"] || "").trim(),
+        week_ending: weekEndingSaturday(d),
+        punches: [],
+        clock_in: inT,
+        clock_out: outT,
+        total_hours: 0,
+        reg_hours: 0,
+        ot_hours: 0,
+        doc_id: `${dateStr}_${safeDocId(dispId)}`,
+      };
+    }
+    const e = map[key];
+    e.punches.push({ in: inT, out: outT, hours: tot });
+    e.total_hours += tot;
+    e.reg_hours += reg;
+    e.ot_hours += ot;
+    // Update earliest-in / latest-out across all punches for the day.
+    if (inT && (!e.clock_in || inT < e.clock_in)) e.clock_in = inT;
+    if (outT && (!e.clock_out || outT > e.clock_out)) e.clock_out = outT;
+  }
+  // Round totals + sort punches chronologically
+  return Object.values(map).map(e => {
+    e.punches.sort((a, b) => (a.in || "").localeCompare(b.in || ""));
+    return {
+      ...e,
+      total_hours: Number(e.total_hours.toFixed(2)),
+      reg_hours: Number(e.reg_hours.toFixed(2)),
+      ot_hours: Number(e.ot_hours.toFixed(2)),
+      punches: e.punches.map(p => ({ ...p, hours: Number(p.hours.toFixed(2)) })),
+    };
+  });
+}
+
 // ─── Firestore writer ────────────────────────────────────────────────────────
 function toFsValue(v: any): any {
   if (v === null || v === undefined) return { nullValue: null };
@@ -386,17 +495,54 @@ export default async (req: Request, _context: Context) => {
     }
 
     const weekly = rollupWeekly(rows);
+    const daily = rollupDaily(rows);
     const isManual = !!(fromParam && toParam);
+    const sourceTag = isManual ? "b600_manual_backfill" : "b600_scheduled";
 
     let saved = 0;
     const weekIds: string[] = [];
     for (const w of weekly) {
       const ok = await fsWrite("timeclock_weekly", w.week_ending, {
         ...w,
-        source: isManual ? "b600_manual_backfill" : "b600_scheduled",
+        source: sourceTag,
         updated_at: new Date().toISOString(),
       });
       if (ok) { saved++; weekIds.push(w.week_ending); }
+    }
+
+    // v2.41.16: Also write per-employee-per-day docs to timeclock_daily so
+    // SENTINEL (and any other consumer needing daily punch detail) can query
+    // by date instead of relying on a static b600-history.json file.
+    //
+    // ~250 docs/week × 200ms each sequential = ~50s, exceeds Netlify sync
+    // timeout. Run with bounded concurrency (10 in flight) instead → ~5s.
+    let dailySaved = 0, dailyFailed = 0;
+    const nowIso = new Date().toISOString();
+    const CONCURRENCY = 10;
+    async function writeOne(e: DailyEntry): Promise<boolean> {
+      return await fsWrite("timeclock_daily", e.doc_id, {
+        date: e.date,
+        display_name: e.display_name,
+        display_id: e.display_id,
+        payroll_id: e.payroll_id,
+        day_of_week: e.day_of_week,
+        week_ending: e.week_ending,
+        punches: e.punches,
+        clock_in: e.clock_in,
+        clock_out: e.clock_out,
+        total_hours: e.total_hours,
+        reg_hours: e.reg_hours,
+        ot_hours: e.ot_hours,
+        source: sourceTag,
+        updated_at: nowIso,
+      });
+    }
+    for (let i = 0; i < daily.length; i += CONCURRENCY) {
+      const batch = daily.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(batch.map(writeOne));
+      for (const ok of results) {
+        if (ok) dailySaved++; else dailyFailed++;
+      }
     }
 
     await fsWrite("marginiq_config", "b600_last_pull", {
@@ -406,6 +552,8 @@ export default async (req: Request, _context: Context) => {
       rows_fetched: rows.length,
       weeks_saved: saved,
       week_endings: weekIds,
+      daily_docs_saved: dailySaved,
+      daily_docs_failed: dailyFailed,
       status: "ok",
     });
 
@@ -416,6 +564,8 @@ export default async (req: Request, _context: Context) => {
         rows_fetched: rows.length,
         weeks_saved: saved,
         week_endings: weekIds,
+        daily_docs_saved: dailySaved,
+        daily_docs_failed: dailyFailed,
       }),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
