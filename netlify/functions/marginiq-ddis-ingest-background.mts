@@ -1,13 +1,23 @@
 import type { Context } from "@netlify/functions";
+import { gunzipSync } from "node:zlib";
 
 /**
- * Davis MarginIQ — DDIS Ingest Background Worker (v2.40.17)
+ * Davis MarginIQ — DDIS Ingest Background Worker (v2.42.13)
  *
  * Persists DDIS payment + file metadata to Firestore after the client has
- * already parsed the CSV(s). Client POSTs the parsed arrays to the dispatcher
- * marginiq-ddis-ingest; the dispatcher forwards them here and returns 202.
+ * already parsed the CSV(s).
  *
- * Why background:
+ * v2.42.13 — Chunked payload support
+ *   Now supports two input modes:
+ *   1. Legacy direct: { ddisFileRecords: [...], ddisPayments: [...] }
+ *      Used for very small files where the dispatcher elects to skip
+ *      chunking. Backward-compat with any caller still using this shape.
+ *   2. Chunked: { run_id: "ddis_srv_..." }
+ *      Used by the v2.42.13 dispatcher and the auto-ingest path. Reads
+ *      gzipped chunks from ddis_ingest_payloads/{run_id}__NNN, decodes
+ *      them, processes, and deletes the chunks at the end.
+ *
+ * Why background (unchanged from v2.40.17):
  *   - A DDIS CSV commonly has ~3000 payment rows. The old client flow wrote
  *     ddis_payments 25 at a time over the Firebase JS SDK from a mobile
  *     browser → ~120 sequential round trips → minutes of stall and occasional
@@ -55,6 +65,77 @@ const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
 // Hard cap on payments we'll write per ingest. Mirrors the v2.5 client cap of
 // 10,000 so behavior stays consistent if someone uploads a year at once.
 const PAYMENT_CAP = 10000;
+
+const FS_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+
+// v2.42.13 — Chunked-payload reader. Loads all
+// ddis_ingest_payloads/{run_id}__NNN chunks staged by the dispatcher,
+// decodes the gzipped base64 content, and returns the concatenated
+// ddisFileRecords[] + ddisPayments[]. Returns chunkDocIds so the caller
+// can delete the chunks after successful processing.
+async function loadStagedPayload(runId: string): Promise<{
+  ddisFileRecords: any[];
+  ddisPayments: any[];
+  chunkDocIds: string[];
+}> {
+  const ddisFileRecords: any[] = [];
+  const ddisPayments: any[] = [];
+  const chunkDocIds: string[] = [];
+
+  let pageToken: string | undefined;
+  const prefix = `${runId}__`;
+  let safety = 0;
+  do {
+    const params = new URLSearchParams({ key: FIREBASE_API_KEY || "", pageSize: "50" });
+    if (pageToken) params.set("pageToken", pageToken);
+    const url = `${FS_BASE}/ddis_ingest_payloads?${params.toString()}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      throw new Error(`Failed to list payload chunks: HTTP ${resp.status}`);
+    }
+    const data: any = await resp.json();
+    for (const doc of (data.documents || [])) {
+      const id: string = String(doc.name).split("/").pop() || "";
+      if (!id.startsWith(prefix)) continue;
+      chunkDocIds.push(id);
+      const f = doc.fields || {};
+      const b64: string = f.data_b64?.stringValue || "";
+      if (!b64) continue;
+      const gz = Buffer.from(b64, "base64");
+      const raw = gunzipSync(gz).toString("utf8");
+      const chunkData = JSON.parse(raw);
+      if (Array.isArray(chunkData.ddisFileRecords)) {
+        for (const fr of chunkData.ddisFileRecords) ddisFileRecords.push(fr);
+      }
+      if (Array.isArray(chunkData.ddisPayments)) {
+        for (const p of chunkData.ddisPayments) ddisPayments.push(p);
+      }
+    }
+    pageToken = data.nextPageToken;
+    safety++;
+    if (safety > 200) break;
+  } while (pageToken);
+
+  chunkDocIds.sort();
+  return { ddisFileRecords, ddisPayments, chunkDocIds };
+}
+
+async function deleteStagedChunks(chunkDocIds: string[]): Promise<{ ok: number; failed: number }> {
+  let ok = 0, failed = 0;
+  const CONC = 10;
+  for (let i = 0; i < chunkDocIds.length; i += CONC) {
+    const batch = chunkDocIds.slice(i, i + CONC);
+    const results = await Promise.all(batch.map(async (id) => {
+      const url = `${FS_BASE}/ddis_ingest_payloads/${encodeURIComponent(id)}?key=${FIREBASE_API_KEY}`;
+      const r = await fetch(url, { method: "DELETE" });
+      return r.ok;
+    }));
+    for (const r of results) {
+      if (r) ok++; else failed++;
+    }
+  }
+  return { ok, failed };
+}
 
 // ─── Firestore REST helpers ────────────────────────────────────────
 
@@ -282,8 +363,32 @@ export default async (req: Request, _context: Context) => {
     return;
   }
 
-  const ddisFileRecords = Array.isArray(body.ddisFileRecords) ? body.ddisFileRecords : [];
-  const ddisPayments = Array.isArray(body.ddisPayments) ? body.ddisPayments : [];
+  let ddisFileRecords: any[] = Array.isArray(body.ddisFileRecords) ? body.ddisFileRecords : [];
+  let ddisPayments: any[] = Array.isArray(body.ddisPayments) ? body.ddisPayments : [];
+  let chunkDocIds: string[] = [];
+  let runId: string = body.run_id || "";
+
+  // v2.42.13: chunked-payload mode. If body has only run_id (no inline arrays),
+  // load the staged chunks from Firestore.
+  if ((ddisFileRecords.length === 0 && ddisPayments.length === 0) && runId) {
+    try {
+      const staged = await loadStagedPayload(runId);
+      ddisFileRecords = staged.ddisFileRecords;
+      ddisPayments = staged.ddisPayments;
+      chunkDocIds = staged.chunkDocIds;
+      console.log(`ddis-ingest-background: loaded ${ddisFileRecords.length} files + ${ddisPayments.length} payments from ${chunkDocIds.length} chunks (run_id=${runId})`);
+    } catch (e: any) {
+      console.error(`ddis-ingest-background: chunk load failed: ${e?.message || String(e)}`);
+      await writeStatus({
+        state: "failed",
+        completed_at: new Date().toISOString(),
+        phase: "done",
+        progress_text: `✗ Chunk load failed: ${e?.message || String(e)}`,
+        error: String(e?.message || e),
+      }).catch(() => {});
+      return;
+    }
+  }
 
   const t0 = Date.now();
   console.log(`ddis-ingest-background: start — ${ddisFileRecords.length} files, ${ddisPayments.length} payments`);
@@ -293,5 +398,12 @@ export default async (req: Request, _context: Context) => {
     console.log(`ddis-ingest-background: done in ${elapsed}s — ${r.fileOk} files, ${r.paymentOk} payments, ${r.failed} failed`);
   } else {
     console.error(`ddis-ingest-background: FAILED in ${elapsed}s — ${(r as any).error}`);
+  }
+
+  // v2.42.13: clean up staged chunks after successful ingest. Best-effort
+  // — orphan chunks are harmless and a future cleanup pass can remove them.
+  if (chunkDocIds.length > 0) {
+    const cleanup = await deleteStagedChunks(chunkDocIds);
+    console.log(`ddis-ingest-background: cleanup deleted ${cleanup.ok}/${chunkDocIds.length} chunks (${cleanup.failed} failed)`);
   }
 };
