@@ -330,10 +330,33 @@ async function fsWrite(collection: string, docId: string, data: any): Promise<bo
 }
 
 // ─── Main handler ────────────────────────────────────────────────────────────
-export default async (_req: Request, _context: Context) => {
+export default async (req: Request, _context: Context) => {
   const startedAt = new Date().toISOString();
   try {
-    const { from, to } = previousWeekSunToSat();
+    // v2.41.15: Allow manual backfill via ?from=YYYY-MM-DD&to=YYYY-MM-DD.
+    // Scheduled runs hit the function with no query params and use the
+    // default "previous Sun-Sat" window via previousWeekSunToSat(). For
+    // backfilling missing weeks, pass explicit ISO dates and the function
+    // will fetch + roll up that range instead.
+    const url = new URL(req.url);
+    const fromParam = url.searchParams.get("from");
+    const toParam = url.searchParams.get("to");
+
+    let from: Date, to: Date;
+    if (fromParam && toParam) {
+      const f = fromParam.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      const t = toParam.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!f || !t) {
+        throw new Error("from/to must be YYYY-MM-DD format");
+      }
+      from = new Date(parseInt(f[1]), parseInt(f[2]) - 1, parseInt(f[3]));
+      from.setHours(0, 0, 0, 0);
+      to = new Date(parseInt(t[1]), parseInt(t[2]) - 1, parseInt(t[3]));
+      to.setHours(23, 59, 59, 999);
+    } else {
+      ({ from, to } = previousWeekSunToSat());
+    }
+
     const jar = await b600Login();
     const csv = await b600FetchCSV(jar, from, to);
     const rows = parseCSV(csv);
@@ -363,13 +386,14 @@ export default async (_req: Request, _context: Context) => {
     }
 
     const weekly = rollupWeekly(rows);
+    const isManual = !!(fromParam && toParam);
 
     let saved = 0;
     const weekIds: string[] = [];
     for (const w of weekly) {
       const ok = await fsWrite("timeclock_weekly", w.week_ending, {
         ...w,
-        source: "b600_scheduled",
+        source: isManual ? "b600_manual_backfill" : "b600_scheduled",
         updated_at: new Date().toISOString(),
       });
       if (ok) { saved++; weekIds.push(w.week_ending); }
