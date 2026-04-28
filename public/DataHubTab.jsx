@@ -282,9 +282,15 @@ function DataHubTab() {
     });
   }, [data.employees]);
 
+  const terminatedCount = useMemo(
+    () => (data.employees || []).filter(e => e.status === "terminated").length,
+    [data.employees]
+  );
+
   const navItems = [
     { id: "dashboard", icon: "📊", label: "Ingestion Status" },
     { id: "employees", icon: "👥", label: "Employee Mapping", badge: unmappedEmployees.length || null, badgeColor: unmappedEmployees.length > 0 ? "yellow" : null },
+    { id: "history", icon: "📜", label: "Driver History", badge: terminatedCount || null, badgeColor: "neutral" },
     { id: "vehicles", icon: "🚛", label: "Vehicle Mapping" },
     { id: "customers", icon: "🏢", label: "Customer Master" },
     { id: "upload", icon: "📤", label: "Manual Upload" },
@@ -325,8 +331,12 @@ function DataHubTab() {
           item.badge && React.createElement("span", {
             style: {
               fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 99,
-              background: item.badgeColor === "yellow" ? DH_T.yellowBg : DH_T.redBg,
-              color: item.badgeColor === "yellow" ? DH_T.yellowText : DH_T.redText,
+              background: item.badgeColor === "yellow" ? DH_T.yellowBg
+                : item.badgeColor === "neutral" ? DH_T.bgSurface
+                : DH_T.redBg,
+              color: item.badgeColor === "yellow" ? DH_T.yellowText
+                : item.badgeColor === "neutral" ? DH_T.textMuted
+                : DH_T.redText,
             }
           }, item.badge)
         );
@@ -338,6 +348,7 @@ function DataHubTab() {
         ? React.createElement(LoadingState)
         : section === "dashboard" ? React.createElement(IngestionStatus, { sources, data, onRefresh: refresh })
         : section === "employees" ? React.createElement(EmployeeMapping, { data, unmapped: unmappedEmployees, onRefresh: refresh })
+        : section === "history" ? React.createElement(DriverHistory, { data, onRefresh: refresh })
         : section === "vehicles" ? React.createElement(VehicleMapping, { data, onRefresh: refresh })
         : section === "customers" ? React.createElement(CustomerMaster, { data, onRefresh: refresh })
         : section === "upload" ? React.createElement(ManualUpload)
@@ -1456,6 +1467,7 @@ function EmployeeEditor({ data, unmapped, onRefresh, onBootstrap }) {
   const [pendingChanges, setPendingChanges] = useState({}); // { employeeId: patch }
   const [saving, setSaving] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [terminating, setTerminating] = useState(null); // employee being terminated
   const [fleetMgmt, setFleetMgmt] = useState(null);
   const [motiveDrivers, setMotiveDrivers] = useState(null);
 
@@ -1504,6 +1516,11 @@ function EmployeeEditor({ data, unmapped, onRefresh, onBootstrap }) {
 
   const filtered = useMemo(() => {
     let list = liveEmployees;
+    // Always hide terminated employees from the main editor — they live in
+    // the Driver History sub-tab. (Override via filter "include_terminated".)
+    if (filter !== "include_terminated") {
+      list = list.filter(e => e.status !== "terminated");
+    }
     if (filter === "unmapped") {
       list = list.filter(e => unmapped.some(u => u.id === e.id));
     } else if (filter.startsWith("role:")) {
@@ -1601,6 +1618,7 @@ function EmployeeEditor({ data, unmapped, onRefresh, onBootstrap }) {
     React.createElement(SpreadsheetTable, {
       employees: filtered, harvested, claimed,
       updateField, updateExternal,
+      onRequestTerminate: setTerminating,
       data,
     }),
 
@@ -1612,12 +1630,37 @@ function EmployeeEditor({ data, unmapped, onRefresh, onBootstrap }) {
         setAdding(false);
         onRefresh();
       },
+    }),
+
+    // Terminate modal — opens when user picks "Terminated" from a status dropdown
+    terminating && React.createElement(TerminateModal, {
+      employee: terminating,
+      onClose: () => setTerminating(null),
+      onConfirm: async (terminationData) => {
+        // Save directly (don't go through pendingChanges, since termination
+        // touches multiple fields and should be atomic).
+        const patch = {
+          status: "terminated",
+          terminatedAt: terminationData.date,
+          terminationReason: terminationData.reason || null,
+          lastTruck: terminating.defaultTruck || null,
+        };
+        // If user opted to release IDs, blank them out.
+        if (terminationData.releaseIds) {
+          patch.externalIds = {};
+          patch.defaultTruck = null;
+          patch.releasedAt = terminationData.date;
+        }
+        await DH.saveEmployee(terminating.id, patch);
+        setTerminating(null);
+        onRefresh();
+      },
     })
   );
 }
 
 // ─── Spreadsheet Table ──────────────────────────────────────────────
-function SpreadsheetTable({ employees, harvested, claimed, updateField, updateExternal, data }) {
+function SpreadsheetTable({ employees, harvested, claimed, updateField, updateExternal, onRequestTerminate, data }) {
   if (employees.length === 0) {
     return React.createElement("div", {
       style: { padding: 30, textAlign: "center", background: DH_T.bgCard, border: `1px dashed ${DH_T.border}`, borderRadius: DH_T.radius, fontSize: 12, color: DH_T.textMuted }
@@ -1657,7 +1700,7 @@ function SpreadsheetTable({ employees, harvested, claimed, updateField, updateEx
       React.createElement("tbody", null,
         employees.map(emp => React.createElement(SpreadsheetRow, {
           key: emp.id, emp, harvested, claimed,
-          updateField, updateExternal, data,
+          updateField, updateExternal, onRequestTerminate, data,
           cellStyle,
         }))
       )
@@ -1665,7 +1708,7 @@ function SpreadsheetTable({ employees, harvested, claimed, updateField, updateEx
   );
 }
 
-function SpreadsheetRow({ emp, harvested, claimed, updateField, updateExternal, data, cellStyle }) {
+function SpreadsheetRow({ emp, harvested, claimed, updateField, updateExternal, onRequestTerminate, data, cellStyle }) {
   const role = ROLE_BY_ID[emp.role] || ROLE_BY_ID.unknown;
   const ext = emp.externalIds || {};
 
@@ -1747,7 +1790,17 @@ function SpreadsheetRow({ emp, harvested, claimed, updateField, updateExternal, 
     // Status
     React.createElement("td", { style: cellStyle },
       React.createElement("select", {
-        value: emp.status || "active", onChange: e => updateField(emp.id, "status", e.target.value),
+        value: emp.status || "active",
+        onChange: e => {
+          const v = e.target.value;
+          if (v === "terminated") {
+            // Don't change the value yet — open the modal which will save
+            // status + termination metadata atomically.
+            onRequestTerminate(emp);
+          } else {
+            updateField(emp.id, "status", v);
+          }
+        },
         style: { padding: "3px 6px", fontSize: 10, border: `1px solid ${DH_T.border}`, borderRadius: 4, fontFamily: "inherit", background: emp.status === "terminated" ? DH_T.redBg : DH_T.greenBg, color: emp.status === "terminated" ? DH_T.redText : DH_T.greenText, fontWeight: 600 }
       },
         React.createElement("option", { value: "active" }, "Active"),
@@ -2063,6 +2116,240 @@ function AddRowModal({ onClose, onSave }) {
         }, saving ? "Adding…" : "Add Employee")
       )
     )
+  );
+}
+
+
+// ─── Terminate Modal ────────────────────────────────────────────────
+// Confirms a termination, captures date + optional reason, and lets the
+// user choose whether to release external IDs (so a new hire can claim
+// them) or keep them claimed (default — preserves audit trail).
+function TerminateModal({ employee, onClose, onConfirm }) {
+  const today = new Date().toISOString().split("T")[0];
+  const [date, setDate] = useState(today);
+  const [reason, setReason] = useState("");
+  const [releaseIds, setReleaseIds] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const ext = employee.externalIds || {};
+  const claimedSystems = [];
+  if (ext.payroll) claimedSystems.push(`Payroll #${ext.payroll}`);
+  if (ext.b600) claimedSystems.push(`B600 ${ext.b600}`);
+  if (ext.nuvizz) claimedSystems.push(`NuVizz ${ext.nuvizz}`);
+  if (ext.motive) claimedSystems.push(`Motive #${ext.motive}`);
+  if (employee.defaultTruck) claimedSystems.push(`Truck ${employee.defaultTruck}`);
+
+  const handle = async () => {
+    setSaving(true);
+    await onConfirm({ date, reason: reason.trim() || null, releaseIds });
+    // parent will call setTerminating(null) which unmounts us
+  };
+
+  const labelStyle = { fontSize: 10, fontWeight: 700, color: DH_T.textMuted, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4, display: "block" };
+  const inputStyle = { padding: "7px 10px", fontSize: 13, border: `1px solid ${DH_T.border}`, borderRadius: 6, fontFamily: "inherit", width: "100%", boxSizing: "border-box", outline: "none" };
+
+  return React.createElement("div", {
+    onClick: onClose,
+    style: { position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 20 }
+  },
+    React.createElement("div", {
+      onClick: e => e.stopPropagation(),
+      style: { background: DH_T.bgCard, borderRadius: DH_T.radius, padding: 22, maxWidth: 460, width: "100%", boxShadow: "0 20px 60px rgba(0,0,0,0.3)" }
+    },
+      React.createElement("div", { style: { fontSize: 16, fontWeight: 700, color: DH_T.text, marginBottom: 4 } },
+        "Terminate ", React.createElement("span", { style: { color: DH_T.redText } }, employee.fullName)
+      ),
+      React.createElement("div", { style: { fontSize: 11, color: DH_T.textMuted, marginBottom: 14 } },
+        "Moves them to Driver History. Their external ID claims are kept by default so historical data still maps correctly."
+      ),
+
+      // Termination date
+      React.createElement("div", { style: { marginBottom: 12 } },
+        React.createElement("label", { style: labelStyle }, "Termination Date"),
+        React.createElement("input", {
+          type: "date", value: date, onChange: e => setDate(e.target.value),
+          style: inputStyle,
+        })
+      ),
+
+      // Reason (optional)
+      React.createElement("div", { style: { marginBottom: 14 } },
+        React.createElement("label", { style: labelStyle }, "Reason (optional)"),
+        React.createElement("input", {
+          type: "text", value: reason, onChange: e => setReason(e.target.value),
+          placeholder: "e.g. quit, no-show, incident, layoff, retired",
+          style: inputStyle,
+        })
+      ),
+
+      // Claimed systems summary
+      claimedSystems.length > 0 && React.createElement("div", {
+        style: { background: DH_T.bgSurface, border: `1px solid ${DH_T.borderLight}`, borderRadius: 6, padding: 10, marginBottom: 12 }
+      },
+        React.createElement("div", { style: { fontSize: 10, fontWeight: 700, color: DH_T.textMuted, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 } },
+          "Currently Claimed Systems"
+        ),
+        React.createElement("div", { style: { fontSize: 11, color: DH_T.text, lineHeight: 1.6 } },
+          claimedSystems.join(" · ")
+        )
+      ),
+
+      // Release IDs override
+      React.createElement("label", {
+        style: { display: "flex", alignItems: "start", gap: 8, fontSize: 11, color: DH_T.text, padding: "10px 12px", background: releaseIds ? DH_T.yellowBg : DH_T.bgSurface, border: `1px solid ${releaseIds ? DH_T.yellow : DH_T.borderLight}`, borderRadius: 6, marginBottom: 16, cursor: "pointer" }
+      },
+        React.createElement("input", {
+          type: "checkbox", checked: releaseIds, onChange: e => setReleaseIds(e.target.checked),
+          style: { marginTop: 2, cursor: "pointer" }
+        }),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontWeight: 600 } }, "Release external IDs"),
+          React.createElement("div", { style: { fontSize: 10, color: DH_T.textMuted, marginTop: 2 } },
+            "Clears Payroll, B600, NuVizz, Motive, and Truck. Use only if a new hire is taking over their slot. Default off — keeps history accurate."
+          )
+        )
+      ),
+
+      React.createElement("div", { style: { display: "flex", gap: 8, justifyContent: "end" } },
+        React.createElement("button", {
+          onClick: onClose, disabled: saving,
+          style: { padding: "8px 14px", fontSize: 12, fontWeight: 600, color: DH_T.textMuted, background: "transparent", border: `1px solid ${DH_T.border}`, borderRadius: 6, cursor: "pointer", fontFamily: "inherit" }
+        }, "Cancel"),
+        React.createElement("button", {
+          onClick: handle, disabled: saving,
+          style: { padding: "8px 16px", fontSize: 12, fontWeight: 700, color: "#fff", background: DH_T.redText || "#dc2626", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "inherit", opacity: saving ? 0.6 : 1 }
+        }, saving ? "Saving…" : "Confirm termination")
+      )
+    )
+  );
+}
+
+
+// ═══ Driver History (terminated employees) ══════════════════════════
+function DriverHistory({ data, onRefresh }) {
+  const [search, setSearch] = useState("");
+  const [reactivating, setReactivating] = useState(null);
+
+  const terminated = useMemo(
+    () => (data.employees || [])
+      .filter(e => e.status === "terminated")
+      .sort((a, b) => {
+        const ad = a.terminatedAt || "";
+        const bd = b.terminatedAt || "";
+        if (ad !== bd) return bd.localeCompare(ad); // most recent first
+        return (a.fullName || "").localeCompare(b.fullName || "");
+      }),
+    [data.employees]
+  );
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return terminated;
+    const q = search.toLowerCase();
+    return terminated.filter(e =>
+      (e.fullName || "").toLowerCase().includes(q) ||
+      (e.terminationReason || "").toLowerCase().includes(q)
+    );
+  }, [terminated, search]);
+
+  const reactivate = async (emp) => {
+    if (!window.confirm(`Reactivate ${emp.fullName}?\n\nMoves them back to Employee Mapping with status "Active". Their external IDs (Payroll, B600, NuVizz, Motive, Truck) will be restored if not previously released.`)) return;
+    await DH.saveEmployee(emp.id, {
+      status: "active",
+      reactivatedAt: new Date().toISOString().split("T")[0],
+    });
+    onRefresh();
+  };
+
+  const headStyle = {
+    padding: "8px 12px", fontSize: 9, fontWeight: 700, textTransform: "uppercase",
+    letterSpacing: "0.05em", color: DH_T.textMuted, background: DH_T.bgSurface,
+    textAlign: "left", borderBottom: `1px solid ${DH_T.border}`, position: "sticky", top: 0, zIndex: 1,
+  };
+  const cellStyle = {
+    padding: "8px 12px", fontSize: 12, borderBottom: `1px solid ${DH_T.borderLight}`,
+    verticalAlign: "middle",
+  };
+
+  return React.createElement("div", null,
+    React.createElement("div", { style: { marginBottom: 16 } },
+      React.createElement("h1", { style: { fontSize: 22, fontWeight: 700, color: DH_T.text, margin: 0, letterSpacing: "-0.02em" } }, "Driver History"),
+      React.createElement("p", { style: { fontSize: 12, color: DH_T.textMuted, margin: "4px 0 0 0" } },
+        `${terminated.length} terminated employee${terminated.length === 1 ? "" : "s"}. Their Payroll/B600/NuVizz/Motive IDs stay claimed by default so historical data still routes to the right person.`)
+    ),
+
+    React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 10, alignItems: "center" } },
+      React.createElement("input", {
+        type: "text", placeholder: "Search by name or reason…",
+        value: search, onChange: e => setSearch(e.target.value),
+        style: { padding: "6px 10px", fontSize: 12, border: `1px solid ${DH_T.border}`, borderRadius: 6, width: 280, fontFamily: "inherit", outline: "none" }
+      }),
+      React.createElement("div", { style: { fontSize: 11, color: DH_T.textMuted } },
+        `${filtered.length} shown`)
+    ),
+
+    filtered.length === 0
+      ? React.createElement("div", {
+          style: { padding: 30, textAlign: "center", background: DH_T.bgCard, border: `1px dashed ${DH_T.border}`, borderRadius: DH_T.radius, fontSize: 12, color: DH_T.textMuted }
+        }, terminated.length === 0 ? "No terminated drivers yet." : "No matches.")
+      : React.createElement("div", {
+          style: { background: DH_T.bgCard, border: `1px solid ${DH_T.border}`, borderRadius: DH_T.radius, overflow: "auto", maxHeight: "calc(100vh - 280px)" }
+        },
+          React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", minWidth: 1100 } },
+            React.createElement("thead", null,
+              React.createElement("tr", null,
+                React.createElement("th", { style: { ...headStyle, minWidth: 200 } }, "Driver"),
+                React.createElement("th", { style: { ...headStyle, minWidth: 130 } }, "Role (last)"),
+                React.createElement("th", { style: { ...headStyle, minWidth: 110 } }, "Terminated"),
+                React.createElement("th", { style: { ...headStyle, minWidth: 80 } }, "Last Truck"),
+                React.createElement("th", { style: { ...headStyle, minWidth: 220 } }, "Reason"),
+                React.createElement("th", { style: { ...headStyle, minWidth: 280 } }, "Claimed IDs"),
+                React.createElement("th", { style: { ...headStyle, minWidth: 100 } }, ""),
+              )
+            ),
+            React.createElement("tbody", null,
+              filtered.map(emp => {
+                const ext = emp.externalIds || {};
+                const idChips = [];
+                if (ext.payroll) idChips.push(`Payroll ${ext.payroll}`);
+                if (ext.b600) idChips.push(`B600 ${ext.b600}`);
+                if (ext.nuvizz) idChips.push(`NuVizz ${ext.nuvizz}`);
+                if (ext.motive) idChips.push(`Motive ${ext.motive}`);
+                const released = !idChips.length;
+                const role = ROLE_BY_ID[emp.role] || ROLE_BY_ID.unknown;
+                return React.createElement("tr", { key: emp.id },
+                  React.createElement("td", { style: { ...cellStyle, fontWeight: 600, color: DH_T.text } }, emp.fullName),
+                  React.createElement("td", { style: cellStyle },
+                    React.createElement("span", {
+                      style: { fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 4, background: role.bg, color: role.text }
+                    }, role.label)
+                  ),
+                  React.createElement("td", { style: { ...cellStyle, fontFamily: "ui-monospace, monospace", fontSize: 11, color: DH_T.textMuted } },
+                    emp.terminatedAt || "—"),
+                  React.createElement("td", { style: { ...cellStyle, fontFamily: "ui-monospace, monospace", fontSize: 11 } },
+                    emp.lastTruck || emp.defaultTruck || "—"),
+                  React.createElement("td", { style: { ...cellStyle, color: DH_T.textMuted, fontStyle: emp.terminationReason ? "normal" : "italic" } },
+                    emp.terminationReason || "(no reason recorded)"),
+                  React.createElement("td", { style: { ...cellStyle, fontSize: 10 } },
+                    released
+                      ? React.createElement("span", { style: { color: DH_T.textDim, fontStyle: "italic" } }, "released — IDs cleared")
+                      : idChips.map((c, i) =>
+                          React.createElement("span", {
+                            key: i,
+                            style: { display: "inline-block", marginRight: 4, marginBottom: 2, padding: "2px 7px", background: DH_T.bgSurface, border: `1px solid ${DH_T.borderLight}`, borderRadius: 4, fontFamily: "ui-monospace, monospace", color: DH_T.text }
+                          }, c)
+                        )
+                  ),
+                  React.createElement("td", { style: cellStyle },
+                    React.createElement("button", {
+                      onClick: () => reactivate(emp),
+                      style: { padding: "5px 11px", fontSize: 11, fontWeight: 600, color: DH_T.brand, background: "transparent", border: `1px solid ${DH_T.brand}`, borderRadius: 6, cursor: "pointer", fontFamily: "inherit" }
+                    }, "Reactivate")
+                  )
+                );
+              })
+            )
+          )
+        )
   );
 }
 
