@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.3";
+const APP_VERSION = "2.42.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10454,31 +10454,34 @@ function MarginIQ() {
   </div>;
 }
 
-// ─── ZoomPhoneTab ────────────────────────────────────────────────────────────
-// Phone call history report tab for Davis MarginIQ
-// Pulls from /.netlify/functions/marginiq-zoom-phone
-// Credentials (ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET)
-// are stored as Netlify env vars — never in the browser.
+// ─── ZoomPhoneTab v2 — Real-Time ─────────────────────────────────────────────
+// Live call feed via Firebase onSnapshot (webhook-driven).
+// Falls back to date-range fetch for historical data.
 
 function ZoomPhoneTab() {
-  const [status, setStatus]         = React.useState(null);   // { configured, missing }
-  const [calls, setCalls]           = React.useState([]);
-  const [loading, setLoading]       = React.useState(false);
-  const [error, setError]           = React.useState("");
-  const [from, setFrom]             = React.useState(() => { const d=new Date(); d.setDate(d.getDate()-7); return d.toISOString().split("T")[0]; });
-  const [to, setTo]                 = React.useState(() => new Date().toISOString().split("T")[0]);
-  const [dirFilter, setDirFilter]   = React.useState("");
-  const [resFilter, setResFilter]   = React.useState("");
-  const [empFilter, setEmpFilter]   = React.useState("");
+  const [status, setStatus]           = React.useState(null);
+  const [calls, setCalls]             = React.useState([]);
+  const [liveCalls, setLiveCalls]     = React.useState([]);   // active/ringing right now
+  const [loading, setLoading]         = React.useState(false);
+  const [liveMode, setLiveMode]       = React.useState(true); // true = listening to Firebase
+  const [liveConnected, setLiveConnected] = React.useState(false);
+  const [lastEvent, setLastEvent]     = React.useState(null); // { ts, event, employee }
+  const [error, setError]             = React.useState("");
+  const [from, setFrom]               = React.useState(() => { const d=new Date(); d.setDate(d.getDate()-7); return d.toISOString().split("T")[0]; });
+  const [to, setTo]                   = React.useState(() => new Date().toISOString().split("T")[0]);
+  const [dirFilter, setDirFilter]     = React.useState("");
+  const [resFilter, setResFilter]     = React.useState("");
+  const [empFilter, setEmpFilter]     = React.useState("");
   const [queueFilter, setQueueFilter] = React.useState("");
-  const [search, setSearch]         = React.useState("");
-  const [sortCol, setSortCol]       = React.useState("date");
-  const [sortDir, setSortDir]       = React.useState("desc");
-  const [page, setPage]             = React.useState(1);
-  const [activeView, setActiveView] = React.useState("employees"); // 'employees' | 'calls'
+  const [search, setSearch]           = React.useState("");
+  const [sortCol, setSortCol]         = React.useState("date");
+  const [sortDir, setSortDir]         = React.useState("desc");
+  const [page, setPage]               = React.useState(1);
+  const [activeView, setActiveView]   = React.useState("live"); // 'live' | 'employees' | 'calls'
+  const unsubRef = React.useRef(null);
   const PAGE = 50;
 
-  // ── Check credentials configured on mount ──────────────────────────────────
+  // ── Check credentials on mount ────────────────────────────────────────────
   React.useEffect(() => {
     fetch("/.netlify/functions/marginiq-zoom-phone?action=status")
       .then(r => r.json())
@@ -10486,7 +10489,69 @@ function ZoomPhoneTab() {
       .catch(() => setStatus({ configured: false, missing: ["unknown"] }));
   }, []);
 
-  // ── Fetch calls ────────────────────────────────────────────────────────────
+  // ── Firebase real-time listener ───────────────────────────────────────────
+  React.useEffect(() => {
+    if (!liveMode) return;
+    const db = window.db;
+    if (!db) { setLiveConnected(false); return; }
+
+    setLiveConnected(false);
+
+    // Listen to zoom_calls collection, last 200 records ordered by ts
+    const unsub = db.collection("zoom_calls")
+      .orderBy("ts", "desc")
+      .limit(200)
+      .onSnapshot(
+        snap => {
+          setLiveConnected(true);
+          const docs = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+
+          // Split active/ringing from completed
+          const active    = docs.filter(c => ["ringing","active"].includes(c.status));
+          const completed = docs.filter(c => !["ringing","active"].includes(c.status));
+
+          setLiveCalls(active);
+
+          // Merge completed into calls list, normalizing to same shape as fetch
+          const normalized = completed.map(c => ({
+            id:           c.call_id || c.id,
+            date:         c.ts || c.updated_at || "",
+            answeredBy:   c.employee || "Unknown",
+            answeredEmail:"",
+            answeredExt:  c.employee_ext || "",
+            direction:    c.direction || "inbound",
+            callerNum:    c.caller_num || "",
+            callerName:   c.caller_name || "",
+            calleeNum:    c.callee_num || "",
+            result:       c.status === "ended" ? "answered"
+                        : c.status === "missed" ? "missed"
+                        : c.status === "voicemail" ? "voicemail"
+                        : c.status || "unknown",
+            talkTime:     c.duration || 0,
+            waitTime:     0,
+            viaQueue:     false,
+            queueName:    "",
+            chain:        [],
+          }));
+          setCalls(normalized);
+
+          // Track latest event for the pulse indicator
+          if (docs.length > 0) {
+            const latest = docs[0];
+            setLastEvent({ ts: latest.updated_at || latest.ts, event: latest.event, employee: latest.employee });
+          }
+        },
+        err => {
+          console.warn("[ZoomPhoneTab] onSnapshot error:", err?.message);
+          setLiveConnected(false);
+        }
+      );
+
+    unsubRef.current = unsub;
+    return () => { unsub(); unsubRef.current = null; };
+  }, [liveMode]);
+
+  // ── Historical fetch (non-live mode) ──────────────────────────────────────
   async function fetchCalls() {
     setLoading(true); setError(""); setCalls([]);
     try {
@@ -10506,7 +10571,16 @@ function ZoomPhoneTab() {
     }
   }
 
-  // ── Derived data ────────────────────────────────────────────────────────────
+  // ── Toggle live mode ──────────────────────────────────────────────────────
+  function toggleLive() {
+    if (liveMode && unsubRef.current) { unsubRef.current(); unsubRef.current = null; }
+    setLiveMode(m => !m);
+    setCalls([]);
+    setLiveCalls([]);
+    setError("");
+  }
+
+  // ── Derived data ──────────────────────────────────────────────────────────
   const empNames = React.useMemo(() =>
     [...new Set(calls.map(c => c.answeredBy).filter(Boolean))].sort()
   , [calls]);
@@ -10529,17 +10603,17 @@ function ZoomPhoneTab() {
   const sorted = React.useMemo(() => {
     return [...filtered].sort((a,b) => {
       let av, bv;
-      if (sortCol==="date")     { av=new Date(a.date||0); bv=new Date(b.date||0); }
+      if (sortCol==="date")          { av=new Date(a.date||0); bv=new Date(b.date||0); }
       else if (sortCol==="employee") { av=a.answeredBy||""; bv=b.answeredBy||""; }
       else if (sortCol==="caller")   { av=a.callerName||a.callerNum||""; bv=b.callerName||b.callerNum||""; }
-      else { av=a[sortCol]??0; bv=b[sortCol]??0; }
+      else                           { av=a[sortCol]??0; bv=b[sortCol]??0; }
       if (av<bv) return sortDir==="asc"?-1:1;
       if (av>bv) return sortDir==="asc"?1:-1;
       return 0;
     });
   }, [filtered, sortCol, sortDir]);
 
-  const pages    = Math.ceil(sorted.length/PAGE)||1;
+  const pages     = Math.ceil(sorted.length/PAGE)||1;
   const pageSlice = sorted.slice((page-1)*PAGE, page*PAGE);
 
   const metrics = React.useMemo(() => {
@@ -10566,9 +10640,10 @@ function ZoomPhoneTab() {
     return Object.values(map).sort((a,b)=>b.total-a.total);
   }, [calls]);
 
-  // ── Helpers ─────────────────────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────
   const fmtDur = s => { if(!s)return"—"; const m=Math.floor(s/60),sec=s%60; return `${m}:${String(sec).padStart(2,"0")}`; };
-  const fmtDT = s => { if(!s)return"—"; const d=new Date(s); if(isNaN(d))return s; return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true}); };
+  const fmtDT  = s => { if(!s)return"—"; const d=new Date(s); if(isNaN(d))return s; return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true}); };
+  const fmtTime = s => { if(!s)return"—"; const d=new Date(s); if(isNaN(d))return s; return d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true}); };
 
   function doSort(col) {
     if(sortCol===col) setSortDir(d=>d==="asc"?"desc":"asc");
@@ -10578,140 +10653,148 @@ function ZoomPhoneTab() {
   const sortIcon = col => sortCol===col ? (sortDir==="asc"?" ↑":" ↓") : "";
 
   function exportCSV() {
-    const h=["Date/Time","Answered By","Email","Extension","Direction","Caller Number","Caller Name","Result","Talk Time (sec)","Wait Time (sec)","Via Queue","Queue Name","Transfer Chain"];
-    const rows=calls.map(c=>[c.date,c.answeredBy,c.answeredEmail,c.answeredExt,c.direction,c.callerNum,c.callerName,c.result,c.talkTime,c.waitTime,c.viaQueue?"Yes":"No",c.queueName,(c.chain||[]).join(" → ")]);
+    const h=["Date/Time","Answered By","Extension","Direction","Caller Number","Caller Name","Result","Talk Time (sec)"];
+    const rows=calls.map(c=>[c.date,c.answeredBy,c.answeredExt,c.direction,c.callerNum,c.callerName,c.result,c.talkTime]);
     const csv=[h,...rows].map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");
     const a=Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:`zoom_calls_${from}_${to}.csv`});
     a.click();
   }
 
-  // ── Styles ──────────────────────────────────────────────────────────────────
-  const card = { background:T.bgCard, border:`1px solid ${T.border}`, borderRadius:T.radius, padding:"16px", boxShadow:T.shadow };
-  const metCard = { ...card, padding:"14px 16px", minWidth:0 };
+  // ── Styles ────────────────────────────────────────────────────────────────
+  const card       = { background:T.bgCard, border:`1px solid ${T.border}`, borderRadius:T.radius, padding:"16px", boxShadow:T.shadow };
+  const metCard    = { ...card, padding:"14px 16px", minWidth:0 };
   const btnPrimary = { padding:"8px 18px", background:T.brand, color:"#fff", border:"none", borderRadius:T.radiusSm, fontWeight:700, fontSize:"13px", cursor:"pointer" };
-  const btnSec = { padding:"7px 14px", background:T.bgSurface, color:T.textMuted, border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontWeight:600, fontSize:"12px", cursor:"pointer" };
+  const btnSec     = { padding:"7px 14px", background:T.bgSurface, color:T.textMuted, border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontWeight:600, fontSize:"12px", cursor:"pointer" };
   const inputStyle = { padding:"8px 10px", border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontSize:"13px", background:T.bgWhite, color:T.text, fontFamily:"inherit", outline:"none" };
-  const thStyle = { padding:"9px 12px", textAlign:"left", fontSize:"11px", fontWeight:700, color:T.textMuted, borderBottom:`2px solid ${T.border}`, background:T.bgSurface, cursor:"pointer", whiteSpace:"nowrap", userSelect:"none" };
-  const tdStyle = { padding:"10px 12px", fontSize:"12px", borderBottom:`1px solid ${T.borderLight}`, whiteSpace:"nowrap" };
+  const thStyle    = { padding:"9px 12px", textAlign:"left", fontSize:"11px", fontWeight:700, color:T.textMuted, borderBottom:`2px solid ${T.border}`, background:T.bgSurface, cursor:"pointer", whiteSpace:"nowrap", userSelect:"none" };
+  const tdStyle    = { padding:"10px 12px", fontSize:"12px", borderBottom:`1px solid ${T.borderLight}`, whiteSpace:"nowrap" };
 
   const resBadge = r => {
-    const styles = {
-      answered: {background:T.greenBg,color:T.greenText},
-      missed:   {background:T.redBg,  color:T.redText},
-      voicemail:{background:T.yellowBg,color:T.yellowText},
-    };
+    const styles = { answered:{background:T.greenBg,color:T.greenText}, missed:{background:T.redBg,color:T.redText}, voicemail:{background:T.yellowBg,color:T.yellowText} };
     const s = styles[r] || {background:T.bgSurface,color:T.textMuted};
     return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:700}}>{r||"—"}</span>;
   };
   const dirBadge = d => {
-    const s = d==="inbound"  ? {background:T.blueBg, color:T.blueText}
-             : d==="outbound" ? {background:T.bgSurface,color:T.textMuted}
-             : {background:T.bgSurface,color:T.textMuted};
+    const s = d==="inbound" ? {background:T.blueBg,color:T.blueText} : {background:T.bgSurface,color:T.textMuted};
     return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:600}}>{d==="inbound"?"↓ In":d==="outbound"?"↑ Out":d||"—"}</span>;
   };
 
-  // ── Credentials not configured ──────────────────────────────────────────────
+  // ── Credentials not configured ────────────────────────────────────────────
   if (status && !status.configured) {
     return (
       <div style={{padding:"24px",maxWidth:700}}>
-        <div style={{...card, borderLeft:`4px solid ${T.accentWarn}`}}>
-          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
-            <span style={{fontSize:20}}>🔑</span>
-            <div style={{fontWeight:700,fontSize:"15px"}}>Zoom Credentials Not Configured</div>
-          </div>
-          <p style={{color:T.textMuted,fontSize:"13px",marginBottom:16,lineHeight:1.6}}>
-            To enable the Phone tab, add these three environment variables to your Netlify site (Site → Environment variables):
-          </p>
-          {["ZOOM_ACCOUNT_ID","ZOOM_CLIENT_ID","ZOOM_CLIENT_SECRET"].map(k => (
-            <div key={k} style={{fontFamily:"monospace",fontSize:"12px",background:T.bgSurface,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"7px 12px",marginBottom:6,color:T.brand,display:"flex",alignItems:"center",gap:8}}>
-              <span style={{color:status.missing?.includes(k)?T.red:T.green}}>{status.missing?.includes(k)?"✗":"✓"}</span>
-              {k}
+        <div style={{...card,borderLeft:`4px solid ${T.accentWarn}`}}>
+          <div style={{fontWeight:700,fontSize:"15px",marginBottom:12}}>🔑 Zoom Credentials Not Configured</div>
+          <p style={{color:T.textMuted,fontSize:"13px",marginBottom:14,lineHeight:1.6}}>Add these env vars to Netlify (Site → Environment variables):</p>
+          {["ZOOM_ACCOUNT_ID","ZOOM_CLIENT_ID","ZOOM_CLIENT_SECRET","ZOOM_WEBHOOK_SECRET_TOKEN","FIREBASE_PROJECT_ID"].map(k => (
+            <div key={k} style={{fontFamily:"monospace",fontSize:"12px",background:T.bgSurface,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"7px 12px",marginBottom:5,color:T.brand,display:"flex",alignItems:"center",gap:8}}>
+              <span style={{color:status.missing?.includes(k)?T.red:T.green}}>{status.missing?.includes(k)?"✗":"✓"}</span>{k}
             </div>
           ))}
-          <p style={{color:T.textMuted,fontSize:"12px",marginTop:14,lineHeight:1.6}}>
-            Create a <strong>Server-to-Server OAuth app</strong> at <code style={{background:T.bgSurface,padding:"1px 5px",borderRadius:4}}>marketplace.zoom.us</code> with scopes: <code style={{background:T.bgSurface,padding:"1px 5px",borderRadius:4}}>phone:read:list_call_history:admin</code> and <code style={{background:T.bgSurface,padding:"1px 5px",borderRadius:4}}>phone:read:call_history:admin</code>. Then redeploy.
-          </p>
         </div>
       </div>
     );
   }
 
-  // ── Main UI ─────────────────────────────────────────────────────────────────
+  // ── Main UI ───────────────────────────────────────────────────────────────
   return (
     <div style={{padding:"20px",maxWidth:1400}}>
 
-      {/* Header row */}
+      {/* Header */}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div>
-          <div style={{fontSize:"16px",fontWeight:800,letterSpacing:"-0.01em"}}>📞 Zoom Phone Calls</div>
-          <div style={{fontSize:"12px",color:T.textMuted,marginTop:2}}>Call history with employee attribution — queue routing resolved via call elements</div>
+          <div style={{fontSize:"16px",fontWeight:800,letterSpacing:"-0.01em"}}>📞 Zoom Phone — Live</div>
+          <div style={{fontSize:"12px",color:T.textMuted,marginTop:2}}>
+            {liveMode && liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.green,marginRight:5,verticalAlign:"middle",boxShadow:`0 0 6px ${T.green}`}} />Live · updates automatically</>}
+            {liveMode && !liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.yellow,marginRight:5,verticalAlign:"middle"}} />Connecting to Firebase…</>}
+            {!liveMode && "Historical mode — manual fetch"}
+          </div>
         </div>
-        {calls.length > 0 && (
-          <button style={btnSec} onClick={exportCSV}>⬇ Export CSV</button>
-        )}
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {lastEvent && liveMode && (
+            <span style={{fontSize:"11px",color:T.textMuted}}>
+              Last event: {fmtTime(lastEvent.ts)} · {lastEvent.employee || "unknown"}
+            </span>
+          )}
+          <button style={{...btnSec, color:liveMode?T.green:T.textMuted, borderColor:liveMode?T.green:T.border}} onClick={toggleLive}>
+            {liveMode ? "⏸ Pause Live" : "▶ Go Live"}
+          </button>
+          {calls.length > 0 && <button style={btnSec} onClick={exportCSV}>⬇ CSV</button>}
+        </div>
       </div>
 
-      {/* Controls */}
-      <div style={{...card,marginBottom:16}}>
-        <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
-          <div>
-            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>FROM</div>
-            <input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={inputStyle} />
+      {/* Active calls board — only shown in live mode */}
+      {liveMode && (
+        <div style={{...card, marginBottom:16, borderLeft:`3px solid ${liveCalls.length>0?T.green:T.border}`}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:liveCalls.length>0?12:0}}>
+            <div style={{fontWeight:700,fontSize:"13px"}}>
+              {liveCalls.length>0
+                ? <><span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:T.green,marginRight:6,verticalAlign:"middle",animation:"pulse 1.5s infinite"}} />{liveCalls.length} Active Call{liveCalls.length!==1?"s":""}</>
+                : <span style={{color:T.textMuted,fontWeight:500,fontSize:"13px"}}>📵 No active calls right now</span>
+              }
+            </div>
           </div>
-          <div>
-            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>TO</div>
-            <input type="date" value={to} onChange={e=>setTo(e.target.value)} style={inputStyle} />
-          </div>
-          <div>
-            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>DIRECTION</div>
-            <select value={dirFilter} onChange={e=>setDirFilter(e.target.value)} style={inputStyle}>
-              <option value="">All</option>
-              <option value="inbound">Inbound</option>
-              <option value="outbound">Outbound</option>
-            </select>
-          </div>
-          <div>
-            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>RESULT</div>
-            <select value={resFilter} onChange={e=>setResFilter(e.target.value)} style={inputStyle}>
-              <option value="">All</option>
-              <option value="answered">Answered</option>
-              <option value="missed">Missed</option>
-              <option value="voicemail">Voicemail</option>
-            </select>
-          </div>
-          <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchCalls} disabled={loading}>
-            {loading ? "Loading…" : "Fetch Calls"}
-          </button>
+          {liveCalls.length > 0 && (
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
+              {liveCalls.map(c => (
+                <div key={c.call_id||c.id} style={{background:c.status==="ringing"?T.yellowBg:T.greenBg, border:`1px solid ${c.status==="ringing"?T.yellow:T.green}`, borderRadius:T.radiusSm, padding:"12px 14px"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
+                    <div style={{fontWeight:700,fontSize:"13px",color:c.status==="ringing"?T.yellowText:T.greenText}}>
+                      {c.status==="ringing"?"📲 Ringing":"📞 On Call"}
+                    </div>
+                    <span style={{fontSize:"10px",color:T.textMuted}}>{fmtTime(c.ts)}</span>
+                  </div>
+                  <div style={{fontWeight:600,fontSize:"14px",marginBottom:2}}>{c.employee||"—"}</div>
+                  <div style={{fontSize:"12px",color:T.textMuted}}>{c.caller_name||c.caller_num||"Unknown caller"}</div>
+                  {c.caller_name && <div style={{fontSize:"11px",color:T.textDim}}>{c.caller_num}</div>}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
-      </div>
+      )}
+
+      {/* Historical fetch controls — only in non-live mode */}
+      {!liveMode && (
+        <div style={{...card,marginBottom:16}}>
+          <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
+            <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>FROM</div><input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={inputStyle} /></div>
+            <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>TO</div><input type="date" value={to} onChange={e=>setTo(e.target.value)} style={inputStyle} /></div>
+            <div>
+              <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>DIRECTION</div>
+              <select value={dirFilter} onChange={e=>setDirFilter(e.target.value)} style={inputStyle}>
+                <option value="">All</option><option value="inbound">Inbound</option><option value="outbound">Outbound</option>
+              </select>
+            </div>
+            <div>
+              <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>RESULT</div>
+              <select value={resFilter} onChange={e=>setResFilter(e.target.value)} style={inputStyle}>
+                <option value="">All</option><option value="answered">Answered</option><option value="missed">Missed</option><option value="voicemail">Voicemail</option>
+              </select>
+            </div>
+            <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchCalls} disabled={loading}>{loading?"Loading…":"Fetch Calls"}</button>
+          </div>
+        </div>
+      )}
 
       {/* Error */}
-      {error && (
-        <div style={{background:T.redBg,border:`1px solid ${T.red}`,borderRadius:T.radiusSm,padding:"12px 16px",color:T.redText,fontSize:"13px",marginBottom:16}}>
-          ⚠ {error}
-        </div>
-      )}
+      {error && <div style={{background:T.redBg,border:`1px solid ${T.red}`,borderRadius:T.radiusSm,padding:"12px 16px",color:T.redText,fontSize:"13px",marginBottom:16}}>⚠ {error}</div>}
 
       {/* Loading */}
-      {loading && (
-        <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}>
-          <div style={{fontSize:36,marginBottom:12}}>📞</div>
-          <div style={{fontWeight:600}}>Fetching call history…</div>
-        </div>
-      )}
+      {loading && <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}><div style={{fontSize:36,marginBottom:12}}>📞</div><div style={{fontWeight:600}}>Fetching…</div></div>}
 
-      {/* Data */}
+      {/* Data views */}
       {!loading && calls.length > 0 && <>
 
         {/* Metrics */}
         <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:16}}>
           {[
-            {label:"Total Calls", value:metrics.tot.toLocaleString(), color:T.brand},
-            {label:"Answered",    value:metrics.ans.toLocaleString(), sub:`${metrics.tot?((metrics.ans/metrics.tot)*100).toFixed(1):0}% rate`, color:T.green},
-            {label:"Missed",      value:metrics.mis.toLocaleString(), sub:`${metrics.tot?((metrics.mis/metrics.tot)*100).toFixed(1):0}% rate`, color:T.red},
-            {label:"Via Queue",   value:metrics.que.toLocaleString(), color:T.blue},
-            {label:"Avg Talk",    value:fmtDur(metrics.avgTalk), color:T.text},
-            {label:"Employees",   value:metrics.emps, color:T.brand},
+            {label:"Total",    value:metrics.tot.toLocaleString(), color:T.brand},
+            {label:"Answered", value:metrics.ans.toLocaleString(), sub:`${metrics.tot?((metrics.ans/metrics.tot)*100).toFixed(1):0}%`, color:T.green},
+            {label:"Missed",   value:metrics.mis.toLocaleString(), sub:`${metrics.tot?((metrics.mis/metrics.tot)*100).toFixed(1):0}%`, color:T.red},
+            {label:"Via Queue",value:metrics.que.toLocaleString(), color:T.blue},
+            {label:"Avg Talk", value:fmtDur(metrics.avgTalk), color:T.text},
+            {label:"Staff",    value:metrics.emps, color:T.brand},
           ].map(m => (
             <div key={m.label} style={metCard}>
               <div style={{fontSize:"10px",fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:4}}>{m.label}</div>
@@ -10724,12 +10807,10 @@ function ZoomPhoneTab() {
         {/* Tab row */}
         <div style={{display:"flex",gap:2,marginBottom:16,borderBottom:`2px solid ${T.border}`}}>
           {[{id:"employees",label:"👥 By Employee"},{id:"calls",label:"📋 All Calls"}].map(t => (
-            <button key={t.id} onClick={()=>setActiveView(t.id)} style={{padding:"9px 16px",border:"none",borderBottom:`3px solid ${activeView===t.id?T.brand:"transparent"}`,background:"transparent",color:activeView===t.id?T.brand:T.textMuted,fontWeight:activeView===t.id?700:500,fontSize:"13px",cursor:"pointer",marginBottom:"-2px",transition:"all 0.2s"}}>
-              {t.label}
-            </button>
+            <button key={t.id} onClick={()=>setActiveView(t.id)} style={{padding:"9px 16px",border:"none",borderBottom:`3px solid ${activeView===t.id?T.brand:"transparent"}`,background:"transparent",color:activeView===t.id?T.brand:T.textMuted,fontWeight:activeView===t.id?700:500,fontSize:"13px",cursor:"pointer",marginBottom:"-2px",transition:"all 0.2s"}}>{t.label}</button>
           ))}
           <div style={{marginLeft:"auto",display:"flex",alignItems:"center",paddingBottom:4}}>
-            <span style={{fontSize:"12px",color:T.textMuted}}>{calls.length.toLocaleString()} calls loaded</span>
+            <span style={{fontSize:"12px",color:T.textMuted}}>{calls.length.toLocaleString()} calls{liveMode?" (live)":""}</span>
           </div>
         </div>
 
@@ -10767,7 +10848,6 @@ function ZoomPhoneTab() {
         {/* Call table */}
         {activeView === "calls" && (
           <div>
-            {/* Filters */}
             <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
               <input placeholder="Search employee, number, caller…" value={search} onChange={e=>{setSearch(e.target.value);setPage(1);}} style={{...inputStyle,width:220}} />
               <select value={empFilter} onChange={e=>{setEmpFilter(e.target.value);setPage(1);}} style={inputStyle}>
@@ -10780,73 +10860,49 @@ function ZoomPhoneTab() {
                 <option value="missed">Missed</option>
                 <option value="voicemail">Voicemail</option>
               </select>
-              <select value={queueFilter} onChange={e=>{setQueueFilter(e.target.value);setPage(1);}} style={inputStyle}>
-                <option value="">All Sources</option>
-                <option value="queue">Via Queue/IVR</option>
-                <option value="direct">Direct Only</option>
-              </select>
-              {(empFilter||resFilter||queueFilter||search) && (
-                <button style={btnSec} onClick={()=>{setEmpFilter("");setResFilter("");setQueueFilter("");setSearch("");setPage(1);}}>✕ Clear</button>
+              {(empFilter||resFilter||search) && (
+                <button style={btnSec} onClick={()=>{setEmpFilter("");setResFilter("");setSearch("");setPage(1);}}>✕ Clear</button>
               )}
               <span style={{marginLeft:"auto",fontSize:"12px",color:T.textMuted}}>{filtered.length.toLocaleString()} calls</span>
             </div>
 
-            {/* Table */}
             <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,overflow:"hidden",boxShadow:T.shadow}}>
               <div style={{overflowX:"auto"}}>
                 <table style={{width:"100%",borderCollapse:"collapse"}}>
                   <thead>
                     <tr>
                       {[
-                        {col:"date",    label:"Date / Time"},
-                        {col:"employee",label:"Answered By"},
+                        {col:"date",     label:"Date / Time"},
+                        {col:"employee", label:"Answered By"},
                         {col:"direction",label:"Dir"},
-                        {col:"caller",  label:"Caller / Called"},
-                        {col:"result",  label:"Result"},
-                        {col:"talkTime",label:"Talk"},
-                        {col:"waitTime",label:"Wait"},
-                        {col:null,      label:"Queue / Route"},
+                        {col:"caller",   label:"Caller"},
+                        {col:"result",   label:"Result"},
+                        {col:"talkTime", label:"Talk"},
                       ].map(({col,label}) => (
-                        <th key={label} onClick={col?()=>doSort(col):undefined} style={{...thStyle,cursor:col?"pointer":"default"}}>
-                          {label}{col?sortIcon(col):""}
-                        </th>
+                        <th key={label} onClick={()=>doSort(col)} style={thStyle}>{label}{sortIcon(col)}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {pageSlice.length === 0 ? (
-                      <tr><td colSpan={8} style={{...tdStyle,textAlign:"center",color:T.textMuted,padding:"40px"}}>No calls match current filters</td></tr>
-                    ) : pageSlice.map((c,i) => (
-                      <tr key={c.id||i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
-                        <td style={{...tdStyle,color:T.textMuted,fontSize:"11px"}}>{fmtDT(c.date)}</td>
-                        <td style={tdStyle}>
-                          <div style={{fontWeight:700}}>{c.answeredBy||"—"}</div>
-                          {c.viaQueue && <div style={{fontSize:"10px",color:T.blue,marginTop:1}}>via queue</div>}
-                        </td>
-                        <td style={tdStyle}>{dirBadge(c.direction)}</td>
-                        <td style={tdStyle}>
-                          {c.direction==="inbound"
-                            ? <><div>{c.callerName||c.callerNum||"—"}</div>{c.callerName&&<div style={{fontSize:"10px",color:T.textMuted}}>{c.callerNum}</div>}</>
-                            : <div style={{color:T.textMuted}}>{c.calleeNum||"—"}</div>
-                          }
-                        </td>
-                        <td style={tdStyle}>{resBadge(c.result)}</td>
-                        <td style={{...tdStyle,fontFamily:"monospace"}}>{fmtDur(c.talkTime)}</td>
-                        <td style={{...tdStyle,fontFamily:"monospace",color:T.textMuted}}>{fmtDur(c.waitTime)}</td>
-                        <td style={tdStyle}>
-                          {c.viaQueue
-                            ? <span style={{background:T.blueBg,color:T.blueText,padding:"2px 8px",borderRadius:"20px",fontSize:"10px",fontWeight:700}}>⇢ {c.queueName||"Queue"}</span>
-                            : (c.chain||[]).length > 1
-                              ? <span style={{fontSize:"10px",color:T.textMuted}}>{c.chain.join(" → ")}</span>
-                              : <span style={{color:T.textDim}}>—</span>
-                          }
-                        </td>
-                      </tr>
-                    ))}
+                    {pageSlice.length === 0
+                      ? <tr><td colSpan={6} style={{...tdStyle,textAlign:"center",color:T.textMuted,padding:"40px"}}>No calls match filters</td></tr>
+                      : pageSlice.map((c,i) => (
+                          <tr key={c.id||i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
+                            <td style={{...tdStyle,color:T.textMuted,fontSize:"11px"}}>{fmtDT(c.date)}</td>
+                            <td style={tdStyle}><div style={{fontWeight:700}}>{c.answeredBy||"—"}</div></td>
+                            <td style={tdStyle}>{dirBadge(c.direction)}</td>
+                            <td style={tdStyle}>
+                              <div>{c.callerName||c.callerNum||"—"}</div>
+                              {c.callerName&&<div style={{fontSize:"10px",color:T.textMuted}}>{c.callerNum}</div>}
+                            </td>
+                            <td style={tdStyle}>{resBadge(c.result)}</td>
+                            <td style={{...tdStyle,fontFamily:"monospace"}}>{fmtDur(c.talkTime)}</td>
+                          </tr>
+                        ))
+                    }
                   </tbody>
                 </table>
               </div>
-              {/* Pagination */}
               {pages > 1 && (
                 <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderTop:`1px solid ${T.border}`,background:T.bgSurface,fontSize:"12px",color:T.textMuted}}>
                   <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===1} onClick={()=>setPage(p=>p-1)}>← Prev</button>
@@ -10863,10 +10919,24 @@ function ZoomPhoneTab() {
       {!loading && calls.length === 0 && !error && (
         <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}>
           <div style={{fontSize:40,marginBottom:12}}>📞</div>
-          <div style={{fontWeight:700,fontSize:"15px",marginBottom:6}}>No calls loaded yet</div>
-          <div style={{fontSize:"13px"}}>Select a date range and click Fetch Calls.</div>
+          <div style={{fontWeight:700,fontSize:"15px",marginBottom:6}}>
+            {liveMode ? "Waiting for calls…" : "No calls loaded"}
+          </div>
+          <div style={{fontSize:"13px"}}>
+            {liveMode
+              ? "The live feed is connected. Calls will appear here as they come in and complete."
+              : "Switch to live mode or select a date range and click Fetch Calls."
+            }
+          </div>
         </div>
       )}
+
+      <style>{`
+        @keyframes pulse {
+          0%,100% { opacity:1; transform:scale(1); }
+          50%      { opacity:0.6; transform:scale(1.3); }
+        }
+      `}</style>
     </div>
   );
 }
