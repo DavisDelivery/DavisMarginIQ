@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.41.16";
+const APP_VERSION = "2.42.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10410,6 +10410,7 @@ function MarginIQ() {
     { id:"gmail", icon:"📧", label:"Gmail Sync" },
     { id:"runsheet", icon:"📋", label:"Run Sheet" },
     { id:"costs", icon:"⚙️", label:"Costs" },
+    { id:"phone", icon:"📞", label:"Phone Calls" },
     { id:"settings", icon:"🔧", label:"Settings" },
   ];
 
@@ -10448,9 +10449,428 @@ function MarginIQ() {
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
+    {!loading && tab==="phone" && <ZoomPhoneTab />}
     {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} onRefresh={refreshData} setTab={setTab} />}
   </div>;
 }
+
+// ─── ZoomPhoneTab ────────────────────────────────────────────────────────────
+// Phone call history report tab for Davis MarginIQ
+// Pulls from /.netlify/functions/marginiq-zoom-phone
+// Credentials (ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET)
+// are stored as Netlify env vars — never in the browser.
+
+function ZoomPhoneTab() {
+  const [status, setStatus]         = React.useState(null);   // { configured, missing }
+  const [calls, setCalls]           = React.useState([]);
+  const [loading, setLoading]       = React.useState(false);
+  const [error, setError]           = React.useState("");
+  const [from, setFrom]             = React.useState(() => { const d=new Date(); d.setDate(d.getDate()-7); return d.toISOString().split("T")[0]; });
+  const [to, setTo]                 = React.useState(() => new Date().toISOString().split("T")[0]);
+  const [dirFilter, setDirFilter]   = React.useState("");
+  const [resFilter, setResFilter]   = React.useState("");
+  const [empFilter, setEmpFilter]   = React.useState("");
+  const [queueFilter, setQueueFilter] = React.useState("");
+  const [search, setSearch]         = React.useState("");
+  const [sortCol, setSortCol]       = React.useState("date");
+  const [sortDir, setSortDir]       = React.useState("desc");
+  const [page, setPage]             = React.useState(1);
+  const [activeView, setActiveView] = React.useState("employees"); // 'employees' | 'calls'
+  const PAGE = 50;
+
+  // ── Check credentials configured on mount ──────────────────────────────────
+  React.useEffect(() => {
+    fetch("/.netlify/functions/marginiq-zoom-phone?action=status")
+      .then(r => r.json())
+      .then(d => setStatus(d))
+      .catch(() => setStatus({ configured: false, missing: ["unknown"] }));
+  }, []);
+
+  // ── Fetch calls ────────────────────────────────────────────────────────────
+  async function fetchCalls() {
+    setLoading(true); setError(""); setCalls([]);
+    try {
+      let url = `/.netlify/functions/marginiq-zoom-phone?action=history&from=${from}&to=${to}`;
+      if (dirFilter) url += `&direction=${dirFilter}`;
+      const r = await fetch(url);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      let recs = d.records || [];
+      if (resFilter) recs = recs.filter(c => c.result === resFilter);
+      setCalls(recs);
+      setPage(1);
+    } catch(e) {
+      setError(String(e.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ── Derived data ────────────────────────────────────────────────────────────
+  const empNames = React.useMemo(() =>
+    [...new Set(calls.map(c => c.answeredBy).filter(Boolean))].sort()
+  , [calls]);
+
+  const filtered = React.useMemo(() => {
+    const s = search.toLowerCase();
+    return calls.filter(c => {
+      if (empFilter   && c.answeredBy !== empFilter) return false;
+      if (resFilter   && c.result !== resFilter) return false;
+      if (queueFilter === "queue"  && !c.viaQueue) return false;
+      if (queueFilter === "direct" &&  c.viaQueue) return false;
+      if (s) {
+        const hay = [c.answeredBy,c.callerNum,c.callerName,c.calleeNum,c.queueName,...(c.chain||[])].join(" ").toLowerCase();
+        if (!hay.includes(s)) return false;
+      }
+      return true;
+    });
+  }, [calls, empFilter, resFilter, queueFilter, search]);
+
+  const sorted = React.useMemo(() => {
+    return [...filtered].sort((a,b) => {
+      let av, bv;
+      if (sortCol==="date")     { av=new Date(a.date||0); bv=new Date(b.date||0); }
+      else if (sortCol==="employee") { av=a.answeredBy||""; bv=b.answeredBy||""; }
+      else if (sortCol==="caller")   { av=a.callerName||a.callerNum||""; bv=b.callerName||b.callerNum||""; }
+      else { av=a[sortCol]??0; bv=b[sortCol]??0; }
+      if (av<bv) return sortDir==="asc"?-1:1;
+      if (av>bv) return sortDir==="asc"?1:-1;
+      return 0;
+    });
+  }, [filtered, sortCol, sortDir]);
+
+  const pages    = Math.ceil(sorted.length/PAGE)||1;
+  const pageSlice = sorted.slice((page-1)*PAGE, page*PAGE);
+
+  const metrics = React.useMemo(() => {
+    const tot = calls.length;
+    const ans = calls.filter(c=>c.result==="answered").length;
+    const mis = calls.filter(c=>c.result==="missed").length;
+    const que = calls.filter(c=>c.viaQueue).length;
+    const ansCalls = calls.filter(c=>c.result==="answered"&&c.talkTime>0);
+    const avgTalk = ansCalls.length ? Math.round(ansCalls.reduce((s,c)=>s+c.talkTime,0)/ansCalls.length) : 0;
+    const emps = new Set(calls.map(c=>c.answeredBy).filter(n=>n&&n!=="Unknown")).size;
+    return { tot, ans, mis, que, avgTalk, emps };
+  }, [calls]);
+
+  const empStats = React.useMemo(() => {
+    const map = {};
+    calls.forEach(c => {
+      const k=c.answeredBy||"Unknown";
+      if(!map[k]) map[k]={name:k,email:c.answeredEmail,ext:c.answeredExt,answered:0,missed:0,voicemail:0,total:0,talk:0};
+      map[k].total++;
+      if(c.result==="answered"){map[k].answered++;map[k].talk+=c.talkTime;}
+      if(c.result==="missed")   map[k].missed++;
+      if(c.result==="voicemail")map[k].voicemail++;
+    });
+    return Object.values(map).sort((a,b)=>b.total-a.total);
+  }, [calls]);
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  const fmtDur = s => { if(!s)return"—"; const m=Math.floor(s/60),sec=s%60; return `${m}:${String(sec).padStart(2,"0")}`; };
+  const fmtDT = s => { if(!s)return"—"; const d=new Date(s); if(isNaN(d))return s; return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true}); };
+
+  function doSort(col) {
+    if(sortCol===col) setSortDir(d=>d==="asc"?"desc":"asc");
+    else { setSortCol(col); setSortDir(col==="date"?"desc":"asc"); }
+    setPage(1);
+  }
+  const sortIcon = col => sortCol===col ? (sortDir==="asc"?" ↑":" ↓") : "";
+
+  function exportCSV() {
+    const h=["Date/Time","Answered By","Email","Extension","Direction","Caller Number","Caller Name","Result","Talk Time (sec)","Wait Time (sec)","Via Queue","Queue Name","Transfer Chain"];
+    const rows=calls.map(c=>[c.date,c.answeredBy,c.answeredEmail,c.answeredExt,c.direction,c.callerNum,c.callerName,c.result,c.talkTime,c.waitTime,c.viaQueue?"Yes":"No",c.queueName,(c.chain||[]).join(" → ")]);
+    const csv=[h,...rows].map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");
+    const a=Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:`zoom_calls_${from}_${to}.csv`});
+    a.click();
+  }
+
+  // ── Styles ──────────────────────────────────────────────────────────────────
+  const card = { background:T.bgCard, border:`1px solid ${T.border}`, borderRadius:T.radius, padding:"16px", boxShadow:T.shadow };
+  const metCard = { ...card, padding:"14px 16px", minWidth:0 };
+  const btnPrimary = { padding:"8px 18px", background:T.brand, color:"#fff", border:"none", borderRadius:T.radiusSm, fontWeight:700, fontSize:"13px", cursor:"pointer" };
+  const btnSec = { padding:"7px 14px", background:T.bgSurface, color:T.textMuted, border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontWeight:600, fontSize:"12px", cursor:"pointer" };
+  const inputStyle = { padding:"8px 10px", border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontSize:"13px", background:T.bgWhite, color:T.text, fontFamily:"inherit", outline:"none" };
+  const thStyle = { padding:"9px 12px", textAlign:"left", fontSize:"11px", fontWeight:700, color:T.textMuted, borderBottom:`2px solid ${T.border}`, background:T.bgSurface, cursor:"pointer", whiteSpace:"nowrap", userSelect:"none" };
+  const tdStyle = { padding:"10px 12px", fontSize:"12px", borderBottom:`1px solid ${T.borderLight}`, whiteSpace:"nowrap" };
+
+  const resBadge = r => {
+    const styles = {
+      answered: {background:T.greenBg,color:T.greenText},
+      missed:   {background:T.redBg,  color:T.redText},
+      voicemail:{background:T.yellowBg,color:T.yellowText},
+    };
+    const s = styles[r] || {background:T.bgSurface,color:T.textMuted};
+    return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:700}}>{r||"—"}</span>;
+  };
+  const dirBadge = d => {
+    const s = d==="inbound"  ? {background:T.blueBg, color:T.blueText}
+             : d==="outbound" ? {background:T.bgSurface,color:T.textMuted}
+             : {background:T.bgSurface,color:T.textMuted};
+    return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:600}}>{d==="inbound"?"↓ In":d==="outbound"?"↑ Out":d||"—"}</span>;
+  };
+
+  // ── Credentials not configured ──────────────────────────────────────────────
+  if (status && !status.configured) {
+    return (
+      <div style={{padding:"24px",maxWidth:700}}>
+        <div style={{...card, borderLeft:`4px solid ${T.accentWarn}`}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+            <span style={{fontSize:20}}>🔑</span>
+            <div style={{fontWeight:700,fontSize:"15px"}}>Zoom Credentials Not Configured</div>
+          </div>
+          <p style={{color:T.textMuted,fontSize:"13px",marginBottom:16,lineHeight:1.6}}>
+            To enable the Phone tab, add these three environment variables to your Netlify site (Site → Environment variables):
+          </p>
+          {["ZOOM_ACCOUNT_ID","ZOOM_CLIENT_ID","ZOOM_CLIENT_SECRET"].map(k => (
+            <div key={k} style={{fontFamily:"monospace",fontSize:"12px",background:T.bgSurface,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"7px 12px",marginBottom:6,color:T.brand,display:"flex",alignItems:"center",gap:8}}>
+              <span style={{color:status.missing?.includes(k)?T.red:T.green}}>{status.missing?.includes(k)?"✗":"✓"}</span>
+              {k}
+            </div>
+          ))}
+          <p style={{color:T.textMuted,fontSize:"12px",marginTop:14,lineHeight:1.6}}>
+            Create a <strong>Server-to-Server OAuth app</strong> at <code style={{background:T.bgSurface,padding:"1px 5px",borderRadius:4}}>marketplace.zoom.us</code> with scopes: <code style={{background:T.bgSurface,padding:"1px 5px",borderRadius:4}}>phone:read:list_call_history:admin</code> and <code style={{background:T.bgSurface,padding:"1px 5px",borderRadius:4}}>phone:read:call_history:admin</code>. Then redeploy.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Main UI ─────────────────────────────────────────────────────────────────
+  return (
+    <div style={{padding:"20px",maxWidth:1400}}>
+
+      {/* Header row */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div>
+          <div style={{fontSize:"16px",fontWeight:800,letterSpacing:"-0.01em"}}>📞 Zoom Phone Calls</div>
+          <div style={{fontSize:"12px",color:T.textMuted,marginTop:2}}>Call history with employee attribution — queue routing resolved via call elements</div>
+        </div>
+        {calls.length > 0 && (
+          <button style={btnSec} onClick={exportCSV}>⬇ Export CSV</button>
+        )}
+      </div>
+
+      {/* Controls */}
+      <div style={{...card,marginBottom:16}}>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
+          <div>
+            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>FROM</div>
+            <input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={inputStyle} />
+          </div>
+          <div>
+            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>TO</div>
+            <input type="date" value={to} onChange={e=>setTo(e.target.value)} style={inputStyle} />
+          </div>
+          <div>
+            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>DIRECTION</div>
+            <select value={dirFilter} onChange={e=>setDirFilter(e.target.value)} style={inputStyle}>
+              <option value="">All</option>
+              <option value="inbound">Inbound</option>
+              <option value="outbound">Outbound</option>
+            </select>
+          </div>
+          <div>
+            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>RESULT</div>
+            <select value={resFilter} onChange={e=>setResFilter(e.target.value)} style={inputStyle}>
+              <option value="">All</option>
+              <option value="answered">Answered</option>
+              <option value="missed">Missed</option>
+              <option value="voicemail">Voicemail</option>
+            </select>
+          </div>
+          <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchCalls} disabled={loading}>
+            {loading ? "Loading…" : "Fetch Calls"}
+          </button>
+        </div>
+      </div>
+
+      {/* Error */}
+      {error && (
+        <div style={{background:T.redBg,border:`1px solid ${T.red}`,borderRadius:T.radiusSm,padding:"12px 16px",color:T.redText,fontSize:"13px",marginBottom:16}}>
+          ⚠ {error}
+        </div>
+      )}
+
+      {/* Loading */}
+      {loading && (
+        <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}>
+          <div style={{fontSize:36,marginBottom:12}}>📞</div>
+          <div style={{fontWeight:600}}>Fetching call history…</div>
+        </div>
+      )}
+
+      {/* Data */}
+      {!loading && calls.length > 0 && <>
+
+        {/* Metrics */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:16}}>
+          {[
+            {label:"Total Calls", value:metrics.tot.toLocaleString(), color:T.brand},
+            {label:"Answered",    value:metrics.ans.toLocaleString(), sub:`${metrics.tot?((metrics.ans/metrics.tot)*100).toFixed(1):0}% rate`, color:T.green},
+            {label:"Missed",      value:metrics.mis.toLocaleString(), sub:`${metrics.tot?((metrics.mis/metrics.tot)*100).toFixed(1):0}% rate`, color:T.red},
+            {label:"Via Queue",   value:metrics.que.toLocaleString(), color:T.blue},
+            {label:"Avg Talk",    value:fmtDur(metrics.avgTalk), color:T.text},
+            {label:"Employees",   value:metrics.emps, color:T.brand},
+          ].map(m => (
+            <div key={m.label} style={metCard}>
+              <div style={{fontSize:"10px",fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:4}}>{m.label}</div>
+              <div style={{fontSize:"22px",fontWeight:800,color:m.color,lineHeight:1}}>{m.value}</div>
+              {m.sub && <div style={{fontSize:"10px",color:T.textMuted,marginTop:2}}>{m.sub}</div>}
+            </div>
+          ))}
+        </div>
+
+        {/* Tab row */}
+        <div style={{display:"flex",gap:2,marginBottom:16,borderBottom:`2px solid ${T.border}`}}>
+          {[{id:"employees",label:"👥 By Employee"},{id:"calls",label:"📋 All Calls"}].map(t => (
+            <button key={t.id} onClick={()=>setActiveView(t.id)} style={{padding:"9px 16px",border:"none",borderBottom:`3px solid ${activeView===t.id?T.brand:"transparent"}`,background:"transparent",color:activeView===t.id?T.brand:T.textMuted,fontWeight:activeView===t.id?700:500,fontSize:"13px",cursor:"pointer",marginBottom:"-2px",transition:"all 0.2s"}}>
+              {t.label}
+            </button>
+          ))}
+          <div style={{marginLeft:"auto",display:"flex",alignItems:"center",paddingBottom:4}}>
+            <span style={{fontSize:"12px",color:T.textMuted}}>{calls.length.toLocaleString()} calls loaded</span>
+          </div>
+        </div>
+
+        {/* Employee cards */}
+        {activeView === "employees" && (
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(270px,1fr))",gap:10}}>
+            {empStats.map(e => {
+              const ini = e.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
+              const rate = e.total ? Math.round((e.answered/e.total)*100) : 0;
+              const avgTalk = e.answered ? Math.round(e.talk/e.answered) : 0;
+              return (
+                <div key={e.name} style={{...card,cursor:"pointer"}} onClick={()=>{setEmpFilter(e.name);setActiveView("calls");setPage(1);}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                    <div style={{width:36,height:36,background:T.brandPale,border:`1px solid ${T.brand}20`,borderRadius:"8px",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:"13px",color:T.brand,flexShrink:0}}>{ini}</div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontWeight:700,fontSize:"14px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.name}</div>
+                      <div style={{fontSize:"11px",color:T.textMuted}}>{e.ext?`Ext ${e.ext}`:e.email||"—"}</div>
+                    </div>
+                    <div style={{fontSize:"11px",color:T.textMuted,fontWeight:700}}>{rate}%</div>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,textAlign:"center"}}>
+                    <div><div style={{fontWeight:800,fontSize:"18px",color:T.green}}>{e.answered}</div><div style={{fontSize:"10px",color:T.textMuted,fontWeight:600}}>ANSWERED</div></div>
+                    <div><div style={{fontWeight:800,fontSize:"18px",color:T.red}}>{e.missed}</div><div style={{fontSize:"10px",color:T.textMuted,fontWeight:600}}>MISSED</div></div>
+                    <div><div style={{fontWeight:800,fontSize:"18px",color:T.text}}>{fmtDur(avgTalk)}</div><div style={{fontSize:"10px",color:T.textMuted,fontWeight:600}}>AVG TALK</div></div>
+                  </div>
+                  <div style={{height:3,background:T.border,borderRadius:3,marginTop:10}}>
+                    <div style={{height:"100%",width:`${rate}%`,background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3,transition:"width 0.5s"}} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Call table */}
+        {activeView === "calls" && (
+          <div>
+            {/* Filters */}
+            <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
+              <input placeholder="Search employee, number, caller…" value={search} onChange={e=>{setSearch(e.target.value);setPage(1);}} style={{...inputStyle,width:220}} />
+              <select value={empFilter} onChange={e=>{setEmpFilter(e.target.value);setPage(1);}} style={inputStyle}>
+                <option value="">All Employees</option>
+                {empNames.map(n=><option key={n} value={n}>{n}</option>)}
+              </select>
+              <select value={resFilter} onChange={e=>{setResFilter(e.target.value);setPage(1);}} style={inputStyle}>
+                <option value="">All Results</option>
+                <option value="answered">Answered</option>
+                <option value="missed">Missed</option>
+                <option value="voicemail">Voicemail</option>
+              </select>
+              <select value={queueFilter} onChange={e=>{setQueueFilter(e.target.value);setPage(1);}} style={inputStyle}>
+                <option value="">All Sources</option>
+                <option value="queue">Via Queue/IVR</option>
+                <option value="direct">Direct Only</option>
+              </select>
+              {(empFilter||resFilter||queueFilter||search) && (
+                <button style={btnSec} onClick={()=>{setEmpFilter("");setResFilter("");setQueueFilter("");setSearch("");setPage(1);}}>✕ Clear</button>
+              )}
+              <span style={{marginLeft:"auto",fontSize:"12px",color:T.textMuted}}>{filtered.length.toLocaleString()} calls</span>
+            </div>
+
+            {/* Table */}
+            <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,overflow:"hidden",boxShadow:T.shadow}}>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr>
+                      {[
+                        {col:"date",    label:"Date / Time"},
+                        {col:"employee",label:"Answered By"},
+                        {col:"direction",label:"Dir"},
+                        {col:"caller",  label:"Caller / Called"},
+                        {col:"result",  label:"Result"},
+                        {col:"talkTime",label:"Talk"},
+                        {col:"waitTime",label:"Wait"},
+                        {col:null,      label:"Queue / Route"},
+                      ].map(({col,label}) => (
+                        <th key={label} onClick={col?()=>doSort(col):undefined} style={{...thStyle,cursor:col?"pointer":"default"}}>
+                          {label}{col?sortIcon(col):""}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageSlice.length === 0 ? (
+                      <tr><td colSpan={8} style={{...tdStyle,textAlign:"center",color:T.textMuted,padding:"40px"}}>No calls match current filters</td></tr>
+                    ) : pageSlice.map((c,i) => (
+                      <tr key={c.id||i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
+                        <td style={{...tdStyle,color:T.textMuted,fontSize:"11px"}}>{fmtDT(c.date)}</td>
+                        <td style={tdStyle}>
+                          <div style={{fontWeight:700}}>{c.answeredBy||"—"}</div>
+                          {c.viaQueue && <div style={{fontSize:"10px",color:T.blue,marginTop:1}}>via queue</div>}
+                        </td>
+                        <td style={tdStyle}>{dirBadge(c.direction)}</td>
+                        <td style={tdStyle}>
+                          {c.direction==="inbound"
+                            ? <><div>{c.callerName||c.callerNum||"—"}</div>{c.callerName&&<div style={{fontSize:"10px",color:T.textMuted}}>{c.callerNum}</div>}</>
+                            : <div style={{color:T.textMuted}}>{c.calleeNum||"—"}</div>
+                          }
+                        </td>
+                        <td style={tdStyle}>{resBadge(c.result)}</td>
+                        <td style={{...tdStyle,fontFamily:"monospace"}}>{fmtDur(c.talkTime)}</td>
+                        <td style={{...tdStyle,fontFamily:"monospace",color:T.textMuted}}>{fmtDur(c.waitTime)}</td>
+                        <td style={tdStyle}>
+                          {c.viaQueue
+                            ? <span style={{background:T.blueBg,color:T.blueText,padding:"2px 8px",borderRadius:"20px",fontSize:"10px",fontWeight:700}}>⇢ {c.queueName||"Queue"}</span>
+                            : (c.chain||[]).length > 1
+                              ? <span style={{fontSize:"10px",color:T.textMuted}}>{c.chain.join(" → ")}</span>
+                              : <span style={{color:T.textDim}}>—</span>
+                          }
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {/* Pagination */}
+              {pages > 1 && (
+                <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderTop:`1px solid ${T.border}`,background:T.bgSurface,fontSize:"12px",color:T.textMuted}}>
+                  <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===1} onClick={()=>setPage(p=>p-1)}>← Prev</button>
+                  <span>Page {page} of {pages} · {filtered.length.toLocaleString()} calls</span>
+                  <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===pages} onClick={()=>setPage(p=>p+1)}>Next →</button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </>}
+
+      {/* Empty state */}
+      {!loading && calls.length === 0 && !error && (
+        <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}>
+          <div style={{fontSize:40,marginBottom:12}}>📞</div>
+          <div style={{fontWeight:700,fontSize:"15px",marginBottom:6}}>No calls loaded yet</div>
+          <div style={{fontSize:"13px"}}>Select a date range and click Fetch Calls.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 if (typeof ReactDOM !== "undefined" && document.getElementById("root")) {
   const root = ReactDOM.createRoot(document.getElementById("root"));
