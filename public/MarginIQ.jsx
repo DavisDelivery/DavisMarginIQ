@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.17";
+const APP_VERSION = "2.42.18";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1599,6 +1599,104 @@ function GmailSync({ onRefresh }) {
   };
   useEffect(() => { loadImportedFilenames(); }, []);
 
+  // ── Pending Uline Files (v2.42.18) ───────────────────────────────────────
+  // Files staged by the marginiq-uline-auto-ingest scheduled function. Each
+  // doc in pending_uline_files holds attachment metadata; the actual content
+  // lives in pending_uline_file_chunks/{file_id}__NNN as gzipped+base64.
+  // The "Load" button below pulls the chunks back, reconstructs a File-like
+  // object, and feeds it into the existing ingestFiles() pipeline.
+  const [pendingUlineFiles, setPendingUlineFiles] = useState([]);
+  const [loadingPending, setLoadingPending] = useState({}); // file_id -> bool
+  const [pendingError, setPendingError] = useState(null);
+
+  const loadPendingUlineFiles = async () => {
+    if (!hasFirebase) return;
+    try {
+      const snap = await window.db.collection("pending_uline_files").orderBy("staged_at", "desc").get();
+      const files = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      setPendingUlineFiles(files);
+    } catch(e) { console.error("loadPendingUlineFiles err:", e); }
+  };
+  useEffect(() => { loadPendingUlineFiles(); }, []);
+
+  // Reconstruct a File from the chunks in pending_uline_file_chunks, then
+  // feed it into ingestFiles. On success, delete the pending docs.
+  const loadPendingFile = async (fileMeta) => {
+    if (!hasFirebase) return;
+    setLoadingPending(p => ({ ...p, [fileMeta.id]: true }));
+    setPendingError(null);
+    try {
+      // Pull all chunks for this file
+      const chunkSnap = await window.db.collection("pending_uline_file_chunks")
+        .where("file_id", "==", fileMeta.id)
+        .orderBy("chunk_index", "asc")
+        .get();
+      if (chunkSnap.empty) {
+        throw new Error(`No chunks found for ${fileMeta.filename}`);
+      }
+      // Concatenate base64 strings, then decode to bytes, then ungzip
+      const b64 = chunkSnap.docs.map(d => d.data().data_b64 || "").join("");
+      const gzBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      // pako is loaded globally for compression in some prior tabs; use it
+      // if available, else fall back to DecompressionStream (modern browsers).
+      let rawBytes;
+      if (typeof DecompressionStream !== "undefined") {
+        const ds = new DecompressionStream("gzip");
+        const stream = new Blob([gzBytes]).stream().pipeThrough(ds);
+        rawBytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      } else if (typeof pako !== "undefined") {
+        rawBytes = pako.ungzip(gzBytes);
+      } else {
+        throw new Error("Browser doesn't support gzip decompression (need DecompressionStream or pako)");
+      }
+      // Wrap into a File. The mime type from staging is preserved so detectFileType
+      // can route it correctly (xlsx vs csv).
+      const file = new File([rawBytes], fileMeta.filename, { type: fileMeta.mime_type || "application/octet-stream" });
+      file._source = "auto_uline";
+      file._emailFrom = fileMeta.email_account || null;
+
+      // Run the existing ingest pipeline. This handles parse, dedup against
+      // file_log, write to Firestore, and audit math — all the proven path.
+      const result = await ingestFiles([file], (s) => {
+        // Surface phase progress as a transient status message
+        setPendingError(null);
+      });
+
+      // If ingestion succeeded, clean up the pending docs
+      if (result && (result.imported > 0 || result.skipped > 0)) {
+        // Delete chunks first (parallel)
+        await Promise.all(chunkSnap.docs.map(d => d.ref.delete().catch(() => {})));
+        // Then delete the parent doc
+        await window.db.collection("pending_uline_files").doc(fileMeta.id).delete().catch(() => {});
+        await loadPendingUlineFiles();      // refresh list
+        await loadImportedFilenames();      // file_log changed
+      } else {
+        throw new Error(result?.error || "Ingest produced no result");
+      }
+    } catch(e) {
+      console.error("loadPendingFile err:", e);
+      setPendingError(`${fileMeta.filename}: ${e.message || String(e)}`);
+    } finally {
+      setLoadingPending(p => ({ ...p, [fileMeta.id]: false }));
+    }
+  };
+
+  const dismissPendingFile = async (fileMeta) => {
+    if (!hasFirebase) return;
+    if (!confirm(`Dismiss ${fileMeta.filename} without ingesting?\n\nThe file will be removed from the staged list but the email will stay marked as processed (so it won't reappear). You can manually re-stage by re-running the auto-ingest function.`)) return;
+    try {
+      const chunkSnap = await window.db.collection("pending_uline_file_chunks")
+        .where("file_id", "==", fileMeta.id)
+        .get();
+      await Promise.all(chunkSnap.docs.map(d => d.ref.delete().catch(() => {})));
+      await window.db.collection("pending_uline_files").doc(fileMeta.id).delete().catch(() => {});
+      await loadPendingUlineFiles();
+    } catch(e) {
+      console.error("dismissPendingFile err:", e);
+      setPendingError(`Dismiss failed: ${e.message}`);
+    }
+  };
+
   // Load Gmail connection state
   useEffect(() => {
     // Handle OAuth callback redirect (?gmail=connected OR ?gmail=error)
@@ -2176,6 +2274,78 @@ function GmailSync({ onRefresh }) {
           padding: "0 4px",
           fontWeight: 700,
         }}>×</button>
+      </div>
+    )}
+
+    {/* v2.42.18: Pending Uline DAS files staged by the Monday auto-ingest.
+        Show only when there are pending files — invisible otherwise. */}
+    {pendingUlineFiles.length > 0 && (
+      <div style={{...cardStyle, marginBottom:16, borderColor:T.brand, background:T.brandPale}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div style={{fontSize:13,fontWeight:700,color:T.brand}}>
+            📥 Pending Uline DAS Files ({pendingUlineFiles.length})
+          </div>
+          <button onClick={loadPendingUlineFiles} style={{
+            background:"transparent", border:`1px solid ${T.brand}`, color:T.brand,
+            borderRadius:6, padding:"4px 10px", fontSize:11, fontWeight:600, cursor:"pointer"
+          }}>↻ Refresh</button>
+        </div>
+        <div style={{fontSize:11,color:T.textDim,marginBottom:10,lineHeight:1.5}}>
+          Files auto-pulled from Gmail by the Monday scheduled function. Click <strong>Load</strong> to parse and ingest into Firestore (uses the same path as manual upload).
+        </div>
+        {pendingError && (
+          <div style={{padding:"8px 10px",marginBottom:10,borderRadius:6,background:"#fef2f2",border:`1px solid ${T.red}`,color:T.redText,fontSize:11,fontFamily:"monospace"}}>
+            ⚠️ {pendingError}
+          </div>
+        )}
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+          <thead>
+            <tr style={{textAlign:"left",borderBottom:`1px solid ${T.borderLight}`}}>
+              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim}}>Filename</th>
+              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim}}>Email Date</th>
+              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim,textAlign:"right"}}>Size</th>
+              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim,textAlign:"right"}}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pendingUlineFiles.map(f => {
+              const isLoading = !!loadingPending[f.id];
+              const sizeKb = f.size_bytes ? Math.round(f.size_bytes / 1024) : 0;
+              const emailDate = f.email_date ? f.email_date.slice(0, 10) : "—";
+              return (
+                <tr key={f.id} style={{borderBottom:`1px solid ${T.borderLight}`}}>
+                  <td style={{padding:"8px",fontFamily:"monospace",fontSize:11,color:T.text,wordBreak:"break-all"}}>
+                    {f.filename}
+                  </td>
+                  <td style={{padding:"8px",color:T.textDim,whiteSpace:"nowrap"}}>{emailDate}</td>
+                  <td style={{padding:"8px",textAlign:"right",color:T.textDim,whiteSpace:"nowrap"}}>{sizeKb.toLocaleString()} KB</td>
+                  <td style={{padding:"8px",textAlign:"right",whiteSpace:"nowrap"}}>
+                    <button
+                      onClick={() => loadPendingFile(f)}
+                      disabled={isLoading}
+                      style={{
+                        background: isLoading ? T.bgSurface : T.brand,
+                        color: isLoading ? T.textDim : "#fff",
+                        border:"none", borderRadius:6, padding:"5px 12px",
+                        fontSize:11, fontWeight:600, cursor: isLoading ? "default" : "pointer",
+                        marginRight:6,
+                      }}
+                    >{isLoading ? "Loading..." : "Load"}</button>
+                    <button
+                      onClick={() => dismissPendingFile(f)}
+                      disabled={isLoading}
+                      style={{
+                        background:"transparent", color:T.textDim,
+                        border:`1px solid ${T.borderLight}`, borderRadius:6,
+                        padding:"5px 10px", fontSize:11, cursor:"pointer",
+                      }}
+                    >Dismiss</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     )}
 
