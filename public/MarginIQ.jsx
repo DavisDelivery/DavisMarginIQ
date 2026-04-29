@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.5";
+const APP_VERSION = "2.42.6";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2293,6 +2293,7 @@ function GmailSync({ onRefresh }) {
           { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
           { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from ebilling@4flyers.com", color:"#2563eb", mode:"quickfuel" },
           { key:"billing_sent", icon:"📤", label:"Billing@ → Uline", desc:"Emails billing@davisdelivery.com sent to any @uline.com recipient with an attachment. Disputes, corrections, POD replies, reshipments — outbound Uline correspondence only.", color:"#8b5cf6", mode:"per-attachment", accountFilter:"billing@davisdelivery.com" },
+          { key:"ampcpas", icon:"📋", label:"AMP CPAs", desc:"Monthly audited financials (P&L, Balance Sheet, Cash Flow) — PDF attachments from @ampcpas.com. Imported via Audited Financials tab.", color:"#0d9488", mode:"per-attachment" },
         ].map(v => {
           const r = results[v.key];
           const isLoading = loading[v.key];
