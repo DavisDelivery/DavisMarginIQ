@@ -38,12 +38,18 @@ async function getPhoneUsers(token: string) {
     npt = d.next_page_token || "";
     if (++pages >= 5) break;
   } while (npt);
-  return users.map(u => ({
-    id:    u.id || "",
-    name:  u.display_name || u.name || ((u.first_name||"") + " " + (u.last_name||"")).trim() || "Unknown",
-    email: u.email || "",
-    ext:   u.extension_number || "",
-  }));
+  return users.map(u => {
+    const fn = (u.first_name || "").trim();
+    const ln = (u.last_name || "").trim();
+    const fullName = [fn, ln].filter(Boolean).join(" ");
+    const emailName = u.email ? String(u.email).split("@")[0].replace(/[._-]/g, " ").replace(/\b\w/g, c => c.toUpperCase()) : "";
+    return {
+      id:    u.id || "",
+      name:  u.display_name || u.name || fullName || emailName || u.email || "Unknown",
+      email: u.email || "",
+      ext:   u.extension_number || "",
+    };
+  });
 }
 
 async function getUserCalls(token: string, userId: string, from: string, to: string): Promise<any[]> {
@@ -220,6 +226,38 @@ export default async (req: Request, _ctx: Context) => {
       } catch(e: any) { console.warn("[zoom-phone] cache read:", e?.message); }
     }
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
+  }
+
+  // ── Debug: return raw user list with all fields ──────────────────────────
+  if (action === "debug-users") {
+    const token = await getToken(ACCT, CID, CSEC);
+    const users: any[] = [];
+    let npt = "", pages = 0;
+    do {
+      const url = `${API}/phone/users?page_size=100${npt ? "&next_page_token=" + encodeURIComponent(npt) : ""}`;
+      const res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+      const d: any = await res.json();
+      if (!res.ok) return new Response(JSON.stringify({error: d.message, status: res.status}), { status: 500, headers: CORS });
+      users.push(...(d.users || []));
+      npt = d.next_page_token || "";
+      if (++pages >= 5) break;
+    } while (npt);
+    return new Response(JSON.stringify({
+      total: users.length,
+      keys: users[0] ? Object.keys(users[0]) : [],
+      users: users.map(u => ({
+        id: u.id,
+        email: u.email,
+        first_name: u.first_name,
+        last_name: u.last_name,
+        display_name: u.display_name,
+        name: u.name,
+        status: u.status,
+        extension_number: u.extension_number,
+        phone_user_id: u.phone_user_id,
+        type: u.type,
+      })),
+    }), { headers: CORS });
   }
 
   // ── Return user list ─────────────────────────────────────────────────────
