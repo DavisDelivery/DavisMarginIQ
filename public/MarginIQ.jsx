@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.43.2";
+const APP_VERSION = "2.43.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10531,19 +10531,35 @@ function ZoomPhoneTab() {
 
   // ── History fetch ────────────────────────────────────────────────────────
   async function fetchHistory() {
-    setHistLoading(true); setError("");
+    setHistLoading(true);
+    setError("");
+    setHistCalls([]);
     try {
-      let url = `/.netlify/functions/marginiq-zoom-phone?action=history&from=${histFrom}&to=${histTo}`;
-      if (histDir) url += `&direction=${histDir}`;
+      let url = "/.netlify/functions/marginiq-zoom-phone?action=history";
+      url += "&from=" + encodeURIComponent(histFrom);
+      url += "&to="   + encodeURIComponent(histTo);
+      if (histDir) url += "&direction=" + encodeURIComponent(histDir);
       const r = await fetch(url);
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-      setHistCalls(d.records || []);
+      if (!r.ok) {
+        const txt = await r.text().catch(()=>"");
+        let msg = "HTTP " + r.status;
+        try { msg = JSON.parse(txt).error || msg; } catch(_) {}
+        setError(msg);
+        return;
+      }
+      const d = await r.json().catch(()=>({}));
+      const records = Array.isArray(d.records) ? d.records : [];
+      setHistCalls(records);
       setSyncedAt(d.synced_at || null);
       setDataSource(d.source || "");
-      if (d.source === "warming") setError("Cache is empty — click 🔄 Sync Now to load data from Zoom for the first time. This takes ~30 seconds but only needs to happen once.");
-    } catch(e) { setError(String(e.message||e)); }
-    finally { setHistLoading(false); }
+      if (d.source === "warming" || records.length === 0) {
+        setError("No data in cache yet — click 🔄 Sync Now to pull from Zoom. Only needed once; updates hourly after that.");
+      }
+    } catch(e) {
+      setError("Fetch error: " + String(e && e.message ? e.message : e));
+    } finally {
+      setHistLoading(false);
+    }
   }
 
   // ── History derived data ─────────────────────────────────────────────────
@@ -10556,9 +10572,9 @@ function ZoomPhoneTab() {
   // Group records by time period
   const periodGroups = React.useMemo(() => {
     const map = {};
-    histFiltered.forEach(c => {
+    try { histFiltered.forEach(c => {
       const d = new Date(c.date);
-      if (isNaN(d)) return;
+      if (!c || !c.date || isNaN(d)) return;
       let key;
       if (histGroupBy === "day")   key = d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"});
       else if (histGroupBy === "week") {
@@ -10572,13 +10588,14 @@ function ZoomPhoneTab() {
       if (c.result==="missed")    map[key].missed++;
       if (c.result==="voicemail") map[key].voicemail++;
     });
+    } catch(_) {}
     return Object.values(map).sort((a,b) => a.date - b.date);
   }, [histFiltered, histGroupBy]);
 
   // Group by employee for the history view
   const empGroups = React.useMemo(() => {
     const map = {};
-    histFiltered.forEach(c => {
+    try { histFiltered.forEach(c => {
       const k = c.answeredBy||"Unknown";
       if (!map[k]) map[k] = { name:k, ext:c.answeredExt||"", answered:0, missed:0, voicemail:0, total:0, talk:0 };
       map[k].total++;
@@ -10586,6 +10603,7 @@ function ZoomPhoneTab() {
       if (c.result==="missed")    map[k].missed++;
       if (c.result==="voicemail") map[k].voicemail++;
     });
+    } catch(_) {}
     return Object.values(map).sort((a,b) => b.total - a.total);
   }, [histFiltered]);
 
@@ -10760,7 +10778,7 @@ function ZoomPhoneTab() {
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:0,flexWrap:"wrap",gap:8}}>
         <div style={{display:"flex",gap:0,borderBottom:`2px solid ${T.border}`}}>
           <button style={tabBtn("live")}    onClick={()=>setActiveTab("live")}>📞 Live Feed</button>
-          <button style={tabBtn("history")} onClick={()=>{setActiveTab("history"); if(!histCalls.length) fetchHistory();}}>📊 History & Analysis</button>
+          <button style={tabBtn("history")} onClick={()=>setActiveTab("history")}>📊 History & Analysis</button>
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center",paddingBottom:4}}>
           {activeTab==="live" && (
