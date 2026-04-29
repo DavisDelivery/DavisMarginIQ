@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.46.2";
+const APP_VERSION = "2.47.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -546,11 +546,20 @@ async function ingestFiles(files, onStatus = () => {}) {
 
   // Time Clock
 
-  let tcWeeksSaved = 0;
+  let tcWeeksSaved = 0, tcDaysSaved = 0;
   if (timeClockEntries.length > 0) {
     const tcWeekly = buildTimeClockWeekly(timeClockEntries);
     tcWeeksSaved = await batchWrite(tcWeekly,
       w => FS.saveTimeClockWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()}),
+      25);
+    // v2.47.0: also persist per-shift entries to timeclock_daily for the
+    // clock-in→first-stop forensics on DriverPerformanceTab.
+    const tcDaily = buildTimeClockDaily(timeClockEntries);
+    tcDaysSaved = await batchWrite(tcDaily,
+      d => {
+        const { doc_id, ...fields } = d;
+        return FS.saveTimeClockDaily(doc_id, {...fields, updated_at:new Date().toISOString()});
+      },
       25);
   }
 
@@ -661,7 +670,7 @@ async function ingestFiles(files, onStatus = () => {}) {
     counts: countsByKind,
     uline: { stops: allStops.length, weeks_saved: savedWeeks, recon_saved: savedRecon, unpaid_saved: topUnpaid.length, audit_saved: savedAudit, payments: Object.keys(paymentByPro).length },
     nuvizz: { stops: nuvizzStops.length, weeks_saved: nvWeeksSaved, stops_saved: nvStopsSaved },
-    timeclock: { entries: timeClockEntries.length, weeks_saved: tcWeeksSaved },
+    timeclock: { entries: timeClockEntries.length, weeks_saved: tcWeeksSaved, days_saved: tcDaysSaved },
     payroll: { entries: payrollEntries.length, weeks_saved: payWeeksSaved },
     qbo: { lines: qboEntries.length, periods_saved: qboPeriodsSaved },
     unknown: unknownFiles,
@@ -3779,6 +3788,7 @@ function parseNuVizz(rows) {
       stop_number: stopNum,
       pro,
       driver_name: normalizeName(driver),
+      driver_key: driverKey(normalizeName(driver)), // v2.47.0: join key matching driver_classifications + timeclock_daily
       delivery_date: deliveryDate,
       delivery_end_at: hasEndTime ? deliveryEndDt : null,
       week_ending: deliveryDate ? weekEndingFriday(deliveryDate) : null,
@@ -3866,11 +3876,13 @@ function buildNuVizzWeekly(stops) {
 // ─── Time Clock Parser ──────────────────────────────────────
 // Flexible column mapping: employee/driver, date, clock in, clock out, hours
 // Supports both generic timeclock format AND CyberPay/B600 format (Display Name, In Time, Out Time, REG, OT1, OT2, Total)
+// v2.47.0: emits driver_key for joining to driver_classifications and
+//          (downstream) nuvizz_stops; preserves raw row for future use.
 function parseTimeClock(rows) {
   const entries = [];
   for (const r of rows) {
-    const name = r["employee"] || r["employee name"] || r["driver"] || r["driver name"] || r["name"] || r["display name"] || r["payroll id"];
-    if (!name) continue;
+    const rawName = r["employee"] || r["employee name"] || r["driver"] || r["driver name"] || r["name"] || r["display name"] || r["payroll id"];
+    if (!rawName) continue;
     const dateRaw = r["date"] || r["punch date"] || r["work date"] || r["day"];
     const date = parseDateMDYFlexible(dateRaw) || (dateRaw ? parseDateMDY(dateRaw) : null);
     const clockIn = r["clock in"] || r["punch in"] || r["time in"] || r["in"] || r["start time"] || r["in time"];
@@ -3881,8 +3893,10 @@ function parseTimeClock(rows) {
     const ot2Hrs = parseHours(r["ot2"] ?? 0) || 0;
     const totalExplicit = parseHours(r["total"] ?? r["total hours"] ?? r["hours"] ?? r["worked"] ?? r["duration"]);
     const hours = totalExplicit || (regHrs + ot1Hrs + ot2Hrs) || 0;
+    const employee = normalizeName(rawName);
     entries.push({
-      employee: normalizeName(name),
+      employee,
+      driver_key: driverKey(employee), // join key — same slug used in driver_classifications
       date,
       week_ending: date ? weekEndingSaturday(date) : null,
       month: date ? dateToMonth(date) : null,
@@ -3892,9 +3906,37 @@ function parseTimeClock(rows) {
       reg_hours: regHrs,
       ot_hours: ot1Hrs + ot2Hrs,
       department: r["department"] ? String(r["department"]).trim() : null,
+      raw: r, // every CSV column verbatim — for future use
     });
   }
   return entries;
+}
+
+// Per-shift docs for clock-in→first-stop / last-stop→clock-out forensics.
+// Doc ID  : `${driver_key}_${date}` — same slug used by driver_classifications,
+//           so consumer-side joins are exact.
+// Strategy: emit one doc per shift; merge:true upserts on re-ingest.
+function buildTimeClockDaily(entries) {
+  const daily = [];
+  for (const e of entries) {
+    if (!e.driver_key || !e.date) continue;
+    daily.push({
+      doc_id: `${e.driver_key}_${e.date}`,
+      employee: e.employee,
+      driver_key: e.driver_key,
+      date: e.date,
+      week_ending: e.week_ending,
+      month: e.month,
+      clock_in: e.clock_in,
+      clock_out: e.clock_out,
+      hours: e.hours,
+      reg_hours: e.reg_hours,
+      ot_hours: e.ot_hours,
+      department: e.department,
+      raw: e.raw,
+    });
+  }
+  return daily;
 }
 
 function buildTimeClockWeekly(entries) {
@@ -6596,14 +6638,23 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       }
     }
 
-    // ─── Time Clock: weekly rollups ───
-    let tcWeeksSaved = 0;
+    // ─── Time Clock: weekly rollups + daily shifts ───
+    let tcWeeksSaved = 0, tcDaysSaved = 0;
     if (timeClockEntries.length > 0) {
       setStatus(`Building time clock weekly rollups (${timeClockEntries.length} entries)...`);
       const tcWeekly = buildTimeClockWeekly(timeClockEntries);
       for (const w of tcWeekly) {
         const ok = await FS.saveTimeClockWeekly(w.week_ending, {...w, updated_at:new Date().toISOString()});
         if (ok) tcWeeksSaved++;
+      }
+      // v2.47.0: also persist per-shift entries to timeclock_daily for the
+      // clock-in→first-stop forensics on DriverPerformanceTab.
+      setStatus(`Saving time clock daily shifts (${timeClockEntries.length} entries)...`);
+      const tcDaily = buildTimeClockDaily(timeClockEntries);
+      for (const d of tcDaily) {
+        const { doc_id, ...fields } = d;
+        const ok = await FS.saveTimeClockDaily(doc_id, {...fields, updated_at:new Date().toISOString()});
+        if (ok) tcDaysSaved++;
       }
     }
 
@@ -6666,7 +6717,7 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       counts: countsByKind,
       uline: { stops: allStops.length, weeks_saved: savedWeeks, recon_saved: savedRecon, unpaid_saved: topUnpaid.length, payments: Object.keys(paymentByPro).length },
       nuvizz: { stops: nuvizzStops.length, weeks_saved: nvWeeksSaved, stops_saved: nvStopsSaved },
-      timeclock: { entries: timeClockEntries.length, weeks_saved: tcWeeksSaved },
+      timeclock: { entries: timeClockEntries.length, weeks_saved: tcWeeksSaved, days_saved: tcDaysSaved },
       payroll: { entries: payrollEntries.length, weeks_saved: payWeeksSaved },
       qbo: { lines: qboEntries.length, periods_saved: qboPeriodsSaved },
       unknown: unknownFiles,
