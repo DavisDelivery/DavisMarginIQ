@@ -184,7 +184,14 @@ async function batchWriteDocs(
     }
     return { ok, failed };
   }
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:batchWrite?key=${FIREBASE_API_KEY}`;
+  // v2.42.16: switched from :batchWrite to :commit because the public web
+  // API key + missing collection rule combination produces PERMISSION_DENIED
+  // on :batchWrite but works fine on :commit (Firestore rules treat the two
+  // endpoints differently — :commit is idempotent-write-friendly, :batchWrite
+  // requires explicit allow rules even for collections that PATCH can hit
+  // unauthenticated). NuVizz BG has been using :commit successfully since
+  // v2.40.34; aligning DDIS to match.
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:commit?key=${FIREBASE_API_KEY}`;
   const writes = docs.map(d => ({
     update: {
       name: `projects/${PROJECT_ID}/databases/(default)/documents/${collection}/${d.docId}`,
@@ -197,35 +204,15 @@ async function batchWriteDocs(
     body: JSON.stringify({ writes }),
   });
   if (!resp.ok) {
-    console.error(`batchWrite ${collection} failed: ${resp.status} ${await resp.text()}`);
+    console.error(`commit ${collection} failed: ${resp.status} ${await resp.text()}`);
     return { ok: 0, failed: docs.length };
   }
   const data: any = await resp.json();
-  // v2.40.15 counter fix: ground truth is writeResults.length; status[] is
-  // populated only on failures. See marginiq-audit-rebuild-background.mts for
-  // the full write-up.
+  // :commit is transactional — either all writes succeed (writeResults filled)
+  // or the whole call fails with non-200 (handled above). No partial-failure
+  // status array like :batchWrite has.
   const writeResults = data.writeResults || [];
-  const statuses = data.status || [];
-  let explicitFailed = 0;
-  let firstErrLogged = false;
-  for (const s of statuses) {
-    if (s && s.code && s.code !== 0) {
-      explicitFailed++;
-      if (!firstErrLogged) {
-        console.error(`batchWrite ${collection}: first rpc.Status code=${s.code} message="${s.message || ""}"`);
-        firstErrLogged = true;
-      }
-    }
-  }
-  if (writeResults.length > 0) {
-    return { ok: writeResults.length - explicitFailed, failed: explicitFailed };
-  }
-  if (statuses.length === 0) return { ok: docs.length, failed: 0 };
-  let okFromStatus = 0;
-  for (const s of statuses) {
-    if (!s || !s.code || s.code === 0) okFromStatus++;
-  }
-  return { ok: okFromStatus, failed: statuses.length - okFromStatus };
+  return { ok: writeResults.length, failed: docs.length - writeResults.length };
 }
 
 // ─── Status writer ──────────────────────────────────────────────────
