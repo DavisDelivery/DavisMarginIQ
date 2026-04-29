@@ -5,6 +5,13 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
+# Extended timeout for Zoom sync functions
+[functions."marginiq-zoom-phone"]
+  timeout = 60
+
+[functions."marginiq-zoom-sync"]
+  timeout = 300
+
 # NuVizz API proxy
 [[redirects]]
   from = "/api/nuvizz/*"
