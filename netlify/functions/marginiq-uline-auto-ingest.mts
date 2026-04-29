@@ -169,16 +169,28 @@ interface DasAttachment {
 
 // Walk MIME parts to collect ALL DAS attachments (CSV or XLSX). Unlike the
 // NuVizz/DDIS auto-ingests which pick one file per email, DAS emails carry
-// 3-4 files (delivery + truckload + accessorials, sometimes corrections).
+// 1-11 files (delivery + truckload + accessorials, sometimes corrections,
+// sometimes catch-up batches with multiple weeks at once).
+//
+// Filename patterns observed in real Gmail traffic — Uline isn't consistent:
+//   "das 04192026 - 04242026.xlsx"           (das + space + date)
+//   "das04192026 - 04242026.xlsx"            (das + digit, NO space)
+//   "das 04192026-04242026 accessorials.xlsx"
+//   "das 20260119-20260123 TK.xlsx"          (TK = truckload variant)
+//   "das 20251229 - 20260102 Accessorials.xlsx"
+// So the only stable fact is filename starts with "das" then either a
+// space, digit, underscore, or dash. The regex below captures all of them.
 function findAllDasAttachments(payload: any): DasAttachment[] {
   const out: DasAttachment[] = [];
+  // ^das followed by space|digit|underscore|dash, then anything ending in
+  // an xlsx/xls/csv extension. Case-insensitive match.
+  const dasPattern = /^das[\s\d_\-]/i;
   function walk(node: any) {
     if (!node) return;
     const filename: string = node.filename || "";
     const fnLower = filename.toLowerCase();
     if (filename && node.body?.attachmentId) {
-      // Match the same "starts with das" filter the manual UI uses.
-      if (fnLower.startsWith("das ") || fnLower.startsWith("das_") || fnLower.startsWith("das-") || fnLower.includes(" das ")) {
+      if (dasPattern.test(fnLower)) {
         if (fnLower.endsWith(".xlsx") || fnLower.endsWith(".xls") || fnLower.endsWith(".csv")) {
           out.push({
             filename,
