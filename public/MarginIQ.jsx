@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.46.0";
+const APP_VERSION = "2.46.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3738,20 +3738,20 @@ function parseDateTimeMDYFlexible(s) {
 function parseNuVizz(rows) {
   const stops = [];
   for (const r of rows) {
-    const stopNum = r["stop number"];
+    const stopNumRaw = r["stop number"];
     const driver = r["driver name"];
-    if (!stopNum && !driver) continue; // skip blank rows
-    // Datetime parse — preserves time-of-day for delivery-window analysis
-    const deliveryEndDt   = parseDateTimeMDYFlexible(r["delivery end"]);
-    const deliveryStartDt = parseDateTimeMDYFlexible(r["delivery start"]);
+    if (!stopNumRaw && !driver) continue; // skip blank rows
+    const stopNum = stopNumRaw ? String(stopNumRaw).trim() : null;
+    // Datetime parse — preserves time-of-day for delivery-window analysis.
+    // NOTE: there is no separate "delivery start" column. The first delivery
+    // of a driver's day = MIN(delivery_end_at) across that driver's stops on
+    // that date; the last delivery = MAX. Both come from this single column.
+    const deliveryEndDt = parseDateTimeMDYFlexible(r["delivery end"]);
     // delivery_date stays date-only (YYYY-MM-DD) for backwards compat with
     // existing readers (week rollups, recon, etc.)
-    const deliveryDate = deliveryEndDt
-      ? deliveryEndDt.slice(0, 10)
-      : (deliveryStartDt ? deliveryStartDt.slice(0, 10) : null);
-    // Only emit *_at fields when an actual time component was found
-    const hasEndTime   = !!(deliveryEndDt   && deliveryEndDt.includes("T"));
-    const hasStartTime = !!(deliveryStartDt && deliveryStartDt.includes("T"));
+    const deliveryDate = deliveryEndDt ? deliveryEndDt.slice(0, 10) : null;
+    // Only emit *_at field when an actual time component was found
+    const hasEndTime = !!(deliveryEndDt && deliveryEndDt.includes("T"));
     const status = r["stop status"] ? String(r["stop status"]).trim() : null;
     const shipTo = r["ship to name"] ? String(r["ship to name"]).trim() : null;
     const city = r["ship to - city"] ? String(r["ship to - city"]).trim() : null;
@@ -3759,13 +3759,20 @@ function parseNuVizz(rows) {
     const payBase = parseMoney(r["stop sealnbr"]);
     const contractorPay = payBase * CONTRACTOR_PAY_PCT; // applied only if driver is 1099
     const pro = normalizePro(stopNum); // cross-reference to Uline PRO
+    // Redelivery detection — two independent signals:
+    //   1. stop_number ends in "-N" (e.g. "12345-1")  → re-attempt suffix
+    //   2. PRO begins with "ATT"  (e.g. "ATT12345")   → NuVizz redelivery prefix
+    // Either one is sufficient. NuVizz may not currently emit the ATT prefix;
+    // operator will add it to the export when available.
+    const isRedeliveryByStop = !!(stopNum && /-\d+$/.test(stopNum));
+    const isRedeliveryByPro  = !!(pro && /^ATT/i.test(pro));
+    const isRedelivery = isRedeliveryByStop || isRedeliveryByPro;
     stops.push({
-      stop_number: stopNum ? String(stopNum).trim() : null,
+      stop_number: stopNum,
       pro,
       driver_name: normalizeName(driver),
       delivery_date: deliveryDate,
-      delivery_end_at:   hasEndTime   ? deliveryEndDt   : null,
-      delivery_start_at: hasStartTime ? deliveryStartDt : null,
+      delivery_end_at: hasEndTime ? deliveryEndDt : null,
       week_ending: deliveryDate ? weekEndingFriday(deliveryDate) : null,
       month: deliveryDate ? dateToMonth(deliveryDate) : null,
       status,
@@ -3773,6 +3780,7 @@ function parseNuVizz(rows) {
       city, zip,
       contractor_pay_base: payBase,         // raw $ from SealNbr column
       contractor_pay_at_40: contractorPay,  // 40% — actual cost IF driver is 1099
+      is_redelivery: isRedelivery,          // v2.46.1: see redelivery comment above
       raw: r,                               // v2.46.0: every CSV column verbatim — for
                                             //         addresses (mileage), weight,
                                             //         accessorial codes, schedule windows
