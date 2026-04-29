@@ -3,11 +3,13 @@ import type { Context } from "@netlify/functions";
 // Zoom Phone API — cache-first reads, per-user sync endpoint
 //
 // Actions:
-//   status  — check credentials configured
-//   history — read from Firebase cache (instant)
-//   users   — return list of phone users (for UI to iterate)
-//   sync-user&userId=X&name=Y — sync ONE user and write to cache
-//   sync-all — sync all users sequentially (uses extended 60s timeout)
+//   status     — check credentials configured
+//   history    — read from Firebase cache (instant)
+//   users      — return list of phone users (for UI to iterate)
+//   sync-user  — sync ONE user and write to cache
+//
+// IMPORTANT: dedup uses call_path_id (one per logical inbound call)
+// not id (which is per-leg as the call routes through receptionist → queue → user)
 
 const TOKEN_URL = "https://zoom.us/oauth/token";
 const API       = "https://api.zoom.us/v2";
@@ -70,19 +72,59 @@ function normalizeRecord(raw: any, user: { name: string; email: string; ext: str
     rStr.includes("voicemail")                           ? "voicemail" :
     rStr.includes("miss") || rStr.includes("no answer") || rStr.includes("abandon") ? "missed" :
     raw.call_result || "unknown";
+
+  // Detect leg type: was this leg the auto-receptionist/queue, or a real user?
+  const calleeType = raw.callee_ext_type || "";
+  const isHumanLeg = calleeType === "user" || (!calleeType && user.name && user.name !== "Unknown");
+
   return {
-    id: raw.id || raw.call_path_id || "", date: raw.start_time || raw.date_time || "",
-    direction: (raw.direction || "").toLowerCase(),
-    answeredBy: user.name, answeredEmail: user.email,
+    // Use call_path_id as the unique call identifier (same for every leg of one call)
+    callPathId: raw.call_path_id || raw.id || "",
+    legId:      raw.id || "",
+    date:       raw.start_time || raw.date_time || "",
+    direction:  (raw.direction || "").toLowerCase(),
+    answeredBy: user.name,
+    answeredEmail: user.email,
     answeredExt: user.ext || raw.callee_ext_number || "",
-    callerNum: raw.caller_did_number || raw.caller_number || "",
+    callerNum:  raw.caller_did_number || raw.caller_number || "",
     callerName: raw.caller_name || "",
-    calleeNum: raw.callee_did_number || raw.callee_number || "",
-    result, talkTime: Number(raw.duration ?? 0), waitTime: 0,
-    viaQueue: raw.callee_ext_type === "auto_receptionist" || raw.callee_ext_type === "call_queue",
-    queueName: (raw.callee_ext_type === "auto_receptionist" || raw.callee_ext_type === "call_queue") ? (raw.callee_name || "") : "",
-    chain: [],
+    calleeNum:  raw.callee_did_number || raw.callee_number || "",
+    calleeType,            // "user" | "auto_receptionist" | "call_queue" | etc.
+    isHumanLeg,            // true if this leg represents a real person
+    result,
+    talkTime:   Number(raw.duration ?? 0),
+    waitTime:   0,
+    viaQueue:   calleeType === "auto_receptionist" || calleeType === "call_queue",
+    queueName:  (calleeType === "auto_receptionist" || calleeType === "call_queue") ? (raw.callee_name || "") : "",
+    chain:      [],
+    // Keep `id` field too for back-compat with UI (which may still reference it)
+    id:         raw.call_path_id || raw.id || "",
   };
+}
+
+// ── Dedup logic — one record per logical call ───────────────────────────────
+// When the same call_path_id appears in multiple records (one per leg), prefer:
+//   1. The leg with a human answerer (callee_ext_type === "user") that was answered
+//   2. Any human leg
+//   3. The original receptionist/queue leg as last resort
+function dedupeByCall(records: any[]): any[] {
+  const byPath = new Map<string, any>();
+  for (const r of records) {
+    const key = r.callPathId || `${r.date}-${r.callerNum}`;
+    const existing = byPath.get(key);
+    if (!existing) {
+      byPath.set(key, r);
+      continue;
+    }
+    // Score each leg: human + answered > human > queue
+    const score = (rec: any) =>
+      (rec.isHumanLeg ? 10 : 0) +
+      (rec.result === "answered" ? 5 : 0) +
+      (rec.answeredBy && rec.answeredBy !== "Unknown" ? 1 : 0);
+
+    if (score(r) > score(existing)) byPath.set(key, r);
+  }
+  return Array.from(byPath.values());
 }
 
 // ── Firebase helpers ─────────────────────────────────────────────────────────
@@ -163,26 +205,31 @@ export default async (req: Request, _ctx: Context) => {
               if (ms >= fromMs && ms <= toMs && (!dir || r.direction === dir)) allRecs.push(r);
             }
           }
-          const seen = new Set<string>();
-          const deduped = allRecs.filter(r => { const k=r.id||`${r.date}-${r.callerNum}-${r.answeredBy}`; if(seen.has(k)) return false; seen.add(k); return true; });
+          // Dedup by call_path_id, preferring human-answered legs
+          const deduped = dedupeByCall(allRecs);
           deduped.sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime());
           const synced_at = userDocs.map(d=>d.synced_at).filter(Boolean).sort().reverse()[0] || null;
-          return new Response(JSON.stringify({ records: deduped, count: deduped.length, source: "cache", synced_at, from, to, ms: Date.now()-t0 }), { headers: CORS });
+          console.log(`[zoom-phone] cache: ${allRecs.length} legs → ${deduped.length} unique calls`);
+          return new Response(JSON.stringify({
+            records: deduped, count: deduped.length,
+            source: "cache", synced_at, from, to,
+            rawLegs: allRecs.length,
+            ms: Date.now()-t0,
+          }), { headers: CORS });
         }
       } catch(e: any) { console.warn("[zoom-phone] cache read:", e?.message); }
     }
-    // Cache empty
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
   }
 
-  // ── Return user list for UI-driven sync ───────────────────────────────────
+  // ── Return user list ─────────────────────────────────────────────────────
   if (action === "users") {
     const token = await getToken(ACCT, CID, CSEC);
     const users = await getPhoneUsers(token);
     return new Response(JSON.stringify({ users }), { headers: CORS });
   }
 
-  // ── Sync ONE user (called per-user from UI with progress display) ─────────
+  // ── Sync ONE user ────────────────────────────────────────────────────────
   if (action === "sync-user") {
     const userId   = u.searchParams.get("userId") || "";
     const userName = u.searchParams.get("name")   || "";
