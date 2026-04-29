@@ -228,6 +228,25 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
   }
 
+  // ── Debug: show what's in Firebase cache for each user ──────────────────
+  if (action === "debug-cache") {
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
+    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
+    return new Response(JSON.stringify({
+      total: userDocs.length,
+      summary: userDocs.map((d:any) => ({
+        name: d.name,
+        email: d.email,
+        ext: d.ext,
+        recordCount: (d.records || []).length,
+        synced_at: d.synced_at,
+        from: d.from,
+        to: d.to,
+        sampleDates: (d.records || []).slice(0, 3).map((r:any) => r.date),
+      })),
+    }), { headers: CORS });
+  }
+
   // ── Debug: return raw user list with all fields ──────────────────────────
   if (action === "debug-users") {
     const token = await getToken(ACCT, CID, CSEC);
