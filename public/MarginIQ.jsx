@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.7";
+const APP_VERSION = "2.43.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10473,6 +10473,8 @@ function ZoomPhoneTab() {
   const [histEmp, setHistEmp]       = React.useState("");
   const [histDir, setHistDir]       = React.useState("");
   const [histCalls, setHistCalls]   = React.useState([]);        // fetched history records
+  const [syncedAt, setSyncedAt]     = React.useState(null);      // when cache was last synced
+  const [dataSource, setDataSource] = React.useState("");        // "cache" | "direct"
   // Live call log filters
   const [empFilter, setEmpFilter]   = React.useState("");
   const [resFilter, setResFilter]   = React.useState("");
@@ -10537,6 +10539,8 @@ function ZoomPhoneTab() {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       setHistCalls(d.records || []);
+      setSyncedAt(d.synced_at || null);
+      setDataSource(d.source || "");
     } catch(e) { setError(String(e.message||e)); }
     finally { setHistLoading(false); }
   }
@@ -10966,10 +10970,20 @@ function ZoomPhoneTab() {
               <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchHistory} disabled={histLoading}>
                 {histLoading?"Loading…":"Run Report"}
               </button>
+              <button style={{...btnSec,alignSelf:"flex-end"}} onClick={()=>{const u=new URL(window.location.href); fetch(`/.netlify/functions/marginiq-zoom-phone?action=refresh&from=${histFrom}&to=${histTo}`).then(()=>fetchHistory());}} disabled={histLoading} title="Force re-fetch from Zoom (bypasses cache)">
+                🔄 Sync Now
+              </button>
             </div>
           </div>
 
-          {histLoading && <div style={{textAlign:"center",padding:"50px",color:T.textMuted}}><div style={{fontSize:32,marginBottom:10}}>📊</div><div style={{fontWeight:600}}>Fetching history…</div></div>}
+          {/* Sync status */}
+          {syncedAt && !histLoading && (
+            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:12,display:"flex",alignItems:"center",gap:6}}>
+              <span style={{display:"inline-block",width:6,height:6,borderRadius:"50%",background:T.green}} />
+              {dataSource==="cache" ? "From cache" : "Live from Zoom"} · Last synced: {new Date(syncedAt).toLocaleString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",hour12:true})}
+            </div>
+          )}
+          {histLoading && <div style={{textAlign:"center",padding:"50px",color:T.textMuted}}><div style={{fontSize:32,marginBottom:10}}>📊</div><div style={{fontWeight:600,marginBottom:6}}>Fetching history…</div><div style={{fontSize:"12px"}}>First run pulls from Zoom directly — may take 10–20 sec. Future loads are instant from cache.</div></div>}
 
           {!histLoading && histCalls.length>0 && <>
 
