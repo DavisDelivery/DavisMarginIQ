@@ -1,17 +1,16 @@
 import type { Context } from "@netlify/functions";
 
-// Zoom Phone API proxy — reads from Firebase cache written by marginiq-zoom-sync
-// Falls back to direct Zoom fetch only for ?action=refresh (manual trigger)
+// Zoom Phone API — reads from Firebase cache written by marginiq-zoom-sync
+// On cache miss: triggers background sync and returns empty with status
 //
 // Env vars: ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET
 //           FIREBASE_API_KEY, FIREBASE_PROJECT_ID
 
 const TOKEN_URL = "https://zoom.us/oauth/token";
 const API       = "https://api.zoom.us/v2";
-const SLEEP_MS  = 400;
+const SLEEP_MS  = 500;
 const sleep     = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-const CORS = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
+const CORS      = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
 
 async function getToken(acct: string, cid: string, csec: string): Promise<string> {
   const res = await fetch(
@@ -53,7 +52,7 @@ async function getUserCalls(token: string, userId: string, from: string, to: str
     if (!res.ok) {
       if (res.status === 404 || res.status === 400) return [];
       if (res.status === 429) { await sleep(2000); continue; }
-      throw new Error(d.message || `Call history ${res.status}`);
+      throw new Error(d.message || `${res.status}`);
     }
     records.push(...(d.call_logs || d.call_history || d.records || []));
     npt = d.next_page_token || "";
@@ -84,7 +83,7 @@ function normalizeRecord(raw: any, user: { name: string; email: string; ext: str
   };
 }
 
-// ── Firebase REST helpers ────────────────────────────────────────────────────
+// ── Firebase helpers ─────────────────────────────────────────────────────────
 function toFV(v: any): any {
   if (v === null || v === undefined) return { nullValue: null };
   if (typeof v === "boolean")        return { booleanValue: v };
@@ -94,38 +93,42 @@ function toFV(v: any): any {
   if (typeof v === "object")         return { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([k, val]) => [k, toFV(val)])) } };
   return { stringValue: String(v) };
 }
-
-async function fsSet(proj: string, key: string, col: string, doc: string, data: any) {
-  const fields = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, toFV(v)]));
-  const url = `https://firestore.googleapis.com/v1/projects/${proj}/databases/(default)/documents/${col}/${encodeURIComponent(doc)}?key=${key}`;
-  const res = await fetch(url, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields }) });
-  if (!res.ok) throw new Error(`Firestore PATCH ${res.status}`);
-}
-
-async function fsGetCollection(proj: string, key: string, col: string): Promise<any[]> {
-  const url = `https://firestore.googleapis.com/v1/projects/${proj}/databases/(default)/documents/${col}?key=${key}&pageSize=200`;
-  const res = await fetch(url, { headers: { "Content-Type": "application/json" } });
-  if (!res.ok) return [];
-  const d: any = await res.json();
-  return (d.documents || []).map((doc: any) => fromFV(doc.fields || {}));
-}
-
-function fromFV(fields: any): any {
-  const out: any = {};
-  for (const [k, v] of Object.entries(fields as any)) {
-    out[k] = fromFVValue(v);
-  }
-  return out;
-}
-function fromFVValue(v: any): any {
+function fromFVVal(v: any): any {
   if (v.nullValue !== undefined)    return null;
   if (v.booleanValue !== undefined) return v.booleanValue;
   if (v.integerValue !== undefined) return Number(v.integerValue);
   if (v.doubleValue !== undefined)  return v.doubleValue;
   if (v.stringValue !== undefined)  return v.stringValue;
-  if (v.arrayValue)                 return (v.arrayValue.values || []).map(fromFVValue);
-  if (v.mapValue)                   return fromFV(v.mapValue.fields || {});
+  if (v.arrayValue)                 return (v.arrayValue.values || []).map(fromFVVal);
+  if (v.mapValue)                   return Object.fromEntries(Object.entries(v.mapValue.fields || {}).map(([k,val]) => [k, fromFVVal(val)]));
   return null;
+}
+function fromFV(fields: any): any {
+  return Object.fromEntries(Object.entries(fields || {}).map(([k, v]) => [k, fromFVVal(v)]));
+}
+
+async function fsSet(proj: string, key: string, col: string, doc: string, data: any) {
+  const fields = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, toFV(v)]));
+  const url = `https://firestore.googleapis.com/v1/projects/${proj}/databases/(default)/documents/${col}/${encodeURIComponent(doc)}?key=${key}`;
+  const res = await fetch(url, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields }) });
+  if (!res.ok) { const e = await res.text().catch(()=>""); throw new Error(`Firestore ${res.status}: ${e.slice(0,100)}`); }
+}
+
+async function fsGetDoc(proj: string, key: string, col: string, doc: string): Promise<any | null> {
+  const url = `https://firestore.googleapis.com/v1/projects/${proj}/databases/(default)/documents/${col}/${encodeURIComponent(doc)}?key=${key}`;
+  const res = await fetch(url);
+  if (res.status === 404) return null;
+  if (!res.ok) return null;
+  const d: any = await res.json();
+  return d.fields ? fromFV(d.fields) : null;
+}
+
+async function fsListDocs(proj: string, key: string, col: string): Promise<any[]> {
+  const url = `https://firestore.googleapis.com/v1/projects/${proj}/databases/(default)/documents/${col}?key=${key}&pageSize=200`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const d: any = await res.json();
+  return (d.documents || []).map((doc: any) => fromFV(doc.fields || {}));
 }
 
 // ── Main handler ─────────────────────────────────────────────────────────────
@@ -133,14 +136,15 @@ export default async (req: Request, _ctx: Context) => {
   const ACCT    = process.env["ZOOM_ACCOUNT_ID"];
   const CID     = process.env["ZOOM_CLIENT_ID"];
   const CSEC    = process.env["ZOOM_CLIENT_SECRET"];
-  const API_KEY = process.env["FIREBASE_API_KEY"];
-  const PROJ    = process.env["FIREBASE_PROJECT_ID"];
+  const FB_KEY  = process.env["FIREBASE_API_KEY"];
+  const FB_PROJ = process.env["FIREBASE_PROJECT_ID"];
 
   const u      = new URL(req.url);
   const action = u.searchParams.get("action") || "history";
   const from   = u.searchParams.get("from") || new Date(Date.now()-30*86400000).toISOString().split("T")[0];
   const to     = u.searchParams.get("to")   || new Date().toISOString().split("T")[0];
   const dir    = u.searchParams.get("direction") || "";
+  const t0     = Date.now();
 
   if (action === "status") {
     return new Response(JSON.stringify({
@@ -150,97 +154,68 @@ export default async (req: Request, _ctx: Context) => {
   }
 
   if (!ACCT || !CID || !CSEC) {
-    return new Response(JSON.stringify({ error: "Missing Zoom env vars." }), { status: 500, headers: CORS });
+    return new Response(JSON.stringify({ error: "Missing Zoom credentials." }), { status: 500, headers: CORS });
   }
 
-  const t0 = Date.now();
-
-  // ── Read from Firebase cache (instant) ───────────────────────────────────
-  if (action === "history" && API_KEY && PROJ) {
+  // ── Read from Firebase cache ─────────────────────────────────────────────
+  if (action === "history" && FB_KEY && FB_PROJ) {
     try {
-      const userDocs = await fsGetCollection(PROJ, API_KEY, "zoom_sync_users");
+      const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
       if (userDocs.length > 0) {
-        // Flatten all user records, filter by date range
-        const fromDate = new Date(from + "T00:00:00Z").getTime();
-        const toDate   = new Date(to   + "T23:59:59Z").getTime();
-        const allRecords: any[] = [];
-
+        const fromMs = new Date(from + "T00:00:00Z").getTime();
+        const toMs   = new Date(to   + "T23:59:59Z").getTime();
+        const allRecs: any[] = [];
         for (const doc of userDocs) {
-          const recs: any[] = doc.records || [];
-          for (const r of recs) {
-            const d = new Date(r.date).getTime();
-            if (d >= fromDate && d <= toDate) {
-              if (!dir || r.direction === dir) allRecords.push(r);
-            }
+          for (const r of (doc.records || [])) {
+            const ms = new Date(r.date).getTime();
+            if (ms >= fromMs && ms <= toMs && (!dir || r.direction === dir)) allRecs.push(r);
           }
         }
-
-        // Deduplicate
         const seen = new Set<string>();
-        const deduped = allRecords.filter(r => {
-          const key = r.id || `${r.date}-${r.callerNum}-${r.answeredBy}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-        deduped.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-
-        const employees = [...new Set(deduped.map((r: any) => r.answeredBy))];
-        const syncMeta  = userDocs[0]?.synced_at || null;
-
-        console.log(`[zoom-phone] cache hit: ${deduped.length} records from ${userDocs.length} users`);
-        return new Response(JSON.stringify({
-          records: deduped, count: deduped.length, employees,
-          source: "cache", synced_at: syncMeta, from, to, ms: Date.now()-t0,
-        }), { headers: CORS });
+        const deduped = allRecs.filter(r => { const k=r.id||`${r.date}-${r.callerNum}-${r.answeredBy}`; if(seen.has(k)) return false; seen.add(k); return true; });
+        deduped.sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        const synced_at = userDocs.map(d => d.synced_at).filter(Boolean).sort().reverse()[0] || null;
+        console.log(`[zoom-phone] cache: ${deduped.length} records, ${userDocs.length} users`);
+        return new Response(JSON.stringify({ records: deduped, count: deduped.length, source: "cache", synced_at, from, to, ms: Date.now()-t0 }), { headers: CORS });
       }
-    } catch (e: any) {
-      console.warn("[zoom-phone] Firebase cache read failed:", e?.message, "— falling through to direct fetch");
+    } catch(e: any) {
+      console.warn("[zoom-phone] cache read error:", e?.message);
+    }
+    // Cache empty — return empty with warming flag so UI shows correct message
+    return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
+  }
+
+  // ── Manual sync trigger (?action=sync) ───────────────────────────────────
+  // Called by "Sync Now" button — fetches all users sequentially and writes to cache
+  if (action === "sync" || action === "refresh") {
+    try {
+      const token = await getToken(ACCT, CID, CSEC);
+      const users = await getPhoneUsers(token);
+      // Sync last 35 days
+      const syncFrom = new Date(Date.now()-35*86400000).toISOString().split("T")[0];
+      const syncTo   = new Date().toISOString().split("T")[0];
+      let total = 0;
+      for (let i = 0; i < users.length; i++) {
+        if (i > 0) await sleep(SLEEP_MS);
+        try {
+          const recs = await getUserCalls(token, users[i].id, syncFrom, syncTo);
+          const normalized = recs.map(r => normalizeRecord(r, users[i]));
+          if (FB_KEY && FB_PROJ) {
+            await fsSet(FB_PROJ, FB_KEY, "zoom_sync_users", users[i].id, {
+              name: users[i].name, email: users[i].email, ext: users[i].ext,
+              records: normalized, count: normalized.length,
+              synced_at: new Date().toISOString(), from: syncFrom, to: syncTo,
+            });
+          }
+          total += normalized.length;
+          console.log(`[zoom-sync] ${users[i].name}: ${normalized.length} records`);
+        } catch(e: any) { console.error(`[zoom-sync] ${users[i].name}:`, e?.message); }
+      }
+      return new Response(JSON.stringify({ ok: true, users: users.length, records: total, ms: Date.now()-t0 }), { headers: CORS });
+    } catch(e: any) {
+      return new Response(JSON.stringify({ error: String(e?.message||e) }), { status: 500, headers: CORS });
     }
   }
 
-  // ── Direct fetch fallback (or ?action=refresh) ────────────────────────────
-  // Used when cache is empty (first run) or user manually triggers refresh
-  try {
-    const token = await getToken(ACCT, CID, CSEC);
-    const users = await getPhoneUsers(token);
-    const allRecords: any[] = [];
-
-    for (let i = 0; i < users.length; i++) {
-      if (i > 0) await sleep(SLEEP_MS);
-      const recs = await getUserCalls(token, users[i].id, from, to);
-      const normalized = recs.map(r => normalizeRecord(r, users[i]));
-      allRecords.push(...normalized);
-
-      // Write to cache as we go
-      if (API_KEY && PROJ) {
-        await fsSet(PROJ, API_KEY, "zoom_sync_users", users[i].id, {
-          name: users[i].name, email: users[i].email, ext: users[i].ext,
-          records: normalized, count: normalized.length,
-          synced_at: new Date().toISOString(), from, to,
-        }).catch(e => console.warn("[zoom-phone] cache write failed:", e?.message));
-      }
-    }
-
-    const seen = new Set<string>();
-    const deduped = allRecords.filter(r => {
-      const key = r.id || `${r.date}-${r.callerNum}-${r.answeredBy}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    deduped.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-
-    const employees = [...new Set(deduped.map(r => r.answeredBy))];
-    console.log(`[zoom-phone] direct fetch: ${deduped.length} records | ${employees.join(", ")}`);
-
-    return new Response(JSON.stringify({
-      records: deduped, count: deduped.length, employees,
-      source: "direct", from, to, ms: Date.now()-t0,
-    }), { headers: CORS });
-
-  } catch (e: any) {
-    console.error("[zoom-phone]", e?.message);
-    return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500, headers: CORS });
-  }
+  return new Response(JSON.stringify({ error: "Unknown action" }), { status: 400, headers: CORS });
 };
