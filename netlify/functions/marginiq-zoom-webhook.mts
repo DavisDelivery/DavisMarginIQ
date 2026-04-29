@@ -6,37 +6,15 @@ import * as crypto from "crypto";
 // Zoom POSTs signed events here. We verify the signature, normalize the
 // payload, then write to Firestore via the Firebase REST API so the
 // MarginIQ Phone tab updates in real-time via onSnapshot.
-//
-// Required env vars:
-//   ZOOM_WEBHOOK_SECRET_TOKEN  — from your Zoom app's Feature → Event Subscriptions page
-//   FIREBASE_API_KEY           — from Firebase project settings
-//   FIREBASE_PROJECT_ID        — e.g. "glorybounddispatch"
-//
-// Events handled:
-//   phone.callee_ringing       → zoom_calls/{callId}  status: ringing
-//   phone.callee_answered      → zoom_calls/{callId}  status: active
-//   phone.callee_ended         → zoom_calls/{callId}  status: ended  (with duration)
-//   phone.caller_ended         → zoom_calls/{callId}  status: ended
-//   phone.callee_missed        → zoom_calls/{callId}  status: missed
-//   phone.voicemail_received   → zoom_calls/{callId}  status: voicemail
-//
-// Zoom URL validation challenge is also handled automatically.
 
 const CORS = { "Content-Type": "application/json" };
 
-function verifyZoomSignature(
-  body: string,
-  timestamp: string,
-  signature: string,
-  secret: string
-): boolean {
+function verifyZoomSignature(body: string, timestamp: string, signature: string, secret: string): boolean {
   const msg = `v0:${timestamp}:${body}`;
   const expected = "v0=" + crypto.createHmac("sha256", secret).update(msg).digest("hex");
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 function normalizeEvent(event: string, obj: any): Record<string, any> | null {
@@ -86,6 +64,7 @@ function normalizeEvent(event: string, obj: any): Record<string, any> | null {
   }
 }
 
+// Signature: (projectId, apiKey, collection, docId, data) — IN THIS ORDER
 async function writeToFirestore(
   projectId: string,
   apiKey: string,
@@ -93,7 +72,6 @@ async function writeToFirestore(
   docId: string,
   data: Record<string, any>
 ): Promise<void> {
-  // Convert JS object to Firestore REST format
   function toFirestoreValue(v: any): any {
     if (v === null || v === undefined) return { nullValue: null };
     if (typeof v === "boolean")        return { booleanValue: v };
@@ -128,7 +106,13 @@ export default async (req: Request, _ctx: Context) => {
   const PROJECT_ID  = process.env["FIREBASE_PROJECT_ID"];
 
   if (req.method === "GET") {
-    return new Response(JSON.stringify({ status: "Zoom webhook endpoint active" }), { headers: CORS });
+    return new Response(JSON.stringify({
+      status: "Zoom webhook endpoint active",
+      hasSecret: !!SECRET,
+      hasFirebaseKey: !!API_KEY,
+      hasFirebaseProject: !!PROJECT_ID,
+      projectId: PROJECT_ID || null,
+    }), { headers: CORS });
   }
 
   if (req.method !== "POST") {
@@ -163,7 +147,6 @@ export default async (req: Request, _ctx: Context) => {
   // ── Normalize ─────────────────────────────────────────────────────────────
   const normalized = normalizeEvent(event, obj);
   if (!normalized || !normalized.call_id) {
-    // Unhandled event — ack it so Zoom doesn't retry
     return new Response(JSON.stringify({ ok: true, skipped: event }), { headers: CORS });
   }
 
@@ -174,11 +157,11 @@ export default async (req: Request, _ctx: Context) => {
   }
 
   try {
-    await writeToFirestore(API_KEY, PROJECT_ID, "zoom_calls", normalized.call_id, normalized);
+    // FIXED: correct argument order — (projectId, apiKey, collection, docId, data)
+    await writeToFirestore(PROJECT_ID, API_KEY, "zoom_calls", normalized.call_id, normalized);
     console.log(`[zoom-webhook] wrote ${event} → zoom_calls/${normalized.call_id}`);
   } catch (e: any) {
     console.error("[zoom-webhook] Firestore error:", e?.message);
-    // Still return 200 so Zoom doesn't retry — log the error for debugging
     return new Response(JSON.stringify({ ok: true, warn: "Firestore write failed", detail: e?.message }), { headers: CORS });
   }
 
