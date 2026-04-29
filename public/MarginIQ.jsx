@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.20";
+const APP_VERSION = "2.42.21";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1626,16 +1626,24 @@ function GmailSync({ onRefresh }) {
     setLoadingPending(p => ({ ...p, [fileMeta.id]: true }));
     setPendingError(null);
     try {
-      // Pull all chunks for this file
+      // Pull all chunks for this file. Doc IDs follow the pattern
+      // `{file_id}__000`, `{file_id}__001`, etc., so we use a doc-ID range
+      // query and sort by doc ID. This avoids needing a composite index
+      // on (file_id, chunk_index) — the where+orderBy combination would
+      // require one.
+      const startId = `${fileMeta.id}__000`;
+      const endId = `${fileMeta.id}__\uf8ff`; // \uf8ff sorts after any normal char
       const chunkSnap = await window.db.collection("pending_uline_file_chunks")
-        .where("file_id", "==", fileMeta.id)
-        .orderBy("chunk_index", "asc")
+        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
+        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
         .get();
       if (chunkSnap.empty) {
         throw new Error(`No chunks found for ${fileMeta.filename}`);
       }
-      // Concatenate base64 strings, then decode to bytes, then ungzip
-      const b64 = chunkSnap.docs.map(d => d.data().data_b64 || "").join("");
+      // Sort by doc ID (which has zero-padded chunk_index, so alphabetical
+      // sort = numerical sort) and concatenate the base64 strings.
+      const sortedDocs = chunkSnap.docs.slice().sort((a, b) => a.id.localeCompare(b.id));
+      const b64 = sortedDocs.map(d => d.data().data_b64 || "").join("");
       const gzBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
       // pako is loaded globally for compression in some prior tabs; use it
       // if available, else fall back to DecompressionStream (modern browsers).
@@ -1685,8 +1693,12 @@ function GmailSync({ onRefresh }) {
     if (!hasFirebase) return;
     if (!confirm(`Dismiss ${fileMeta.filename} without ingesting?\n\nThe file will be removed from the staged list but the email will stay marked as processed (so it won't reappear). You can manually re-stage by re-running the auto-ingest function.`)) return;
     try {
+      // Use doc-ID range (same pattern as loadPendingFile) — no index needed
+      const startId = `${fileMeta.id}__000`;
+      const endId = `${fileMeta.id}__\uf8ff`;
       const chunkSnap = await window.db.collection("pending_uline_file_chunks")
-        .where("file_id", "==", fileMeta.id)
+        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
+        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
         .get();
       await Promise.all(chunkSnap.docs.map(d => d.ref.delete().catch(() => {})));
       await window.db.collection("pending_uline_files").doc(fileMeta.id).delete().catch(() => {});
