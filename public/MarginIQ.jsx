@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.44.0";
+const APP_VERSION = "2.43.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10972,14 +10972,28 @@ function ZoomPhoneTab() {
                 {histLoading?"Loading…":"Run Report"}
               </button>
               <button style={{...btnSec,alignSelf:"flex-end",color:T.brand,borderColor:T.brand}} onClick={async()=>{
-                setHistLoading(true); setError("Syncing from Zoom — fetching each employee's call history. This takes ~30 seconds…");
+                setHistLoading(true); setError("");
                 try {
-                  const r = await fetch("/.netlify/functions/marginiq-zoom-phone?action=sync");
-                  const d = await r.json();
-                  if (!r.ok) throw new Error(d.error||"Sync failed");
+                  // Step 1: get user list
+                  setError("Getting employee list from Zoom…");
+                  const ur = await fetch("/.netlify/functions/marginiq-zoom-phone?action=users");
+                  const ud = await ur.json();
+                  if (!ur.ok) throw new Error(ud.error||"Failed to get users");
+                  const users = ud.users || [];
+                  if (!users.length) throw new Error("No phone users found in Zoom");
+                  // Step 2: sync each user one at a time with progress
+                  for (let i = 0; i < users.length; i++) {
+                    const u = users[i];
+                    setError(`Syncing ${i+1}/${users.length}: ${u.name}…`);
+                    const params = new URLSearchParams({ action:"sync-user", userId:u.id, name:u.name, email:u.email||"", ext:u.ext||"" });
+                    const sr = await fetch(`/.netlify/functions/marginiq-zoom-phone?${params}`);
+                    const sd = await sr.json();
+                    if (!sr.ok) console.warn(`Sync failed for ${u.name}:`, sd.error);
+                  }
                   setError("");
                   await fetchHistory();
-                } catch(e) { setError("Sync error: "+String(e.message||e)); setHistLoading(false); }
+                } catch(e) { setError("Sync error: "+String(e.message||e)); }
+                finally { setHistLoading(false); }
               }} disabled={histLoading} title="Pull fresh data from Zoom and update cache">
                 🔄 Sync Now
               </button>
