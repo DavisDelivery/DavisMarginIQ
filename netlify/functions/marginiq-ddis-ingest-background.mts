@@ -308,23 +308,37 @@ async function ingest(
     console.log(`ddis-ingest: wrote ${payResult.ok}/${paymentDocs.length} ddis_payments (${payResult.failed} failed)`);
 
     const totalFailed = fileResult.failed + payResult.failed;
+    const totalAttempted = fileRecords.length + paymentDocs.length;
+    const totalOk = fileResult.ok + payResult.ok;
     const droppedNote = droppedPayments > 0 ? ` · ${droppedPayments} payment rows dropped (over ${PAYMENT_CAP} cap)` : "";
 
+    // v2.42.14: distinguish between fully-successful, partial, and total
+    // failure. Pre-v2.42.14 always returned state=complete even when 100%
+    // of writes failed (e.g., missing Firestore rule for ddis_payments).
+    // Now: if zero docs landed, mark failed; if some landed, complete.
+    const allFailed = totalAttempted > 0 && totalOk === 0;
+    const finalState = allFailed ? "failed" : "complete";
+    const progressText = allFailed
+      ? `✗ All ${totalAttempted} writes failed — check Firestore rules for ddis_files/ddis_payments`
+      : `✓ Wrote ${fileResult.ok} file record(s) + ${payResult.ok.toLocaleString()} payment row(s)${droppedNote}`;
+
     await writeStatus({
-      state: "complete",
+      state: finalState,
       completed_at: new Date().toISOString(),
       phase: "done",
-      progress_text: `✓ Wrote ${fileResult.ok} file record(s) + ${payResult.ok.toLocaleString()} payment row(s)${droppedNote}`,
+      progress_text: progressText,
       file_records_ok: fileResult.ok,
       payment_rows_ok: payResult.ok,
       failed_writes: totalFailed,
+      error: allFailed ? "All writes failed (likely Firestore rules issue)" : null,
     });
 
     return {
-      ok: true,
+      ok: !allFailed,
       fileOk: fileResult.ok,
       paymentOk: payResult.ok,
       failed: totalFailed,
+      allFailed,
     };
   } catch (e: any) {
     const msg = e?.message || String(e);

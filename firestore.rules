@@ -42,6 +42,24 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // DDIS per-PRO payment rows (one doc per PRO+bill_date+check). Used by
+    // audit rebuild for billed-vs-paid variance matching. Pre-v2.42.13
+    // these were written client-side via the authenticated Firebase JS SDK,
+    // so the missing collection rule was never noticed. v2.42.13's BG worker
+    // writes via the REST batchWrite endpoint with the public web key, which
+    // requires an explicit allow-rule.
+    match /ddis_payments/{paymentId} {
+      allow read, write: if true;
+    }
+
+    // DDIS dispatcher staging area (v2.42.13 chunked-payload fix). Holds
+    // gzipped+base64 chunks between dispatcher write and BG read; cleaned
+    // up by the BG after successful processing. Effectively an internal
+    // queue, but needs read/write for the BG to load and delete chunks.
+    match /ddis_ingest_payloads/{chunkId} {
+      allow read, write: if true;
+    }
+
     // File upload log
     match /file_log/{fileId} {
       allow read, write: if true;
