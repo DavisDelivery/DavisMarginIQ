@@ -18,5 +18,11 @@ service firebase.storage {
       allow read, write: if true;
     }
 
+    // Audited financials PDFs from AMP CPAs (one PDF per month).
+    // v2.43.0+: stored when user imports via Gmail Sync.
+    match /audited_financials/{allPaths=**} {
+      allow read, write: if true;
+    }
+
   }
 }

@@ -165,6 +165,37 @@ async function saveFinancial(monthKey, data) {
   } catch (e) { console.error("saveFinancial", e); return false; }
 }
 
+// Upload the original PDF to Firebase Storage so the user can view it later.
+// Path: audited_financials/{period}.pdf  (one canonical copy per month;
+// re-imports overwrite). Returns { storage_path, download_url } or null.
+async function uploadPdfToStorage(period, pdfBytes, originalFilename) {
+  if (!window.fbStorage) return null;
+  try {
+    const path = `audited_financials/${period}.pdf`;
+    const ref = window.fbStorage.ref(path);
+    const blob = new Blob([pdfBytes], { type: "application/pdf" });
+    const metadata = {
+      contentType: "application/pdf",
+      customMetadata: { original_filename: originalFilename || "" },
+    };
+    await ref.put(blob, metadata);
+    const url = await ref.getDownloadURL();
+    return { storage_path: path, download_url: url };
+  } catch (e) {
+    console.error("uploadPdfToStorage failed:", e);
+    return null;
+  }
+}
+
+// Re-fetch the download URL for a stored PDF (URLs are short-lived tokens
+// in some configs, so we always refresh just before opening).
+async function refreshPdfUrl(storagePath) {
+  if (!window.fbStorage || !storagePath) return null;
+  try {
+    return await window.fbStorage.ref(storagePath).getDownloadURL();
+  } catch (e) { console.error("refreshPdfUrl failed:", e); return null; }
+}
+
 // FIXED v2.0.0: Don't use orderBy — if any doc lacks `period`, Firestore
 // silently returns 0 results. Just .get() everything and sort client-side.
 async function getFinancials() {
@@ -385,9 +416,26 @@ function DetailModal({ record, onClose, onDelete }) {
             <div style={{ fontSize:12, color:T.text, lineHeight:1.6 }}>{record.notes}</div>
           </div>
         )}
-        {record.filename && (
+        {record.pdf_storage_path && (
+          <div style={{ marginTop:18, padding:"12px 14px", background:T.brandPale, borderRadius:T.radiusSm, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <div>
+              <div style={{ fontSize:12, fontWeight:700, color:T.brandDark }}>📎 Original PDF available</div>
+              <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>{record.filename || "audited financials"}</div>
+            </div>
+            <button onClick={async () => {
+              const url = await refreshPdfUrl(record.pdf_storage_path);
+              if (url) window.open(url, "_blank", "noopener,noreferrer");
+              else window.alert("Could not open PDF — check console");
+            }}
+              style={{ padding:"8px 16px", borderRadius:T.radiusSm, border:"none", background:T.brand, color:"#fff", fontSize:12, fontWeight:700, cursor:"pointer" }}>
+              View Original PDF
+            </button>
+          </div>
+        )}
+        {record.filename && !record.pdf_storage_path && (
           <div style={{ marginTop:14, fontSize:10, color:T.textDim }}>
             Source: {record.filename}{record.email_subject ? ` · "${record.email_subject}"` : ""}
+            <div style={{ marginTop:4, color:T.yellowText }}>⚠️ PDF not yet stored — re-import this month from Gmail Sync to keep a viewable copy.</div>
           </div>
         )}
       </div>
@@ -814,6 +862,10 @@ function GmailSyncPanel({ onImported }) {
           setProcessing(p => ({ ...p, [emailId]:`✗ Could not determine period for ${att.filename}` }));
           continue;
         }
+        // Upload PDF to Firebase Storage for later viewing
+        setProcessing(p => ({ ...p, [emailId]:`Saving PDF to storage (${monthLabel(period)})...` }));
+        const pdfMeta = await uploadPdfToStorage(period, pdfBytes, att.filename);
+
         const record = {
           ...extracted,
           period,
@@ -822,8 +874,10 @@ function GmailSyncPanel({ onImported }) {
           email_date: email.emailDate,
           from: email.from,
           filename: att.filename,
+          pdf_storage_path: pdfMeta?.storage_path || null,
+          pdf_download_url: pdfMeta?.download_url || null,
         };
-        setProcessing(p => ({ ...p, [emailId]:`Saving ${monthLabel(period)}...` }));
+        setProcessing(p => ({ ...p, [emailId]:`Saving ${monthLabel(period)} financials...` }));
         const ok = await saveFinancial(period, record);
         if (!ok) throw new Error("Firestore write failed");
         await saveEmailProcessed(emailId, { period, filename: att.filename, subject: email.emailSubject });
