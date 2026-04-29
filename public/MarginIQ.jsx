@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.22";
+const APP_VERSION = "2.42.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1599,118 +1599,6 @@ function GmailSync({ onRefresh }) {
   };
   useEffect(() => { loadImportedFilenames(); }, []);
 
-  // ── Pending Uline Files (v2.42.18) ───────────────────────────────────────
-  // Files staged by the marginiq-uline-auto-ingest scheduled function. Each
-  // doc in pending_uline_files holds attachment metadata; the actual content
-  // lives in pending_uline_file_chunks/{file_id}__NNN as gzipped+base64.
-  // The "Load" button below pulls the chunks back, reconstructs a File-like
-  // object, and feeds it into the existing ingestFiles() pipeline.
-  const [pendingUlineFiles, setPendingUlineFiles] = useState([]);
-  const [loadingPending, setLoadingPending] = useState({}); // file_id -> bool
-  const [pendingError, setPendingError] = useState(null);
-
-  const loadPendingUlineFiles = async () => {
-    if (!hasFirebase) return;
-    try {
-      const snap = await window.db.collection("pending_uline_files").orderBy("staged_at", "desc").get();
-      const files = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      setPendingUlineFiles(files);
-    } catch(e) { console.error("loadPendingUlineFiles err:", e); }
-  };
-  useEffect(() => { loadPendingUlineFiles(); }, []);
-
-  // Reconstruct a File from the chunks in pending_uline_file_chunks, then
-  // feed it into ingestFiles. On success, delete the pending docs.
-  const loadPendingFile = async (fileMeta) => {
-    if (!hasFirebase) return;
-    setLoadingPending(p => ({ ...p, [fileMeta.id]: true }));
-    setPendingError(null);
-    try {
-      // Pull all chunks for this file. Doc IDs follow the pattern
-      // `{file_id}__000`, `{file_id}__001`, etc., so we use a doc-ID range
-      // query and sort by doc ID. This avoids needing a composite index
-      // on (file_id, chunk_index) — the where+orderBy combination would
-      // require one.
-      const startId = `${fileMeta.id}__000`;
-      const endId = `${fileMeta.id}__\uf8ff`; // \uf8ff sorts after any normal char
-      const chunkSnap = await window.db.collection("pending_uline_file_chunks")
-        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
-        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
-        .get();
-      if (chunkSnap.empty) {
-        throw new Error(`No chunks found for ${fileMeta.filename}`);
-      }
-      // Sort by doc ID (which has zero-padded chunk_index, so alphabetical
-      // sort = numerical sort) and concatenate the base64 strings.
-      const sortedDocs = chunkSnap.docs.slice().sort((a, b) => a.id.localeCompare(b.id));
-      const b64 = sortedDocs.map(d => d.data().data_b64 || "").join("");
-      const gzBytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-      // pako is loaded globally for compression in some prior tabs; use it
-      // if available, else fall back to DecompressionStream (modern browsers).
-      let rawBytes;
-      if (typeof DecompressionStream !== "undefined") {
-        const ds = new DecompressionStream("gzip");
-        const stream = new Blob([gzBytes]).stream().pipeThrough(ds);
-        rawBytes = new Uint8Array(await new Response(stream).arrayBuffer());
-      } else if (typeof pako !== "undefined") {
-        rawBytes = pako.ungzip(gzBytes);
-      } else {
-        throw new Error("Browser doesn't support gzip decompression (need DecompressionStream or pako)");
-      }
-      // Wrap into a File. The mime type from staging is preserved so detectFileType
-      // can route it correctly (xlsx vs csv).
-      const file = new File([rawBytes], fileMeta.filename, { type: fileMeta.mime_type || "application/octet-stream" });
-      file._source = "auto_uline";
-      file._emailFrom = fileMeta.email_account || null;
-
-      // Run the existing ingest pipeline. This handles parse, dedup against
-      // file_log, write to Firestore, and audit math — all the proven path.
-      const result = await ingestFiles([file], (s) => {
-        setPendingError(null);
-      });
-
-      // ingestFiles returns { files_processed, counts, uline, nuvizz, ... }
-      // Consider it a success if the call returned at all (no exception thrown)
-      // and files_processed > 0. A file that's already in file_log still
-      // returns files_processed=1 — that's fine, just clean up the pending doc.
-      if (result && result.files_processed > 0) {
-        // Delete chunks first (parallel)
-        await Promise.all(sortedDocs.map(d => d.ref.delete().catch(() => {})));
-        // Then delete the parent doc
-        await window.db.collection("pending_uline_files").doc(fileMeta.id).delete().catch(() => {});
-        await loadPendingUlineFiles();
-        await loadImportedFilenames();
-      } else {
-        throw new Error("ingestFiles returned 0 files_processed — check console for parser errors");
-      }
-    } catch(e) {
-      console.error("loadPendingFile err:", e);
-      setPendingError(`${fileMeta.filename}: ${e.message || String(e)}`);
-    } finally {
-      setLoadingPending(p => ({ ...p, [fileMeta.id]: false }));
-    }
-  };
-
-  const dismissPendingFile = async (fileMeta) => {
-    if (!hasFirebase) return;
-    if (!confirm(`Dismiss ${fileMeta.filename} without ingesting?\n\nThe file will be removed from the staged list but the email will stay marked as processed (so it won't reappear). You can manually re-stage by re-running the auto-ingest function.`)) return;
-    try {
-      // Use doc-ID range (same pattern as loadPendingFile) — no index needed
-      const startId = `${fileMeta.id}__000`;
-      const endId = `${fileMeta.id}__\uf8ff`;
-      const chunkSnap = await window.db.collection("pending_uline_file_chunks")
-        .where(firebase.firestore.FieldPath.documentId(), ">=", startId)
-        .where(firebase.firestore.FieldPath.documentId(), "<=", endId)
-        .get();
-      await Promise.all(chunkSnap.docs.map(d => d.ref.delete().catch(() => {})));
-      await window.db.collection("pending_uline_files").doc(fileMeta.id).delete().catch(() => {});
-      await loadPendingUlineFiles();
-    } catch(e) {
-      console.error("dismissPendingFile err:", e);
-      setPendingError(`Dismiss failed: ${e.message}`);
-    }
-  };
-
   // Load Gmail connection state
   useEffect(() => {
     // Handle OAuth callback redirect (?gmail=connected OR ?gmail=error)
@@ -2288,78 +2176,6 @@ function GmailSync({ onRefresh }) {
           padding: "0 4px",
           fontWeight: 700,
         }}>×</button>
-      </div>
-    )}
-
-    {/* v2.42.18: Pending Uline DAS files staged by the Monday auto-ingest.
-        Show only when there are pending files — invisible otherwise. */}
-    {pendingUlineFiles.length > 0 && (
-      <div style={{...cardStyle, marginBottom:16, borderColor:T.brand, background:T.brandPale}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-          <div style={{fontSize:13,fontWeight:700,color:T.brand}}>
-            📥 Pending Uline DAS Files ({pendingUlineFiles.length})
-          </div>
-          <button onClick={loadPendingUlineFiles} style={{
-            background:"transparent", border:`1px solid ${T.brand}`, color:T.brand,
-            borderRadius:6, padding:"4px 10px", fontSize:11, fontWeight:600, cursor:"pointer"
-          }}>↻ Refresh</button>
-        </div>
-        <div style={{fontSize:11,color:T.textDim,marginBottom:10,lineHeight:1.5}}>
-          Files auto-pulled from Gmail by the Monday scheduled function. Click <strong>Load</strong> to parse and ingest into Firestore (uses the same path as manual upload).
-        </div>
-        {pendingError && (
-          <div style={{padding:"8px 10px",marginBottom:10,borderRadius:6,background:"#fef2f2",border:`1px solid ${T.red}`,color:T.redText,fontSize:11,fontFamily:"monospace"}}>
-            ⚠️ {pendingError}
-          </div>
-        )}
-        <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-          <thead>
-            <tr style={{textAlign:"left",borderBottom:`1px solid ${T.borderLight}`}}>
-              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim}}>Filename</th>
-              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim}}>Email Date</th>
-              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim,textAlign:"right"}}>Size</th>
-              <th style={{padding:"6px 8px",fontWeight:600,color:T.textDim,textAlign:"right"}}>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {pendingUlineFiles.map(f => {
-              const isLoading = !!loadingPending[f.id];
-              const sizeKb = f.size_bytes ? Math.round(f.size_bytes / 1024) : 0;
-              const emailDate = f.email_date ? f.email_date.slice(0, 10) : "—";
-              return (
-                <tr key={f.id} style={{borderBottom:`1px solid ${T.borderLight}`}}>
-                  <td style={{padding:"8px",fontFamily:"monospace",fontSize:11,color:T.text,wordBreak:"break-all"}}>
-                    {f.filename}
-                  </td>
-                  <td style={{padding:"8px",color:T.textDim,whiteSpace:"nowrap"}}>{emailDate}</td>
-                  <td style={{padding:"8px",textAlign:"right",color:T.textDim,whiteSpace:"nowrap"}}>{sizeKb.toLocaleString()} KB</td>
-                  <td style={{padding:"8px",textAlign:"right",whiteSpace:"nowrap"}}>
-                    <button
-                      onClick={() => loadPendingFile(f)}
-                      disabled={isLoading}
-                      style={{
-                        background: isLoading ? T.bgSurface : T.brand,
-                        color: isLoading ? T.textDim : "#fff",
-                        border:"none", borderRadius:6, padding:"5px 12px",
-                        fontSize:11, fontWeight:600, cursor: isLoading ? "default" : "pointer",
-                        marginRight:6,
-                      }}
-                    >{isLoading ? "Loading..." : "Load"}</button>
-                    <button
-                      onClick={() => dismissPendingFile(f)}
-                      disabled={isLoading}
-                      style={{
-                        background:"transparent", color:T.textDim,
-                        border:`1px solid ${T.borderLight}`, borderRadius:6,
-                        padding:"5px 10px", fontSize:11, cursor:"pointer",
-                      }}
-                    >Dismiss</button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
       </div>
     )}
 
@@ -10638,196 +10454,208 @@ function MarginIQ() {
   </div>;
 }
 
-// ─── ZoomPhoneTab v2 — Real-Time ─────────────────────────────────────────────
-// Live call feed via Firebase onSnapshot (webhook-driven).
-// Falls back to date-range fetch for historical data.
-
+// ─── ZoomPhoneTab v3 — Real-Time + History Analytics ─────────────────────────
 function ZoomPhoneTab() {
-  const [status, setStatus]           = React.useState(null);
-  const [calls, setCalls]             = React.useState([]);
-  const [liveCalls, setLiveCalls]     = React.useState([]);   // active/ringing right now
-  const [loading, setLoading]         = React.useState(false);
-  const [liveMode, setLiveMode]       = React.useState(true); // true = listening to Firebase
+  const [status, setStatus]               = React.useState(null);
+  const [calls, setCalls]                 = React.useState([]);
+  const [liveCalls, setLiveCalls]         = React.useState([]);
+  const [loading, setLoading]             = React.useState(false);
+  const [histLoading, setHistLoading]     = React.useState(false);
+  const [liveMode, setLiveMode]           = React.useState(true);
   const [liveConnected, setLiveConnected] = React.useState(false);
-  const [lastEvent, setLastEvent]     = React.useState(null); // { ts, event, employee }
-  const [error, setError]             = React.useState("");
-  const [from, setFrom]               = React.useState(() => { const d=new Date(); d.setDate(d.getDate()-7); return d.toISOString().split("T")[0]; });
-  const [to, setTo]                   = React.useState(() => new Date().toISOString().split("T")[0]);
-  const [dirFilter, setDirFilter]     = React.useState("");
-  const [resFilter, setResFilter]     = React.useState("");
-  const [empFilter, setEmpFilter]     = React.useState("");
-  const [queueFilter, setQueueFilter] = React.useState("");
-  const [search, setSearch]           = React.useState("");
-  const [sortCol, setSortCol]         = React.useState("date");
-  const [sortDir, setSortDir]         = React.useState("desc");
-  const [page, setPage]               = React.useState(1);
-  const [activeView, setActiveView]   = React.useState("live"); // 'live' | 'employees' | 'calls'
+  const [lastEvent, setLastEvent]         = React.useState(null);
+  const [error, setError]                 = React.useState("");
+  const [activeTab, setActiveTab]         = React.useState("live"); // live | history
+  // History controls
+  const [histFrom, setHistFrom]     = React.useState(() => { const d=new Date(); d.setDate(1); d.setMonth(d.getMonth()-2); return d.toISOString().split("T")[0]; });
+  const [histTo, setHistTo]         = React.useState(() => new Date().toISOString().split("T")[0]);
+  const [histGroupBy, setHistGroupBy] = React.useState("day");   // day | week | month
+  const [histEmp, setHistEmp]       = React.useState("");
+  const [histDir, setHistDir]       = React.useState("");
+  const [histCalls, setHistCalls]   = React.useState([]);        // fetched history records
+  // Live call log filters
+  const [empFilter, setEmpFilter]   = React.useState("");
+  const [resFilter, setResFilter]   = React.useState("");
+  const [search, setSearch]         = React.useState("");
+  const [sortCol, setSortCol]       = React.useState("date");
+  const [sortDir, setSortDir]       = React.useState("desc");
+  const [page, setPage]             = React.useState(1);
+  const [logView, setLogView]       = React.useState("employees"); // employees | calls
   const unsubRef = React.useRef(null);
   const PAGE = 50;
 
-  // ── Check credentials on mount ────────────────────────────────────────────
+  // ── Credentials check ────────────────────────────────────────────────────
   React.useEffect(() => {
     fetch("/.netlify/functions/marginiq-zoom-phone?action=status")
-      .then(r => r.json())
-      .then(d => setStatus(d))
+      .then(r => r.json()).then(setStatus)
       .catch(() => setStatus({ configured: false, missing: ["unknown"] }));
   }, []);
 
-  // ── Firebase real-time listener ───────────────────────────────────────────
+  // ── Firebase live listener ───────────────────────────────────────────────
   React.useEffect(() => {
-    if (!liveMode) return;
+    if (!liveMode || activeTab !== "live") return;
     const db = window.db;
     if (!db) { setLiveConnected(false); return; }
-
     setLiveConnected(false);
-
-    // Listen to zoom_calls collection, last 200 records ordered by ts
     const unsub = db.collection("zoom_calls")
-      .orderBy("ts", "desc")
-      .limit(200)
-      .onSnapshot(
-        snap => {
-          setLiveConnected(true);
-          const docs = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-
-          // Split active/ringing from completed
-          const active    = docs.filter(c => ["ringing","active"].includes(c.status));
-          const completed = docs.filter(c => !["ringing","active"].includes(c.status));
-
-          setLiveCalls(active);
-
-          // Merge completed into calls list, normalizing to same shape as fetch
-          const normalized = completed.map(c => ({
-            id:           c.call_id || c.id,
-            date:         c.ts || c.updated_at || "",
-            answeredBy:   c.employee || "Unknown",
-            answeredEmail:"",
-            answeredExt:  c.employee_ext || "",
-            direction:    c.direction || "inbound",
-            callerNum:    c.caller_num || "",
-            callerName:   c.caller_name || "",
-            calleeNum:    c.callee_num || "",
-            result:       c.status === "ended" ? "answered"
-                        : c.status === "missed" ? "missed"
-                        : c.status === "voicemail" ? "voicemail"
-                        : c.status || "unknown",
-            talkTime:     c.duration || 0,
-            waitTime:     0,
-            viaQueue:     false,
-            queueName:    "",
-            chain:        [],
-          }));
-          setCalls(normalized);
-
-          // Track latest event for the pulse indicator
-          if (docs.length > 0) {
-            const latest = docs[0];
-            setLastEvent({ ts: latest.updated_at || latest.ts, event: latest.event, employee: latest.employee });
-          }
-        },
-        err => {
-          console.warn("[ZoomPhoneTab] onSnapshot error:", err?.message);
-          setLiveConnected(false);
-        }
-      );
-
+      .orderBy("ts","desc").limit(200)
+      .onSnapshot(snap => {
+        setLiveConnected(true);
+        const docs = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+        setLiveCalls(docs.filter(c => ["ringing","active"].includes(c.status)));
+        const completed = docs.filter(c => !["ringing","active"].includes(c.status));
+        setCalls(completed.map(normalizeLiveDoc));
+        if (docs.length > 0) setLastEvent({ ts: docs[0].updated_at||docs[0].ts, employee: docs[0].employee });
+      }, err => { console.warn("[ZoomPhone]", err?.message); setLiveConnected(false); });
     unsubRef.current = unsub;
     return () => { unsub(); unsubRef.current = null; };
-  }, [liveMode]);
+  }, [liveMode, activeTab]);
 
-  // ── Historical fetch (non-live mode) ──────────────────────────────────────
-  async function fetchCalls() {
-    setLoading(true); setError(""); setCalls([]);
+  function normalizeLiveDoc(c) {
+    return {
+      id: c.call_id||c.id, date: c.ts||c.updated_at||"",
+      answeredBy: c.employee||"Unknown", answeredExt: c.employee_ext||"",
+      direction: c.direction||"inbound",
+      callerNum: c.caller_num||"", callerName: c.caller_name||"",
+      result: c.status==="ended"?"answered": c.status==="missed"?"missed": c.status==="voicemail"?"voicemail": c.status||"unknown",
+      talkTime: c.duration||0, waitTime: 0, viaQueue: false, queueName: "", chain: [],
+    };
+  }
+
+  function toggleLive() {
+    if (liveMode && unsubRef.current) { unsubRef.current(); unsubRef.current = null; }
+    setLiveMode(m => !m); setCalls([]); setLiveCalls([]); setError("");
+  }
+
+  // ── History fetch ────────────────────────────────────────────────────────
+  async function fetchHistory() {
+    setHistLoading(true); setError("");
     try {
-      let url = `/.netlify/functions/marginiq-zoom-phone?action=history&from=${from}&to=${to}`;
-      if (dirFilter) url += `&direction=${dirFilter}`;
+      let url = `/.netlify/functions/marginiq-zoom-phone?action=history&from=${histFrom}&to=${histTo}`;
+      if (histDir) url += `&direction=${histDir}`;
       const r = await fetch(url);
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-      let recs = d.records || [];
-      if (resFilter) recs = recs.filter(c => c.result === resFilter);
-      setCalls(recs);
-      setPage(1);
-    } catch(e) {
-      setError(String(e.message || e));
-    } finally {
-      setLoading(false);
-    }
+      setHistCalls(d.records || []);
+    } catch(e) { setError(String(e.message||e)); }
+    finally { setHistLoading(false); }
   }
 
-  // ── Toggle live mode ──────────────────────────────────────────────────────
-  function toggleLive() {
-    if (liveMode && unsubRef.current) { unsubRef.current(); unsubRef.current = null; }
-    setLiveMode(m => !m);
-    setCalls([]);
-    setLiveCalls([]);
-    setError("");
-  }
+  // ── History derived data ─────────────────────────────────────────────────
+  const histFiltered = React.useMemo(() => {
+    let recs = histCalls;
+    if (histEmp) recs = recs.filter(c => c.answeredBy === histEmp);
+    return recs;
+  }, [histCalls, histEmp]);
 
-  // ── Derived data ──────────────────────────────────────────────────────────
-  const empNames = React.useMemo(() =>
-    [...new Set(calls.map(c => c.answeredBy).filter(Boolean))].sort()
+  // Group records by time period
+  const periodGroups = React.useMemo(() => {
+    const map = {};
+    histFiltered.forEach(c => {
+      const d = new Date(c.date);
+      if (isNaN(d)) return;
+      let key;
+      if (histGroupBy === "day")   key = d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"});
+      else if (histGroupBy === "week") {
+        const mon = new Date(d); mon.setDate(d.getDate() - ((d.getDay()+6)%7));
+        key = "Wk of " + mon.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
+      } else key = d.toLocaleDateString("en-US",{month:"long",year:"numeric"});
+
+      if (!map[key]) map[key] = { period:key, date:d, answered:0, missed:0, voicemail:0, total:0, talk:0, wait:0 };
+      map[key].total++;
+      if (c.result==="answered") { map[key].answered++; map[key].talk += c.talkTime||0; map[key].wait += c.waitTime||0; }
+      if (c.result==="missed")    map[key].missed++;
+      if (c.result==="voicemail") map[key].voicemail++;
+    });
+    return Object.values(map).sort((a,b) => a.date - b.date);
+  }, [histFiltered, histGroupBy]);
+
+  // Group by employee for the history view
+  const empGroups = React.useMemo(() => {
+    const map = {};
+    histFiltered.forEach(c => {
+      const k = c.answeredBy||"Unknown";
+      if (!map[k]) map[k] = { name:k, ext:c.answeredExt||"", answered:0, missed:0, voicemail:0, total:0, talk:0 };
+      map[k].total++;
+      if (c.result==="answered") { map[k].answered++; map[k].talk += c.talkTime||0; }
+      if (c.result==="missed")    map[k].missed++;
+      if (c.result==="voicemail") map[k].voicemail++;
+    });
+    return Object.values(map).sort((a,b) => b.total - a.total);
+  }, [histFiltered]);
+
+  const histEmpNames = React.useMemo(() =>
+    [...new Set(histCalls.map(c=>c.answeredBy).filter(Boolean))].sort()
+  , [histCalls]);
+
+  // Overall history metrics
+  const histMetrics = React.useMemo(() => {
+    const tot = histFiltered.length;
+    const ans = histFiltered.filter(c=>c.result==="answered").length;
+    const mis = histFiltered.filter(c=>c.result==="missed").length;
+    const vm  = histFiltered.filter(c=>c.result==="voicemail").length;
+    const ansCalls = histFiltered.filter(c=>c.result==="answered"&&c.talkTime>0);
+    const avgTalk = ansCalls.length ? Math.round(ansCalls.reduce((s,c)=>s+c.talkTime,0)/ansCalls.length) : 0;
+    const busiest = periodGroups.length ? [...periodGroups].sort((a,b)=>b.total-a.total)[0] : null;
+    return { tot, ans, mis, vm, avgTalk, busiest, ansRate: tot ? ((ans/tot)*100).toFixed(1) : 0 };
+  }, [histFiltered, periodGroups]);
+
+  // ── Live log derived ─────────────────────────────────────────────────────
+  const liveEmpNames = React.useMemo(() =>
+    [...new Set(calls.map(c=>c.answeredBy).filter(Boolean))].sort()
   , [calls]);
 
-  const filtered = React.useMemo(() => {
+  const liveFiltered = React.useMemo(() => {
     const s = search.toLowerCase();
     return calls.filter(c => {
-      if (empFilter   && c.answeredBy !== empFilter) return false;
-      if (resFilter   && c.result !== resFilter) return false;
-      if (queueFilter === "queue"  && !c.viaQueue) return false;
-      if (queueFilter === "direct" &&  c.viaQueue) return false;
-      if (s) {
-        const hay = [c.answeredBy,c.callerNum,c.callerName,c.calleeNum,c.queueName,...(c.chain||[])].join(" ").toLowerCase();
-        if (!hay.includes(s)) return false;
-      }
+      if (empFilter && c.answeredBy!==empFilter) return false;
+      if (resFilter && c.result!==resFilter) return false;
+      if (s) { const hay=[c.answeredBy,c.callerNum,c.callerName].join(" ").toLowerCase(); if(!hay.includes(s)) return false; }
       return true;
     });
-  }, [calls, empFilter, resFilter, queueFilter, search]);
+  }, [calls, empFilter, resFilter, search]);
 
-  const sorted = React.useMemo(() => {
-    return [...filtered].sort((a,b) => {
-      let av, bv;
+  const liveSorted = React.useMemo(() => {
+    return [...liveFiltered].sort((a,b) => {
+      let av,bv;
       if (sortCol==="date")          { av=new Date(a.date||0); bv=new Date(b.date||0); }
       else if (sortCol==="employee") { av=a.answeredBy||""; bv=b.answeredBy||""; }
-      else if (sortCol==="caller")   { av=a.callerName||a.callerNum||""; bv=b.callerName||b.callerNum||""; }
       else                           { av=a[sortCol]??0; bv=b[sortCol]??0; }
       if (av<bv) return sortDir==="asc"?-1:1;
       if (av>bv) return sortDir==="asc"?1:-1;
       return 0;
     });
-  }, [filtered, sortCol, sortDir]);
+  }, [liveFiltered, sortCol, sortDir]);
 
-  const pages     = Math.ceil(sorted.length/PAGE)||1;
-  const pageSlice = sorted.slice((page-1)*PAGE, page*PAGE);
+  const livePages = Math.ceil(liveSorted.length/PAGE)||1;
+  const liveSlice = liveSorted.slice((page-1)*PAGE, page*PAGE);
 
-  const metrics = React.useMemo(() => {
-    const tot = calls.length;
-    const ans = calls.filter(c=>c.result==="answered").length;
-    const mis = calls.filter(c=>c.result==="missed").length;
-    const que = calls.filter(c=>c.viaQueue).length;
-    const ansCalls = calls.filter(c=>c.result==="answered"&&c.talkTime>0);
-    const avgTalk = ansCalls.length ? Math.round(ansCalls.reduce((s,c)=>s+c.talkTime,0)/ansCalls.length) : 0;
-    const emps = new Set(calls.map(c=>c.answeredBy).filter(n=>n&&n!=="Unknown")).size;
-    return { tot, ans, mis, que, avgTalk, emps };
+  const liveMetrics = React.useMemo(() => {
+    const tot=calls.length, ans=calls.filter(c=>c.result==="answered").length, mis=calls.filter(c=>c.result==="missed").length;
+    const ansCalls=calls.filter(c=>c.result==="answered"&&c.talkTime>0);
+    const avgTalk=ansCalls.length?Math.round(ansCalls.reduce((s,c)=>s+c.talkTime,0)/ansCalls.length):0;
+    const emps=new Set(calls.map(c=>c.answeredBy).filter(n=>n&&n!=="Unknown")).size;
+    return { tot,ans,mis,avgTalk,emps };
   }, [calls]);
 
-  const empStats = React.useMemo(() => {
-    const map = {};
+  const liveEmpStats = React.useMemo(() => {
+    const map={};
     calls.forEach(c => {
       const k=c.answeredBy||"Unknown";
-      if(!map[k]) map[k]={name:k,email:c.answeredEmail,ext:c.answeredExt,answered:0,missed:0,voicemail:0,total:0,talk:0};
+      if(!map[k]) map[k]={name:k,ext:c.answeredExt||"",answered:0,missed:0,voicemail:0,total:0,talk:0};
       map[k].total++;
       if(c.result==="answered"){map[k].answered++;map[k].talk+=c.talkTime;}
-      if(c.result==="missed")   map[k].missed++;
+      if(c.result==="missed")  map[k].missed++;
       if(c.result==="voicemail")map[k].voicemail++;
     });
     return Object.values(map).sort((a,b)=>b.total-a.total);
   }, [calls]);
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
-  const fmtDur = s => { if(!s)return"—"; const m=Math.floor(s/60),sec=s%60; return `${m}:${String(sec).padStart(2,"0")}`; };
-  const fmtDT  = s => { if(!s)return"—"; const d=new Date(s); if(isNaN(d))return s; return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true}); };
-  const fmtTime = s => { if(!s)return"—"; const d=new Date(s); if(isNaN(d))return s; return d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true}); };
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  const fmtDur = s => { if(!s) return"—"; const m=Math.floor(s/60),sec=s%60; return `${m}:${String(sec).padStart(2,"0")}`; };
+  const fmtDT  = s => { if(!s) return"—"; const d=new Date(s); if(isNaN(d)) return s; return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true}); };
+  const fmtTime= s => { if(!s) return"—"; const d=new Date(s); if(isNaN(d)) return s; return d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true}); };
+  const pct    = (a,b) => b ? ((a/b)*100).toFixed(1)+"%" : "—";
 
   function doSort(col) {
     if(sortCol===col) setSortDir(d=>d==="asc"?"desc":"asc");
@@ -10836,15 +10664,19 @@ function ZoomPhoneTab() {
   }
   const sortIcon = col => sortCol===col ? (sortDir==="asc"?" ↑":" ↓") : "";
 
-  function exportCSV() {
-    const h=["Date/Time","Answered By","Extension","Direction","Caller Number","Caller Name","Result","Talk Time (sec)"];
-    const rows=calls.map(c=>[c.date,c.answeredBy,c.answeredExt,c.direction,c.callerNum,c.callerName,c.result,c.talkTime]);
-    const csv=[h,...rows].map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");
-    const a=Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:`zoom_calls_${from}_${to}.csv`});
-    a.click();
+  function exportHistCSV() {
+    const h=["Period","Total","Answered","Missed","Voicemail","Answer Rate %","Avg Talk (sec)"];
+    const rows=periodGroups.map(p=>[p.period,p.total,p.answered,p.missed,p.voicemail,p.total?((p.answered/p.total)*100).toFixed(1):0,p.answered?Math.round(p.talk/p.answered):0]);
+    dlCSV(`zoom_history_${histGroupBy}_${histFrom}_${histTo}.csv`,[h,...rows]);
   }
+  function exportEmpHistCSV() {
+    const h=["Employee","Extension","Total","Answered","Missed","Voicemail","Answer Rate %","Avg Talk (sec)"];
+    const rows=empGroups.map(e=>[e.name,e.ext,e.total,e.answered,e.missed,e.voicemail,e.total?((e.answered/e.total)*100).toFixed(1):0,e.answered?Math.round(e.talk/e.answered):0]);
+    dlCSV(`zoom_employee_history_${histFrom}_${histTo}.csv`,[h,...rows]);
+  }
+  function dlCSV(name,rows){const csv=rows.map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");const a=Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:name});a.click();}
 
-  // ── Styles ────────────────────────────────────────────────────────────────
+  // ── Styles ───────────────────────────────────────────────────────────────
   const card       = { background:T.bgCard, border:`1px solid ${T.border}`, borderRadius:T.radius, padding:"16px", boxShadow:T.shadow };
   const metCard    = { ...card, padding:"14px 16px", minWidth:0 };
   const btnPrimary = { padding:"8px 18px", background:T.brand, color:"#fff", border:"none", borderRadius:T.radiusSm, fontWeight:700, fontSize:"13px", cursor:"pointer" };
@@ -10852,27 +10684,62 @@ function ZoomPhoneTab() {
   const inputStyle = { padding:"8px 10px", border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontSize:"13px", background:T.bgWhite, color:T.text, fontFamily:"inherit", outline:"none" };
   const thStyle    = { padding:"9px 12px", textAlign:"left", fontSize:"11px", fontWeight:700, color:T.textMuted, borderBottom:`2px solid ${T.border}`, background:T.bgSurface, cursor:"pointer", whiteSpace:"nowrap", userSelect:"none" };
   const tdStyle    = { padding:"10px 12px", fontSize:"12px", borderBottom:`1px solid ${T.borderLight}`, whiteSpace:"nowrap" };
+  const tabBtn = (id) => ({ padding:"10px 18px", border:"none", borderBottom:`3px solid ${activeTab===id?T.brand:"transparent"}`, background:"transparent", color:activeTab===id?T.brand:T.textMuted, fontWeight:activeTab===id?700:500, fontSize:"13px", cursor:"pointer", marginBottom:"-2px", transition:"all 0.15s" });
 
-  const resBadge = r => {
-    const styles = { answered:{background:T.greenBg,color:T.greenText}, missed:{background:T.redBg,color:T.redText}, voicemail:{background:T.yellowBg,color:T.yellowText} };
-    const s = styles[r] || {background:T.bgSurface,color:T.textMuted};
-    return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:700}}>{r||"—"}</span>;
-  };
-  const dirBadge = d => {
-    const s = d==="inbound" ? {background:T.blueBg,color:T.blueText} : {background:T.bgSurface,color:T.textMuted};
-    return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:600}}>{d==="inbound"?"↓ In":d==="outbound"?"↑ Out":d||"—"}</span>;
-  };
+  const resBadge = r => { const m={answered:{background:T.greenBg,color:T.greenText},missed:{background:T.redBg,color:T.redText},voicemail:{background:T.yellowBg,color:T.yellowText}}; const s=m[r]||{background:T.bgSurface,color:T.textMuted}; return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:700}}>{r||"—"}</span>; };
+  const dirBadge = d => { const s=d==="inbound"?{background:T.blueBg,color:T.blueText}:{background:T.bgSurface,color:T.textMuted}; return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:600}}>{d==="inbound"?"↓ In":d==="outbound"?"↑ Out":d||"—"}</span>; };
 
-  // ── Credentials not configured ────────────────────────────────────────────
+  // ── Mini bar chart ───────────────────────────────────────────────────────
+  function MiniBarChart({ data, maxVal }) {
+    if (!data || !data.length) return null;
+    const max = maxVal || Math.max(...data.map(d=>d.total), 1);
+    return (
+      <div style={{display:"flex",alignItems:"flex-end",gap:2,height:60,padding:"0 0 4px 0"}}>
+        {data.map((d,i) => (
+          <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2,minWidth:0}}>
+            <div style={{width:"100%",display:"flex",flexDirection:"column",gap:1,justifyContent:"flex-end",height:52}}>
+              <div title={`Answered: ${d.answered}`} style={{width:"100%",height:`${(d.answered/max)*48}px`,background:T.green,minHeight:d.answered?1:0,transition:"height 0.3s"}} />
+              <div title={`Missed: ${d.missed}`}    style={{width:"100%",height:`${(d.missed/max)*48}px`,background:T.red,minHeight:d.missed?1:0,transition:"height 0.3s"}} />
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  // ── Inline sparkline for employee trend ──────────────────────────────────
+  function EmpTrend({ empName }) {
+    const pts = periodGroups.map(p => {
+      const sub = histFiltered.filter(c => c.answeredBy===empName && (() => {
+        const d=new Date(c.date); if(isNaN(d)) return false;
+        let key;
+        if(histGroupBy==="day") key=d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"});
+        else if(histGroupBy==="week"){ const m=new Date(d); m.setDate(d.getDate()-((d.getDay()+6)%7)); key="Wk of "+m.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
+        else key=d.toLocaleDateString("en-US",{month:"long",year:"numeric"});
+        return key===p.period;
+      })());
+      return sub.length;
+    });
+    if (!pts.length) return null;
+    const max = Math.max(...pts, 1);
+    const W=80, H=24;
+    const points = pts.map((v,i) => `${(i/(pts.length-1||1))*W},${H-(v/max)*H}`).join(" ");
+    return (
+      <svg width={W} height={H} style={{display:"block"}}>
+        <polyline points={points} fill="none" stroke={T.brand} strokeWidth="1.5" strokeLinejoin="round" />
+      </svg>
+    );
+  }
+
+  // ── Not configured ───────────────────────────────────────────────────────
   if (status && !status.configured) {
     return (
       <div style={{padding:"24px",maxWidth:700}}>
         <div style={{...card,borderLeft:`4px solid ${T.accentWarn}`}}>
           <div style={{fontWeight:700,fontSize:"15px",marginBottom:12}}>🔑 Zoom Credentials Not Configured</div>
-          <p style={{color:T.textMuted,fontSize:"13px",marginBottom:14,lineHeight:1.6}}>Add these env vars to Netlify (Site → Environment variables):</p>
-          {["ZOOM_ACCOUNT_ID","ZOOM_CLIENT_ID","ZOOM_CLIENT_SECRET","ZOOM_WEBHOOK_SECRET_TOKEN","FIREBASE_PROJECT_ID"].map(k => (
-            <div key={k} style={{fontFamily:"monospace",fontSize:"12px",background:T.bgSurface,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"7px 12px",marginBottom:5,color:T.brand,display:"flex",alignItems:"center",gap:8}}>
-              <span style={{color:status.missing?.includes(k)?T.red:T.green}}>{status.missing?.includes(k)?"✗":"✓"}</span>{k}
+          {["ZOOM_ACCOUNT_ID","ZOOM_CLIENT_ID","ZOOM_CLIENT_SECRET","ZOOM_WEBHOOK_SECRET_TOKEN","FIREBASE_PROJECT_ID"].map(k=>(
+            <div key={k} style={{fontFamily:"monospace",fontSize:"12px",background:T.bgSurface,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"6px 12px",marginBottom:4,color:T.brand}}>
+              <span style={{color:status.missing?.includes(k)?T.red:T.green,marginRight:6}}>{status.missing?.includes(k)?"✗":"✓"}</span>{k}
             </div>
           ))}
         </div>
@@ -10884,241 +10751,375 @@ function ZoomPhoneTab() {
   return (
     <div style={{padding:"20px",maxWidth:1400}}>
 
-      {/* Header */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:10}}>
-        <div>
-          <div style={{fontSize:"16px",fontWeight:800,letterSpacing:"-0.01em"}}>📞 Zoom Phone — Live</div>
-          <div style={{fontSize:"12px",color:T.textMuted,marginTop:2}}>
-            {liveMode && liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.green,marginRight:5,verticalAlign:"middle",boxShadow:`0 0 6px ${T.green}`}} />Live · updates automatically</>}
-            {liveMode && !liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.yellow,marginRight:5,verticalAlign:"middle"}} />Connecting to Firebase…</>}
-            {!liveMode && "Historical mode — manual fetch"}
-          </div>
+      {/* Top nav tabs */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:0,flexWrap:"wrap",gap:8}}>
+        <div style={{display:"flex",gap:0,borderBottom:`2px solid ${T.border}`}}>
+          <button style={tabBtn("live")}    onClick={()=>setActiveTab("live")}>📞 Live Feed</button>
+          <button style={tabBtn("history")} onClick={()=>{setActiveTab("history"); if(!histCalls.length) fetchHistory();}}>📊 History & Analysis</button>
         </div>
-        <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          {lastEvent && liveMode && (
-            <span style={{fontSize:"11px",color:T.textMuted}}>
-              Last event: {fmtTime(lastEvent.ts)} · {lastEvent.employee || "unknown"}
-            </span>
+        <div style={{display:"flex",gap:8,alignItems:"center",paddingBottom:4}}>
+          {activeTab==="live" && (
+            <>
+              {lastEvent && liveMode && <span style={{fontSize:"11px",color:T.textMuted}}>Last: {fmtTime(lastEvent.ts)} · {lastEvent.employee}</span>}
+              <button style={{...btnSec,color:liveMode?T.green:T.textMuted,borderColor:liveMode?T.green:T.border}} onClick={toggleLive}>
+                {liveMode?"⏸ Pause":"▶ Live"}
+              </button>
+            </>
           )}
-          <button style={{...btnSec, color:liveMode?T.green:T.textMuted, borderColor:liveMode?T.green:T.border}} onClick={toggleLive}>
-            {liveMode ? "⏸ Pause Live" : "▶ Go Live"}
-          </button>
-          {calls.length > 0 && <button style={btnSec} onClick={exportCSV}>⬇ CSV</button>}
+          {activeTab==="history" && histCalls.length>0 && (
+            <div style={{display:"flex",gap:6}}>
+              <button style={btnSec} onClick={exportHistCSV}>⬇ Period CSV</button>
+              <button style={btnSec} onClick={exportEmpHistCSV}>⬇ Employee CSV</button>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Active calls board — only shown in live mode */}
-      {liveMode && (
-        <div style={{...card, marginBottom:16, borderLeft:`3px solid ${liveCalls.length>0?T.green:T.border}`}}>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:liveCalls.length>0?12:0}}>
-            <div style={{fontWeight:700,fontSize:"13px"}}>
-              {liveCalls.length>0
-                ? <><span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:T.green,marginRight:6,verticalAlign:"middle",animation:"pulse 1.5s infinite"}} />{liveCalls.length} Active Call{liveCalls.length!==1?"s":""}</>
-                : <span style={{color:T.textMuted,fontWeight:500,fontSize:"13px"}}>📵 No active calls right now</span>
-              }
-            </div>
+      {/* Error */}
+      {error && <div style={{background:T.redBg,border:`1px solid ${T.red}`,borderRadius:T.radiusSm,padding:"10px 14px",color:T.redText,fontSize:"13px",margin:"12px 0"}}>⚠ {error}</div>}
+
+      {/* ═══════════════════════ LIVE TAB ═══════════════════════════════════ */}
+      {activeTab === "live" && (
+        <div style={{marginTop:16}}>
+          {/* Connection status */}
+          <div style={{fontSize:"12px",color:T.textMuted,marginBottom:12}}>
+            {liveMode && liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.green,marginRight:5,verticalAlign:"middle",boxShadow:`0 0 6px ${T.green}`}} />Live · updates automatically</>}
+            {liveMode && !liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.yellow,marginRight:5,verticalAlign:"middle"}} />Connecting…</>}
+            {!liveMode && "Paused — showing last loaded data"}
           </div>
-          {liveCalls.length > 0 && (
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
-              {liveCalls.map(c => (
-                <div key={c.call_id||c.id} style={{background:c.status==="ringing"?T.yellowBg:T.greenBg, border:`1px solid ${c.status==="ringing"?T.yellow:T.green}`, borderRadius:T.radiusSm, padding:"12px 14px"}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
-                    <div style={{fontWeight:700,fontSize:"13px",color:c.status==="ringing"?T.yellowText:T.greenText}}>
-                      {c.status==="ringing"?"📲 Ringing":"📞 On Call"}
+
+          {/* Active calls */}
+          <div style={{...card,marginBottom:14,borderLeft:`3px solid ${liveCalls.length>0?T.green:T.border}`}}>
+            <div style={{fontWeight:700,fontSize:"13px",marginBottom:liveCalls.length>0?10:0}}>
+              {liveCalls.length>0
+                ? <><span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:T.green,marginRight:6,verticalAlign:"middle",animation:"zmPulse 1.5s infinite"}} />{liveCalls.length} Active Call{liveCalls.length!==1?"s":""}</>
+                : <span style={{color:T.textMuted,fontWeight:500}}>📵 No active calls</span>}
+            </div>
+            {liveCalls.length>0 && (
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:8,marginTop:8}}>
+                {liveCalls.map(c=>(
+                  <div key={c.call_id||c.id} style={{background:c.status==="ringing"?T.yellowBg:T.greenBg,border:`1px solid ${c.status==="ringing"?T.yellow:T.green}`,borderRadius:T.radiusSm,padding:"11px 13px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                      <div style={{fontWeight:700,fontSize:"12px",color:c.status==="ringing"?T.yellowText:T.greenText}}>{c.status==="ringing"?"📲 Ringing":"📞 On Call"}</div>
+                      <span style={{fontSize:"10px",color:T.textMuted}}>{fmtTime(c.ts)}</span>
                     </div>
-                    <span style={{fontSize:"10px",color:T.textMuted}}>{fmtTime(c.ts)}</span>
+                    <div style={{fontWeight:600,fontSize:"14px"}}>{c.employee||"—"}</div>
+                    <div style={{fontSize:"12px",color:T.textMuted}}>{c.caller_name||c.caller_num||"Unknown"}</div>
                   </div>
-                  <div style={{fontWeight:600,fontSize:"14px",marginBottom:2}}>{c.employee||"—"}</div>
-                  <div style={{fontSize:"12px",color:T.textMuted}}>{c.caller_name||c.caller_num||"Unknown caller"}</div>
-                  {c.caller_name && <div style={{fontSize:"11px",color:T.textDim}}>{c.caller_num}</div>}
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Live metrics */}
+          {calls.length>0 && (
+            <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:14}}>
+              {[
+                {label:"Calls (today)",value:liveMetrics.tot.toLocaleString(),color:T.brand},
+                {label:"Answered",value:liveMetrics.ans.toLocaleString(),sub:pct(liveMetrics.ans,liveMetrics.tot),color:T.green},
+                {label:"Missed",  value:liveMetrics.mis.toLocaleString(),sub:pct(liveMetrics.mis,liveMetrics.tot),color:T.red},
+                {label:"Avg Talk",value:fmtDur(liveMetrics.avgTalk),color:T.text},
+                {label:"Staff",   value:liveMetrics.emps,color:T.brand},
+              ].map(m=>(
+                <div key={m.label} style={metCard}>
+                  <div style={{fontSize:"10px",fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:3}}>{m.label}</div>
+                  <div style={{fontSize:"22px",fontWeight:800,color:m.color,lineHeight:1}}>{m.value}</div>
+                  {m.sub&&<div style={{fontSize:"10px",color:T.textMuted,marginTop:2}}>{m.sub}</div>}
                 </div>
               ))}
             </div>
           )}
-        </div>
-      )}
 
-      {/* Historical fetch controls — only in non-live mode */}
-      {!liveMode && (
-        <div style={{...card,marginBottom:16}}>
-          <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
-            <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>FROM</div><input type="date" value={from} onChange={e=>setFrom(e.target.value)} style={inputStyle} /></div>
-            <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>TO</div><input type="date" value={to} onChange={e=>setTo(e.target.value)} style={inputStyle} /></div>
-            <div>
-              <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>DIRECTION</div>
-              <select value={dirFilter} onChange={e=>setDirFilter(e.target.value)} style={inputStyle}>
-                <option value="">All</option><option value="inbound">Inbound</option><option value="outbound">Outbound</option>
-              </select>
-            </div>
-            <div>
-              <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>RESULT</div>
-              <select value={resFilter} onChange={e=>setResFilter(e.target.value)} style={inputStyle}>
-                <option value="">All</option><option value="answered">Answered</option><option value="missed">Missed</option><option value="voicemail">Voicemail</option>
-              </select>
-            </div>
-            <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchCalls} disabled={loading}>{loading?"Loading…":"Fetch Calls"}</button>
-          </div>
-        </div>
-      )}
+          {/* Live log sub-tabs */}
+          {calls.length>0 && (
+            <>
+              <div style={{display:"flex",gap:2,borderBottom:`2px solid ${T.border}`,marginBottom:14}}>
+                {[{id:"employees",label:"👥 By Employee"},{id:"calls",label:"📋 Call Log"}].map(t=>(
+                  <button key={t.id} onClick={()=>setLogView(t.id)} style={{padding:"8px 14px",border:"none",borderBottom:`2px solid ${logView===t.id?T.brand:"transparent"}`,background:"transparent",color:logView===t.id?T.brand:T.textMuted,fontWeight:logView===t.id?700:500,fontSize:"12px",cursor:"pointer",marginBottom:"-2px"}}>
+                    {t.label}
+                  </button>
+                ))}
+                <span style={{marginLeft:"auto",fontSize:"11px",color:T.textMuted,alignSelf:"center"}}>{calls.length.toLocaleString()} calls (live)</span>
+              </div>
 
-      {/* Error */}
-      {error && <div style={{background:T.redBg,border:`1px solid ${T.red}`,borderRadius:T.radiusSm,padding:"12px 16px",color:T.redText,fontSize:"13px",marginBottom:16}}>⚠ {error}</div>}
+              {/* Employee cards */}
+              {logView==="employees" && (
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
+                  {liveEmpStats.map(e=>{
+                    const ini=e.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
+                    const rate=e.total?Math.round((e.answered/e.total)*100):0;
+                    return (
+                      <div key={e.name} style={{...card,cursor:"pointer"}} onClick={()=>{setEmpFilter(e.name);setLogView("calls");setPage(1);}}>
+                        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                          <div style={{width:34,height:34,background:T.brandPale,border:`1px solid ${T.brand}20`,borderRadius:"8px",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:"12px",color:T.brand,flexShrink:0}}>{ini}</div>
+                          <div style={{flex:1,minWidth:0}}><div style={{fontWeight:700,fontSize:"14px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.name}</div><div style={{fontSize:"11px",color:T.textMuted}}>{e.ext?`Ext ${e.ext}`:"—"}</div></div>
+                          <div style={{fontSize:"11px",fontWeight:700,color:T.textMuted}}>{rate}%</div>
+                        </div>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:4,textAlign:"center"}}>
+                          <div><div style={{fontWeight:800,fontSize:"17px",color:T.green}}>{e.answered}</div><div style={{fontSize:"9px",color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>Answered</div></div>
+                          <div><div style={{fontWeight:800,fontSize:"17px",color:T.red}}>{e.missed}</div><div style={{fontSize:"9px",color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>Missed</div></div>
+                          <div><div style={{fontWeight:800,fontSize:"17px"}}>{fmtDur(e.answered?Math.round(e.talk/e.answered):0)}</div><div style={{fontSize:"9px",color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>Avg</div></div>
+                        </div>
+                        <div style={{height:3,background:T.border,borderRadius:3,marginTop:9}}><div style={{height:"100%",width:`${rate}%`,background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3}} /></div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
 
-      {/* Loading */}
-      {loading && <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}><div style={{fontSize:36,marginBottom:12}}>📞</div><div style={{fontWeight:600}}>Fetching…</div></div>}
-
-      {/* Data views */}
-      {!loading && calls.length > 0 && <>
-
-        {/* Metrics */}
-        <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:16}}>
-          {[
-            {label:"Total",    value:metrics.tot.toLocaleString(), color:T.brand},
-            {label:"Answered", value:metrics.ans.toLocaleString(), sub:`${metrics.tot?((metrics.ans/metrics.tot)*100).toFixed(1):0}%`, color:T.green},
-            {label:"Missed",   value:metrics.mis.toLocaleString(), sub:`${metrics.tot?((metrics.mis/metrics.tot)*100).toFixed(1):0}%`, color:T.red},
-            {label:"Via Queue",value:metrics.que.toLocaleString(), color:T.blue},
-            {label:"Avg Talk", value:fmtDur(metrics.avgTalk), color:T.text},
-            {label:"Staff",    value:metrics.emps, color:T.brand},
-          ].map(m => (
-            <div key={m.label} style={metCard}>
-              <div style={{fontSize:"10px",fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:4}}>{m.label}</div>
-              <div style={{fontSize:"22px",fontWeight:800,color:m.color,lineHeight:1}}>{m.value}</div>
-              {m.sub && <div style={{fontSize:"10px",color:T.textMuted,marginTop:2}}>{m.sub}</div>}
-            </div>
-          ))}
-        </div>
-
-        {/* Tab row */}
-        <div style={{display:"flex",gap:2,marginBottom:16,borderBottom:`2px solid ${T.border}`}}>
-          {[{id:"employees",label:"👥 By Employee"},{id:"calls",label:"📋 All Calls"}].map(t => (
-            <button key={t.id} onClick={()=>setActiveView(t.id)} style={{padding:"9px 16px",border:"none",borderBottom:`3px solid ${activeView===t.id?T.brand:"transparent"}`,background:"transparent",color:activeView===t.id?T.brand:T.textMuted,fontWeight:activeView===t.id?700:500,fontSize:"13px",cursor:"pointer",marginBottom:"-2px",transition:"all 0.2s"}}>{t.label}</button>
-          ))}
-          <div style={{marginLeft:"auto",display:"flex",alignItems:"center",paddingBottom:4}}>
-            <span style={{fontSize:"12px",color:T.textMuted}}>{calls.length.toLocaleString()} calls{liveMode?" (live)":""}</span>
-          </div>
-        </div>
-
-        {/* Employee cards */}
-        {activeView === "employees" && (
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(270px,1fr))",gap:10}}>
-            {empStats.map(e => {
-              const ini = e.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
-              const rate = e.total ? Math.round((e.answered/e.total)*100) : 0;
-              const avgTalk = e.answered ? Math.round(e.talk/e.answered) : 0;
-              return (
-                <div key={e.name} style={{...card,cursor:"pointer"}} onClick={()=>{setEmpFilter(e.name);setActiveView("calls");setPage(1);}}>
-                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
-                    <div style={{width:36,height:36,background:T.brandPale,border:`1px solid ${T.brand}20`,borderRadius:"8px",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:"13px",color:T.brand,flexShrink:0}}>{ini}</div>
-                    <div style={{flex:1,minWidth:0}}>
-                      <div style={{fontWeight:700,fontSize:"14px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.name}</div>
-                      <div style={{fontSize:"11px",color:T.textMuted}}>{e.ext?`Ext ${e.ext}`:e.email||"—"}</div>
+              {/* Call log table */}
+              {logView==="calls" && (
+                <div>
+                  <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
+                    <input placeholder="Search…" value={search} onChange={e=>{setSearch(e.target.value);setPage(1);}} style={{...inputStyle,width:200}} />
+                    <select value={empFilter} onChange={e=>{setEmpFilter(e.target.value);setPage(1);}} style={inputStyle}>
+                      <option value="">All Employees</option>
+                      {liveEmpNames.map(n=><option key={n} value={n}>{n}</option>)}
+                    </select>
+                    <select value={resFilter} onChange={e=>{setResFilter(e.target.value);setPage(1);}} style={inputStyle}>
+                      <option value="">All Results</option>
+                      <option value="answered">Answered</option>
+                      <option value="missed">Missed</option>
+                      <option value="voicemail">Voicemail</option>
+                    </select>
+                    {(empFilter||resFilter||search)&&<button style={btnSec} onClick={()=>{setEmpFilter("");setResFilter("");setSearch("");setPage(1);}}>✕ Clear</button>}
+                    <span style={{marginLeft:"auto",fontSize:"12px",color:T.textMuted}}>{liveFiltered.length.toLocaleString()} calls</span>
+                  </div>
+                  <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,overflow:"hidden"}}>
+                    <div style={{overflowX:"auto"}}>
+                      <table style={{width:"100%",borderCollapse:"collapse"}}>
+                        <thead><tr>
+                          {[{c:"date",l:"Date/Time"},{c:"employee",l:"Answered By"},{c:"direction",l:"Dir"},{c:"caller",l:"Caller"},{c:"result",l:"Result"},{c:"talkTime",l:"Talk"}].map(({c,l})=>(
+                            <th key={l} onClick={()=>doSort(c)} style={thStyle}>{l}{sortIcon(c)}</th>
+                          ))}
+                        </tr></thead>
+                        <tbody>
+                          {liveSlice.length===0
+                            ? <tr><td colSpan={6} style={{...tdStyle,textAlign:"center",color:T.textMuted,padding:"40px"}}>No calls match filters</td></tr>
+                            : liveSlice.map((c,i)=>(
+                                <tr key={c.id||i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
+                                  <td style={{...tdStyle,color:T.textMuted,fontSize:"11px"}}>{fmtDT(c.date)}</td>
+                                  <td style={tdStyle}><div style={{fontWeight:700}}>{c.answeredBy||"—"}</div></td>
+                                  <td style={tdStyle}>{dirBadge(c.direction)}</td>
+                                  <td style={tdStyle}><div>{c.callerName||c.callerNum||"—"}</div>{c.callerName&&<div style={{fontSize:"10px",color:T.textMuted}}>{c.callerNum}</div>}</td>
+                                  <td style={tdStyle}>{resBadge(c.result)}</td>
+                                  <td style={{...tdStyle,fontFamily:"monospace"}}>{fmtDur(c.talkTime)}</td>
+                                </tr>
+                              ))
+                          }
+                        </tbody>
+                      </table>
                     </div>
-                    <div style={{fontSize:"11px",color:T.textMuted,fontWeight:700}}>{rate}%</div>
-                  </div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,textAlign:"center"}}>
-                    <div><div style={{fontWeight:800,fontSize:"18px",color:T.green}}>{e.answered}</div><div style={{fontSize:"10px",color:T.textMuted,fontWeight:600}}>ANSWERED</div></div>
-                    <div><div style={{fontWeight:800,fontSize:"18px",color:T.red}}>{e.missed}</div><div style={{fontSize:"10px",color:T.textMuted,fontWeight:600}}>MISSED</div></div>
-                    <div><div style={{fontWeight:800,fontSize:"18px",color:T.text}}>{fmtDur(avgTalk)}</div><div style={{fontSize:"10px",color:T.textMuted,fontWeight:600}}>AVG TALK</div></div>
-                  </div>
-                  <div style={{height:3,background:T.border,borderRadius:3,marginTop:10}}>
-                    <div style={{height:"100%",width:`${rate}%`,background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3,transition:"width 0.5s"}} />
+                    {livePages>1&&<div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderTop:`1px solid ${T.border}`,background:T.bgSurface,fontSize:"12px",color:T.textMuted}}>
+                      <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===1} onClick={()=>setPage(p=>p-1)}>← Prev</button>
+                      <span>Page {page} of {livePages}</span>
+                      <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===livePages} onClick={()=>setPage(p=>p+1)}>Next →</button>
+                    </div>}
                   </div>
                 </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Call table */}
-        {activeView === "calls" && (
-          <div>
-            <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
-              <input placeholder="Search employee, number, caller…" value={search} onChange={e=>{setSearch(e.target.value);setPage(1);}} style={{...inputStyle,width:220}} />
-              <select value={empFilter} onChange={e=>{setEmpFilter(e.target.value);setPage(1);}} style={inputStyle}>
-                <option value="">All Employees</option>
-                {empNames.map(n=><option key={n} value={n}>{n}</option>)}
-              </select>
-              <select value={resFilter} onChange={e=>{setResFilter(e.target.value);setPage(1);}} style={inputStyle}>
-                <option value="">All Results</option>
-                <option value="answered">Answered</option>
-                <option value="missed">Missed</option>
-                <option value="voicemail">Voicemail</option>
-              </select>
-              {(empFilter||resFilter||search) && (
-                <button style={btnSec} onClick={()=>{setEmpFilter("");setResFilter("");setSearch("");setPage(1);}}>✕ Clear</button>
               )}
-              <span style={{marginLeft:"auto",fontSize:"12px",color:T.textMuted}}>{filtered.length.toLocaleString()} calls</span>
+            </>
+          )}
+
+          {!calls.length && !loading && (
+            <div style={{textAlign:"center",padding:"50px 20px",color:T.textMuted}}>
+              <div style={{fontSize:36,marginBottom:10}}>📞</div>
+              <div style={{fontWeight:600,marginBottom:4}}>{liveMode?"Waiting for calls…":"Paused"}</div>
+              <div style={{fontSize:"12px"}}>{liveMode?"Live feed connected. Calls appear here as they complete.":"Hit ▶ Live to resume."}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══════════════════════ HISTORY TAB ════════════════════════════════ */}
+      {activeTab === "history" && (
+        <div style={{marginTop:16}}>
+
+          {/* Controls */}
+          <div style={{...card,marginBottom:16}}>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
+              <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>FROM</div><input type="date" value={histFrom} onChange={e=>setHistFrom(e.target.value)} style={inputStyle} /></div>
+              <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>TO</div><input type="date" value={histTo} onChange={e=>setHistTo(e.target.value)} style={inputStyle} /></div>
+              <div>
+                <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>GROUP BY</div>
+                <select value={histGroupBy} onChange={e=>setHistGroupBy(e.target.value)} style={inputStyle}>
+                  <option value="day">Day</option>
+                  <option value="week">Week</option>
+                  <option value="month">Month</option>
+                </select>
+              </div>
+              <div>
+                <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>EMPLOYEE</div>
+                <select value={histEmp} onChange={e=>setHistEmp(e.target.value)} style={inputStyle}>
+                  <option value="">All Employees</option>
+                  {histEmpNames.map(n=><option key={n} value={n}>{n}</option>)}
+                </select>
+              </div>
+              <div>
+                <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>DIRECTION</div>
+                <select value={histDir} onChange={e=>setHistDir(e.target.value)} style={inputStyle}>
+                  <option value="">All</option>
+                  <option value="inbound">Inbound</option>
+                  <option value="outbound">Outbound</option>
+                </select>
+              </div>
+              <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchHistory} disabled={histLoading}>
+                {histLoading?"Loading…":"Run Report"}
+              </button>
+            </div>
+          </div>
+
+          {histLoading && <div style={{textAlign:"center",padding:"50px",color:T.textMuted}}><div style={{fontSize:32,marginBottom:10}}>📊</div><div style={{fontWeight:600}}>Fetching history…</div></div>}
+
+          {!histLoading && histCalls.length>0 && <>
+
+            {/* Summary metrics */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:16}}>
+              {[
+                {label:"Total Calls",  value:histMetrics.tot.toLocaleString(), color:T.brand},
+                {label:"Answered",     value:histMetrics.ans.toLocaleString(), sub:histMetrics.ansRate+"%", color:T.green},
+                {label:"Missed",       value:histMetrics.mis.toLocaleString(), sub:pct(histMetrics.mis,histMetrics.tot), color:T.red},
+                {label:"Voicemail",    value:histMetrics.vm.toLocaleString(),  color:T.yellow},
+                {label:"Avg Talk",     value:fmtDur(histMetrics.avgTalk), color:T.text},
+                {label:"Busiest "+histGroupBy, value:histMetrics.busiest?histMetrics.busiest.total:"—", sub:histMetrics.busiest?.period||"", color:T.brand},
+              ].map(m=>(
+                <div key={m.label} style={metCard}>
+                  <div style={{fontSize:"9px",fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:3}}>{m.label}</div>
+                  <div style={{fontSize:"20px",fontWeight:800,color:m.color,lineHeight:1}}>{m.value}</div>
+                  {m.sub&&<div style={{fontSize:"9px",color:T.textMuted,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.sub}</div>}
+                </div>
+              ))}
             </div>
 
-            <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,overflow:"hidden",boxShadow:T.shadow}}>
+            {/* Bar chart overview */}
+            <div style={{...card,marginBottom:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div style={{fontWeight:700,fontSize:"13px"}}>Call Volume by {histGroupBy.charAt(0).toUpperCase()+histGroupBy.slice(1)}</div>
+                <div style={{display:"flex",gap:12,fontSize:"11px"}}>
+                  <span style={{color:T.green}}>■ Answered</span>
+                  <span style={{color:T.red}}>■ Missed</span>
+                </div>
+              </div>
+              <MiniBarChart data={periodGroups} />
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",color:T.textMuted,marginTop:2,overflow:"hidden"}}>
+                {periodGroups.length<=12
+                  ? periodGroups.map((p,i)=><span key={i} style={{flex:1,textAlign:"center",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"80px"}}>{p.period.replace(" of ","<br/>")}</span>)
+                  : <><span>{periodGroups[0]?.period}</span><span style={{marginLeft:"auto"}}>{periodGroups[periodGroups.length-1]?.period}</span></>
+                }
+              </div>
+            </div>
+
+            {/* Period breakdown table */}
+            <div style={{...card,marginBottom:16}}>
+              <div style={{fontWeight:700,fontSize:"13px",marginBottom:12}}>
+                {histGroupBy.charAt(0).toUpperCase()+histGroupBy.slice(1)}ly Breakdown
+                {histEmp && <span style={{fontWeight:400,color:T.textMuted,fontSize:"12px",marginLeft:8}}>— {histEmp}</span>}
+              </div>
               <div style={{overflowX:"auto"}}>
                 <table style={{width:"100%",borderCollapse:"collapse"}}>
                   <thead>
                     <tr>
-                      {[
-                        {col:"date",     label:"Date / Time"},
-                        {col:"employee", label:"Answered By"},
-                        {col:"direction",label:"Dir"},
-                        {col:"caller",   label:"Caller"},
-                        {col:"result",   label:"Result"},
-                        {col:"talkTime", label:"Talk"},
-                      ].map(({col,label}) => (
-                        <th key={label} onClick={()=>doSort(col)} style={thStyle}>{label}{sortIcon(col)}</th>
+                      {["Period","Total","Answered","Missed","Voicemail","Answer Rate","Avg Talk","Volume"].map(h=>(
+                        <th key={h} style={thStyle}>{h}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {pageSlice.length === 0
-                      ? <tr><td colSpan={6} style={{...tdStyle,textAlign:"center",color:T.textMuted,padding:"40px"}}>No calls match filters</td></tr>
-                      : pageSlice.map((c,i) => (
-                          <tr key={c.id||i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
-                            <td style={{...tdStyle,color:T.textMuted,fontSize:"11px"}}>{fmtDT(c.date)}</td>
-                            <td style={tdStyle}><div style={{fontWeight:700}}>{c.answeredBy||"—"}</div></td>
-                            <td style={tdStyle}>{dirBadge(c.direction)}</td>
-                            <td style={tdStyle}>
-                              <div>{c.callerName||c.callerNum||"—"}</div>
-                              {c.callerName&&<div style={{fontSize:"10px",color:T.textMuted}}>{c.callerNum}</div>}
-                            </td>
-                            <td style={tdStyle}>{resBadge(c.result)}</td>
-                            <td style={{...tdStyle,fontFamily:"monospace"}}>{fmtDur(c.talkTime)}</td>
-                          </tr>
-                        ))
-                    }
+                    {[...periodGroups].reverse().map((p,i) => {
+                      const rate = p.total ? Math.round((p.answered/p.total)*100) : 0;
+                      const maxTotal = Math.max(...periodGroups.map(x=>x.total),1);
+                      return (
+                        <tr key={i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
+                          <td style={{...tdStyle,fontWeight:600}}>{p.period}</td>
+                          <td style={{...tdStyle,fontWeight:700,color:T.brand}}>{p.total}</td>
+                          <td style={{...tdStyle,color:T.green,fontWeight:600}}>{p.answered}</td>
+                          <td style={{...tdStyle,color:T.red,fontWeight:600}}>{p.missed}</td>
+                          <td style={{...tdStyle,color:T.yellow}}>{p.voicemail}</td>
+                          <td style={tdStyle}>
+                            <div style={{display:"flex",alignItems:"center",gap:6}}>
+                              <div style={{width:60,height:6,background:T.border,borderRadius:3}}>
+                                <div style={{width:`${rate}%`,height:"100%",background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3}} />
+                              </div>
+                              <span style={{fontSize:"11px",color:T.textMuted}}>{rate}%</span>
+                            </div>
+                          </td>
+                          <td style={{...tdStyle,fontFamily:"monospace"}}>{p.answered?fmtDur(Math.round(p.talk/p.answered)):"—"}</td>
+                          <td style={tdStyle}>
+                            <div style={{width:`${Math.round((p.total/maxTotal)*80)}px`,height:8,background:T.brand,borderRadius:2,minWidth:2}} />
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
-              {pages > 1 && (
-                <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderTop:`1px solid ${T.border}`,background:T.bgSurface,fontSize:"12px",color:T.textMuted}}>
-                  <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===1} onClick={()=>setPage(p=>p-1)}>← Prev</button>
-                  <span>Page {page} of {pages} · {filtered.length.toLocaleString()} calls</span>
-                  <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===pages} onClick={()=>setPage(p=>p+1)}>Next →</button>
-                </div>
-              )}
             </div>
-          </div>
-        )}
-      </>}
 
-      {/* Empty state */}
-      {!loading && calls.length === 0 && !error && (
-        <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}>
-          <div style={{fontSize:40,marginBottom:12}}>📞</div>
-          <div style={{fontWeight:700,fontSize:"15px",marginBottom:6}}>
-            {liveMode ? "Waiting for calls…" : "No calls loaded"}
-          </div>
-          <div style={{fontSize:"13px"}}>
-            {liveMode
-              ? "The live feed is connected. Calls will appear here as they come in and complete."
-              : "Switch to live mode or select a date range and click Fetch Calls."
-            }
-          </div>
+            {/* Employee breakdown */}
+            <div style={{...card}}>
+              <div style={{fontWeight:700,fontSize:"13px",marginBottom:12}}>Employee Breakdown — {histFrom} to {histTo}</div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr>
+                      {["Employee","Ext","Total","Answered","Missed","Voicemail","Answer Rate","Avg Talk","Trend"].map(h=>(
+                        <th key={h} style={thStyle}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {empGroups.map((e,i) => {
+                      const rate = e.total ? Math.round((e.answered/e.total)*100) : 0;
+                      return (
+                        <tr key={i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
+                          <td style={{...tdStyle,fontWeight:700}}>
+                            <div style={{display:"flex",alignItems:"center",gap:8}}>
+                              <div style={{width:28,height:28,background:T.brandPale,border:`1px solid ${T.brand}20`,borderRadius:"6px",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"11px",fontWeight:800,color:T.brand,flexShrink:0}}>
+                                {e.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
+                              </div>
+                              {e.name}
+                            </div>
+                          </td>
+                          <td style={{...tdStyle,color:T.textMuted}}>{e.ext||"—"}</td>
+                          <td style={{...tdStyle,fontWeight:700,color:T.brand}}>{e.total}</td>
+                          <td style={{...tdStyle,color:T.green,fontWeight:600}}>{e.answered}</td>
+                          <td style={{...tdStyle,color:T.red,fontWeight:600}}>{e.missed}</td>
+                          <td style={{...tdStyle,color:T.yellow}}>{e.voicemail}</td>
+                          <td style={tdStyle}>
+                            <div style={{display:"flex",alignItems:"center",gap:6}}>
+                              <div style={{width:60,height:6,background:T.border,borderRadius:3}}>
+                                <div style={{width:`${rate}%`,height:"100%",background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3}} />
+                              </div>
+                              <span style={{fontSize:"11px",color:T.textMuted}}>{rate}%</span>
+                            </div>
+                          </td>
+                          <td style={{...tdStyle,fontFamily:"monospace"}}>{e.answered?fmtDur(Math.round(e.talk/e.answered)):"—"}</td>
+                          <td style={tdStyle}>
+                            {periodGroups.length > 1 ? <EmpTrend empName={e.name} /> : <span style={{color:T.textDim,fontSize:"11px"}}>—</span>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>}
+
+          {!histLoading && !histCalls.length && !error && (
+            <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}>
+              <div style={{fontSize:40,marginBottom:12}}>📊</div>
+              <div style={{fontWeight:700,fontSize:"15px",marginBottom:6}}>No data loaded</div>
+              <div style={{fontSize:"13px"}}>Select a date range and click Run Report.</div>
+            </div>
+          )}
         </div>
       )}
 
       <style>{`
-        @keyframes pulse {
-          0%,100% { opacity:1; transform:scale(1); }
-          50%      { opacity:0.6; transform:scale(1.3); }
+        @keyframes zmPulse {
+          0%,100%{opacity:1;transform:scale(1)}
+          50%{opacity:.6;transform:scale(1.3)}
         }
       `}</style>
     </div>
