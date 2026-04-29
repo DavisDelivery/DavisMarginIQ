@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.21";
+const APP_VERSION = "2.42.22";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -1666,20 +1666,22 @@ function GmailSync({ onRefresh }) {
       // Run the existing ingest pipeline. This handles parse, dedup against
       // file_log, write to Firestore, and audit math — all the proven path.
       const result = await ingestFiles([file], (s) => {
-        // Surface phase progress as a transient status message
         setPendingError(null);
       });
 
-      // If ingestion succeeded, clean up the pending docs
-      if (result && (result.imported > 0 || result.skipped > 0)) {
+      // ingestFiles returns { files_processed, counts, uline, nuvizz, ... }
+      // Consider it a success if the call returned at all (no exception thrown)
+      // and files_processed > 0. A file that's already in file_log still
+      // returns files_processed=1 — that's fine, just clean up the pending doc.
+      if (result && result.files_processed > 0) {
         // Delete chunks first (parallel)
-        await Promise.all(chunkSnap.docs.map(d => d.ref.delete().catch(() => {})));
+        await Promise.all(sortedDocs.map(d => d.ref.delete().catch(() => {})));
         // Then delete the parent doc
         await window.db.collection("pending_uline_files").doc(fileMeta.id).delete().catch(() => {});
-        await loadPendingUlineFiles();      // refresh list
-        await loadImportedFilenames();      // file_log changed
+        await loadPendingUlineFiles();
+        await loadImportedFilenames();
       } else {
-        throw new Error(result?.error || "Ingest produced no result");
+        throw new Error("ingestFiles returned 0 files_processed — check console for parser errors");
       }
     } catch(e) {
       console.error("loadPendingFile err:", e);
