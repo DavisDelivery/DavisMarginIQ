@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.7";
+const APP_VERSION = "2.43.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10412,6 +10412,7 @@ function MarginIQ() {
     { id:"runsheet", icon:"📋", label:"Run Sheet" },
     { id:"qbo", icon:"📊", label:"QuickBooks" },
     { id:"financials", icon:"📋", label:"Audited Financials" },
+    { id:"customers_analysis", icon:"📊", label:"Customer Analysis" },
     { id:"costs", icon:"⚙️", label:"Costs" },
     { id:"phone", icon:"📞", label:"Phone Calls" },
     { id:"settings", icon:"🔧", label:"Settings" },
@@ -10452,6 +10453,7 @@ function MarginIQ() {
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
     {!loading && tab==="financials" && (typeof window !== "undefined" && window.AuditedFinancialsTab ? React.createElement(window.AuditedFinancialsTab) : <EmptyState icon="📋" title="Audited Financials module not loaded" sub="AuditedFinancialsTab.jsx did not load." />)}
+    {!loading && tab==="customers_analysis" && (typeof window !== "undefined" && window.CustomerAnalysisTab ? React.createElement(window.CustomerAnalysisTab) : <EmptyState icon="📊" title="Customer Analysis module not loaded" sub="CustomerAnalysisTab.jsx did not load." />)}
     {!loading && tab==="qbo" && (typeof window !== "undefined" && window.QBOImportTab ? React.createElement(window.QBOImportTab) : <EmptyState icon="📊" title="QuickBooks module not loaded" sub="QBOImportTab.jsx did not load. Check console." />)}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
     {!loading && tab==="phone" && <ZoomPhoneTab />}

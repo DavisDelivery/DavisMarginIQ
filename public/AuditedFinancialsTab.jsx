@@ -1,8 +1,7 @@
 // AuditedFinancialsTab.jsx — Audited Financials from AMP CPAs
-// Searches Gmail for emails from @ampcpas.com with PDF attachments,
-// converts PDFs to images via pdf.js, extracts P&L / Balance Sheet /
-// Cash Flow using Claude vision, saves to Firestore audited_financials.
-// v1.0.0
+// v2.0.0 — Adds Dashboard view + AI Chat Q&A. Fixes silent-fail load bug.
+//
+// Views: 📊 Dashboard | 📋 Statements | 💬 Ask AI | 📧 Gmail Sync
 
 (function () {
 "use strict";
@@ -19,14 +18,15 @@ const T = {
   red:"#ef4444", redBg:"#fef2f2", redText:"#991b1b",
   yellow:"#f59e0b", yellowBg:"#fffbeb", yellowText:"#92400e",
   blue:"#3b82f6", blueBg:"#eff6ff", blueText:"#1e40af",
+  purple:"#8b5cf6", purpleBg:"#f5f3ff",
   radius:"12px", radiusSm:"8px",
   shadow:"0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06)",
 };
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
-const fmt  = n => n==null||isNaN(n)?"$0":"$"+Number(n).toLocaleString("en-US",{maximumFractionDigits:0});
-const fmtK = n => { if(n==null||isNaN(n)) return "$0"; const v=Number(n); if(Math.abs(v)>=1000000) return "$"+(v/1000000).toFixed(2)+"M"; if(Math.abs(v)>=1000) return "$"+(v/1000).toFixed(1)+"K"; return "$"+v.toFixed(0); };
-const fmtPct = (n,d=1) => n==null||isNaN(n)?"0%":Number(n).toFixed(d)+"%";
+const fmt   = n => n==null||isNaN(n)?"$0":"$"+Number(n).toLocaleString("en-US",{maximumFractionDigits:0});
+const fmtK  = n => { if(n==null||isNaN(n)) return "$0"; const v=Number(n); if(Math.abs(v)>=1000000) return "$"+(v/1000000).toFixed(2)+"M"; if(Math.abs(v)>=1000) return "$"+(v/1000).toFixed(1)+"K"; return "$"+v.toFixed(0); };
+const fmtPct= (n,d=1) => n==null||isNaN(n)?"0%":Number(n).toFixed(d)+"%";
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
 const card  = { background:T.bgCard, borderRadius:T.radius, border:`1px solid ${T.border}`, padding:"16px", boxShadow:T.shadow };
@@ -44,7 +44,6 @@ function monthLabel(key) {
   return `${MONTH_NAMES[parseInt(m)]} ${y}`;
 }
 
-// Extract YYYY-MM from an email subject like "March 2025 Financials"
 function extractMonthFromSubject(subject) {
   if (!subject) return null;
   const s = subject.toLowerCase();
@@ -57,7 +56,6 @@ function extractMonthFromSubject(subject) {
       return `${year}-${String(i).padStart(2, "0")}`;
     }
   }
-  // Try MM/YYYY or YYYY-MM directly
   const m1 = subject.match(/\b(\d{1,2})[\/-](20\d{2})\b/);
   if (m1) return `${m1[2]}-${m1[1].padStart(2,"0")}`;
   const m2 = subject.match(/\b(20\d{2})[\/-](\d{1,2})\b/);
@@ -70,12 +68,10 @@ async function pdfToPages(pdfBytes, maxPages = 20) {
   if (!window.pdfjsLib) throw new Error("pdf.js not loaded");
   window.pdfjsLib.GlobalWorkerOptions.workerSrc =
     "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-
   const loadingTask = window.pdfjsLib.getDocument({ data: pdfBytes });
   const pdf = await loadingTask.promise;
   const numPages = Math.min(pdf.numPages, maxPages);
   const pages = [];
-
   for (let p = 1; p <= numPages; p++) {
     const page = await pdf.getPage(p);
     const viewport = page.getViewport({ scale: 1.8 });
@@ -143,22 +139,14 @@ async function extractFinancials(pages) {
     type: "image",
     source: { type: "base64", media_type: "image/png", data: b64 },
   }));
-
   const resp = await fetch("/.netlify/functions/marginiq-scan-financials", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       max_tokens: 8192,
-      messages: [{
-        role: "user",
-        content: [
-          ...imageBlocks,
-          { type: "text", text: EXTRACTION_PROMPT },
-        ],
-      }],
+      messages: [{ role: "user", content: [...imageBlocks, { type: "text", text: EXTRACTION_PROMPT }] }],
     }),
   });
-
   if (!resp.ok) throw new Error(`Vision API error: ${resp.status}`);
   const data = await resp.json();
   const text = (data.content || []).map(b => b.text || "").join("").trim();
@@ -172,17 +160,31 @@ const db = () => window.db;
 async function saveFinancial(monthKey, data) {
   try {
     await db().collection("audited_financials").doc(monthKey)
-      .set({ ...data, updated_at: new Date().toISOString() }, { merge: true });
+      .set({ ...data, period: monthKey, updated_at: new Date().toISOString() }, { merge: true });
     return true;
   } catch (e) { console.error("saveFinancial", e); return false; }
 }
 
+// FIXED v2.0.0: Don't use orderBy — if any doc lacks `period`, Firestore
+// silently returns 0 results. Just .get() everything and sort client-side.
 async function getFinancials() {
   try {
-    const s = await db().collection("audited_financials")
-      .orderBy("period", "desc").limit(60).get();
-    return s.docs.map(d => ({ id: d.id, ...d.data() }));
-  } catch (e) { return []; }
+    const s = await db().collection("audited_financials").limit(120).get();
+    const docs = s.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Fall back to doc id (which is the period key) if the period field is missing
+    const withPeriod = docs.map(d => ({ ...d, period: d.period || d.id }));
+    return withPeriod.sort((a, b) => (b.period || "").localeCompare(a.period || ""));
+  } catch (e) {
+    console.error("getFinancials failed:", e);
+    return [];
+  }
+}
+
+async function deleteFinancial(monthKey) {
+  try {
+    await db().collection("audited_financials").doc(monthKey).delete();
+    return true;
+  } catch (e) { console.error("deleteFinancial", e); return false; }
 }
 
 async function saveEmailProcessed(emailId, meta) {
@@ -220,31 +222,41 @@ async function fetchAttachment(messageId, attachmentId, accountEmail, accountDoc
   if (!resp.ok) throw new Error(`Attachment fetch error: ${resp.status}`);
   const data = await resp.json();
   if (data.error) throw new Error(data.error);
-  // Convert base64 to Uint8Array
   const bin = atob(data.data);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
 }
 
-// ─── Mini components ──────────────────────────────────────────────────────────
+// ─── Q&A backend call ─────────────────────────────────────────────────────────
+async function askAI(question, financials, history) {
+  const resp = await fetch("/.netlify/functions/marginiq-financials-qa", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question, financials, history }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || `QA API error: ${resp.status}`);
+  return data.answer || "(empty response)";
+}
+
+// ─── UI atoms ─────────────────────────────────────────────────────────────────
 const Badge = ({ text, color, bg }) => (
   <span style={{ padding:"2px 8px", borderRadius:20, fontSize:10, fontWeight:700, color:color||T.blueText, background:bg||T.blueBg, display:"inline-block" }}>{text}</span>
 );
-
-const StatusLine = ({ text }) => {
-  if (!text) return null;
-  const isErr  = text.startsWith("✗") || text.toLowerCase().includes("error");
-  const isOk   = text.startsWith("✓");
-  const color  = isErr ? T.red : isOk ? T.green : T.brand;
-  return <div style={{ fontSize:12, color, fontWeight:600, marginTop:8 }}>{text}</div>;
-};
-
 const Spinner = () => (
   <span style={{ display:"inline-block", animation:"spin 1s linear infinite", fontSize:16 }}>⏳</span>
 );
+const KPI = ({ label, value, sub, color, bg, trend }) => (
+  <div style={{ ...card, flex:1, minWidth:160, background:bg||T.bgCard }}>
+    <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.05em", marginBottom:4 }}>{label}</div>
+    <div style={{ fontSize:22, fontWeight:800, color:color||T.text }}>{value}</div>
+    {sub && <div style={{ fontSize:10, color:T.textDim, marginTop:2 }}>{sub}</div>}
+    {trend && <div style={{ fontSize:11, marginTop:4, color: trend.startsWith("+")?T.green : trend.startsWith("-")?T.red : T.textMuted, fontWeight:600 }}>{trend}</div>}
+  </div>
+);
 
-// ─── P&L Detail Card ─────────────────────────────────────────────────────────
+// ─── PL / BS / CF detail cards (from v1) ──────────────────────────────────────
 function PLCard({ pl }) {
   if (!pl) return <div style={{ color:T.textMuted, fontSize:12 }}>No P&L data</div>;
   const margin = pl.revenue > 0 ? (pl.net_income / pl.revenue) * 100 : 0;
@@ -286,7 +298,6 @@ function PLCard({ pl }) {
   );
 }
 
-// ─── Balance Sheet Card ───────────────────────────────────────────────────────
 function BSCard({ bs }) {
   if (!bs) return <div style={{ color:T.textMuted, fontSize:12 }}>No balance sheet data</div>;
   return (
@@ -322,7 +333,6 @@ function BSCard({ bs }) {
   );
 }
 
-// ─── Cash Flow Card ───────────────────────────────────────────────────────────
 function CFCard({ cf }) {
   if (!cf) return <div style={{ color:T.textMuted, fontSize:12 }}>No cash flow data</div>;
   return (
@@ -345,37 +355,39 @@ function CFCard({ cf }) {
 }
 
 // ─── Detail Modal ─────────────────────────────────────────────────────────────
-function DetailModal({ record, onClose }) {
+function DetailModal({ record, onClose, onDelete }) {
   if (!record) return null;
   return (
-    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}
-         onClick={onClose}>
-      <div style={{ background:T.bgWhite, borderRadius:T.radius, padding:24, maxWidth:900, width:"100%", maxHeight:"90vh", overflowY:"auto" }}
-           onClick={e => e.stopPropagation()}>
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }} onClick={onClose}>
+      <div style={{ background:T.bgWhite, borderRadius:T.radius, padding:24, maxWidth:900, width:"100%", maxHeight:"90vh", overflowY:"auto" }} onClick={e => e.stopPropagation()}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
           <div style={{ fontSize:16, fontWeight:800 }}>📋 {monthLabel(record.period)} — Audited Financials</div>
-          <button onClick={onClose} style={{ background:"none", border:"none", fontSize:20, cursor:"pointer", color:T.textMuted }}>✕</button>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={() => onDelete(record)} style={{ background:T.redBg, border:`1px solid ${T.red}`, color:T.red, padding:"6px 12px", borderRadius:T.radiusSm, fontSize:11, fontWeight:600, cursor:"pointer" }}>Delete</button>
+            <button onClick={onClose} style={{ background:"none", border:"none", fontSize:20, cursor:"pointer", color:T.textMuted }}>✕</button>
+          </div>
         </div>
-
         <div style={{ marginBottom:20 }}>
           <div style={{ fontSize:13, fontWeight:700, marginBottom:12 }}>📈 Profit & Loss</div>
           <PLCard pl={record.pl} />
         </div>
-
         <div style={{ marginBottom:20 }}>
           <div style={{ fontSize:13, fontWeight:700, marginBottom:12 }}>🏦 Balance Sheet</div>
           <BSCard bs={record.balance_sheet} />
         </div>
-
         <div style={{ marginBottom:20 }}>
           <div style={{ fontSize:13, fontWeight:700, marginBottom:12 }}>💵 Cash Flow</div>
           <CFCard cf={record.cash_flow} />
         </div>
-
         {record.notes && (
           <div style={{ ...card, background:T.yellowBg, borderColor:T.yellow }}>
             <div style={{ fontSize:11, fontWeight:700, color:T.yellowText, marginBottom:4 }}>📝 CPA Notes</div>
             <div style={{ fontSize:12, color:T.text, lineHeight:1.6 }}>{record.notes}</div>
+          </div>
+        )}
+        {record.filename && (
+          <div style={{ marginTop:14, fontSize:10, color:T.textDim }}>
+            Source: {record.filename}{record.email_subject ? ` · "${record.email_subject}"` : ""}
           </div>
         )}
       </div>
@@ -383,12 +395,373 @@ function DetailModal({ record, onClose }) {
   );
 }
 
-// ─── Gmail Sync Panel ─────────────────────────────────────────────────────────
+// ─── Mini sparkline / trend chart ─────────────────────────────────────────────
+function MiniLineChart({ data, height=180, colors={ revenue:T.brand, expenses:T.red, netIncome:T.green } }) {
+  if (!data || data.length < 2) return <div style={{ padding:"20px", textAlign:"center", color:T.textDim, fontSize:11 }}>Need at least 2 months for a trend chart</div>;
+
+  const W = 720, H = height, pad = { l:60, r:120, t:14, b:32 };
+  const innerW = W - pad.l - pad.r, innerH = H - pad.t - pad.b;
+  const allVals = data.flatMap(d => [d.revenue||0, d.expenses||0, d.netIncome||0].filter(v => v != null));
+  const max = Math.max(...allVals, 1);
+  const min = Math.min(...allVals, 0);
+  const range = max - min || 1;
+  const xAt = i => pad.l + (data.length<2?0:(i/(data.length-1))*innerW);
+  const yAt = v => pad.t + innerH - ((v-min)/range)*innerH;
+  const series = [
+    { key:"revenue",   label:"Revenue",    color:colors.revenue   },
+    { key:"expenses",  label:"Expenses",   color:colors.expenses  },
+    { key:"netIncome", label:"Net Income", color:colors.netIncome },
+  ];
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display:"block" }}>
+      {/* Y gridlines */}
+      {[0, 0.25, 0.5, 0.75, 1].map(p => (
+        <g key={p}>
+          <line x1={pad.l} y1={pad.t+innerH-p*innerH} x2={pad.l+innerW} y2={pad.t+innerH-p*innerH} stroke={T.borderLight} strokeDasharray="2,4" />
+          <text x={pad.l-8} y={pad.t+innerH-p*innerH+3} fontSize="9" fill={T.textDim} textAnchor="end">{fmtK(min+range*p)}</text>
+        </g>
+      ))}
+      {/* X labels */}
+      {data.map((d, i) => {
+        const skip = Math.ceil(data.length/8);
+        if (i%skip!==0 && i!==data.length-1) return null;
+        const lbl = monthLabel(d.period);
+        const short = lbl.replace(/(\w{3})\w* (\d{4})/, "$1 '$2".slice(0,4)+"'$2".slice(-2));
+        return <text key={i} x={xAt(i)} y={H-pad.b+16} fontSize="9" fill={T.textDim} textAnchor="middle">{lbl.replace(/(\d{4})/, "'$1".slice(-3))}</text>;
+      })}
+      {/* Lines */}
+      {series.map(s => {
+        const path = data.map((d,i) => `${i===0?"M":"L"} ${xAt(i)} ${yAt(d[s.key]||0)}`).join(" ");
+        return (
+          <g key={s.key}>
+            <path d={path} stroke={s.color} strokeWidth="2.5" fill="none" />
+            {data.map((d,i) => <circle key={i} cx={xAt(i)} cy={yAt(d[s.key]||0)} r="3" fill={s.color} />)}
+          </g>
+        );
+      })}
+      {/* Legend */}
+      {series.map((s, i) => (
+        <g key={s.key} transform={`translate(${pad.l+innerW+10}, ${pad.t+i*22})`}>
+          <rect width="12" height="3" fill={s.color} y="3" rx="1" />
+          <text x="18" y="9" fontSize="11" fill={T.text}>{s.label}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+// ─── Dashboard view ───────────────────────────────────────────────────────────
+function Dashboard({ records, onSelect }) {
+  if (!records.length) return (
+    <div style={{ ...card, textAlign:"center", padding:"60px 20px", color:T.textMuted }}>
+      <div style={{ fontSize:36, marginBottom:8 }}>📋</div>
+      <div style={{ fontSize:13, fontWeight:600 }}>No audited financials yet</div>
+      <div style={{ fontSize:11, marginTop:6 }}>Use 📧 Gmail Sync to import statements from AMP CPAs</div>
+    </div>
+  );
+
+  // Sort ascending by period for trend computation
+  const asc = [...records].filter(r => r.period).sort((a,b) => a.period.localeCompare(b.period));
+  const latest   = asc[asc.length-1];
+  const previous = asc[asc.length-2] || null;
+
+  // Trend chart data
+  const trendData = asc.map(r => ({
+    period: r.period,
+    revenue: r.pl?.revenue || 0,
+    expenses: (r.pl?.cost_of_goods_sold || 0) + (r.pl?.operating_expenses || 0),
+    netIncome: r.pl?.net_income || 0,
+  }));
+
+  // Aggregates
+  const ttmAsc = asc.slice(-12); // trailing 12 months
+  const ttmRevenue   = ttmAsc.reduce((s,r) => s + (r.pl?.revenue||0), 0);
+  const ttmNet       = ttmAsc.reduce((s,r) => s + (r.pl?.net_income||0), 0);
+  const ttmExpenses  = ttmAsc.reduce((s,r) => s + ((r.pl?.cost_of_goods_sold||0) + (r.pl?.operating_expenses||0)), 0);
+  const avgMargin    = ttmAsc.length ? (ttmAsc.reduce((s,r) => { const rev=r.pl?.revenue||0; return s + (rev>0?(r.pl?.net_income||0)/rev*100:0); }, 0) / ttmAsc.length) : 0;
+
+  // MoM change
+  const momChange = (cur, prev) => {
+    if (!prev || prev === 0) return null;
+    const pct = ((cur - prev) / Math.abs(prev)) * 100;
+    return (pct >= 0 ? "+" : "") + pct.toFixed(1) + "% vs " + monthLabel(previous.period);
+  };
+
+  return (
+    <div>
+      {/* Latest month KPIs */}
+      <div style={{ marginBottom:20 }}>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase", marginBottom:8 }}>Latest — {monthLabel(latest.period)}</div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(170px, 1fr))", gap:12 }}>
+          <KPI label="Revenue"
+               value={fmtK(latest.pl?.revenue)}
+               color={T.brand}
+               trend={previous ? momChange(latest.pl?.revenue||0, previous.pl?.revenue||0) : null} />
+          <KPI label="Net Income"
+               value={fmtK(latest.pl?.net_income)}
+               color={(latest.pl?.net_income||0)>=0?T.green:T.red}
+               trend={previous ? momChange(latest.pl?.net_income||0, previous.pl?.net_income||0) : null} />
+          <KPI label="Net Margin"
+               value={fmtPct(latest.pl?.revenue ? (latest.pl.net_income/latest.pl.revenue)*100 : 0)}
+               color={(latest.pl?.net_income||0)>=0?T.green:T.red} />
+          <KPI label="Operating Income"
+               value={fmtK(latest.pl?.operating_income)}
+               color={(latest.pl?.operating_income||0)>=0?T.green:T.red} />
+          <KPI label="Total Assets"
+               value={fmtK(latest.balance_sheet?.total_assets)}
+               color={T.brand}
+               sub={latest.balance_sheet?.equity ? `Equity: ${fmtK(latest.balance_sheet.equity)}` : ""} />
+          <KPI label="Ending Cash"
+               value={fmtK(latest.cash_flow?.ending_cash)}
+               color={T.purple} />
+        </div>
+      </div>
+
+      {/* Trend chart */}
+      <div style={{ ...card, marginBottom:20 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:8 }}>
+          <div style={{ fontSize:13, fontWeight:700 }}>📈 Revenue · Expenses · Net Income — Monthly Trend</div>
+          <div style={{ fontSize:10, color:T.textDim }}>{asc.length} months</div>
+        </div>
+        <MiniLineChart data={trendData} height={220} />
+      </div>
+
+      {/* TTM aggregates */}
+      <div style={{ marginBottom:20 }}>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase", marginBottom:8 }}>
+          {ttmAsc.length === 12 ? "Trailing 12 Months" : `Last ${ttmAsc.length} Month${ttmAsc.length===1?"":"s"}`}
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(170px, 1fr))", gap:12 }}>
+          <KPI label="Total Revenue"   value={fmtK(ttmRevenue)}  color={T.brand} />
+          <KPI label="Total Expenses"  value={fmtK(ttmExpenses)} color={T.red}   />
+          <KPI label="Total Net"       value={fmtK(ttmNet)}      color={ttmNet>=0?T.green:T.red} />
+          <KPI label="Avg Net Margin"  value={fmtPct(avgMargin)} color={avgMargin>=0?T.green:T.red} />
+        </div>
+      </div>
+
+      {/* Period table at bottom */}
+      <div style={{ ...card, padding:0, overflow:"auto" }}>
+        <div style={{ padding:"12px 16px", fontSize:12, fontWeight:700, borderBottom:`1px solid ${T.border}` }}>📋 All Periods</div>
+        <table style={{ width:"100%", borderCollapse:"collapse" }}>
+          <thead>
+            <tr>
+              <th style={tblH}>Period</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Revenue</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Expenses</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Net</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Margin</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Cash</th>
+              <th style={tblH}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...asc].reverse().map(r => {
+              const pl = r.pl || {};
+              const exp = (pl.cost_of_goods_sold||0) + (pl.operating_expenses||0);
+              const margin = pl.revenue ? (pl.net_income/pl.revenue)*100 : 0;
+              return (
+                <tr key={r.id} style={{ cursor:"pointer" }} onClick={() => onSelect(r)}>
+                  <td style={{ ...tblD, fontWeight:600 }}>{monthLabel(r.period)}</td>
+                  <td style={tblDR}>{fmt(pl.revenue)}</td>
+                  <td style={{ ...tblDR, color:T.red }}>{fmt(exp)}</td>
+                  <td style={{ ...tblDR, fontWeight:700, color:(pl.net_income||0)>=0?T.green:T.red }}>{fmt(pl.net_income)}</td>
+                  <td style={{ ...tblDR, color:margin>=0?T.greenText:T.redText }}>{fmtPct(margin)}</td>
+                  <td style={{ ...tblDR, color:T.purple }}>{fmt(r.cash_flow?.ending_cash)}</td>
+                  <td style={tblD}><span style={{ fontSize:11, color:T.brand, fontWeight:600 }}>View →</span></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── AI Chat view ─────────────────────────────────────────────────────────────
+const SUGGESTED_QUESTIONS = [
+  "What was my best month for net income?",
+  "How did my operating expenses change month over month?",
+  "What's my average net margin over the past year?",
+  "Which expenses are growing fastest?",
+  "Summarize my financial health right now",
+  "Compare my latest month to the same month last year",
+];
+
+function AIChat({ records }) {
+  const [history, setHistory] = useState([]); // [{role, content}, ...]
+  const [input, setInput]     = useState("");
+  const [busy, setBusy]       = useState(false);
+  const [err, setErr]         = useState("");
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [history, busy]);
+
+  const send = async (q) => {
+    const question = (q || input).trim();
+    if (!question || busy) return;
+    setErr(""); setInput("");
+    const newHist = [...history, { role:"user", content: question }];
+    setHistory(newHist);
+    setBusy(true);
+    try {
+      const answer = await askAI(question, records, history);
+      setHistory(h => [...h, { role:"assistant", content: answer }]);
+    } catch(e) {
+      setErr(e.message);
+      setHistory(h => [...h, { role:"assistant", content: `⚠️ Error: ${e.message}` }]);
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", height:"calc(100vh - 240px)", minHeight:520 }}>
+      {/* Header strip */}
+      <div style={{ ...card, padding:"12px 16px", marginBottom:12, display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:10 }}>
+        <div>
+          <div style={{ fontSize:13, fontWeight:700 }}>💬 Ask AI about your financials</div>
+          <div style={{ fontSize:11, color:T.textMuted }}>Powered by Claude · Sees {records.length} month(s) of audited data</div>
+        </div>
+        {history.length > 0 && (
+          <button onClick={() => { setHistory([]); setErr(""); }}
+            style={{ padding:"6px 12px", borderRadius:T.radiusSm, border:`1px solid ${T.border}`, background:T.bgWhite, color:T.textMuted, fontSize:11, fontWeight:600, cursor:"pointer" }}>
+            New conversation
+          </button>
+        )}
+      </div>
+
+      {/* Chat scroll area */}
+      <div ref={scrollRef} style={{ ...card, flex:1, overflow:"auto", padding:"16px", marginBottom:12 }}>
+        {history.length === 0 ? (
+          <div>
+            <div style={{ textAlign:"center", padding:"30px 10px 18px", color:T.textMuted }}>
+              <div style={{ fontSize:36, marginBottom:8 }}>💬</div>
+              <div style={{ fontSize:13, fontWeight:600 }}>Ask anything about your financials</div>
+              <div style={{ fontSize:11, marginTop:4 }}>Try one of these or type your own question below</div>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(260px, 1fr))", gap:8, marginTop:14 }}>
+              {SUGGESTED_QUESTIONS.map((q,i) => (
+                <button key={i} onClick={() => send(q)}
+                  style={{ textAlign:"left", padding:"10px 14px", borderRadius:T.radiusSm, border:`1px solid ${T.border}`, background:T.bgSurface, color:T.text, fontSize:12, cursor:"pointer", fontFamily:"inherit", lineHeight:1.4 }}>
+                  💡 {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          history.map((m, i) => (
+            <div key={i} style={{ marginBottom:14, display:"flex", flexDirection:"column", alignItems: m.role==="user" ? "flex-end" : "flex-start" }}>
+              <div style={{
+                maxWidth:"85%",
+                padding:"10px 14px",
+                borderRadius: m.role==="user" ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
+                background: m.role==="user" ? T.brand : T.bgSurface,
+                color: m.role==="user" ? "#fff" : T.text,
+                fontSize:13, lineHeight:1.55, whiteSpace:"pre-wrap",
+                border: m.role==="assistant" ? `1px solid ${T.border}` : "none",
+              }}>
+                {m.content}
+              </div>
+              <div style={{ fontSize:9, color:T.textDim, marginTop:3, padding:"0 6px" }}>
+                {m.role==="user" ? "You" : "Claude"}
+              </div>
+            </div>
+          ))
+        )}
+        {busy && (
+          <div style={{ display:"flex", alignItems:"center", gap:8, color:T.textMuted, fontSize:12 }}>
+            <Spinner /> Thinking...
+          </div>
+        )}
+      </div>
+
+      {err && <div style={{ fontSize:11, color:T.red, padding:"8px 12px", background:T.redBg, borderRadius:T.radiusSm, marginBottom:8 }}>{err}</div>}
+
+      {/* Input */}
+      <div style={{ display:"flex", gap:8 }}>
+        <input
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          placeholder="Ask anything about your financials..."
+          disabled={busy}
+          style={{
+            flex:1, padding:"10px 14px", borderRadius:T.radiusSm, border:`1px solid ${T.border}`,
+            background:T.bgWhite, fontSize:13, fontFamily:"inherit", outline:"none",
+          }}
+        />
+        <button onClick={() => send()} disabled={busy || !input.trim()}
+          style={{ padding:"10px 20px", borderRadius:T.radiusSm, border:"none",
+            background: (busy||!input.trim()) ? T.textDim : T.brand, color:"#fff",
+            fontSize:12, fontWeight:700, cursor: (busy||!input.trim())?"not-allowed":"pointer" }}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Statements list (renamed from old "Summary") ─────────────────────────────
+function StatementsList({ records, onSelect }) {
+  const sorted = [...records].sort((a,b) => (b.period||"").localeCompare(a.period||""));
+  if (!sorted.length) return (
+    <div style={{ ...card, textAlign:"center", padding:"40px 20px", color:T.textMuted }}>
+      <div style={{ fontSize:36, marginBottom:8 }}>📋</div>
+      <div style={{ fontSize:13, fontWeight:600 }}>No audited financials yet</div>
+      <div style={{ fontSize:11, marginTop:6 }}>Use 📧 Gmail Sync to import statements from AMP CPAs</div>
+    </div>
+  );
+  return (
+    <div style={{ ...card, padding:0, overflow:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse" }}>
+        <thead>
+          <tr>
+            <th style={tblH}>Period</th>
+            <th style={{ ...tblH, textAlign:"right" }}>Revenue</th>
+            <th style={{ ...tblH, textAlign:"right" }}>COGS</th>
+            <th style={{ ...tblH, textAlign:"right" }}>Gross Profit</th>
+            <th style={{ ...tblH, textAlign:"right" }}>Op Expenses</th>
+            <th style={{ ...tblH, textAlign:"right" }}>Net Income</th>
+            <th style={{ ...tblH, textAlign:"right" }}>Net %</th>
+            <th style={{ ...tblH, textAlign:"right" }}>Total Assets</th>
+            <th style={{ ...tblH, textAlign:"right" }}>Equity</th>
+            <th style={tblH}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map(r => {
+            const pl = r.pl || {};
+            const bs = r.balance_sheet || {};
+            const margin = pl.revenue > 0 ? (pl.net_income / pl.revenue) * 100 : 0;
+            return (
+              <tr key={r.id} style={{ cursor:"pointer" }} onClick={() => onSelect(r)}>
+                <td style={{ ...tblD, fontWeight:600 }}>{monthLabel(r.period)}</td>
+                <td style={tblDR}>{fmt(pl.revenue)}</td>
+                <td style={{ ...tblDR, color:T.textMuted }}>{pl.cost_of_goods_sold ? fmt(pl.cost_of_goods_sold) : "—"}</td>
+                <td style={{ ...tblDR, color:(pl.gross_profit||0)>=0?T.green:T.red }}>{fmt(pl.gross_profit)}</td>
+                <td style={{ ...tblDR, color:T.red }}>{fmt(pl.operating_expenses)}</td>
+                <td style={{ ...tblDR, fontWeight:700, color:(pl.net_income||0)>=0?T.green:T.red }}>{fmt(pl.net_income)}</td>
+                <td style={{ ...tblDR, color:margin>=0?T.greenText:T.redText }}>{fmtPct(margin)}</td>
+                <td style={tblDR}>{fmt(bs.total_assets)}</td>
+                <td style={{ ...tblDR, color:T.green }}>{fmt(bs.equity)}</td>
+                <td style={tblD}><span style={{ fontSize:11, color:T.brand, fontWeight:600 }}>View →</span></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── Gmail Sync Panel (mostly v1, with tweaks) ────────────────────────────────
 function GmailSyncPanel({ onImported }) {
   const [emails, setEmails]       = useState([]);
   const [searching, setSearching] = useState(false);
   const [searchErr, setSearchErr] = useState("");
-  const [processing, setProcessing] = useState({}); // emailId → status string
+  const [processing, setProcessing] = useState({});
   const [processedIds, setProcessedIds] = useState(new Set());
 
   const searchEmails = async () => {
@@ -407,14 +780,12 @@ function GmailSyncPanel({ onImported }) {
 
   const processEmail = async (email) => {
     const emailId = email.emailId;
-    // Only Financial Statements PDFs — skip invoice PDFs (Invoice #XXXXX)
     const pdfs = (email.attachments || []).filter(a => { const fn=(a.filename||"").toLowerCase(); return fn.endsWith(".pdf") && fn.includes("financial"); });
     if (!pdfs.length) {
-      setProcessing(p => ({ ...p, [emailId]:"✗ No PDF attachment found" }));
+      setProcessing(p => ({ ...p, [emailId]:"✗ No financial-statement PDF found" }));
       return;
     }
 
-    // Load pdf.js once up front if needed
     if (!window.pdfjsLib) {
       setProcessing(p => ({ ...p, [emailId]:"Loading PDF engine..." }));
       await new Promise((res, rej) => {
@@ -425,32 +796,24 @@ function GmailSyncPanel({ onImported }) {
       });
     }
 
-    // Process each financial PDF in this email (sometimes 2 arrive together e.g. March + April)
     const savedPeriods = [];
     try {
       for (let pi = 0; pi < pdfs.length; pi++) {
         const att = pdfs[pi];
         const label = pdfs.length > 1 ? ` (${pi+1}/${pdfs.length}: ${att.filename})` : "";
-
         setProcessing(p => ({ ...p, [emailId]:`Fetching PDF${label}...` }));
         const pdfBytes = await fetchAttachment(emailId, att.attachmentId, email.account_email, email.account_doc_id);
-
         setProcessing(p => ({ ...p, [emailId]:`Converting to images${label}...` }));
         const pages = await pdfToPages(pdfBytes, 30);
-
         setProcessing(p => ({ ...p, [emailId]:`Extracting financials (${pages.length} pages)${label}...` }));
         const extracted = await extractFinancials(pages);
-
-        // Determine period — try Claude extraction first, then filename, then subject
         let period = (extracted.period && /^\d{4}-\d{2}$/.test(extracted.period))
           ? extracted.period
           : extractMonthFromSubject(att.filename) || extractMonthFromSubject(email.emailSubject);
-
         if (!period) {
           setProcessing(p => ({ ...p, [emailId]:`✗ Could not determine period for ${att.filename}` }));
           continue;
         }
-
         const record = {
           ...extracted,
           period,
@@ -460,16 +823,13 @@ function GmailSyncPanel({ onImported }) {
           from: email.from,
           filename: att.filename,
         };
-
         setProcessing(p => ({ ...p, [emailId]:`Saving ${monthLabel(period)}...` }));
         const ok = await saveFinancial(period, record);
         if (!ok) throw new Error("Firestore write failed");
-
         await saveEmailProcessed(emailId, { period, filename: att.filename, subject: email.emailSubject });
         setProcessedIds(prev => new Set([...prev, emailId]));
         savedPeriods.push(period);
-      } // end for each PDF
-
+      }
       if (savedPeriods.length > 0) {
         setProcessing(p => ({ ...p, [emailId]:`✓ Saved ${savedPeriods.map(monthLabel).join(", ")}` }));
         onImported();
@@ -483,9 +843,7 @@ function GmailSyncPanel({ onImported }) {
 
   const processAll = async () => {
     const unprocessed = emails.filter(e => !processedIds.has(e.emailId) && (e.attachments||[]).some(a=>{ const fn=(a.filename||"").toLowerCase(); return fn.endsWith(".pdf") && fn.includes("financial"); }));
-    for (const email of unprocessed) {
-      await processEmail(email);
-    }
+    for (const email of unprocessed) await processEmail(email);
   };
 
   const unprocessedCount = emails.filter(e => !processedIds.has(e.emailId)).length;
@@ -531,21 +889,11 @@ function GmailSyncPanel({ onImported }) {
                 const isBusy = status && !isOk && !isErr;
                 return (
                   <tr key={email.emailId}>
-                    <td style={{ ...tblD, whiteSpace:"nowrap", color:T.textMuted }}>
-                      {email.emailDate ? new Date(email.emailDate).toLocaleDateString() : "—"}
-                    </td>
-                    <td style={{ ...tblD, maxWidth:280, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                      {email.emailSubject || "—"}
-                    </td>
+                    <td style={{ ...tblD, whiteSpace:"nowrap", color:T.textMuted }}>{email.emailDate ? new Date(email.emailDate).toLocaleDateString() : "—"}</td>
+                    <td style={{ ...tblD, maxWidth:280, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{email.emailSubject || "—"}</td>
                     <td style={{ ...tblD, color:T.textMuted, fontSize:11 }}>{email.from || "—"}</td>
-                    <td style={tblD}>
-                      {pdfs.length > 0
-                        ? <Badge text={pdfs[0].filename} color={T.blueText} bg={T.blueBg} />
-                        : <span style={{ color:T.textDim, fontSize:11 }}>No PDF</span>}
-                    </td>
-                    <td style={{ ...tblD, color:isOk?T.green:isErr?T.red:T.brand, fontSize:11 }}>
-                      {isBusy && <Spinner />} {status}
-                    </td>
+                    <td style={tblD}>{pdfs.length > 0 ? <Badge text={pdfs[0].filename} color={T.blueText} bg={T.blueBg} /> : <span style={{ color:T.textDim, fontSize:11 }}>No PDF</span>}</td>
+                    <td style={{ ...tblD, color:isOk?T.green:isErr?T.red:T.brand, fontSize:11 }}>{isBusy && <Spinner />} {status}</td>
                     <td style={tblD}>
                       {!alreadyDone && pdfs.length > 0 && !isBusy && (
                         <button onClick={() => processEmail(email)}
@@ -566,111 +914,46 @@ function GmailSyncPanel({ onImported }) {
         <div style={{ textAlign:"center", padding:"40px 20px", color:T.textMuted }}>
           <div style={{ fontSize:36, marginBottom:8 }}>📧</div>
           <div style={{ fontSize:13, fontWeight:600 }}>Search Gmail for AMP CPAs emails</div>
-          <div style={{ fontSize:11, marginTop:4 }}>Looks for PDF attachments from @ampcpas.com</div>
+          <div style={{ fontSize:11, marginTop:4 }}>Looks for "Financial Statements" PDFs from @ampcpas.com</div>
         </div>
       )}
     </div>
   );
 }
 
-// ─── Summary Table ────────────────────────────────────────────────────────────
-function SummaryTable({ records, onSelect }) {
-  const sorted = [...records].sort((a,b) => (b.period||"").localeCompare(a.period||""));
-  if (!sorted.length) return (
-    <div style={{ textAlign:"center", padding:"40px 20px", color:T.textMuted }}>
-      <div style={{ fontSize:36, marginBottom:8 }}>📋</div>
-      <div style={{ fontSize:13, fontWeight:600 }}>No audited financials yet</div>
-      <div style={{ fontSize:11, marginTop:4 }}>Use Gmail Sync to import monthly statements from AMP CPAs</div>
-    </div>
-  );
-
-  // Summary KPIs
-  const totRev = sorted.reduce((s,r) => s+(r.pl?.revenue||0), 0);
-  const totNet = sorted.reduce((s,r) => s+(r.pl?.net_income||0), 0);
-  const avgMargin = sorted.length
-    ? sorted.reduce((s,r) => { const rev=r.pl?.revenue||0; return s+(rev>0?(r.pl?.net_income||0)/rev*100:0); }, 0) / sorted.length
-    : 0;
-
-  return (
-    <div>
-      <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:20 }}>
-        {[
-          { label:"Total Revenue",  val:fmtK(totRev),          color:T.brand },
-          { label:"Total Net Income", val:fmtK(totNet),         color:totNet>=0?T.green:T.red },
-          { label:"Avg Net Margin", val:fmtPct(avgMargin),      color:avgMargin>=0?T.green:T.red },
-          { label:"Months on File", val:sorted.length+" months", color:T.text },
-        ].map(k => (
-          <div key={k.label} style={{ ...card, flex:1, minWidth:150 }}>
-            <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>{k.label}</div>
-            <div style={{ fontSize:22, fontWeight:800, color:k.color }}>{k.val}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ ...card, padding:0, overflow:"hidden" }}>
-        <table style={{ width:"100%", borderCollapse:"collapse" }}>
-          <thead>
-            <tr>
-              <th style={tblH}>Period</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Revenue</th>
-              <th style={{ ...tblH, textAlign:"right" }}>COGS</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Gross Profit</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Expenses</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Net Income</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Net %</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Total Assets</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Equity</th>
-              <th style={tblH}></th>
-            </tr>
-          </thead>
-          <tbody>
-            {sorted.map(r => {
-              const pl = r.pl || {};
-              const bs = r.balance_sheet || {};
-              const margin = pl.revenue > 0 ? (pl.net_income / pl.revenue) * 100 : 0;
-              return (
-                <tr key={r.id} style={{ cursor:"pointer" }} onClick={() => onSelect(r)}>
-                  <td style={{ ...tblD, fontWeight:600 }}>{monthLabel(r.period)}</td>
-                  <td style={tblDR}>{fmt(pl.revenue)}</td>
-                  <td style={{ ...tblDR, color:T.textMuted }}>{pl.cost_of_goods_sold ? fmt(pl.cost_of_goods_sold) : "—"}</td>
-                  <td style={{ ...tblDR, color:(pl.gross_profit||0)>=0?T.green:T.red }}>{fmt(pl.gross_profit)}</td>
-                  <td style={{ ...tblDR, color:T.red }}>{fmt(pl.operating_expenses)}</td>
-                  <td style={{ ...tblDR, fontWeight:700, color:(pl.net_income||0)>=0?T.green:T.red }}>{fmt(pl.net_income)}</td>
-                  <td style={{ ...tblDR, color:margin>=0?T.greenText:T.redText }}>{fmtPct(margin)}</td>
-                  <td style={tblDR}>{fmt(bs.total_assets)}</td>
-                  <td style={{ ...tblDR, color:T.green }}>{fmt(bs.equity)}</td>
-                  <td style={tblD}>
-                    <span style={{ fontSize:11, color:T.brand, fontWeight:600 }}>View →</span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
 // ─── Main Component ───────────────────────────────────────────────────────────
 function AuditedFinancialsTab() {
-  const [view, setView]         = useState("summary"); // summary | gmail
+  const [view, setView]         = useState("dashboard"); // dashboard | statements | chat | gmail
   const [records, setRecords]   = useState([]);
   const [loading, setLoading]   = useState(true);
   const [selected, setSelected] = useState(null);
+  const [loadErr, setLoadErr]   = useState("");
 
   const load = useCallback(async () => {
-    setLoading(true);
-    const data = await getFinancials();
-    setRecords(data);
+    setLoading(true); setLoadErr("");
+    try {
+      const data = await getFinancials();
+      setRecords(data);
+    } catch (e) {
+      setLoadErr(e.message || "Failed to load financials");
+    }
     setLoading(false);
   }, []);
 
   useEffect(() => { load(); }, [load]);
 
+  const handleDelete = async (rec) => {
+    if (!window.confirm(`Delete ${monthLabel(rec.period)} financials? This can't be undone.`)) return;
+    const ok = await deleteFinancial(rec.period);
+    if (ok) { setSelected(null); load(); }
+    else window.alert("Delete failed — check console");
+  };
+
   const views = [
-    { id:"summary", icon:"📋", label:"Financials",  count:records.length },
-    { id:"gmail",   icon:"📧", label:"Gmail Sync",  count:null },
+    { id:"dashboard",  icon:"📊", label:"Dashboard",  count:null },
+    { id:"statements", icon:"📋", label:"Statements", count:records.length },
+    { id:"chat",       icon:"💬", label:"Ask AI",     count:null },
+    { id:"gmail",      icon:"📧", label:"Gmail Sync", count:null },
   ];
 
   if (loading) return (
@@ -684,17 +967,20 @@ function AuditedFinancialsTab() {
     <div style={{ padding:"20px", maxWidth:1400, margin:"0 auto" }} className="fade-in">
       <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
 
-      {/* Header */}
-      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexWrap:"wrap", gap:10 }}>
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
           <span style={{ fontSize:18 }}>📋</span>
           <span style={{ fontSize:15, fontWeight:700, color:T.text }}>Audited Financials</span>
-          <span style={{ fontSize:11, color:T.textDim, marginLeft:4 }}>AMP CPAs</span>
+          <span style={{ fontSize:11, color:T.textDim, marginLeft:4 }}>AMP CPAs · {records.length} month(s)</span>
         </div>
-        <span style={{ fontSize:11, color:T.textMuted }}>Monthly CPA statements — auto-imported from Gmail</span>
+        <button onClick={load} title="Reload from Firestore"
+          style={{ padding:"6px 12px", borderRadius:T.radiusSm, border:`1px solid ${T.border}`, background:T.bgWhite, color:T.textMuted, fontSize:11, fontWeight:600, cursor:"pointer" }}>
+          🔄 Refresh
+        </button>
       </div>
 
-      {/* View tabs */}
+      {loadErr && <div style={{ marginBottom:12, padding:"10px 14px", background:T.redBg, color:T.red, borderRadius:T.radiusSm, fontSize:12 }}>⚠️ {loadErr}</div>}
+
       <div style={{ display:"flex", gap:6, marginBottom:20, flexWrap:"wrap" }}>
         {views.map(v => (
           <button key={v.id} onClick={() => setView(v.id)} style={{
@@ -707,17 +993,17 @@ function AuditedFinancialsTab() {
           }}>
             <span>{v.icon}</span>
             <span>{v.label}</span>
-            {v.count!=null && (
-              <span style={{ padding:"1px 6px", borderRadius:10, fontSize:9, fontWeight:700, color:view===v.id?"rgba(255,255,255,0.9)":T.blueText, background:view===v.id?"rgba(255,255,255,0.2)":T.blueBg }}>{v.count}</span>
-            )}
+            {v.count!=null && <span style={{ padding:"1px 6px", borderRadius:10, fontSize:9, fontWeight:700, color:view===v.id?"rgba(255,255,255,0.9)":T.blueText, background:view===v.id?"rgba(255,255,255,0.2)":T.blueBg }}>{v.count}</span>}
           </button>
         ))}
       </div>
 
-      {view === "summary" && <SummaryTable records={records} onSelect={setSelected} />}
-      {view === "gmail"   && <GmailSyncPanel onImported={load} />}
+      {view === "dashboard"  && <Dashboard records={records} onSelect={setSelected} />}
+      {view === "statements" && <StatementsList records={records} onSelect={setSelected} />}
+      {view === "chat"       && <AIChat records={records} />}
+      {view === "gmail"      && <GmailSyncPanel onImported={load} />}
 
-      {selected && <DetailModal record={selected} onClose={() => setSelected(null)} />}
+      {selected && <DetailModal record={selected} onClose={() => setSelected(null)} onDelete={handleDelete} />}
     </div>
   );
 }
