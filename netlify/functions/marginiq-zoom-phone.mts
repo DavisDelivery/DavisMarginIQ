@@ -66,7 +66,7 @@ async function getUserCalls(token: string, userId: string, from: string, to: str
     }
     records.push(...(d.call_logs || d.call_history || d.records || []));
     npt = d.next_page_token || "";
-    if (++pages >= 20) break;
+    if (++pages >= 50) break;
   } while (npt);
   return records;
 }
@@ -226,6 +226,36 @@ export default async (req: Request, _ctx: Context) => {
       } catch(e: any) { console.warn("[zoom-phone] cache read:", e?.message); }
     }
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
+  }
+
+  // ── Debug: show employee distribution after dedup ───────────────────────
+  if (action === "debug-employees") {
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
+    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
+    const fromMs = new Date(from + "T00:00:00Z").getTime();
+    const toMs   = new Date(to   + "T23:59:59Z").getTime();
+    const allRecs: any[] = [];
+    for (const doc of userDocs) {
+      for (const r of (doc.records || [])) {
+        const ms = new Date(r.date).getTime();
+        if (ms >= fromMs && ms <= toMs) allRecs.push(r);
+      }
+    }
+    // Count by answeredBy BEFORE dedup
+    const beforeDedup: Record<string, number> = {};
+    allRecs.forEach((r:any) => { beforeDedup[r.answeredBy||"(blank)"] = (beforeDedup[r.answeredBy||"(blank)"]||0) + 1; });
+    // After dedup
+    const deduped = dedupeByCall(allRecs);
+    const afterDedup: Record<string, number> = {};
+    deduped.forEach((r:any) => { afterDedup[r.answeredBy||"(blank)"] = (afterDedup[r.answeredBy||"(blank)"]||0) + 1; });
+    return new Response(JSON.stringify({
+      from, to,
+      totalLegs: allRecs.length,
+      uniqueCalls: deduped.length,
+      beforeDedup,
+      afterDedup,
+      sampleJessica: allRecs.filter((r:any)=>r.answeredBy==="Jessica Sage").slice(0,3),
+    }), { headers: CORS });
   }
 
   // ── Debug: show what's in Firebase cache for each user ──────────────────
