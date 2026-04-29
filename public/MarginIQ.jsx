@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.47.0";
+const APP_VERSION = "2.47.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2826,10 +2826,10 @@ function detectFileType(filename, firstRow) {
   if (fn.startsWith("das") || fn.startsWith("das ")) return "original";
   // NuVizz family
   if (fn.includes("driver_stops") || fn.includes("driver stops") || fn.includes("nuvizz")) return "nuvizz";
-  // Time clock / SENTINEL
-  if (fn.includes("sentinel") || fn.includes("timeclock") || fn.includes("time_clock") || fn.includes("b600") || fn.includes("punch")) return "timeclock";
+  // Time clock / SENTINEL — accept space, underscore, hyphen, or no separator
+  if (/sentinel|time[\s_-]?clock|timeclock|b600|punch/i.test(fn)) return "timeclock";
   // Payroll (CyberPay)
-  if (fn.includes("cyberpay") || fn.includes("payroll") || fn.includes("paydetail") || fn.includes("pay_detail") || fn.includes("pay_register") || fn.includes("payregister")) return "payroll";
+  if (/cyberpay|payroll|pay[\s_-]?detail|paydetail|pay[\s_-]?register|payregister/i.test(fn)) return "payroll";
   // QBO
   if (fn.includes("profit") && fn.includes("loss")) return "qbo_pl";
   if (fn.includes("p&l") || fn.includes("p_l")) return "qbo_pl";
@@ -3323,13 +3323,17 @@ function auditFilenames(files) {
       suggestedRename = name.replace(m[0], `${s}-${e}`);
     } else {
       // No date range found. Some file types legitimately don't have one (DDIS
-      // files, dispute logs, PDF backups) — those aren't "unparsed", they just
-      // don't need a week-ending. Only flag as unparsed if we can't otherwise
-      // classify the file.
+      // files, dispute logs, PDF backups, time clock CSVs, payroll exports,
+      // QBO statements) — those aren't "unparsed", they just don't need a
+      // week-ending. Only flag as unparsed if we can't otherwise classify
+      // the file.
       const hasDdisName = /^ddis820|\bddis\b/i.test(lower);
       const hasDisputeName = /dispute/i.test(name);
       const hasNuVizzName = /nuvizz|driver.?stops/i.test(name);
-      if (hasDdisName || hasDisputeName || hasNuVizzName || isPdf) parseStatus = "no-date-ok";
+      const hasTimeClockName = /sentinel|time[\s_-]?clock|timeclock|b600|punch/i.test(name);
+      const hasPayrollName = /cyberpay|payroll|pay[\s_-]?detail|paydetail|pay[\s_-]?register|payregister/i.test(name);
+      const hasQboName = /profit.+loss|p&l|p_l|trial[\s_-]?balance|tb_|general[\s_-]?ledger|_gl_|quickbooks|qbo_/i.test(name);
+      if (hasDdisName || hasDisputeName || hasNuVizzName || hasTimeClockName || hasPayrollName || hasQboName || isPdf) parseStatus = "no-date-ok";
       else parseStatus = "unparsed";
     }
 
@@ -3344,6 +3348,10 @@ function auditFilenames(files) {
     else if (isBackup || isInvoicePdf) kind = "pdf-backup";
     else if (isPdf) kind = "pdf-other";
     else if (/^ddis820|\bddis\b/i.test(lower)) kind = "ddis";
+    else if (/sentinel|time[\s_-]?clock|timeclock|b600|punch/i.test(name)) kind = "timeclock";
+    else if (/cyberpay|payroll|pay[\s_-]?detail|paydetail|pay[\s_-]?register|payregister/i.test(name)) kind = "payroll";
+    else if (/profit.+loss|p&l|p_l|trial[\s_-]?balance|tb_|general[\s_-]?ledger|_gl_|quickbooks|qbo_/i.test(name)) kind = "qbo";
+    else if (/nuvizz|driver.?stops/i.test(name)) kind = "nuvizz";
     else if (isAccessorial) kind = "accessorial";
     else kind = "original";
 
