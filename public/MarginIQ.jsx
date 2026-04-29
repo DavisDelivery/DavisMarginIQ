@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.45.0";
+const APP_VERSION = "2.46.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3686,12 +3686,54 @@ async function serverSaveNuVizzStops(stops, source, onStatus) {
 }
 
 // ─── NuVizz Parser ──────────────────────────────────────────
-// Columns: Delivery End, Stop Number, Stop Status, Driver Name,
-//          Ship To Name, Ship To, Ship To - City, Ship To - Zip Code, Stop SealNbr
+// Captures stop-level data from the NuVizz manifest export.
+// As of v2.46.0 every CSV column is preserved verbatim under the `raw` field
+// — addresses, weights, accessorial codes, schedule windows, etc. — so future
+// analytics (mileage calc, on-time, etc.) don't require a re-ingest.
+// Known columns historically: Delivery End, Delivery Start, Stop Number,
+// Stop Status, Driver Name, Ship To Name, Ship To, Ship To - City,
+// Ship To - Zip Code, Stop SealNbr. NuVizz is free to add more — we capture
+// whatever's there.
 // "Stop SealNbr" is the base dollar amount used to calculate contractor pay.
 // 1099 contractors get 40% of SealNbr per stop. W2 drivers are paid hourly (CyberPay).
 // Driver W2/1099 classification lives in Fleet Management.
 const CONTRACTOR_PAY_PCT = 0.40;
+
+// Like parseDateMDYFlexible but preserves time-of-day when present.
+// Returns YYYY-MM-DD if no time in source, or YYYY-MM-DDTHH:MM:SS if time
+// component is included. Handles Excel serial fractions (where the
+// fractional part encodes time) AND string formats with 12/24-hour clock.
+function parseDateTimeMDYFlexible(s) {
+  if (s == null || s === "") return null;
+  if (typeof s === "number" && isFinite(s)) {
+    const ms = Math.round((s - 25569) * 86400 * 1000);
+    const d = new Date(ms);
+    if (isNaN(d)) return null;
+    const y = d.getUTCFullYear();
+    const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    const hh = String(d.getUTCHours()).padStart(2, "0");
+    const mi = String(d.getUTCMinutes()).padStart(2, "0");
+    const ss = String(d.getUTCSeconds()).padStart(2, "0");
+    // If serial has no fractional part, return date-only
+    const hasTime = (hh !== "00" || mi !== "00" || ss !== "00");
+    return hasTime ? `${y}-${mo}-${dd}T${hh}:${mi}:${ss}` : `${y}-${mo}-${dd}`;
+  }
+  const str = String(s).trim();
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?)?/);
+  if (!m) return null;
+  let [, mo, d, y, hh, mi, ss, ampm] = m;
+  if (y.length === 2) y = (parseInt(y) >= 70 ? "19" : "20") + y;
+  const datePart = `${y}-${mo.padStart(2,"0")}-${d.padStart(2,"0")}`;
+  if (!hh) return datePart;
+  let h = parseInt(hh);
+  if (ampm) {
+    const isPM = /pm/i.test(ampm);
+    if (isPM && h < 12) h += 12;
+    else if (!isPM && h === 12) h = 0;
+  }
+  return `${datePart}T${String(h).padStart(2,"0")}:${mi}:${ss || "00"}`;
+}
 
 function parseNuVizz(rows) {
   const stops = [];
@@ -3699,7 +3741,17 @@ function parseNuVizz(rows) {
     const stopNum = r["stop number"];
     const driver = r["driver name"];
     if (!stopNum && !driver) continue; // skip blank rows
-    const deliveryDate = parseDateMDYFlexible(r["delivery end"]);
+    // Datetime parse — preserves time-of-day for delivery-window analysis
+    const deliveryEndDt   = parseDateTimeMDYFlexible(r["delivery end"]);
+    const deliveryStartDt = parseDateTimeMDYFlexible(r["delivery start"]);
+    // delivery_date stays date-only (YYYY-MM-DD) for backwards compat with
+    // existing readers (week rollups, recon, etc.)
+    const deliveryDate = deliveryEndDt
+      ? deliveryEndDt.slice(0, 10)
+      : (deliveryStartDt ? deliveryStartDt.slice(0, 10) : null);
+    // Only emit *_at fields when an actual time component was found
+    const hasEndTime   = !!(deliveryEndDt   && deliveryEndDt.includes("T"));
+    const hasStartTime = !!(deliveryStartDt && deliveryStartDt.includes("T"));
     const status = r["stop status"] ? String(r["stop status"]).trim() : null;
     const shipTo = r["ship to name"] ? String(r["ship to name"]).trim() : null;
     const city = r["ship to - city"] ? String(r["ship to - city"]).trim() : null;
@@ -3712,6 +3764,8 @@ function parseNuVizz(rows) {
       pro,
       driver_name: normalizeName(driver),
       delivery_date: deliveryDate,
+      delivery_end_at:   hasEndTime   ? deliveryEndDt   : null,
+      delivery_start_at: hasStartTime ? deliveryStartDt : null,
       week_ending: deliveryDate ? weekEndingFriday(deliveryDate) : null,
       month: deliveryDate ? dateToMonth(deliveryDate) : null,
       status,
@@ -3719,6 +3773,9 @@ function parseNuVizz(rows) {
       city, zip,
       contractor_pay_base: payBase,         // raw $ from SealNbr column
       contractor_pay_at_40: contractorPay,  // 40% — actual cost IF driver is 1099
+      raw: r,                               // v2.46.0: every CSV column verbatim — for
+                                            //         addresses (mileage), weight,
+                                            //         accessorial codes, schedule windows
     });
   }
   return stops;

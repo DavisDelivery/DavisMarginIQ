@@ -429,17 +429,17 @@ export default async (req: Request, _context: Context) => {
       prefixCounts[prefix] = (prefixCounts[prefix] || 0) + 1;
 
       const weekEnding = weekEndingFriday(delivDate);
+      // v2.46.0: pass through every field the client sent (including `raw`,
+      // delivery_end_at, delivery_start_at, and any future additions),
+      // then override with server-canonical/derived fields. This means we
+      // don't have to update this function every time we add a stop attribute.
       const fields: Record<string, any> = {
+        ...s,
         stop_number: stopNum,
         pro: docId,
-        driver_name: s.driver_name || null,
         delivery_date: delivDate,
         week_ending: weekEnding,
         month: weekEnding ? dateToMonth(weekEnding) : null,
-        status: s.status || null,
-        ship_to: s.ship_to || null,
-        city: s.city || null,
-        zip: s.zip || null,
         contractor_pay_base: payBase,
         contractor_pay_at_40: Math.round(payBase * CONTRACTOR_PAY_PCT * 10000) / 10000,
       };
