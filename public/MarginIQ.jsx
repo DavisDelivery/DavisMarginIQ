@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.42.3";
+const APP_VERSION = "2.42.4";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10409,6 +10409,7 @@ function MarginIQ() {
     { id:"ingest", icon:"📤", label:"Data Ingest" },
     { id:"gmail", icon:"📧", label:"Gmail Sync" },
     { id:"runsheet", icon:"📋", label:"Run Sheet" },
+    { id:"qbo", icon:"📊", label:"QuickBooks" },
     { id:"costs", icon:"⚙️", label:"Costs" },
     { id:"phone", icon:"📞", label:"Phone Calls" },
     { id:"settings", icon:"🔧", label:"Settings" },
@@ -10448,6 +10449,7 @@ function MarginIQ() {
     {!loading && tab==="datahub" && (typeof window !== "undefined" && window.DataHubTab ? React.createElement(window.DataHubTab) : <EmptyState icon="🗄️" title="Data Hub module not loaded" sub="DataHubTab.jsx did not load. Check console." />)}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
+    {!loading && tab==="qbo" && (typeof window !== "undefined" && window.QBOImportTab ? React.createElement(window.QBOImportTab) : <EmptyState icon="📊" title="QuickBooks module not loaded" sub="QBOImportTab.jsx did not load. Check console." />)}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
     {!loading && tab==="phone" && <ZoomPhoneTab />}
     {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} onRefresh={refreshData} setTab={setTab} />}
