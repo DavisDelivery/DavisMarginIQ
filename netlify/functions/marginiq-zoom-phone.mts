@@ -157,18 +157,13 @@ export default async (req: Request, _ctx: Context) => {
     const users = await getPhoneUsers(token);
     console.log(`[zoom-phone] ${users.length} phone users: ${users.map(u=>u.name).join(", ")}`);
 
-    // Fetch all users concurrently (max 10 at a time to avoid rate limits)
-    const BATCH = 10;
+    // Fetch users sequentially with small delay to avoid Zoom rate limits
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
     const allRecords: any[] = [];
-    for (let i = 0; i < users.length; i += BATCH) {
-      const batch = users.slice(i, i + BATCH);
-      const results = await Promise.all(
-        batch.map(async user => {
-          const recs = await getUserCallHistory(token, user.id, from, to, dir);
-          return recs.map(r => normalize(r, user));
-        })
-      );
-      results.forEach(recs => allRecords.push(...recs));
+    for (let i = 0; i < users.length; i++) {
+      if (i > 0) await sleep(300); // 300ms between requests = ~3 req/sec well under limit
+      const recs = await getUserCallHistory(token, users[i].id, from, to, dir);
+      allRecords.push(...recs.map(r => normalize(r, users[i])));
     }
 
     // Deduplicate by call_id (same call can appear in multiple users' logs if transferred)
