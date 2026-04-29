@@ -27,6 +27,11 @@ const VENDOR_QUERIES: Record<string, string> = {
   // Locked to sender only — loose text matching pulls unrelated docs
   quickfuel: 'from:ebilling@4flyers.com has:attachment',
 
+  // AMP CPAs: monthly audited financials (P&L, Balance Sheet, Cash Flow).
+  // Subject always contains the month + year (e.g. "March 2025").
+  // PDF attachment from any sender at ampcpas.com.
+  ampcpas: 'from:@ampcpas.com has:attachment filename:pdf',
+
   // v2.40.2: billing@ → Uline. Only emails billing@davisdelivery.com sent
   // out to an @uline.com recipient, with an attachment. Focuses on outbound
   // correspondence to Uline (disputes, corrections, POD replies, reshipments,
