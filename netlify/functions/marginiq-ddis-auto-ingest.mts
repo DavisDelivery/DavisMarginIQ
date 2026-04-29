@@ -3,19 +3,19 @@ import type { Context, Config } from "@netlify/functions";
 /**
  * Davis MarginIQ — DDIS Email Auto-Ingest (v2.42.11)
  *
- * Scheduled function that runs Monday morning, looks for the most recent
+ * Scheduled function that runs Sunday evening, looks for the most recent
  * unprocessed Uline DDIS820 payment-remittance CSV email in any connected
  * Gmail account, downloads the attachment, parses it, and dispatches
  * through the existing marginiq-ddis-ingest endpoint.
  *
- * Why Monday morning: Uline DDIS remittances arrive throughout the week
- * (typically Mon/Wed/Fri) as APFreight settlements clear. Running Monday
- * 8am ET catches anything posted Fri-Sun, then subsequent runs catch the
- * rest as they arrive. Idempotency means daily runs are also safe.
+ * Why Sunday evening: catches anything posted Mon-Fri the prior week plus
+ * any weekend remittances. Running 6pm Sunday gives Chad fresh data for
+ * Monday morning planning. Idempotency means accidental multiple runs
+ * are safe.
  *
- * Schedule: cron `0 12,13 * * 1` (Mon 12:00 UTC + 13:00 UTC).
- *   - 12:00 UTC = 8am EDT (Mar–Nov)
- *   - 13:00 UTC = 8am EST (Nov–Mar)
+ * Schedule: cron `0 22,23 * * 0` (Sun 22:00 UTC + 23:00 UTC).
+ *   - 22:00 UTC = 6pm EDT (Mar–Nov)
+ *   - 23:00 UTC = 6pm EST (Nov–Mar)
  * Same DST-aware double-fire pattern as the B600 + NuVizz schedules.
  *
  * Process (parallels marginiq-nuvizz-auto-ingest.mts v2.42.10):
@@ -633,9 +633,13 @@ export default async (req: Request, _context: Context) => {
   }
 };
 
-// Schedule: Monday at 12:00 UTC AND 13:00 UTC. Same DST-aware double-fire
-// pattern as B600 (Sun) and NuVizz (Sun) schedules. Idempotency via the
+// Schedule: Sunday at 22:00 UTC AND 23:00 UTC. Same DST-aware double-fire
+// pattern as B600 (Sat) and NuVizz (Sun) schedules. Idempotency via the
 // ddis_processed_emails collection makes the duplicate run a no-op.
+//   - 22:00 UTC = 6pm EDT (Mar–Nov, daylight time)
+//   - 23:00 UTC = 6pm EST (Nov–Mar, standard time)
+// Sunday-evening run sequencing: comes after NuVizz (Sun 8am ET) so the
+// week's stops are in Firestore before any audit math touches them.
 export const config: Config = {
-  schedule: "0 12,13 * * 1",
+  schedule: "0 22,23 * * 0",
 };

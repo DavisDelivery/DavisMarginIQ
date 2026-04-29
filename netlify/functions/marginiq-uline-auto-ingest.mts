@@ -30,12 +30,17 @@ import { gzipSync } from "node:zlib";
  * after attachments are successfully staged. Subsequent runs skip
  * already-processed messages.
  *
- * Schedule: cron `0 13,14 * * 1` (Mon 13:00 UTC + 14:00 UTC).
- *   - 13:00 UTC = 9am EDT (Mar–Nov)
- *   - 14:00 UTC = 9am EST (Nov–Mar)
- * Runs an hour after DDIS auto-ingest (which is at 12,13 * * 1) so DDIS
- * payment data is in Firestore first — the manual DAS upload's audit
- * math depends on it.
+ * Schedule: cron `0 3,4 * * 4` (Thu 03:00 UTC + 04:00 UTC = Wed 11pm ET).
+ *   - 03:00 UTC Thu = 11pm EDT Wed (Mar–Nov)
+ *   - 04:00 UTC Thu = 11pm EST Wed (Nov–Mar)
+ * Cron weekday is 4 (Thursday) not 3 (Wednesday) because the UTC moment
+ * has already crossed midnight when we fire — using weekday=3 would
+ * delay the run by 24 hours.
+ *
+ * Wednesday-night cadence gives Chad time to review staged files Thursday
+ * morning and click Load before end of week. The audit math invoked on
+ * Load depends on DDIS payment data — Sunday-evening DDIS auto-ingest
+ * has already landed the prior week's payments by then.
  *
  * Manual trigger: GET /.netlify/functions/marginiq-uline-auto-ingest
  *   ?dry_run=1 — preview without staging
@@ -467,9 +472,17 @@ export default async (req: Request, _context: Context) => {
   }
 };
 
-// Schedule: Monday 13:00 UTC + 14:00 UTC. DST-aware double-fire pattern.
-// Sequenced to run AFTER DDIS (12,13 UTC) so payment data is in Firestore
-// before any DAS file gets manually loaded — the audit math depends on it.
+// Schedule: Wednesday 11pm ET → fires Thursday early UTC. DST-aware.
+//   - 03:00 UTC Thu = 11pm EDT Wed (Mar–Nov)
+//   - 04:00 UTC Thu = 11pm EST Wed (Nov–Mar)
+// Cron weekday = 4 (Thursday) NOT 3 (Wednesday) because the UTC time has
+// already rolled past midnight by the time we fire. Setting weekday=3
+// would fire 24 hours late.
+//
+// Wednesday evening cadence: gives Chad time to review staged DAS files
+// Thursday morning and click Load before end of week. The audit math
+// invoked on Load depends on DDIS payment data — Sunday's DDIS auto-ingest
+// (the prior week's payments) is already in Firestore by Wednesday.
 export const config: Config = {
-  schedule: "0 13,14 * * 1",
+  schedule: "0 3,4 * * 4",
 };
