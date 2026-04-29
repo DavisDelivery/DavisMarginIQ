@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.43.4";
+const APP_VERSION = "2.45.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -4856,6 +4856,83 @@ function LaborReality({ margins }) {
   );
 }
 
+function AuditedKpiStrip({ setTab }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      if (!hasFirebase) { setLoading(false); return; }
+      try {
+        const s = await window.db.collection("audited_financials").limit(60).get();
+        const records = s.docs.map(d => ({ id: d.id, period: d.id, ...d.data() }))
+          .filter(r => r.pl)
+          .sort((a,b) => (b.period||"").localeCompare(a.period||""));
+        if (records.length === 0) { setData({ empty: true }); setLoading(false); return; }
+        const latest = records[0];
+        const previous = records[1] || null;
+        const ttm = records.slice(0, 12);
+        const ttmRev = ttm.reduce((s,r) => s + (r.pl?.revenue||0), 0);
+        const ttmNet = ttm.reduce((s,r) => s + (r.pl?.net_income||0), 0);
+        const ttmMargin = ttmRev > 0 ? (ttmNet/ttmRev) * 100 : 0;
+        const latestNet = latest.pl?.net_income || 0;
+        const previousNet = previous?.pl?.net_income || 0;
+        const momChange = previous && previousNet !== 0 ? ((latestNet - previousNet) / Math.abs(previousNet)) * 100 : null;
+        setData({ records, latest, previous, ttm, ttmRev, ttmNet, ttmMargin, latestNet, previousNet, momChange });
+      } catch (e) { console.error("AuditedKpiStrip load err:", e); }
+      setLoading(false);
+    })();
+  }, []);
+
+  if (loading) return null;
+
+  if (data?.empty) {
+    return (
+      <div style={{...cardStyle, background:T.bgSurface, borderLeft:`3px solid ${T.textDim}`, marginBottom:12}}>
+        <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", gap:8, flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontSize:13, fontWeight:700, marginBottom:4}}>📋 Audited Financials</div>
+            <div style={{fontSize:11, color:T.textMuted}}>No CPA-audited statements imported yet. Connect Gmail Sync to pull from @ampcpas.com.</div>
+          </div>
+          <button onClick={() => setTab("gmail")} style={{padding:"6px 14px", borderRadius:8, border:`1px solid ${T.brand}`, background:"transparent", color:T.brand, fontSize:12, fontWeight:600, cursor:"pointer"}}>Connect →</button>
+        </div>
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  const marginColor = data.ttmMargin >= 20 ? T.green : data.ttmMargin >= 10 ? T.yellow : T.red;
+  const momColor = data.momChange == null ? T.textMuted : data.momChange >= 0 ? T.green : T.red;
+  const momSign = data.momChange != null && data.momChange >= 0 ? "+" : "";
+  const latestLabel = (() => {
+    const parts = (data.latest.period||"").split("-");
+    if (parts.length < 2) return data.latest.period||"—";
+    const months = ["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    return months[parseInt(parts[1])||0] + " " + parts[0];
+  })();
+
+  return (
+    <div style={{...cardStyle, borderLeft:`3px solid ${T.green}`, marginBottom:12}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8, marginBottom:10}}>
+        <div>
+          <div style={{fontSize:13, fontWeight:700, display:"flex", alignItems:"center", gap:6}}>
+            📋 Audited Financials
+            <span style={{fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:10, background:T.green, color:"#fff"}}>AUDITED</span>
+          </div>
+          <div style={{fontSize:10, color:T.textMuted, marginTop:2}}>TTM ({data.ttm.length} months) · latest: {latestLabel}</div>
+        </div>
+        <button onClick={() => setTab("audited")} style={{padding:"6px 12px", borderRadius:8, border:`1px solid ${T.border}`, background:"transparent", color:T.text, fontSize:11, fontWeight:600, cursor:"pointer"}}>Details →</button>
+      </div>
+      <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10}}>
+        <KPI label="TTM Revenue"    value={fmtK(data.ttmRev)} sub={`${data.records.length} mo audited`} subColor={T.brand} />
+        <KPI label="TTM Net Income" value={fmtK(data.ttmNet)} subColor={data.ttmNet>=0?T.green:T.red} />
+        <KPI label="TTM Margin"     value={fmtPct(data.ttmMargin)} sub="net income / revenue" subColor={marginColor} />
+        <KPI label={`${latestLabel} Net`} value={fmtK(data.latestNet)} sub={data.momChange != null ? `${momSign}${fmtPct(data.momChange)} MoM` : "—"} subColor={momColor} />
+      </div>
+    </div>
+  );
+}
+
 function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, reconMeta, connections, setTab }) {
   const m = margins;
   const marginColor = m.dailyMarginPct >= 30 ? T.green : m.dailyMarginPct >= 20 ? T.yellow : T.red;
@@ -4903,6 +4980,8 @@ function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, rec
       title="Scanning KPIs + data completeness for anomalies."
       compact
     />
+
+    <AuditedKpiStrip setTab={setTab} />
 
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
       <KPI icon="💰" label="Daily Revenue" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.annualRevenue)}/yr projected`} subColor={T.green} />
@@ -10398,10 +10477,13 @@ function MarginIQ() {
 
   const tabs = [
     { id:"command", icon:"🎯", label:"Command" },
+    { id:"audited", icon:"📋", label:"Audited" },
+    { id:"customers", icon:"📊", label:"Customers" },
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
     { id:"nvrecon", icon:"🔄", label:"Uline↔NuVizz" },
     { id:"drivers", icon:"👥", label:"Drivers" },
+    { id:"drivers-perf", icon:"🏁", label:"Driver Perf" },
     { id:"timeclock", icon:"⏰", label:"Time Clock" },
     { id:"fuel", icon:"⛽", label:"Fuel" },
     { id:"completeness", icon:"✅", label:"Data Health" },
@@ -10437,6 +10519,9 @@ function MarginIQ() {
       <div style={{fontSize:14,fontWeight:600}}>Loading MarginIQ...</div>
     </div>}
     {!loading && tab==="command" && <CommandCenter margins={margins} weeklyRollups={weeklyRollups} completeness={completeness} qboConnected={qboConnected} reconMeta={reconMeta} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
+    {!loading && tab==="audited" && (typeof window !== "undefined" && window.AuditedFinancialsTab ? React.createElement(window.AuditedFinancialsTab) : <EmptyState icon="📋" title="Audited Financials module not loaded" sub="AuditedFinancialsTab.jsx did not load. Check console." />)}
+    {!loading && tab==="customers" && (typeof window !== "undefined" && window.CustomerAnalysisTab ? React.createElement(window.CustomerAnalysisTab) : <EmptyState icon="📊" title="Customer Analysis module not loaded" sub="CustomerAnalysisTab.jsx did not load. Check console." />)}
+    {!loading && tab==="drivers-perf" && (typeof window !== "undefined" && window.DriverPerformanceTab ? React.createElement(window.DriverPerformanceTab) : <EmptyState icon="🏁" title="Driver Performance module not loaded" sub="DriverPerformanceTab.jsx did not load. Check console." />)}
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
     {!loading && tab==="recon" && <Audit reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
     {!loading && tab==="nvrecon" && <UlineNuVizzRecon weeklyRollups={weeklyRollups} />}
