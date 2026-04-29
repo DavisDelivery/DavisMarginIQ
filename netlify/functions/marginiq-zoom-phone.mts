@@ -289,6 +289,28 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
   }
 
+  // ── Debug: pull RAW Zoom data for one user (bypasses normalize) ──────────
+  if (action === "debug-zoomraw") {
+    const userId = u.searchParams.get("userId") || "UgG02EaxRauMiyuJ4Hixag"; // Jessica
+    const dFrom  = u.searchParams.get("from") || new Date(Date.now()-2*86400000).toISOString().split("T")[0];
+    const dTo    = u.searchParams.get("to")   || new Date().toISOString().split("T")[0];
+    const token  = await getToken(ACCT, CID, CSEC);
+    const url    = `${API}/phone/users/${userId}/call_history?from=${dFrom}&to=${dTo}&page_size=5`;
+    const res    = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+    const d: any = await res.json();
+    if (!res.ok) return new Response(JSON.stringify({error: d.message, status: res.status}), { headers: CORS });
+    const records = d.call_logs || d.call_history || d.records || [];
+    return new Response(JSON.stringify({
+      userId,
+      from: dFrom, to: dTo,
+      totalReturned: records.length,
+      // Top-level fields
+      topLevelKeys: records[0] ? Object.keys(records[0]) : [],
+      // First 3 raw records UNTOUCHED
+      rawSample: records.slice(0, 3),
+    }), { headers: CORS });
+  }
+
   // ── Debug: dump raw cached records for one user ─────────────────────────
   if (action === "debug-userraw") {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
