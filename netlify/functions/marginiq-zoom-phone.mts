@@ -289,6 +289,44 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
   }
 
+  // ── Debug: pull raw record for a specific call_path_id ──────────────────
+  // Shows EVERY leg of one call so we can see actual field values
+  if (action === "debug-rawcall") {
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
+    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
+    // Find a call_path_id that appears in BOTH Brandi and Jessica's caches
+    const pathToLegs = new Map<string, any[]>();
+    for (const doc of userDocs) {
+      for (const r of (doc.records || [])) {
+        if (!r.callPathId) continue;
+        if (!pathToLegs.has(r.callPathId)) pathToLegs.set(r.callPathId, []);
+        pathToLegs.get(r.callPathId)!.push({ ...r, _ownerCache: doc.name });
+      }
+    }
+    // Find calls that appear in 3+ different user caches (queue rang multiple)
+    const multi = Array.from(pathToLegs.entries())
+      .filter(([_, legs]) => {
+        const owners = new Set(legs.map(l => l._ownerCache));
+        return owners.size >= 2;
+      })
+      .slice(0, 5);
+    return new Response(JSON.stringify({
+      sampleCallsWithMultipleRingers: multi.map(([path, legs]) => ({
+        callPathId: path,
+        legCount: legs.length,
+        legs: legs.map(l => ({
+          ownerCache: l._ownerCache,
+          answeredBy: l.answeredBy,
+          result: l.result,
+          talkTime: l.talkTime,
+          calleeType: l.calleeType,
+          isHumanLeg: l.isHumanLeg,
+          date: l.date,
+        })),
+      })),
+    }), { headers: CORS });
+  }
+
   // ── Debug: show employee distribution after dedup ───────────────────────
   if (action === "debug-employees") {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
