@@ -139,7 +139,7 @@ function chunkPayload(
   return chunks;
 }
 
-export default async (req: Request, _context: Context) => {
+export default async (req: Request, context: Context) => {
   if (!FIREBASE_API_KEY) {
     return new Response(JSON.stringify({ error: "FIREBASE_API_KEY not configured" }), {
       status: 500,
@@ -205,14 +205,24 @@ export default async (req: Request, _context: Context) => {
 
   // Fire BG with a tiny payload — just the run_id. The BG reads the
   // staged chunks back from Firestore.
+  //
+  // v2.42.17: wrap in context.waitUntil so Lambda keeps the runtime alive
+  // long enough for the BG-fire fetch to complete its handoff. Bare
+  // fire-and-forget `fetch().catch()` was being killed when the parent
+  // function returned 202 — the BG never received the trigger. Same fix
+  // we used in the NuVizz dispatcher (v2.41.17). The trigger payload
+  // here is ~80 bytes (just { run_id }) so it's well under Lambda's
+  // 256 KB async-invocation body limit.
   const bgUrl = `${url.origin}/.netlify/functions/marginiq-ddis-ingest-background`;
-  fetch(bgUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ run_id: runId }),
-  }).catch((e) => {
-    console.error("ddis-ingest dispatch: background fetch failed", e?.message || String(e));
-  });
+  context.waitUntil(
+    fetch(bgUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId }),
+    }).catch((e) => {
+      console.error("ddis-ingest dispatch: background fetch failed", e?.message || String(e));
+    })
+  );
 
   return new Response(
     JSON.stringify({
