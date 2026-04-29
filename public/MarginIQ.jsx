@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.43.0";
+const APP_VERSION = "2.42.7";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2293,7 +2293,6 @@ function GmailSync({ onRefresh }) {
           { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
           { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from ebilling@4flyers.com", color:"#2563eb", mode:"quickfuel" },
           { key:"billing_sent", icon:"📤", label:"Billing@ → Uline", desc:"Emails billing@davisdelivery.com sent to any @uline.com recipient with an attachment. Disputes, corrections, POD replies, reshipments — outbound Uline correspondence only.", color:"#8b5cf6", mode:"per-attachment", accountFilter:"billing@davisdelivery.com" },
-          { key:"ampcpas", icon:"📋", label:"AMP CPAs", desc:"Monthly audited financials (P&L, Balance Sheet, Cash Flow) — PDF attachments from @ampcpas.com. Imported via Audited Financials tab.", color:"#0d9488", mode:"per-attachment" },
         ].map(v => {
           const r = results[v.key];
           const isLoading = loading[v.key];
@@ -10410,9 +10409,6 @@ function MarginIQ() {
     { id:"ingest", icon:"📤", label:"Data Ingest" },
     { id:"gmail", icon:"📧", label:"Gmail Sync" },
     { id:"runsheet", icon:"📋", label:"Run Sheet" },
-    { id:"qbo", icon:"📊", label:"QuickBooks" },
-    { id:"financials", icon:"📋", label:"Audited Financials" },
-    { id:"customers_analysis", icon:"📊", label:"Customer Analysis" },
     { id:"costs", icon:"⚙️", label:"Costs" },
     { id:"phone", icon:"📞", label:"Phone Calls" },
     { id:"settings", icon:"🔧", label:"Settings" },
@@ -10452,9 +10448,6 @@ function MarginIQ() {
     {!loading && tab==="datahub" && (typeof window !== "undefined" && window.DataHubTab ? React.createElement(window.DataHubTab) : <EmptyState icon="🗄️" title="Data Hub module not loaded" sub="DataHubTab.jsx did not load. Check console." />)}
     {!loading && tab==="ingest" && <DataIngest weeklyRollups={weeklyRollups} reconMeta={reconMeta} fileLog={fileLog} onRefresh={refreshData} />}
     {!loading && tab==="gmail" && <GmailSync onRefresh={refreshData} />}
-    {!loading && tab==="financials" && (typeof window !== "undefined" && window.AuditedFinancialsTab ? React.createElement(window.AuditedFinancialsTab) : <EmptyState icon="📋" title="Audited Financials module not loaded" sub="AuditedFinancialsTab.jsx did not load." />)}
-    {!loading && tab==="customers_analysis" && (typeof window !== "undefined" && window.CustomerAnalysisTab ? React.createElement(window.CustomerAnalysisTab) : <EmptyState icon="📊" title="Customer Analysis module not loaded" sub="CustomerAnalysisTab.jsx did not load." />)}
-    {!loading && tab==="qbo" && (typeof window !== "undefined" && window.QBOImportTab ? React.createElement(window.QBOImportTab) : <EmptyState icon="📊" title="QuickBooks module not loaded" sub="QBOImportTab.jsx did not load. Check console." />)}
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
     {!loading && tab==="phone" && <ZoomPhoneTab />}
     {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} onRefresh={refreshData} setTab={setTab} />}
@@ -10474,7 +10467,7 @@ function ZoomPhoneTab() {
   const [error, setError]                 = React.useState("");
   const [activeTab, setActiveTab]         = React.useState("live"); // live | history
   // History controls
-  const [histFrom, setHistFrom]     = React.useState(() => { const d=new Date(); d.setDate(1); d.setMonth(d.getMonth()-2); return d.toISOString().split("T")[0]; });
+  const [histFrom, setHistFrom]     = React.useState(() => { const d=new Date(); d.setDate(d.getDate()-30); return d.toISOString().split("T")[0]; });
   const [histTo, setHistTo]         = React.useState(() => new Date().toISOString().split("T")[0]);
   const [histGroupBy, setHistGroupBy] = React.useState("day");   // day | week | month
   const [histEmp, setHistEmp]       = React.useState("");
