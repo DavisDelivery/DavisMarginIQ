@@ -289,6 +289,40 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
   }
 
+  // ── Debug: dump raw cached records for one user ─────────────────────────
+  if (action === "debug-userraw") {
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
+    const userName = u.searchParams.get("name") || "Brandi Bradberry";
+    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
+    const doc = userDocs.find((d:any) => d.name === userName);
+    if (!doc) return new Response(JSON.stringify({error:"User not found in cache",available:userDocs.map((d:any)=>d.name)}), { headers: CORS });
+    const recs = (doc.records || []) as any[];
+    // Stats
+    const totalCount = recs.length;
+    const withTalk = recs.filter(r => Number(r.talkTime) > 0);
+    const zeroTalk = recs.filter(r => !Number(r.talkTime) || Number(r.talkTime) === 0);
+    const byResult: Record<string, number> = {};
+    recs.forEach(r => { byResult[r.result||"(none)"] = (byResult[r.result||"(none)"]||0) + 1; });
+    const byCalleeType: Record<string, number> = {};
+    recs.forEach(r => { byCalleeType[r.calleeType||"(none)"] = (byCalleeType[r.calleeType||"(none)"]||0) + 1; });
+    return new Response(JSON.stringify({
+      user: userName,
+      totalCount,
+      withTalkTime: withTalk.length,
+      zeroTalkTime: zeroTalk.length,
+      byResult,
+      byCalleeType,
+      // First 3 with talk_time > 0 (real calls)
+      sampleAnswered: withTalk.slice(0, 3),
+      // First 3 with talk_time = 0 (rang but didn't answer)
+      sampleNotAnswered: zeroTalk.slice(0, 3),
+      dateRange: {
+        oldest: recs.length ? recs[recs.length-1].date : null,
+        newest: recs.length ? recs[0].date : null,
+      },
+    }), { headers: CORS });
+  }
+
   // ── Debug: pull raw record for a specific call_path_id ──────────────────
   // Shows EVERY leg of one call so we can see actual field values
   if (action === "debug-rawcall") {
