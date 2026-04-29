@@ -308,7 +308,7 @@ async function ingest(
     console.log(`ddis-ingest: wrote ${payResult.ok}/${paymentDocs.length} ddis_payments (${payResult.failed} failed)`);
 
     const totalFailed = fileResult.failed + payResult.failed;
-    const totalAttempted = fileRecords.length + paymentDocs.length;
+    const totalAttempted = fileDocs.length + paymentDocs.length;
     const totalOk = fileResult.ok + payResult.ok;
     const droppedNote = droppedPayments > 0 ? ` · ${droppedPayments} payment rows dropped (over ${PAYMENT_CAP} cap)` : "";
 
@@ -333,12 +333,17 @@ async function ingest(
       error: allFailed ? "All writes failed (likely Firestore rules issue)" : null,
     });
 
+    if (allFailed) {
+      return {
+        ok: false,
+        error: "All writes failed (likely Firestore rules issue)",
+      };
+    }
     return {
-      ok: !allFailed,
+      ok: true,
       fileOk: fileResult.ok,
       paymentOk: payResult.ok,
       failed: totalFailed,
-      allFailed,
     };
   } catch (e: any) {
     const msg = e?.message || String(e);
