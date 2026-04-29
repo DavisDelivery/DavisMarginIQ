@@ -138,28 +138,60 @@ function normalizeRecord(raw: any, user: { name: string; email: string; ext: str
 }
 
 // ── Dedup logic — one record per logical call ───────────────────────────────
-// When the same call_path_id appears in multiple records (one per leg), prefer:
-//   1. The leg with a human answerer (callee_ext_type === "user") that was answered
-//   2. Any human leg
-//   3. The original receptionist/queue leg as last resort
+// When a call rings multiple phones simultaneously (queue), each ringer's user history
+// gets a record with their name. But only ONE actually picked up. The signal of
+// "actually talked" is talk_time > 0. We also collect the names of all ringers
+// for the chain field.
+//
+// Scoring (highest wins):
+//   100 = had real talk_time (this person actually conversed)
+//    50 = is a human leg + result=answered (fallback if talk_time missing)
+//    10 = is a human leg
+//     1 = has a non-Unknown name
 function dedupeByCall(records: any[]): any[] {
-  const byPath = new Map<string, any>();
+  const byPath = new Map<string, { winner: any; ringers: Set<string> }>();
+
   for (const r of records) {
     const key = r.callPathId || `${r.date}-${r.callerNum}`;
-    const existing = byPath.get(key);
-    if (!existing) {
-      byPath.set(key, r);
-      continue;
+    let bucket = byPath.get(key);
+    if (!bucket) {
+      bucket = { winner: r, ringers: new Set() };
+      byPath.set(key, bucket);
     }
-    // Score each leg: human + answered > human > queue
-    const score = (rec: any) =>
-      (rec.isHumanLeg ? 10 : 0) +
-      (rec.result === "answered" ? 5 : 0) +
-      (rec.answeredBy && rec.answeredBy !== "Unknown" ? 1 : 0);
 
-    if (score(r) > score(existing)) byPath.set(key, r);
+    // Track everyone whose phone rang for this call
+    if (r.isHumanLeg && r.answeredBy && r.answeredBy !== "Unknown") {
+      bucket.ringers.add(r.answeredBy);
+    }
+
+    const score = (rec: any) => {
+      const talkTime = Number(rec.talkTime) || 0;
+      const isHuman = rec.isHumanLeg ? 1 : 0;
+      const answered = rec.result === "answered" ? 1 : 0;
+      const hasName = (rec.answeredBy && rec.answeredBy !== "Unknown") ? 1 : 0;
+
+      // Strongest signal: this leg has actual talk time AND is a human leg
+      if (talkTime > 0 && isHuman) return 1000 + talkTime;
+      // Next: any human leg with talk_time
+      if (talkTime > 0) return 500 + talkTime;
+      // Next: human leg + answered
+      if (isHuman && answered) return 50 + hasName;
+      // Next: any human leg
+      if (isHuman) return 10 + hasName;
+      // Last resort
+      return hasName;
+    };
+
+    if (score(r) > score(bucket.winner)) {
+      bucket.winner = r;
+    }
   }
-  return Array.from(byPath.values());
+
+  // Build final records, attaching the chain of who rang
+  return Array.from(byPath.values()).map(({ winner, ringers }) => ({
+    ...winner,
+    chain: Array.from(ringers),
+  }));
 }
 
 // ── Firebase helpers ─────────────────────────────────────────────────────────
