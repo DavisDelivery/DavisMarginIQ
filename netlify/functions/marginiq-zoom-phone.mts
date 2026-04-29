@@ -52,23 +52,52 @@ async function getPhoneUsers(token: string) {
   });
 }
 
-async function getUserCalls(token: string, userId: string, from: string, to: string): Promise<any[]> {
+async function getUserCalls(token: string, userId: string, from: string, to: string): Promise<{records: any[], truncated: boolean, error?: string}> {
   const records: any[] = [];
   let npt = "", pages = 0;
-  do {
+  let truncated = false;
+  const MAX_PAGES = 30;  // 3000 records max — keeps us under Netlify timeout
+  const MAX_RETRIES_PER_PAGE = 3;
+
+  while (true) {
     const url = `${API}/phone/users/${userId}/call_history?from=${from}&to=${to}&page_size=100${npt ? "&next_page_token=" + encodeURIComponent(npt) : ""}`;
-    const res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-    const d: any = await res.json();
-    if (!res.ok) {
-      if (res.status === 404 || res.status === 400) return [];
-      if (res.status === 429) { await sleep(3000); continue; }
-      throw new Error(d.message || `${res.status}`);
+    let res: Response | null = null;
+    let lastErr = "";
+    let success = false;
+
+    // Retry on 429 with exponential backoff
+    for (let attempt = 0; attempt < MAX_RETRIES_PER_PAGE; attempt++) {
+      try {
+        res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+        if (res.status === 429) {
+          await sleep(2000 * (attempt + 1));
+          continue;
+        }
+        success = true;
+        break;
+      } catch(e: any) {
+        lastErr = e?.message || "fetch failed";
+        await sleep(1000);
+      }
     }
+
+    if (!success || !res) return { records, truncated: true, error: lastErr || "max retries on 429" };
+
+    const d: any = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 400) return { records, truncated: false };
+      return { records, truncated: true, error: d.message || `HTTP ${res.status}` };
+    }
+
     records.push(...(d.call_logs || d.call_history || d.records || []));
     npt = d.next_page_token || "";
-    if (++pages >= 50) break;
-  } while (npt);
-  return records;
+    pages++;
+
+    if (!npt) break;
+    if (pages >= MAX_PAGES) { truncated = true; break; }
+  }
+
+  return { records, truncated };
 }
 
 function normalizeRecord(raw: any, user: { name: string; email: string; ext: string }) {
@@ -329,18 +358,31 @@ export default async (req: Request, _ctx: Context) => {
 
     try {
       const token  = await getToken(ACCT, CID, CSEC);
-      const recs   = await getUserCalls(token, userId, syncFrom, syncTo);
+      const result = await getUserCalls(token, userId, syncFrom, syncTo);
       const user   = { name: userName, email: userEmail, ext: userExt };
-      const normalized = recs.map(r => normalizeRecord(r, user));
+      const normalized = result.records.map(r => normalizeRecord(r, user));
 
+      // Don't overwrite a populated cache with empty results unless we know it's intentional
+      let action_taken = "wrote";
       if (FB_KEY && FB_PROJ) {
-        await fsSet(FB_PROJ, FB_KEY, "zoom_sync_users", userId, {
-          name: userName, email: userEmail, ext: userExt,
-          records: normalized, count: normalized.length,
-          synced_at: new Date().toISOString(), from: syncFrom, to: syncTo,
-        });
+        if (normalized.length === 0 && result.error) {
+          // Sync failed — keep existing cache, just report error
+          action_taken = "failed-kept-cache";
+        } else {
+          await fsSet(FB_PROJ, FB_KEY, "zoom_sync_users", userId, {
+            name: userName, email: userEmail, ext: userExt,
+            records: normalized, count: normalized.length,
+            synced_at: new Date().toISOString(), from: syncFrom, to: syncTo,
+            truncated: result.truncated || false,
+            sync_error: result.error || "",
+          });
+        }
       }
-      return new Response(JSON.stringify({ ok: true, name: userName, count: normalized.length, ms: Date.now()-t0 }), { headers: CORS });
+      return new Response(JSON.stringify({
+        ok: !result.error, name: userName, count: normalized.length,
+        truncated: result.truncated, error: result.error || null,
+        action: action_taken, ms: Date.now()-t0,
+      }), { headers: CORS });
     } catch(e: any) {
       return new Response(JSON.stringify({ error: String(e?.message||e), name: userName }), { status: 500, headers: CORS });
     }
