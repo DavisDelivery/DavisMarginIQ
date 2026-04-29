@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.43.3";
+const APP_VERSION = "2.43.4";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10454,315 +10454,457 @@ function MarginIQ() {
   </div>;
 }
 
-// ─── ZoomPhoneTab v3 — Real-Time + History Analytics ─────────────────────────
-function ZoomPhoneTab() {
-  const [status, setStatus]               = React.useState(null);
-  const [calls, setCalls]                 = React.useState([]);
-  const [liveCalls, setLiveCalls]         = React.useState([]);
-  const [loading, setLoading]             = React.useState(false);
-  const [histLoading, setHistLoading]     = React.useState(false);
-  const [liveMode, setLiveMode]           = React.useState(true);
-  const [liveConnected, setLiveConnected] = React.useState(false);
-  const [lastEvent, setLastEvent]         = React.useState(null);
-  const [error, setError]                 = React.useState("");
-  const [activeTab, setActiveTab]         = React.useState("live"); // live | history
-  // History controls
-  const [histFrom, setHistFrom]     = React.useState(() => { const d=new Date(); d.setDate(d.getDate()-30); return d.toISOString().split("T")[0]; });
-  const [histTo, setHistTo]         = React.useState(() => new Date().toISOString().split("T")[0]);
-  const [histGroupBy, setHistGroupBy] = React.useState("day");   // day | week | month
-  const [histEmp, setHistEmp]       = React.useState("");
-  const [histDir, setHistDir]       = React.useState("");
-  const [histCalls, setHistCalls]   = React.useState([]);        // fetched history records
-  const [syncedAt, setSyncedAt]     = React.useState(null);      // when cache was last synced
-  const [dataSource, setDataSource] = React.useState("");        // "cache" | "direct" | "warming"
-  // Live call log filters
-  const [empFilter, setEmpFilter]   = React.useState("");
-  const [resFilter, setResFilter]   = React.useState("");
-  const [search, setSearch]         = React.useState("");
-  const [sortCol, setSortCol]       = React.useState("date");
-  const [sortDir, setSortDir]       = React.useState("desc");
-  const [page, setPage]             = React.useState(1);
-  const [logView, setLogView]       = React.useState("employees"); // employees | calls
-  const unsubRef = React.useRef(null);
-  const PAGE = 50;
+// ─── ZoomPhoneTab v4 — Stable, mobile-first, sortable ───────────────────────
+// Top-level helpers (stable refs across renders)
+function _phoneFmtDur(s) {
+  if (!s || isNaN(s)) return "—";
+  const m = Math.floor(s/60), sec = s%60;
+  return m + ":" + String(sec).padStart(2,"0");
+}
+function _phoneFmtDT(s) {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (isNaN(d)) return s;
+  return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"})
+    + " " + d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true});
+}
+function _phoneFmtTime(s) {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (isNaN(d)) return s;
+  return d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true});
+}
+function _phoneInitials(name) {
+  if (!name || typeof name !== "string") return "?";
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "?";
+  return (parts[0][0] + (parts[1]?.[0] || "")).toUpperCase();
+}
+function _phoneRateColor(rate) {
+  if (rate >= 80) return T.green;
+  if (rate >= 50) return T.yellow;
+  return T.red;
+}
+function _phonePeriodKey(date, groupBy) {
+  const d = new Date(date);
+  if (isNaN(d)) return null;
+  if (groupBy === "day") {
+    return d.toISOString().slice(0,10); // YYYY-MM-DD for stable sort
+  }
+  if (groupBy === "week") {
+    const m = new Date(d);
+    m.setDate(d.getDate() - ((d.getDay()+6)%7));
+    return m.toISOString().slice(0,10);
+  }
+  return d.toISOString().slice(0,7); // YYYY-MM
+}
+function _phonePeriodLabel(key, groupBy) {
+  if (!key) return "—";
+  if (groupBy === "day") {
+    const d = new Date(key+"T00:00:00");
+    return d.toLocaleDateString("en-US",{month:"short",day:"numeric"});
+  }
+  if (groupBy === "week") {
+    const d = new Date(key+"T00:00:00");
+    return "Wk " + d.toLocaleDateString("en-US",{month:"short",day:"numeric"});
+  }
+  const [y,m] = key.split("-");
+  return new Date(+y, +m-1, 1).toLocaleDateString("en-US",{month:"short",year:"numeric"});
+}
 
-  // ── Credentials check ────────────────────────────────────────────────────
+// Stable child components (defined outside parent so they're not recreated)
+function _PhoneStatPill({ label, value, sub, color }) {
+  return (
+    <div style={{
+      background: T.bgCard, border: `1px solid ${T.border}`,
+      borderRadius: T.radiusSm, padding: "10px 12px",
+      minWidth: 0, boxShadow: T.shadow,
+    }}>
+      <div style={{
+        fontSize: 9, fontWeight: 700, color: T.textMuted,
+        textTransform: "uppercase", letterSpacing: "0.06em",
+        marginBottom: 4, whiteSpace: "nowrap",
+        overflow: "hidden", textOverflow: "ellipsis",
+      }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 800, color: color || T.text, lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: T.textMuted, marginTop: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sub}</div>}
+    </div>
+  );
+}
+
+function _PhoneRateBar({ rate }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+      <div style={{ flex: "1 1 40px", maxWidth: 80, height: 5, background: T.borderLight, borderRadius: 3, minWidth: 24 }}>
+        <div style={{ width: `${Math.max(0, Math.min(100, rate))}%`, height: "100%", background: _phoneRateColor(rate), borderRadius: 3, transition: "width 0.4s" }} />
+      </div>
+      <span style={{ fontSize: 11, color: T.textMuted, fontWeight: 600, width: 32, textAlign: "right" }}>{rate}%</span>
+    </div>
+  );
+}
+
+function _PhoneEmptyState({ icon, title, body }) {
+  return (
+    <div style={{ textAlign: "center", padding: "48px 20px", color: T.textMuted }}>
+      <div style={{ fontSize: 36, marginBottom: 10, opacity: 0.6 }}>{icon}</div>
+      <div style={{ fontWeight: 700, fontSize: 14, color: T.text, marginBottom: 4 }}>{title}</div>
+      {body && <div style={{ fontSize: 12, maxWidth: 360, margin: "0 auto", lineHeight: 1.5 }}>{body}</div>}
+    </div>
+  );
+}
+
+function ZoomPhoneTab() {
+  // ── State ──────────────────────────────────────────────────────────────
+  const [status, setStatus]               = React.useState(null);
+  const [activeTab, setActiveTab]         = React.useState("live");
+
+  // Live state
+  const [liveCalls, setLiveCalls]         = React.useState([]);
+  const [recentCalls, setRecentCalls]     = React.useState([]);
+  const [liveConnected, setLiveConnected] = React.useState(false);
+  const [livePaused, setLivePaused]       = React.useState(false);
+  const [lastEvent, setLastEvent]         = React.useState(null);
+
+  // History state
+  const today  = React.useMemo(() => new Date(), []);
+  const day30  = React.useMemo(() => { const d=new Date(); d.setDate(d.getDate()-30); return d; }, []);
+  const [histFrom, setHistFrom]       = React.useState(day30.toISOString().slice(0,10));
+  const [histTo, setHistTo]           = React.useState(today.toISOString().slice(0,10));
+  const [histGroupBy, setHistGroupBy] = React.useState("day");
+  const [histEmp, setHistEmp]         = React.useState("");
+  const [histDir, setHistDir]         = React.useState("");
+  const [histCalls, setHistCalls]     = React.useState([]);
+  const [histLoading, setHistLoading] = React.useState(false);
+  const [histError, setHistError]     = React.useState("");
+  const [histInfo, setHistInfo]       = React.useState("");
+  const [syncedAt, setSyncedAt]       = React.useState(null);
+  const [syncProgress, setSyncProgress] = React.useState(null); // { current, total, name }
+  const [hasFetched, setHasFetched]   = React.useState(false);
+
+  const unsubRef = React.useRef(null);
+
+  // ── Mount: check credentials ───────────────────────────────────────────
   React.useEffect(() => {
+    let cancelled = false;
     fetch("/.netlify/functions/marginiq-zoom-phone?action=status")
-      .then(r => r.json()).then(setStatus)
-      .catch(() => setStatus({ configured: false, missing: ["unknown"] }));
+      .then(r => r.ok ? r.json() : { configured: false, missing: ["unknown"] })
+      .then(d => { if (!cancelled) setStatus(d); })
+      .catch(() => { if (!cancelled) setStatus({ configured: false, missing: ["unknown"] }); });
+    return () => { cancelled = true; };
   }, []);
 
-  // ── Firebase live listener ───────────────────────────────────────────────
+  // ── Live: Firebase listener ────────────────────────────────────────────
   React.useEffect(() => {
-    if (!liveMode || activeTab !== "live") return;
+    if (livePaused || activeTab !== "live") {
+      if (unsubRef.current) { try { unsubRef.current(); } catch(_){} unsubRef.current = null; }
+      return;
+    }
     const db = window.db;
     if (!db) { setLiveConnected(false); return; }
+
     setLiveConnected(false);
-    const unsub = db.collection("zoom_calls")
-      .orderBy("ts","desc").limit(200)
-      .onSnapshot(snap => {
-        setLiveConnected(true);
-        const docs = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-        setLiveCalls(docs.filter(c => ["ringing","active"].includes(c.status)));
-        const completed = docs.filter(c => !["ringing","active"].includes(c.status));
-        setCalls(completed.map(normalizeLiveDoc));
-        if (docs.length > 0) setLastEvent({ ts: docs[0].updated_at||docs[0].ts, employee: docs[0].employee });
-      }, err => { console.warn("[ZoomPhone]", err?.message); setLiveConnected(false); });
-    unsubRef.current = unsub;
-    return () => { unsub(); unsubRef.current = null; };
-  }, [liveMode, activeTab]);
-
-  function normalizeLiveDoc(c) {
-    return {
-      id: c.call_id||c.id, date: c.ts||c.updated_at||"",
-      answeredBy: c.employee||"Unknown", answeredExt: c.employee_ext||"",
-      direction: c.direction||"inbound",
-      callerNum: c.caller_num||"", callerName: c.caller_name||"",
-      result: c.status==="ended"?"answered": c.status==="missed"?"missed": c.status==="voicemail"?"voicemail": c.status||"unknown",
-      talkTime: c.duration||0, waitTime: 0, viaQueue: false, queueName: "", chain: [],
-    };
-  }
-
-  function toggleLive() {
-    if (liveMode && unsubRef.current) { unsubRef.current(); unsubRef.current = null; }
-    setLiveMode(m => !m); setCalls([]); setLiveCalls([]); setError("");
-  }
-
-  // ── History fetch ────────────────────────────────────────────────────────
-  async function fetchHistory() {
-    setHistLoading(true);
-    setError("");
-    setHistCalls([]);
+    let unsub = null;
     try {
-      let url = "/.netlify/functions/marginiq-zoom-phone?action=history";
-      url += "&from=" + encodeURIComponent(histFrom);
-      url += "&to="   + encodeURIComponent(histTo);
-      if (histDir) url += "&direction=" + encodeURIComponent(histDir);
-      const r = await fetch(url);
+      unsub = db.collection("zoom_calls")
+        .orderBy("ts","desc").limit(150)
+        .onSnapshot(
+          snap => {
+            try {
+              setLiveConnected(true);
+              const docs = snap.docs.map(d => {
+                try { return { ...d.data(), _docId: d.id }; } catch(_) { return null; }
+              }).filter(Boolean);
+
+              const active = docs.filter(c => c && (c.status === "ringing" || c.status === "active"));
+              const done   = docs.filter(c => c && c.status !== "ringing" && c.status !== "active");
+
+              setLiveCalls(active);
+              setRecentCalls(done.slice(0, 30).map(c => ({
+                id:         c.call_id || c._docId,
+                date:       c.ts || c.updated_at || "",
+                answeredBy: c.employee || "Unknown",
+                callerNum:  c.caller_num || "",
+                callerName: c.caller_name || "",
+                direction:  (c.direction || "inbound").toLowerCase(),
+                result:     c.status === "ended" ? "answered"
+                          : c.status === "missed" ? "missed"
+                          : c.status === "voicemail" ? "voicemail"
+                          : "unknown",
+                talkTime:   Number(c.duration) || 0,
+              })));
+
+              if (docs.length > 0 && docs[0]) {
+                setLastEvent({
+                  ts: docs[0].updated_at || docs[0].ts,
+                  employee: docs[0].employee || "—",
+                });
+              }
+            } catch(err) {
+              console.warn("[ZoomPhone] snapshot processing error:", err?.message);
+            }
+          },
+          err => {
+            console.warn("[ZoomPhone] listener error:", err?.message);
+            setLiveConnected(false);
+          }
+        );
+      unsubRef.current = unsub;
+    } catch(err) {
+      console.warn("[ZoomPhone] subscribe error:", err?.message);
+      setLiveConnected(false);
+    }
+    return () => { if (unsub) { try { unsub(); } catch(_){} } unsubRef.current = null; };
+  }, [livePaused, activeTab]);
+
+  // ── History: fetch from cache ──────────────────────────────────────────
+  const fetchHistory = React.useCallback(async () => {
+    setHistLoading(true);
+    setHistError("");
+    setHistInfo("");
+    setHasFetched(true);
+    try {
+      const params = new URLSearchParams({
+        action: "history",
+        from:   histFrom,
+        to:     histTo,
+      });
+      if (histDir) params.set("direction", histDir);
+
+      const r = await fetch("/.netlify/functions/marginiq-zoom-phone?" + params.toString());
       if (!r.ok) {
-        const txt = await r.text().catch(()=>"");
+        const txt = await r.text().catch(() => "");
         let msg = "HTTP " + r.status;
         try { msg = JSON.parse(txt).error || msg; } catch(_) {}
-        setError(msg);
+        setHistError(msg);
+        setHistCalls([]);
         return;
       }
-      const d = await r.json().catch(()=>({}));
+      const d = await r.json().catch(() => ({}));
       const records = Array.isArray(d.records) ? d.records : [];
       setHistCalls(records);
       setSyncedAt(d.synced_at || null);
-      setDataSource(d.source || "");
-      if (d.source === "warming" || records.length === 0) {
-        setError("No data in cache yet — click 🔄 Sync Now to pull from Zoom. Only needed once; updates hourly after that.");
+      if (d.source === "warming" || (records.length === 0 && !d.synced_at)) {
+        setHistInfo("No data in cache yet. Tap “Sync from Zoom” to load it for the first time. After that, this loads instantly.");
+      } else if (records.length === 0) {
+        setHistInfo("No calls match the selected filters.");
       }
     } catch(e) {
-      setError("Fetch error: " + String(e && e.message ? e.message : e));
+      setHistError("Couldn't load: " + String(e?.message || e));
+      setHistCalls([]);
     } finally {
       setHistLoading(false);
     }
-  }
+  }, [histFrom, histTo, histDir]);
 
-  // ── History derived data ─────────────────────────────────────────────────
+  // ── History: sync from Zoom (manual, per-user with progress) ───────────
+  const syncFromZoom = React.useCallback(async () => {
+    setHistLoading(true);
+    setHistError("");
+    setHistInfo("");
+    setSyncProgress({ current: 0, total: 0, name: "Getting employee list…" });
+    try {
+      const ur = await fetch("/.netlify/functions/marginiq-zoom-phone?action=users");
+      if (!ur.ok) {
+        const e = await ur.json().catch(() => ({}));
+        throw new Error(e.error || ("Failed to load employees: HTTP " + ur.status));
+      }
+      const ud = await ur.json();
+      const users = Array.isArray(ud.users) ? ud.users : [];
+      if (!users.length) throw new Error("No phone users found in your Zoom account.");
+
+      for (let i = 0; i < users.length; i++) {
+        const u = users[i] || {};
+        setSyncProgress({ current: i + 1, total: users.length, name: u.name || "Unknown" });
+        try {
+          const params = new URLSearchParams({
+            action:  "sync-user",
+            userId:  u.id || "",
+            name:    u.name || "",
+            email:   u.email || "",
+            ext:     u.ext || "",
+          });
+          const sr = await fetch("/.netlify/functions/marginiq-zoom-phone?" + params.toString());
+          if (!sr.ok) {
+            const e = await sr.json().catch(() => ({}));
+            console.warn("[ZoomPhone] sync failed for " + u.name + ":", e.error);
+          }
+        } catch(err) {
+          console.warn("[ZoomPhone] sync error for " + u.name + ":", err?.message);
+        }
+      }
+
+      setSyncProgress(null);
+      setHistInfo("Sync complete. Loading report…");
+      await fetchHistory();
+    } catch(e) {
+      setHistError("Sync failed: " + String(e?.message || e));
+      setSyncProgress(null);
+      setHistLoading(false);
+    }
+  }, [fetchHistory]);
+
+  // ── Derived: filtered + grouped history ────────────────────────────────
   const histFiltered = React.useMemo(() => {
-    let recs = histCalls;
-    if (histEmp) recs = recs.filter(c => c.answeredBy === histEmp);
-    return recs;
+    if (!Array.isArray(histCalls)) return [];
+    if (!histEmp) return histCalls;
+    return histCalls.filter(c => c && c.answeredBy === histEmp);
   }, [histCalls, histEmp]);
 
-  // Group records by time period
-  const periodGroups = React.useMemo(() => {
-    const map = {};
-    try { histFiltered.forEach(c => {
-      const d = new Date(c.date);
-      if (!c || !c.date || isNaN(d)) return;
-      let key;
-      if (histGroupBy === "day")   key = d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"});
-      else if (histGroupBy === "week") {
-        const mon = new Date(d); mon.setDate(d.getDate() - ((d.getDay()+6)%7));
-        key = "Wk of " + mon.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
-      } else key = d.toLocaleDateString("en-US",{month:"long",year:"numeric"});
+  const histEmployees = React.useMemo(() => {
+    const set = new Set();
+    histCalls.forEach(c => { if (c?.answeredBy) set.add(c.answeredBy); });
+    return Array.from(set).sort();
+  }, [histCalls]);
 
-      if (!map[key]) map[key] = { period:key, date:d, answered:0, missed:0, voicemail:0, total:0, talk:0, wait:0 };
-      map[key].total++;
-      if (c.result==="answered") { map[key].answered++; map[key].talk += c.talkTime||0; map[key].wait += c.waitTime||0; }
-      if (c.result==="missed")    map[key].missed++;
-      if (c.result==="voicemail") map[key].voicemail++;
+  const periodGroups = React.useMemo(() => {
+    const map = new Map();
+    histFiltered.forEach(c => {
+      if (!c || !c.date) return;
+      const key = _phonePeriodKey(c.date, histGroupBy);
+      if (!key) return;
+      let g = map.get(key);
+      if (!g) {
+        g = { key, label: _phonePeriodLabel(key, histGroupBy), total: 0, answered: 0, missed: 0, voicemail: 0, talk: 0 };
+        map.set(key, g);
+      }
+      g.total++;
+      if (c.result === "answered") { g.answered++; g.talk += Number(c.talkTime) || 0; }
+      else if (c.result === "missed")    g.missed++;
+      else if (c.result === "voicemail") g.voicemail++;
     });
-    } catch(_) {}
-    return Object.values(map).sort((a,b) => a.date - b.date);
+    return Array.from(map.values()).map(g => ({
+      ...g,
+      rate: g.total ? Math.round((g.answered/g.total)*100) : 0,
+      avgTalk: g.answered ? Math.round(g.talk / g.answered) : 0,
+    }));
   }, [histFiltered, histGroupBy]);
 
-  // Group by employee for the history view
   const empGroups = React.useMemo(() => {
-    const map = {};
-    try { histFiltered.forEach(c => {
-      const k = c.answeredBy||"Unknown";
-      if (!map[k]) map[k] = { name:k, ext:c.answeredExt||"", answered:0, missed:0, voicemail:0, total:0, talk:0 };
-      map[k].total++;
-      if (c.result==="answered") { map[k].answered++; map[k].talk += c.talkTime||0; }
-      if (c.result==="missed")    map[k].missed++;
-      if (c.result==="voicemail") map[k].voicemail++;
+    const map = new Map();
+    histFiltered.forEach(c => {
+      if (!c) return;
+      const k = c.answeredBy || "Unknown";
+      let g = map.get(k);
+      if (!g) {
+        g = { name: k, ext: c.answeredExt || "", total: 0, answered: 0, missed: 0, voicemail: 0, talk: 0 };
+        map.set(k, g);
+      }
+      g.total++;
+      if (c.result === "answered") { g.answered++; g.talk += Number(c.talkTime) || 0; }
+      else if (c.result === "missed")    g.missed++;
+      else if (c.result === "voicemail") g.voicemail++;
     });
-    } catch(_) {}
-    return Object.values(map).sort((a,b) => b.total - a.total);
+    return Array.from(map.values()).map(g => ({
+      ...g,
+      rate: g.total ? Math.round((g.answered/g.total)*100) : 0,
+      avgTalk: g.answered ? Math.round(g.talk / g.answered) : 0,
+    }));
   }, [histFiltered]);
 
-  const histEmpNames = React.useMemo(() =>
-    [...new Set(histCalls.map(c=>c.answeredBy).filter(Boolean))].sort()
-  , [histCalls]);
-
-  // Overall history metrics
   const histMetrics = React.useMemo(() => {
     const tot = histFiltered.length;
-    const ans = histFiltered.filter(c=>c.result==="answered").length;
-    const mis = histFiltered.filter(c=>c.result==="missed").length;
-    const vm  = histFiltered.filter(c=>c.result==="voicemail").length;
-    const ansCalls = histFiltered.filter(c=>c.result==="answered"&&c.talkTime>0);
-    const avgTalk = ansCalls.length ? Math.round(ansCalls.reduce((s,c)=>s+c.talkTime,0)/ansCalls.length) : 0;
-    const busiest = periodGroups.length ? [...periodGroups].sort((a,b)=>b.total-a.total)[0] : null;
-    return { tot, ans, mis, vm, avgTalk, busiest, ansRate: tot ? ((ans/tot)*100).toFixed(1) : 0 };
+    let ans = 0, mis = 0, vm = 0, talkSum = 0, talkCount = 0;
+    histFiltered.forEach(c => {
+      if (!c) return;
+      if (c.result === "answered") {
+        ans++;
+        const t = Number(c.talkTime) || 0;
+        if (t > 0) { talkSum += t; talkCount++; }
+      }
+      else if (c.result === "missed")    mis++;
+      else if (c.result === "voicemail") vm++;
+    });
+    const busiest = periodGroups.length
+      ? periodGroups.reduce((max, g) => g.total > max.total ? g : max, periodGroups[0])
+      : null;
+    return {
+      tot, ans, mis, vm,
+      avgTalk:  talkCount ? Math.round(talkSum / talkCount) : 0,
+      ansRate:  tot ? Math.round((ans/tot)*100) : 0,
+      missRate: tot ? Math.round((mis/tot)*100) : 0,
+      busiest,
+    };
   }, [histFiltered, periodGroups]);
 
-  // ── Live log derived ─────────────────────────────────────────────────────
-  const liveEmpNames = React.useMemo(() =>
-    [...new Set(calls.map(c=>c.answeredBy).filter(Boolean))].sort()
-  , [calls]);
+  // Sortable hooks for the two history tables
+  const periodSort = useSortable(periodGroups, "key", "desc");
+  const empSort    = useSortable(empGroups, "total", "desc");
 
-  const liveFiltered = React.useMemo(() => {
-    const s = search.toLowerCase();
-    return calls.filter(c => {
-      if (empFilter && c.answeredBy!==empFilter) return false;
-      if (resFilter && c.result!==resFilter) return false;
-      if (s) { const hay=[c.answeredBy,c.callerNum,c.callerName].join(" ").toLowerCase(); if(!hay.includes(s)) return false; }
-      return true;
+  // ── CSV exports ────────────────────────────────────────────────────────
+  const exportPeriodCSV = () => {
+    const rows = [
+      ["Period","Total","Answered","Missed","Voicemail","Answer Rate %","Avg Talk (sec)"],
+      ...periodGroups.map(p => [p.label, p.total, p.answered, p.missed, p.voicemail, p.rate, p.avgTalk]),
+    ];
+    const csv = rows.map(r => r.map(v => `"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([csv], { type: "text/csv" })),
+      download: `phone_history_by_${histGroupBy}_${histFrom}_${histTo}.csv`,
     });
-  }, [calls, empFilter, resFilter, search]);
-
-  const liveSorted = React.useMemo(() => {
-    return [...liveFiltered].sort((a,b) => {
-      let av,bv;
-      if (sortCol==="date")          { av=new Date(a.date||0); bv=new Date(b.date||0); }
-      else if (sortCol==="employee") { av=a.answeredBy||""; bv=b.answeredBy||""; }
-      else                           { av=a[sortCol]??0; bv=b[sortCol]??0; }
-      if (av<bv) return sortDir==="asc"?-1:1;
-      if (av>bv) return sortDir==="asc"?1:-1;
-      return 0;
+    a.click();
+  };
+  const exportEmpCSV = () => {
+    const rows = [
+      ["Employee","Ext","Total","Answered","Missed","Voicemail","Answer Rate %","Avg Talk (sec)"],
+      ...empGroups.map(e => [e.name, e.ext, e.total, e.answered, e.missed, e.voicemail, e.rate, e.avgTalk]),
+    ];
+    const csv = rows.map(r => r.map(v => `"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([csv], { type: "text/csv" })),
+      download: `phone_history_by_employee_${histFrom}_${histTo}.csv`,
     });
-  }, [liveFiltered, sortCol, sortDir]);
+    a.click();
+  };
 
-  const livePages = Math.ceil(liveSorted.length/PAGE)||1;
-  const liveSlice = liveSorted.slice((page-1)*PAGE, page*PAGE);
+  // ── Styles ─────────────────────────────────────────────────────────────
+  const card = {
+    background: T.bgCard, border: `1px solid ${T.border}`,
+    borderRadius: T.radius, padding: 14, boxShadow: T.shadow,
+  };
+  const inputStyle = {
+    padding: "9px 11px", border: `1px solid ${T.border}`,
+    borderRadius: T.radiusSm, fontSize: 14,
+    background: T.bgWhite, color: T.text,
+    fontFamily: "inherit", outline: "none",
+    width: "100%", minHeight: 38,
+  };
+  const labelStyle = {
+    fontSize: 10, fontWeight: 700, color: T.textMuted,
+    textTransform: "uppercase", letterSpacing: "0.06em",
+    marginBottom: 4, display: "block",
+  };
+  const btnPrimary = {
+    padding: "10px 18px", background: T.brand, color: "#fff",
+    border: "none", borderRadius: T.radiusSm,
+    fontWeight: 700, fontSize: 13, cursor: "pointer",
+    minHeight: 40, whiteSpace: "nowrap",
+  };
+  const btnSec = {
+    padding: "10px 14px", background: T.bgSurface, color: T.textMuted,
+    border: `1px solid ${T.border}`, borderRadius: T.radiusSm,
+    fontWeight: 600, fontSize: 12, cursor: "pointer",
+    minHeight: 40, whiteSpace: "nowrap",
+  };
+  const tdStyle = { padding: "10px 10px", fontSize: 12, borderBottom: `1px solid ${T.borderLight}`, verticalAlign: "middle" };
 
-  const liveMetrics = React.useMemo(() => {
-    const tot=calls.length, ans=calls.filter(c=>c.result==="answered").length, mis=calls.filter(c=>c.result==="missed").length;
-    const ansCalls=calls.filter(c=>c.result==="answered"&&c.talkTime>0);
-    const avgTalk=ansCalls.length?Math.round(ansCalls.reduce((s,c)=>s+c.talkTime,0)/ansCalls.length):0;
-    const emps=new Set(calls.map(c=>c.answeredBy).filter(n=>n&&n!=="Unknown")).size;
-    return { tot,ans,mis,avgTalk,emps };
-  }, [calls]);
-
-  const liveEmpStats = React.useMemo(() => {
-    const map={};
-    calls.forEach(c => {
-      const k=c.answeredBy||"Unknown";
-      if(!map[k]) map[k]={name:k,ext:c.answeredExt||"",answered:0,missed:0,voicemail:0,total:0,talk:0};
-      map[k].total++;
-      if(c.result==="answered"){map[k].answered++;map[k].talk+=c.talkTime;}
-      if(c.result==="missed")  map[k].missed++;
-      if(c.result==="voicemail")map[k].voicemail++;
-    });
-    return Object.values(map).sort((a,b)=>b.total-a.total);
-  }, [calls]);
-
-  // ── Helpers ──────────────────────────────────────────────────────────────
-  const fmtDur = s => { if(!s) return"—"; const m=Math.floor(s/60),sec=s%60; return `${m}:${String(sec).padStart(2,"0")}`; };
-  const fmtDT  = s => { if(!s) return"—"; const d=new Date(s); if(isNaN(d)) return s; return d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true}); };
-  const fmtTime= s => { if(!s) return"—"; const d=new Date(s); if(isNaN(d)) return s; return d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true}); };
-  const pct    = (a,b) => b ? ((a/b)*100).toFixed(1)+"%" : "—";
-
-  function doSort(col) {
-    if(sortCol===col) setSortDir(d=>d==="asc"?"desc":"asc");
-    else { setSortCol(col); setSortDir(col==="date"?"desc":"asc"); }
-    setPage(1);
-  }
-  const sortIcon = col => sortCol===col ? (sortDir==="asc"?" ↑":" ↓") : "";
-
-  function exportHistCSV() {
-    const h=["Period","Total","Answered","Missed","Voicemail","Answer Rate %","Avg Talk (sec)"];
-    const rows=periodGroups.map(p=>[p.period,p.total,p.answered,p.missed,p.voicemail,p.total?((p.answered/p.total)*100).toFixed(1):0,p.answered?Math.round(p.talk/p.answered):0]);
-    dlCSV(`zoom_history_${histGroupBy}_${histFrom}_${histTo}.csv`,[h,...rows]);
-  }
-  function exportEmpHistCSV() {
-    const h=["Employee","Extension","Total","Answered","Missed","Voicemail","Answer Rate %","Avg Talk (sec)"];
-    const rows=empGroups.map(e=>[e.name,e.ext,e.total,e.answered,e.missed,e.voicemail,e.total?((e.answered/e.total)*100).toFixed(1):0,e.answered?Math.round(e.talk/e.answered):0]);
-    dlCSV(`zoom_employee_history_${histFrom}_${histTo}.csv`,[h,...rows]);
-  }
-  function dlCSV(name,rows){const csv=rows.map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");const a=Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:name});a.click();}
-
-  // ── Styles ───────────────────────────────────────────────────────────────
-  const card       = { background:T.bgCard, border:`1px solid ${T.border}`, borderRadius:T.radius, padding:"16px", boxShadow:T.shadow };
-  const metCard    = { ...card, padding:"14px 16px", minWidth:0 };
-  const btnPrimary = { padding:"8px 18px", background:T.brand, color:"#fff", border:"none", borderRadius:T.radiusSm, fontWeight:700, fontSize:"13px", cursor:"pointer" };
-  const btnSec     = { padding:"7px 14px", background:T.bgSurface, color:T.textMuted, border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontWeight:600, fontSize:"12px", cursor:"pointer" };
-  const inputStyle = { padding:"8px 10px", border:`1px solid ${T.border}`, borderRadius:T.radiusSm, fontSize:"13px", background:T.bgWhite, color:T.text, fontFamily:"inherit", outline:"none" };
-  const thStyle    = { padding:"9px 12px", textAlign:"left", fontSize:"11px", fontWeight:700, color:T.textMuted, borderBottom:`2px solid ${T.border}`, background:T.bgSurface, cursor:"pointer", whiteSpace:"nowrap", userSelect:"none" };
-  const tdStyle    = { padding:"10px 12px", fontSize:"12px", borderBottom:`1px solid ${T.borderLight}`, whiteSpace:"nowrap" };
-  const tabBtn = (id) => ({ padding:"10px 18px", border:"none", borderBottom:`3px solid ${activeTab===id?T.brand:"transparent"}`, background:"transparent", color:activeTab===id?T.brand:T.textMuted, fontWeight:activeTab===id?700:500, fontSize:"13px", cursor:"pointer", marginBottom:"-2px", transition:"all 0.15s" });
-
-  const resBadge = r => { const m={answered:{background:T.greenBg,color:T.greenText},missed:{background:T.redBg,color:T.redText},voicemail:{background:T.yellowBg,color:T.yellowText}}; const s=m[r]||{background:T.bgSurface,color:T.textMuted}; return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:700}}>{r||"—"}</span>; };
-  const dirBadge = d => { const s=d==="inbound"?{background:T.blueBg,color:T.blueText}:{background:T.bgSurface,color:T.textMuted}; return <span style={{...s,padding:"2px 8px",borderRadius:"20px",fontSize:"11px",fontWeight:600}}>{d==="inbound"?"↓ In":d==="outbound"?"↑ Out":d||"—"}</span>; };
-
-  // ── Mini bar chart ───────────────────────────────────────────────────────
-  function MiniBarChart({ data, maxVal }) {
-    if (!data || !data.length) return null;
-    const max = maxVal || Math.max(...data.map(d=>d.total), 1);
-    return (
-      <div style={{display:"flex",alignItems:"flex-end",gap:2,height:60,padding:"0 0 4px 0"}}>
-        {data.map((d,i) => (
-          <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2,minWidth:0}}>
-            <div style={{width:"100%",display:"flex",flexDirection:"column",gap:1,justifyContent:"flex-end",height:52}}>
-              <div title={`Answered: ${d.answered}`} style={{width:"100%",height:`${(d.answered/max)*48}px`,background:T.green,minHeight:d.answered?1:0,transition:"height 0.3s"}} />
-              <div title={`Missed: ${d.missed}`}    style={{width:"100%",height:`${(d.missed/max)*48}px`,background:T.red,minHeight:d.missed?1:0,transition:"height 0.3s"}} />
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  }
-
-  // ── Inline sparkline for employee trend ──────────────────────────────────
-  function EmpTrend({ empName }) {
-    const pts = periodGroups.map(p => {
-      const sub = histFiltered.filter(c => c.answeredBy===empName && (() => {
-        const d=new Date(c.date); if(isNaN(d)) return false;
-        let key;
-        if(histGroupBy==="day") key=d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"});
-        else if(histGroupBy==="week"){ const m=new Date(d); m.setDate(d.getDate()-((d.getDay()+6)%7)); key="Wk of "+m.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
-        else key=d.toLocaleDateString("en-US",{month:"long",year:"numeric"});
-        return key===p.period;
-      })());
-      return sub.length;
-    });
-    if (!pts.length) return null;
-    const max = Math.max(...pts, 1);
-    const W=80, H=24;
-    const points = pts.map((v,i) => `${(i/(pts.length-1||1))*W},${H-(v/max)*H}`).join(" ");
-    return (
-      <svg width={W} height={H} style={{display:"block"}}>
-        <polyline points={points} fill="none" stroke={T.brand} strokeWidth="1.5" strokeLinejoin="round" />
-      </svg>
-    );
-  }
-
-  // ── Not configured ───────────────────────────────────────────────────────
+  // ── Not configured ─────────────────────────────────────────────────────
   if (status && !status.configured) {
     return (
-      <div style={{padding:"24px",maxWidth:700}}>
-        <div style={{...card,borderLeft:`4px solid ${T.accentWarn}`}}>
-          <div style={{fontWeight:700,fontSize:"15px",marginBottom:12}}>🔑 Zoom Credentials Not Configured</div>
-          {["ZOOM_ACCOUNT_ID","ZOOM_CLIENT_ID","ZOOM_CLIENT_SECRET","ZOOM_WEBHOOK_SECRET_TOKEN","FIREBASE_PROJECT_ID"].map(k=>(
-            <div key={k} style={{fontFamily:"monospace",fontSize:"12px",background:T.bgSurface,border:`1px solid ${T.border}`,borderRadius:T.radiusSm,padding:"6px 12px",marginBottom:4,color:T.brand}}>
-              <span style={{color:status.missing?.includes(k)?T.red:T.green,marginRight:6}}>{status.missing?.includes(k)?"✗":"✓"}</span>{k}
+      <div style={{ padding: 16, maxWidth: 600 }}>
+        <div style={{ ...card, borderLeft: `4px solid ${T.accentWarn}` }}>
+          <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 12 }}>🔑 Zoom Credentials Not Configured</div>
+          <p style={{ color: T.textMuted, fontSize: 13, marginBottom: 12, lineHeight: 1.6 }}>
+            Add these environment variables to Netlify:
+          </p>
+          {["ZOOM_ACCOUNT_ID","ZOOM_CLIENT_ID","ZOOM_CLIENT_SECRET","FIREBASE_PROJECT_ID","FIREBASE_API_KEY"].map(k => (
+            <div key={k} style={{
+              fontFamily: "monospace", fontSize: 12, background: T.bgSurface,
+              border: `1px solid ${T.border}`, borderRadius: T.radiusSm,
+              padding: "7px 11px", marginBottom: 5, color: T.brand,
+            }}>
+              <span style={{ color: status.missing?.includes(k) ? T.red : T.green, marginRight: 6 }}>
+                {status.missing?.includes(k) ? "✗" : "✓"}
+              </span>{k}
             </div>
           ))}
         </div>
@@ -10770,412 +10912,377 @@ function ZoomPhoneTab() {
     );
   }
 
-  // ── Main UI ───────────────────────────────────────────────────────────────
+  // ── Main render ────────────────────────────────────────────────────────
   return (
-    <div style={{padding:"20px",maxWidth:1400}}>
+    <div style={{ padding: "12px clamp(12px, 3vw, 20px) 24px", maxWidth: 1400, margin: "0 auto" }}>
 
-      {/* Top nav tabs */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:0,flexWrap:"wrap",gap:8}}>
-        <div style={{display:"flex",gap:0,borderBottom:`2px solid ${T.border}`}}>
-          <button style={tabBtn("live")}    onClick={()=>setActiveTab("live")}>📞 Live Feed</button>
-          <button style={tabBtn("history")} onClick={()=>setActiveTab("history")}>📊 History & Analysis</button>
-        </div>
-        <div style={{display:"flex",gap:8,alignItems:"center",paddingBottom:4}}>
-          {activeTab==="live" && (
-            <>
-              {lastEvent && liveMode && <span style={{fontSize:"11px",color:T.textMuted}}>Last: {fmtTime(lastEvent.ts)} · {lastEvent.employee}</span>}
-              <button style={{...btnSec,color:liveMode?T.green:T.textMuted,borderColor:liveMode?T.green:T.border}} onClick={toggleLive}>
-                {liveMode?"⏸ Pause":"▶ Live"}
-              </button>
-            </>
-          )}
-          {activeTab==="history" && histCalls.length>0 && (
-            <div style={{display:"flex",gap:6}}>
-              <button style={btnSec} onClick={exportHistCSV}>⬇ Period CSV</button>
-              <button style={btnSec} onClick={exportEmpHistCSV}>⬇ Employee CSV</button>
-            </div>
-          )}
-        </div>
+      {/* Tab nav */}
+      <div style={{
+        display: "flex", borderBottom: `2px solid ${T.border}`,
+        marginBottom: 14, overflowX: "auto", WebkitOverflowScrolling: "touch",
+      }}>
+        {[
+          { id: "live", label: "Live Feed", icon: "📞" },
+          { id: "history", label: "History & Analysis", icon: "📊" },
+        ].map(t => (
+          <button
+            key={t.id}
+            onClick={() => setActiveTab(t.id)}
+            style={{
+              padding: "10px 14px", background: "transparent",
+              border: "none", borderBottom: `3px solid ${activeTab === t.id ? T.brand : "transparent"}`,
+              color: activeTab === t.id ? T.brand : T.textMuted,
+              fontWeight: activeTab === t.id ? 700 : 500,
+              fontSize: 13, cursor: "pointer", marginBottom: -2,
+              whiteSpace: "nowrap", transition: "all 0.15s",
+            }}
+          >
+            <span style={{ marginRight: 6 }}>{t.icon}</span>{t.label}
+          </button>
+        ))}
       </div>
 
-      {/* Error */}
-      {error && <div style={{background:T.redBg,border:`1px solid ${T.red}`,borderRadius:T.radiusSm,padding:"10px 14px",color:T.redText,fontSize:"13px",margin:"12px 0"}}>⚠ {error}</div>}
-
-      {/* ═══════════════════════ LIVE TAB ═══════════════════════════════════ */}
+      {/* ═══════════ LIVE FEED ═══════════ */}
       {activeTab === "live" && (
-        <div style={{marginTop:16}}>
+        <div>
           {/* Connection status */}
-          <div style={{fontSize:"12px",color:T.textMuted,marginBottom:12}}>
-            {liveMode && liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.green,marginRight:5,verticalAlign:"middle",boxShadow:`0 0 6px ${T.green}`}} />Live · updates automatically</>}
-            {liveMode && !liveConnected && <><span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:T.yellow,marginRight:5,verticalAlign:"middle"}} />Connecting…</>}
-            {!liveMode && "Paused — showing last loaded data"}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+            <div style={{ fontSize: 12, color: T.textMuted, display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{
+                display: "inline-block", width: 8, height: 8, borderRadius: "50%",
+                background: livePaused ? T.textDim : (liveConnected ? T.green : T.yellow),
+                boxShadow: liveConnected && !livePaused ? `0 0 6px ${T.green}` : "none",
+              }} />
+              {livePaused ? "Paused" : liveConnected ? "Live · auto-updating" : "Connecting…"}
+              {lastEvent && !livePaused && (
+                <span style={{ marginLeft: 8 }}>· last: {_phoneFmtTime(lastEvent.ts)} {lastEvent.employee}</span>
+              )}
+            </div>
+            <button
+              style={{ ...btnSec, color: livePaused ? T.brand : T.green, borderColor: livePaused ? T.brand : T.green }}
+              onClick={() => setLivePaused(p => !p)}
+            >
+              {livePaused ? "▶ Resume" : "⏸ Pause"}
+            </button>
           </div>
 
           {/* Active calls */}
-          <div style={{...card,marginBottom:14,borderLeft:`3px solid ${liveCalls.length>0?T.green:T.border}`}}>
-            <div style={{fontWeight:700,fontSize:"13px",marginBottom:liveCalls.length>0?10:0}}>
-              {liveCalls.length>0
-                ? <><span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:T.green,marginRight:6,verticalAlign:"middle",animation:"zmPulse 1.5s infinite"}} />{liveCalls.length} Active Call{liveCalls.length!==1?"s":""}</>
-                : <span style={{color:T.textMuted,fontWeight:500}}>📵 No active calls</span>}
+          <div style={{ ...card, borderLeft: `3px solid ${liveCalls.length ? T.green : T.border}`, marginBottom: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: liveCalls.length ? 10 : 0 }}>
+              {liveCalls.length
+                ? <><span style={{ display:"inline-block", width:8, height:8, borderRadius:"50%", background:T.green, marginRight:6, verticalAlign:"middle", animation:"zmPulse 1.5s infinite" }} />{liveCalls.length} Active Call{liveCalls.length !== 1 ? "s" : ""}</>
+                : <span style={{ color: T.textMuted, fontWeight: 500 }}>📵 No active calls</span>
+              }
             </div>
-            {liveCalls.length>0 && (
-              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:8,marginTop:8}}>
-                {liveCalls.map(c=>(
-                  <div key={c.call_id||c.id} style={{background:c.status==="ringing"?T.yellowBg:T.greenBg,border:`1px solid ${c.status==="ringing"?T.yellow:T.green}`,borderRadius:T.radiusSm,padding:"11px 13px"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
-                      <div style={{fontWeight:700,fontSize:"12px",color:c.status==="ringing"?T.yellowText:T.greenText}}>{c.status==="ringing"?"📲 Ringing":"📞 On Call"}</div>
-                      <span style={{fontSize:"10px",color:T.textMuted}}>{fmtTime(c.ts)}</span>
+            {liveCalls.length > 0 && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 8 }}>
+                {liveCalls.map(c => (
+                  <div key={c.call_id || c._docId} style={{
+                    background: c.status === "ringing" ? T.yellowBg : T.greenBg,
+                    border: `1px solid ${c.status === "ringing" ? T.yellow : T.green}`,
+                    borderRadius: T.radiusSm, padding: "10px 12px",
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                      <div style={{ fontWeight: 700, fontSize: 12, color: c.status === "ringing" ? T.yellowText : T.greenText }}>
+                        {c.status === "ringing" ? "📲 Ringing" : "📞 On Call"}
+                      </div>
+                      <span style={{ fontSize: 10, color: T.textMuted }}>{_phoneFmtTime(c.ts)}</span>
                     </div>
-                    <div style={{fontWeight:600,fontSize:"14px"}}>{c.employee||"—"}</div>
-                    <div style={{fontSize:"12px",color:T.textMuted}}>{c.caller_name||c.caller_num||"Unknown"}</div>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{c.employee || "—"}</div>
+                    <div style={{ fontSize: 12, color: T.textMuted, marginTop: 2 }}>
+                      {c.caller_name || c.caller_num || "Unknown caller"}
+                    </div>
                   </div>
                 ))}
               </div>
             )}
           </div>
 
-          {/* Live metrics */}
-          {calls.length>0 && (
-            <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:14}}>
-              {[
-                {label:"Calls (today)",value:liveMetrics.tot.toLocaleString(),color:T.brand},
-                {label:"Answered",value:liveMetrics.ans.toLocaleString(),sub:pct(liveMetrics.ans,liveMetrics.tot),color:T.green},
-                {label:"Missed",  value:liveMetrics.mis.toLocaleString(),sub:pct(liveMetrics.mis,liveMetrics.tot),color:T.red},
-                {label:"Avg Talk",value:fmtDur(liveMetrics.avgTalk),color:T.text},
-                {label:"Staff",   value:liveMetrics.emps,color:T.brand},
-              ].map(m=>(
-                <div key={m.label} style={metCard}>
-                  <div style={{fontSize:"10px",fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:3}}>{m.label}</div>
-                  <div style={{fontSize:"22px",fontWeight:800,color:m.color,lineHeight:1}}>{m.value}</div>
-                  {m.sub&&<div style={{fontSize:"10px",color:T.textMuted,marginTop:2}}>{m.sub}</div>}
-                </div>
-              ))}
+          {/* Recent calls (compact list, no horizontal scroll on mobile) */}
+          <div style={{ ...card }}>
+            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 10 }}>
+              Recent Calls
+              <span style={{ fontWeight: 400, color: T.textMuted, fontSize: 12, marginLeft: 8 }}>
+                ({recentCalls.length})
+              </span>
             </div>
-          )}
+            {recentCalls.length === 0 ? (
+              <_PhoneEmptyState
+                icon="📞"
+                title="No recent calls yet"
+                body="Calls will appear here as they complete. Active calls show up at the top."
+              />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {recentCalls.map((c, i) => (
+                  <div key={c.id || i} style={{
+                    display: "flex", alignItems: "center", gap: 10,
+                    padding: "8px 10px",
+                    background: i % 2 === 0 ? T.bgWhite : T.bgSurface,
+                    borderRadius: T.radiusSm, border: `1px solid ${T.borderLight}`,
+                  }}>
+                    {/* Result dot */}
+                    <span style={{
+                      flexShrink: 0, width: 8, height: 8, borderRadius: "50%",
+                      background: c.result === "answered" ? T.green
+                                 : c.result === "missed" ? T.red
+                                 : c.result === "voicemail" ? T.yellow
+                                 : T.textDim,
+                    }} />
 
-          {/* Live log sub-tabs */}
-          {calls.length>0 && (
-            <>
-              <div style={{display:"flex",gap:2,borderBottom:`2px solid ${T.border}`,marginBottom:14}}>
-                {[{id:"employees",label:"👥 By Employee"},{id:"calls",label:"📋 Call Log"}].map(t=>(
-                  <button key={t.id} onClick={()=>setLogView(t.id)} style={{padding:"8px 14px",border:"none",borderBottom:`2px solid ${logView===t.id?T.brand:"transparent"}`,background:"transparent",color:logView===t.id?T.brand:T.textMuted,fontWeight:logView===t.id?700:500,fontSize:"12px",cursor:"pointer",marginBottom:"-2px"}}>
-                    {t.label}
-                  </button>
-                ))}
-                <span style={{marginLeft:"auto",fontSize:"11px",color:T.textMuted,alignSelf:"center"}}>{calls.length.toLocaleString()} calls (live)</span>
-              </div>
-
-              {/* Employee cards */}
-              {logView==="employees" && (
-                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
-                  {liveEmpStats.map(e=>{
-                    const ini=e.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
-                    const rate=e.total?Math.round((e.answered/e.total)*100):0;
-                    return (
-                      <div key={e.name} style={{...card,cursor:"pointer"}} onClick={()=>{setEmpFilter(e.name);setLogView("calls");setPage(1);}}>
-                        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
-                          <div style={{width:34,height:34,background:T.brandPale,border:`1px solid ${T.brand}20`,borderRadius:"8px",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:"12px",color:T.brand,flexShrink:0}}>{ini}</div>
-                          <div style={{flex:1,minWidth:0}}><div style={{fontWeight:700,fontSize:"14px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.name}</div><div style={{fontSize:"11px",color:T.textMuted}}>{e.ext?`Ext ${e.ext}`:"—"}</div></div>
-                          <div style={{fontSize:"11px",fontWeight:700,color:T.textMuted}}>{rate}%</div>
-                        </div>
-                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:4,textAlign:"center"}}>
-                          <div><div style={{fontWeight:800,fontSize:"17px",color:T.green}}>{e.answered}</div><div style={{fontSize:"9px",color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>Answered</div></div>
-                          <div><div style={{fontWeight:800,fontSize:"17px",color:T.red}}>{e.missed}</div><div style={{fontSize:"9px",color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>Missed</div></div>
-                          <div><div style={{fontWeight:800,fontSize:"17px"}}>{fmtDur(e.answered?Math.round(e.talk/e.answered):0)}</div><div style={{fontSize:"9px",color:T.textMuted,fontWeight:600,textTransform:"uppercase"}}>Avg</div></div>
-                        </div>
-                        <div style={{height:3,background:T.border,borderRadius:3,marginTop:9}}><div style={{height:"100%",width:`${rate}%`,background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3}} /></div>
+                    {/* Employee & caller */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13, color: T.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {c.answeredBy || "—"}
+                        {c.direction === "outbound" && <span style={{ fontSize: 10, color: T.textMuted, marginLeft: 6 }}>→ out</span>}
                       </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Call log table */}
-              {logView==="calls" && (
-                <div>
-                  <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
-                    <input placeholder="Search…" value={search} onChange={e=>{setSearch(e.target.value);setPage(1);}} style={{...inputStyle,width:200}} />
-                    <select value={empFilter} onChange={e=>{setEmpFilter(e.target.value);setPage(1);}} style={inputStyle}>
-                      <option value="">All Employees</option>
-                      {liveEmpNames.map(n=><option key={n} value={n}>{n}</option>)}
-                    </select>
-                    <select value={resFilter} onChange={e=>{setResFilter(e.target.value);setPage(1);}} style={inputStyle}>
-                      <option value="">All Results</option>
-                      <option value="answered">Answered</option>
-                      <option value="missed">Missed</option>
-                      <option value="voicemail">Voicemail</option>
-                    </select>
-                    {(empFilter||resFilter||search)&&<button style={btnSec} onClick={()=>{setEmpFilter("");setResFilter("");setSearch("");setPage(1);}}>✕ Clear</button>}
-                    <span style={{marginLeft:"auto",fontSize:"12px",color:T.textMuted}}>{liveFiltered.length.toLocaleString()} calls</span>
-                  </div>
-                  <div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:T.radius,overflow:"hidden"}}>
-                    <div style={{overflowX:"auto"}}>
-                      <table style={{width:"100%",borderCollapse:"collapse"}}>
-                        <thead><tr>
-                          {[{c:"date",l:"Date/Time"},{c:"employee",l:"Answered By"},{c:"direction",l:"Dir"},{c:"caller",l:"Caller"},{c:"result",l:"Result"},{c:"talkTime",l:"Talk"}].map(({c,l})=>(
-                            <th key={l} onClick={()=>doSort(c)} style={thStyle}>{l}{sortIcon(c)}</th>
-                          ))}
-                        </tr></thead>
-                        <tbody>
-                          {liveSlice.length===0
-                            ? <tr><td colSpan={6} style={{...tdStyle,textAlign:"center",color:T.textMuted,padding:"40px"}}>No calls match filters</td></tr>
-                            : liveSlice.map((c,i)=>(
-                                <tr key={c.id||i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
-                                  <td style={{...tdStyle,color:T.textMuted,fontSize:"11px"}}>{fmtDT(c.date)}</td>
-                                  <td style={tdStyle}><div style={{fontWeight:700}}>{c.answeredBy||"—"}</div></td>
-                                  <td style={tdStyle}>{dirBadge(c.direction)}</td>
-                                  <td style={tdStyle}><div>{c.callerName||c.callerNum||"—"}</div>{c.callerName&&<div style={{fontSize:"10px",color:T.textMuted}}>{c.callerNum}</div>}</td>
-                                  <td style={tdStyle}>{resBadge(c.result)}</td>
-                                  <td style={{...tdStyle,fontFamily:"monospace"}}>{fmtDur(c.talkTime)}</td>
-                                </tr>
-                              ))
-                          }
-                        </tbody>
-                      </table>
+                      <div style={{ fontSize: 11, color: T.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {c.callerName || c.callerNum || "Unknown"}
+                      </div>
                     </div>
-                    {livePages>1&&<div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderTop:`1px solid ${T.border}`,background:T.bgSurface,fontSize:"12px",color:T.textMuted}}>
-                      <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===1} onClick={()=>setPage(p=>p-1)}>← Prev</button>
-                      <span>Page {page} of {livePages}</span>
-                      <button style={{...btnSec,padding:"5px 12px",fontSize:"11px"}} disabled={page===livePages} onClick={()=>setPage(p=>p+1)}>Next →</button>
-                    </div>}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
 
-          {!calls.length && !loading && (
-            <div style={{textAlign:"center",padding:"50px 20px",color:T.textMuted}}>
-              <div style={{fontSize:36,marginBottom:10}}>📞</div>
-              <div style={{fontWeight:600,marginBottom:4}}>{liveMode?"Waiting for calls…":"Paused"}</div>
-              <div style={{fontSize:"12px"}}>{liveMode?"Live feed connected. Calls appear here as they complete.":"Hit ▶ Live to resume."}</div>
-            </div>
-          )}
+                    {/* Talk + time */}
+                    <div style={{ flexShrink: 0, textAlign: "right" }}>
+                      <div style={{ fontSize: 12, fontFamily: "monospace", color: T.text, fontWeight: 600 }}>{_phoneFmtDur(c.talkTime)}</div>
+                      <div style={{ fontSize: 10, color: T.textMuted }}>{_phoneFmtTime(c.date)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
-      {/* ═══════════════════════ HISTORY TAB ════════════════════════════════ */}
+      {/* ═══════════ HISTORY ═══════════ */}
       {activeTab === "history" && (
-        <div style={{marginTop:16}}>
-
-          {/* Controls */}
-          <div style={{...card,marginBottom:16}}>
-            <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
-              <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>FROM</div><input type="date" value={histFrom} onChange={e=>setHistFrom(e.target.value)} style={inputStyle} /></div>
-              <div><div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>TO</div><input type="date" value={histTo} onChange={e=>setHistTo(e.target.value)} style={inputStyle} /></div>
+        <div>
+          {/* Controls — mobile-first stack */}
+          <div style={{ ...card, marginBottom: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10, marginBottom: 10 }}>
               <div>
-                <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>GROUP BY</div>
-                <select value={histGroupBy} onChange={e=>setHistGroupBy(e.target.value)} style={inputStyle}>
+                <div style={labelStyle}>From</div>
+                <input type="date" value={histFrom} onChange={e => setHistFrom(e.target.value)} max={histTo} style={inputStyle} />
+              </div>
+              <div>
+                <div style={labelStyle}>To</div>
+                <input type="date" value={histTo} onChange={e => setHistTo(e.target.value)} min={histFrom} style={inputStyle} />
+              </div>
+              <div>
+                <div style={labelStyle}>Group by</div>
+                <select value={histGroupBy} onChange={e => setHistGroupBy(e.target.value)} style={inputStyle}>
                   <option value="day">Day</option>
                   <option value="week">Week</option>
                   <option value="month">Month</option>
                 </select>
               </div>
               <div>
-                <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>EMPLOYEE</div>
-                <select value={histEmp} onChange={e=>setHistEmp(e.target.value)} style={inputStyle}>
-                  <option value="">All Employees</option>
-                  {histEmpNames.map(n=><option key={n} value={n}>{n}</option>)}
+                <div style={labelStyle}>Employee</div>
+                <select value={histEmp} onChange={e => setHistEmp(e.target.value)} style={inputStyle}>
+                  <option value="">All</option>
+                  {histEmployees.map(n => <option key={n} value={n}>{n}</option>)}
                 </select>
               </div>
               <div>
-                <div style={{fontSize:"11px",color:T.textMuted,marginBottom:4,fontWeight:600}}>DIRECTION</div>
-                <select value={histDir} onChange={e=>setHistDir(e.target.value)} style={inputStyle}>
+                <div style={labelStyle}>Direction</div>
+                <select value={histDir} onChange={e => setHistDir(e.target.value)} style={inputStyle}>
                   <option value="">All</option>
                   <option value="inbound">Inbound</option>
                   <option value="outbound">Outbound</option>
                 </select>
               </div>
-              <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchHistory} disabled={histLoading}>
-                {histLoading?"Loading…":"Run Report"}
+            </div>
+
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+              <button style={btnPrimary} onClick={fetchHistory} disabled={histLoading}>
+                {histLoading && !syncProgress ? "Loading…" : "Run Report"}
               </button>
-              <button style={{...btnSec,alignSelf:"flex-end",color:T.brand,borderColor:T.brand}} onClick={async()=>{
-                setHistLoading(true); setError("");
-                try {
-                  // Step 1: get user list
-                  setError("Getting employee list from Zoom…");
-                  const ur = await fetch("/.netlify/functions/marginiq-zoom-phone?action=users");
-                  const ud = await ur.json();
-                  if (!ur.ok) throw new Error(ud.error||"Failed to get users");
-                  const users = ud.users || [];
-                  if (!users.length) throw new Error("No phone users found in Zoom");
-                  // Step 2: sync each user one at a time with progress
-                  for (let i = 0; i < users.length; i++) {
-                    const u = users[i];
-                    setError(`Syncing ${i+1}/${users.length}: ${u.name}…`);
-                    const params = new URLSearchParams({ action:"sync-user", userId:u.id, name:u.name, email:u.email||"", ext:u.ext||"" });
-                    const sr = await fetch(`/.netlify/functions/marginiq-zoom-phone?${params}`);
-                    const sd = await sr.json();
-                    if (!sr.ok) console.warn(`Sync failed for ${u.name}:`, sd.error);
-                  }
-                  setError("");
-                  await fetchHistory();
-                } catch(e) { setError("Sync error: "+String(e.message||e)); }
-                finally { setHistLoading(false); }
-              }} disabled={histLoading} title="Pull fresh data from Zoom and update cache">
-                🔄 Sync Now
+              <button style={{ ...btnSec, color: T.brand, borderColor: T.brand }} onClick={syncFromZoom} disabled={histLoading}>
+                🔄 Sync from Zoom
               </button>
+              {syncedAt && (
+                <div style={{ fontSize: 11, color: T.textMuted, display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: T.green }} />
+                  Synced {new Date(syncedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Sync status */}
-          {syncedAt && !histLoading && (
-            <div style={{fontSize:"11px",color:T.textMuted,marginBottom:12,display:"flex",alignItems:"center",gap:6}}>
-              <span style={{display:"inline-block",width:6,height:6,borderRadius:"50%",background:T.green}} />
-              {dataSource==="cache" ? "From cache" : "Live from Zoom"} · Last synced: {new Date(syncedAt).toLocaleString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",hour12:true})}
+          {/* Sync progress */}
+          {syncProgress && (
+            <div style={{ ...card, borderLeft: `3px solid ${T.brand}`, marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
+                Syncing from Zoom · {syncProgress.current} / {syncProgress.total || "?"}
+              </div>
+              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 8 }}>{syncProgress.name}</div>
+              <div style={{ height: 6, background: T.borderLight, borderRadius: 3, overflow: "hidden" }}>
+                <div style={{
+                  width: syncProgress.total ? `${(syncProgress.current / syncProgress.total) * 100}%` : "0%",
+                  height: "100%", background: T.brand, transition: "width 0.3s",
+                }} />
+              </div>
             </div>
           )}
-          {histLoading && <div style={{textAlign:"center",padding:"50px",color:T.textMuted}}><div style={{fontSize:32,marginBottom:10}}>📊</div><div style={{fontWeight:600,marginBottom:6}}>Fetching history…</div><div style={{fontSize:"12px"}}>First run pulls from Zoom directly — may take 10–20 sec. Future loads are instant from cache.</div></div>}
 
-          {!histLoading && histCalls.length>0 && <>
+          {/* Error / Info banners */}
+          {histError && (
+            <div style={{
+              background: T.redBg, border: `1px solid ${T.red}`,
+              borderRadius: T.radiusSm, padding: "10px 14px",
+              color: T.redText, fontSize: 13, marginBottom: 12,
+            }}>⚠ {histError}</div>
+          )}
+          {histInfo && !histError && (
+            <div style={{
+              background: T.blueBg, border: `1px solid ${T.blue}`,
+              borderRadius: T.radiusSm, padding: "10px 14px",
+              color: T.blueText, fontSize: 13, marginBottom: 12,
+            }}>{histInfo}</div>
+          )}
 
-            {/* Summary metrics */}
-            <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:16}}>
-              {[
-                {label:"Total Calls",  value:histMetrics.tot.toLocaleString(), color:T.brand},
-                {label:"Answered",     value:histMetrics.ans.toLocaleString(), sub:histMetrics.ansRate+"%", color:T.green},
-                {label:"Missed",       value:histMetrics.mis.toLocaleString(), sub:pct(histMetrics.mis,histMetrics.tot), color:T.red},
-                {label:"Voicemail",    value:histMetrics.vm.toLocaleString(),  color:T.yellow},
-                {label:"Avg Talk",     value:fmtDur(histMetrics.avgTalk), color:T.text},
-                {label:"Busiest "+histGroupBy, value:histMetrics.busiest?histMetrics.busiest.total:"—", sub:histMetrics.busiest?.period||"", color:T.brand},
-              ].map(m=>(
-                <div key={m.label} style={metCard}>
-                  <div style={{fontSize:"9px",fontWeight:700,color:T.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:3}}>{m.label}</div>
-                  <div style={{fontSize:"20px",fontWeight:800,color:m.color,lineHeight:1}}>{m.value}</div>
-                  {m.sub&&<div style={{fontSize:"9px",color:T.textMuted,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.sub}</div>}
+          {/* Loading state */}
+          {histLoading && !syncProgress && (
+            <_PhoneEmptyState icon="📊" title="Loading…" />
+          )}
+
+          {/* Empty before first fetch */}
+          {!histLoading && !hasFetched && (
+            <_PhoneEmptyState
+              icon="📊"
+              title="Ready to analyze"
+              body="Pick a date range and tap Run Report. First time? Tap Sync from Zoom to load your data."
+            />
+          )}
+
+          {/* Results */}
+          {!histLoading && histCalls.length > 0 && (
+            <>
+              {/* Summary tiles — auto-fit, no fixed 6-col grid */}
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))",
+                gap: 8, marginBottom: 12,
+              }}>
+                <_PhoneStatPill label="Total Calls" value={histMetrics.tot.toLocaleString()} color={T.brand} />
+                <_PhoneStatPill label="Answered"   value={histMetrics.ans.toLocaleString()} sub={`${histMetrics.ansRate}% rate`} color={T.green} />
+                <_PhoneStatPill label="Missed"     value={histMetrics.mis.toLocaleString()} sub={`${histMetrics.missRate}% rate`} color={T.red} />
+                <_PhoneStatPill label="Voicemail"  value={histMetrics.vm.toLocaleString()} color={T.yellow} />
+                <_PhoneStatPill label="Avg Talk"   value={_phoneFmtDur(histMetrics.avgTalk)} color={T.text} />
+                {histMetrics.busiest && (
+                  <_PhoneStatPill
+                    label={`Busiest ${histGroupBy}`}
+                    value={String(histMetrics.busiest.total)}
+                    sub={histMetrics.busiest.label}
+                    color={T.brand}
+                  />
+                )}
+              </div>
+
+              {/* By Period */}
+              <div style={{ ...card, marginBottom: 12, padding: 0, overflow: "hidden" }}>
+                <div style={{ padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${T.borderLight}`, flexWrap: "wrap", gap: 8 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>
+                    By {histGroupBy.charAt(0).toUpperCase() + histGroupBy.slice(1)}
+                    {histEmp && <span style={{ fontWeight: 400, color: T.textMuted, fontSize: 12, marginLeft: 6 }}>· {histEmp}</span>}
+                  </div>
+                  <button style={{ ...btnSec, padding: "6px 12px", fontSize: 11, minHeight: 32 }} onClick={exportPeriodCSV}>⬇ CSV</button>
                 </div>
-              ))}
-            </div>
-
-            {/* Bar chart overview */}
-            <div style={{...card,marginBottom:16}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                <div style={{fontWeight:700,fontSize:"13px"}}>Call Volume by {histGroupBy.charAt(0).toUpperCase()+histGroupBy.slice(1)}</div>
-                <div style={{display:"flex",gap:12,fontSize:"11px"}}>
-                  <span style={{color:T.green}}>■ Answered</span>
-                  <span style={{color:T.red}}>■ Missed</span>
+                <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 520 }}>
+                    <thead>
+                      <tr>
+                        <SortableTh label="Period"      col="key"      sortKey={periodSort.sortKey} sortDir={periodSort.sortDir} onSort={periodSort.toggleSort} />
+                        <SortableTh label="Total"       col="total"    sortKey={periodSort.sortKey} sortDir={periodSort.sortDir} onSort={periodSort.toggleSort} align="right" />
+                        <SortableTh label="Answered"    col="answered" sortKey={periodSort.sortKey} sortDir={periodSort.sortDir} onSort={periodSort.toggleSort} align="right" />
+                        <SortableTh label="Missed"      col="missed"   sortKey={periodSort.sortKey} sortDir={periodSort.sortDir} onSort={periodSort.toggleSort} align="right" />
+                        <SortableTh label="Answer Rate" col="rate"     sortKey={periodSort.sortKey} sortDir={periodSort.sortDir} onSort={periodSort.toggleSort} />
+                        <SortableTh label="Avg Talk"    col="avgTalk"  sortKey={periodSort.sortKey} sortDir={periodSort.sortDir} onSort={periodSort.toggleSort} align="right" />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {periodSort.sorted.map((p, i) => (
+                        <tr key={p.key} style={{ background: i % 2 === 0 ? T.bgWhite : T.bgSurface }}>
+                          <td style={{ ...tdStyle, fontWeight: 600 }}>{p.label}</td>
+                          <td style={{ ...tdStyle, textAlign: "right", fontWeight: 700, color: T.brand }}>{p.total}</td>
+                          <td style={{ ...tdStyle, textAlign: "right", color: T.green, fontWeight: 600 }}>{p.answered}</td>
+                          <td style={{ ...tdStyle, textAlign: "right", color: T.red, fontWeight: 600 }}>{p.missed}</td>
+                          <td style={tdStyle}><_PhoneRateBar rate={p.rate} /></td>
+                          <td style={{ ...tdStyle, textAlign: "right", fontFamily: "monospace" }}>{p.answered ? _phoneFmtDur(p.avgTalk) : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
-              <MiniBarChart data={periodGroups} />
-              <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",color:T.textMuted,marginTop:2,overflow:"hidden"}}>
-                {periodGroups.length<=12
-                  ? periodGroups.map((p,i)=><span key={i} style={{flex:1,textAlign:"center",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"80px"}}>{p.period.replace(" of ","<br/>")}</span>)
-                  : <><span>{periodGroups[0]?.period}</span><span style={{marginLeft:"auto"}}>{periodGroups[periodGroups.length-1]?.period}</span></>
-                }
-              </div>
-            </div>
 
-            {/* Period breakdown table */}
-            <div style={{...card,marginBottom:16}}>
-              <div style={{fontWeight:700,fontSize:"13px",marginBottom:12}}>
-                {histGroupBy.charAt(0).toUpperCase()+histGroupBy.slice(1)}ly Breakdown
-                {histEmp && <span style={{fontWeight:400,color:T.textMuted,fontSize:"12px",marginLeft:8}}>— {histEmp}</span>}
-              </div>
-              <div style={{overflowX:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse"}}>
-                  <thead>
-                    <tr>
-                      {["Period","Total","Answered","Missed","Voicemail","Answer Rate","Avg Talk","Volume"].map(h=>(
-                        <th key={h} style={thStyle}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[...periodGroups].reverse().map((p,i) => {
-                      const rate = p.total ? Math.round((p.answered/p.total)*100) : 0;
-                      const maxTotal = Math.max(...periodGroups.map(x=>x.total),1);
-                      return (
-                        <tr key={i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
-                          <td style={{...tdStyle,fontWeight:600}}>{p.period}</td>
-                          <td style={{...tdStyle,fontWeight:700,color:T.brand}}>{p.total}</td>
-                          <td style={{...tdStyle,color:T.green,fontWeight:600}}>{p.answered}</td>
-                          <td style={{...tdStyle,color:T.red,fontWeight:600}}>{p.missed}</td>
-                          <td style={{...tdStyle,color:T.yellow}}>{p.voicemail}</td>
-                          <td style={tdStyle}>
-                            <div style={{display:"flex",alignItems:"center",gap:6}}>
-                              <div style={{width:60,height:6,background:T.border,borderRadius:3}}>
-                                <div style={{width:`${rate}%`,height:"100%",background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3}} />
+              {/* By Employee */}
+              <div style={{ ...card, padding: 0, overflow: "hidden" }}>
+                <div style={{ padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${T.borderLight}`, flexWrap: "wrap", gap: 8 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>
+                    By Employee
+                    <span style={{ fontWeight: 400, color: T.textMuted, fontSize: 12, marginLeft: 6 }}>
+                      · {empGroups.length} {empGroups.length === 1 ? "person" : "people"}
+                    </span>
+                  </div>
+                  <button style={{ ...btnSec, padding: "6px 12px", fontSize: 11, minHeight: 32 }} onClick={exportEmpCSV}>⬇ CSV</button>
+                </div>
+                <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 600 }}>
+                    <thead>
+                      <tr>
+                        <SortableTh label="Employee"    col="name"     sortKey={empSort.sortKey} sortDir={empSort.sortDir} onSort={empSort.toggleSort} />
+                        <SortableTh label="Total"       col="total"    sortKey={empSort.sortKey} sortDir={empSort.sortDir} onSort={empSort.toggleSort} align="right" />
+                        <SortableTh label="Answered"    col="answered" sortKey={empSort.sortKey} sortDir={empSort.sortDir} onSort={empSort.toggleSort} align="right" />
+                        <SortableTh label="Missed"      col="missed"   sortKey={empSort.sortKey} sortDir={empSort.sortDir} onSort={empSort.toggleSort} align="right" />
+                        <SortableTh label="Voicemail"   col="voicemail" sortKey={empSort.sortKey} sortDir={empSort.sortDir} onSort={empSort.toggleSort} align="right" />
+                        <SortableTh label="Answer Rate" col="rate"     sortKey={empSort.sortKey} sortDir={empSort.sortDir} onSort={empSort.toggleSort} />
+                        <SortableTh label="Avg Talk"    col="avgTalk"  sortKey={empSort.sortKey} sortDir={empSort.sortDir} onSort={empSort.toggleSort} align="right" />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {empSort.sorted.map((e, i) => (
+                        <tr
+                          key={e.name}
+                          style={{ background: i % 2 === 0 ? T.bgWhite : T.bgSurface, cursor: "pointer" }}
+                          onClick={() => setHistEmp(histEmp === e.name ? "" : e.name)}
+                          title={histEmp === e.name ? "Click to clear filter" : "Click to filter to this employee"}
+                        >
+                          <td style={{ ...tdStyle, fontWeight: 700 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <div style={{
+                                width: 28, height: 28, background: T.brandPale,
+                                border: `1px solid ${T.brand}33`, borderRadius: 6,
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                                fontSize: 11, fontWeight: 800, color: T.brand, flexShrink: 0,
+                              }}>{_phoneInitials(e.name)}</div>
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 180 }}>{e.name}</div>
+                                {e.ext && <div style={{ fontSize: 10, color: T.textMuted, fontWeight: 500 }}>Ext {e.ext}</div>}
                               </div>
-                              <span style={{fontSize:"11px",color:T.textMuted}}>{rate}%</span>
                             </div>
                           </td>
-                          <td style={{...tdStyle,fontFamily:"monospace"}}>{p.answered?fmtDur(Math.round(p.talk/p.answered)):"—"}</td>
-                          <td style={tdStyle}>
-                            <div style={{width:`${Math.round((p.total/maxTotal)*80)}px`,height:8,background:T.brand,borderRadius:2,minWidth:2}} />
-                          </td>
+                          <td style={{ ...tdStyle, textAlign: "right", fontWeight: 700, color: T.brand }}>{e.total}</td>
+                          <td style={{ ...tdStyle, textAlign: "right", color: T.green, fontWeight: 600 }}>{e.answered}</td>
+                          <td style={{ ...tdStyle, textAlign: "right", color: T.red, fontWeight: 600 }}>{e.missed}</td>
+                          <td style={{ ...tdStyle, textAlign: "right", color: T.yellow }}>{e.voicemail}</td>
+                          <td style={tdStyle}><_PhoneRateBar rate={e.rate} /></td>
+                          <td style={{ ...tdStyle, textAlign: "right", fontFamily: "monospace" }}>{e.answered ? _phoneFmtDur(e.avgTalk) : "—"}</td>
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* Employee breakdown */}
-            <div style={{...card}}>
-              <div style={{fontWeight:700,fontSize:"13px",marginBottom:12}}>Employee Breakdown — {histFrom} to {histTo}</div>
-              <div style={{overflowX:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse"}}>
-                  <thead>
-                    <tr>
-                      {["Employee","Ext","Total","Answered","Missed","Voicemail","Answer Rate","Avg Talk","Trend"].map(h=>(
-                        <th key={h} style={thStyle}>{h}</th>
                       ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {empGroups.map((e,i) => {
-                      const rate = e.total ? Math.round((e.answered/e.total)*100) : 0;
-                      return (
-                        <tr key={i} style={{background:i%2===0?T.bgWhite:T.bgSurface}}>
-                          <td style={{...tdStyle,fontWeight:700}}>
-                            <div style={{display:"flex",alignItems:"center",gap:8}}>
-                              <div style={{width:28,height:28,background:T.brandPale,border:`1px solid ${T.brand}20`,borderRadius:"6px",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"11px",fontWeight:800,color:T.brand,flexShrink:0}}>
-                                {e.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}
-                              </div>
-                              {e.name}
-                            </div>
-                          </td>
-                          <td style={{...tdStyle,color:T.textMuted}}>{e.ext||"—"}</td>
-                          <td style={{...tdStyle,fontWeight:700,color:T.brand}}>{e.total}</td>
-                          <td style={{...tdStyle,color:T.green,fontWeight:600}}>{e.answered}</td>
-                          <td style={{...tdStyle,color:T.red,fontWeight:600}}>{e.missed}</td>
-                          <td style={{...tdStyle,color:T.yellow}}>{e.voicemail}</td>
-                          <td style={tdStyle}>
-                            <div style={{display:"flex",alignItems:"center",gap:6}}>
-                              <div style={{width:60,height:6,background:T.border,borderRadius:3}}>
-                                <div style={{width:`${rate}%`,height:"100%",background:rate>80?T.green:rate>50?T.yellow:T.red,borderRadius:3}} />
-                              </div>
-                              <span style={{fontSize:"11px",color:T.textMuted}}>{rate}%</span>
-                            </div>
-                          </td>
-                          <td style={{...tdStyle,fontFamily:"monospace"}}>{e.answered?fmtDur(Math.round(e.talk/e.answered)):"—"}</td>
-                          <td style={tdStyle}>
-                            {periodGroups.length > 1 ? <EmpTrend empName={e.name} /> : <span style={{color:T.textDim,fontSize:"11px"}}>—</span>}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
-          </>}
-
-          {!histLoading && !histCalls.length && !error && (
-            <div style={{textAlign:"center",padding:"60px 20px",color:T.textMuted}}>
-              <div style={{fontSize:40,marginBottom:12}}>📊</div>
-              <div style={{fontWeight:700,fontSize:"15px",marginBottom:6}}>No data loaded</div>
-              <div style={{fontSize:"13px"}}>Select a date range and click Run Report.</div>
-            </div>
+            </>
           )}
         </div>
       )}
 
       <style>{`
         @keyframes zmPulse {
-          0%,100%{opacity:1;transform:scale(1)}
-          50%{opacity:.6;transform:scale(1.3)}
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50%      { opacity: 0.6; transform: scale(1.3); }
         }
       `}</style>
     </div>
