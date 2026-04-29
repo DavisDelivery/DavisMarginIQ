@@ -3,7 +3,7 @@ import type { Context } from "@netlify/functions";
 // Zoom Phone API — clean rewrite based on actual Zoom response shape
 //
 // Key Zoom fields (verified from real API responses):
-//   talk_time      — number, seconds. ONLY non-zero on the leg that actually answered.
+//   talk_time      — seconds. ONLY non-zero on the leg that actually answered.
 //   answer_time    — timestamp. Empty string on rings that didn't connect.
 //   wait_time      — seconds caller waited.
 //   hold_time      — seconds put on hold.
@@ -59,47 +59,6 @@ async function getPhoneUsers(token: string) {
   });
 }
 
-async function getUserCalls(token: string, userId: string, from: string, to: string): Promise<{records: any[], truncated: boolean, error?: string, totalAvailable?: number}> {
-  const records: any[] = [];
-  let npt = "", pages = 0;
-  let totalAvailable: number | undefined;
-  const MAX_PAGES = 50;  // 5000 records max
-  const MAX_RETRIES_PER_PAGE = 3;
-
-  while (true) {
-    const url = `${API}/phone/users/${userId}/call_history?from=${from}&to=${to}&page_size=100${npt ? "&next_page_token=" + encodeURIComponent(npt) : ""}`;
-    let res: Response | null = null;
-    let success = false;
-
-    for (let attempt = 0; attempt < MAX_RETRIES_PER_PAGE; attempt++) {
-      try {
-        res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-        if (res.status === 429) { await sleep(2000 * (attempt + 1)); continue; }
-        success = true;
-        break;
-      } catch(e: any) { await sleep(1000); }
-    }
-
-    if (!success || !res) return { records, truncated: true, error: "fetch failed", totalAvailable };
-
-    const d: any = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      if (res.status === 404 || res.status === 400) return { records, truncated: false, totalAvailable };
-      return { records, truncated: true, error: d.message || `HTTP ${res.status}`, totalAvailable };
-    }
-
-    if (totalAvailable === undefined) totalAvailable = d.total_records;
-    records.push(...(d.call_logs || []));
-    npt = d.next_page_token || "";
-    pages++;
-
-    if (!npt) break;
-    if (pages >= MAX_PAGES) return { records, truncated: true, totalAvailable };
-  }
-
-  return { records, truncated: false, totalAvailable };
-}
-
 // ── Normalize: read the ACTUAL fields Zoom returns ──────────────────────────
 function normalizeRecord(raw: any, owner: { name: string; email: string; ext: string }) {
   const talkTime    = Number(raw.talk_time) || 0;
@@ -109,7 +68,6 @@ function normalizeRecord(raw: any, owner: { name: string; email: string; ext: st
   const calleeType  = raw.callee_ext_type || "";
   const operatorType= raw.operator_ext_type || "";
 
-  // The result field from Zoom: "answered" | "no_answer" | "ring_timeout" | "voicemail" | "missed"
   const rawResult = String(raw.result || "").toLowerCase();
   let result: string;
   if (rawResult === "answered" && answered)     result = "answered";
@@ -119,16 +77,12 @@ function normalizeRecord(raw: any, owner: { name: string; email: string; ext: st
   else if (answered)                             result = "answered";
   else                                            result = rawResult || "unknown";
 
-  // Was this call routed via a queue or auto-receptionist?
   const viaQueue  = operatorType === "call_queue" || operatorType === "auto_receptionist"
                   || calleeType === "call_queue"  || calleeType === "auto_receptionist";
   const queueName = raw.operator_name || (calleeType !== "user" ? raw.callee_name : "") || "";
 
-  // The actual person on this leg — could be the user (if callee_ext_type=user) or the queue/auto
   const isHumanLeg = calleeType === "user";
-  const personName = isHumanLeg
-    ? (raw.callee_name || owner.name)
-    : (raw.callee_name || owner.name);  // fall back to owner if leg is opaque
+  const personName = (isHumanLeg ? raw.callee_name : "") || owner.name;
 
   return {
     callPathId:    raw.call_path_id || raw.id || "",
@@ -138,34 +92,24 @@ function normalizeRecord(raw: any, owner: { name: string; email: string; ext: st
     answerTime:    raw.answer_time || "",
     endTime:       raw.end_time || "",
     direction:     String(raw.direction || "").toLowerCase(),
-
-    // Attribution
     answeredBy:    personName,
     answeredEmail: raw.callee_email || owner.email || "",
     answeredExt:   String(raw.callee_ext_number || owner.ext || ""),
     isHumanLeg,
-    answered,                     // boolean: did this leg actually have a conversation?
-
-    // Caller
+    answered,
     callerNum:     raw.caller_did_number || raw.caller_number || "",
     callerName:    raw.caller_name || "",
-
-    // Routing context
-    calleeType,                  // user | call_queue | auto_receptionist
-    operatorType,                // queue/receptionist that routed it
+    calleeType,
+    operatorType,
     viaQueue,
     queueName,
     department:    raw.department || "",
-    event:         raw.event || "",   // ring_to_member, etc.
-
-    // Timing
-    result,                       // answered | missed | voicemail
-    rawResult,                    // original Zoom string
+    event:         raw.event || "",
+    result,
+    rawResult,
     talkTime,
     waitTime,
     holdTime,
-
-    // Back-compat
     id:            raw.call_path_id || raw.id || "",
   };
 }
@@ -173,7 +117,6 @@ function normalizeRecord(raw: any, owner: { name: string; email: string; ext: st
 // ── Dedup by call_path_id, picking the leg that actually answered ───────────
 function dedupeByCall(records: any[]): any[] {
   const byPath = new Map<string, { winner: any; ringers: Set<string> }>();
-
   for (const r of records) {
     const key = r.callPathId || r.legId || `${r.date}-${r.callerNum}`;
     let bucket = byPath.get(key);
@@ -181,24 +124,18 @@ function dedupeByCall(records: any[]): any[] {
       bucket = { winner: r, ringers: new Set() };
       byPath.set(key, bucket);
     }
-
-    // Track everyone whose phone rang for this call
     if (r.isHumanLeg && r.answeredBy) bucket.ringers.add(r.answeredBy);
-
-    // Score each leg — answerer wins
     const score = (rec: any) => {
       let s = 0;
-      if (rec.answered)              s += 10000;  // had answer_time AND talk_time>0 — definitive
-      if (rec.talkTime > 0)          s += 5000 + rec.talkTime;  // at minimum spoke
+      if (rec.answered)              s += 10000;
+      if (rec.talkTime > 0)          s += 5000 + rec.talkTime;
       if (rec.result === "answered") s += 100;
       if (rec.isHumanLeg)            s += 50;
       if (rec.answeredBy && rec.answeredBy !== "Unknown") s += 1;
       return s;
     };
-
     if (score(r) > score(bucket.winner)) bucket.winner = r;
   }
-
   return Array.from(byPath.values()).map(({ winner, ringers }) => ({
     ...winner,
     chain: Array.from(ringers),
@@ -240,6 +177,95 @@ async function fsListDocs(proj: string, key: string, col: string): Promise<any[]
   if (!res.ok) return [];
   const d: any = await res.json();
   return (d.documents || []).map((doc: any) => fromFV(doc.fields || {}));
+}
+async function fsDelete(proj: string, key: string, col: string, doc: string) {
+  const url = `https://firestore.googleapis.com/v1/projects/${proj}/databases/(default)/documents/${col}/${encodeURIComponent(doc)}?key=${key}`;
+  await fetch(url, { method: "DELETE" }).catch(() => {});
+}
+
+// ── Sync one user with INCREMENTAL writes (saves progress per page) ─────────
+// This is the key fix: we write to Firebase after every page, so even if the
+// function times out we keep what we got. Each page write OVERWRITES the doc.
+async function syncUserIncremental(
+  token: string,
+  userId: string,
+  owner: { name: string; email: string; ext: string },
+  from: string,
+  to: string,
+  fbProj: string,
+  fbKey: string,
+): Promise<{ count: number; truncated: boolean; totalAvailable?: number; error?: string }> {
+  const allNormalized: any[] = [];
+  let npt = "";
+  let pages = 0;
+  let totalAvailable: number | undefined;
+  const MAX_PAGES = 100;  // 10000 records max
+  const MAX_RETRIES = 3;
+
+  while (true) {
+    const url = `${API}/phone/users/${userId}/call_history?from=${from}&to=${to}&page_size=100${npt ? "&next_page_token=" + encodeURIComponent(npt) : ""}`;
+    let res: Response | null = null;
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+        if (res.status === 429) { await sleep(2000 * (attempt + 1)); continue; }
+        break;
+      } catch(e: any) { await sleep(1000); }
+    }
+
+    if (!res) {
+      // Save what we have, mark truncated
+      await writeProgress(fbProj, fbKey, userId, owner, allNormalized, from, to, true, totalAvailable, "fetch failed");
+      return { count: allNormalized.length, truncated: true, totalAvailable, error: "fetch failed" };
+    }
+
+    const d: any = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 400) {
+        // No data for this user — write empty doc explicitly so we know it's intentional
+        await writeProgress(fbProj, fbKey, userId, owner, allNormalized, from, to, false, totalAvailable);
+        return { count: 0, truncated: false, totalAvailable };
+      }
+      await writeProgress(fbProj, fbKey, userId, owner, allNormalized, from, to, true, totalAvailable, d.message || `HTTP ${res.status}`);
+      return { count: allNormalized.length, truncated: true, totalAvailable, error: d.message || `HTTP ${res.status}` };
+    }
+
+    if (totalAvailable === undefined) totalAvailable = d.total_records;
+    const pageRecords = d.call_logs || [];
+    for (const r of pageRecords) allNormalized.push(normalizeRecord(r, owner));
+    npt = d.next_page_token || "";
+    pages++;
+
+    // Save after every page (so partial syncs are preserved)
+    await writeProgress(fbProj, fbKey, userId, owner, allNormalized, from, to, false, totalAvailable);
+
+    if (!npt) return { count: allNormalized.length, truncated: false, totalAvailable };
+    if (pages >= MAX_PAGES) {
+      await writeProgress(fbProj, fbKey, userId, owner, allNormalized, from, to, true, totalAvailable);
+      return { count: allNormalized.length, truncated: true, totalAvailable };
+    }
+  }
+}
+
+async function writeProgress(
+  proj: string, key: string, userId: string,
+  owner: { name: string; email: string; ext: string },
+  records: any[],
+  from: string, to: string,
+  truncated: boolean,
+  totalAvailable: number | undefined,
+  errorMsg?: string,
+) {
+  await fsSet(proj, key, "zoom_sync_users", userId, {
+    name: owner.name, email: owner.email, ext: owner.ext,
+    records, count: records.length,
+    synced_at: new Date().toISOString(),
+    from, to,
+    truncated,
+    totalAvailable: totalAvailable || 0,
+    sync_error: errorMsg || "",
+  }).catch(e => console.warn("[zoom-phone] write failed:", e?.message));
 }
 
 // ── Main handler ─────────────────────────────────────────────────────────────
@@ -298,6 +324,27 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
   }
 
+  // ── Wipe a user's cache before re-syncing ────────────────────────────────
+  if (action === "wipe-user") {
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
+    const userId = u.searchParams.get("userId") || "";
+    if (!userId) return new Response(JSON.stringify({ error: "userId required" }), { status: 400, headers: CORS });
+    await fsDelete(FB_PROJ, FB_KEY, "zoom_sync_users", userId);
+    return new Response(JSON.stringify({ ok: true, userId }), { headers: CORS });
+  }
+
+  // ── Wipe ALL user caches at once ─────────────────────────────────────────
+  if (action === "wipe-all") {
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
+    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
+    const token = await getToken(ACCT, CID, CSEC);
+    const users = await getPhoneUsers(token);
+    for (const user of users) {
+      await fsDelete(FB_PROJ, FB_KEY, "zoom_sync_users", user.id);
+    }
+    return new Response(JSON.stringify({ ok: true, wiped: users.length, users: users.map(u=>u.name) }), { headers: CORS });
+  }
+
   // ── Debug: pull RAW Zoom data for one user ───────────────────────────────
   if (action === "debug-zoomraw") {
     const userId = u.searchParams.get("userId") || "UgG02EaxRauMiyuJ4Hixag";
@@ -327,14 +374,17 @@ export default async (req: Request, _ctx: Context) => {
       summary: userDocs.map((d:any) => {
         const recs = (d.records || []) as any[];
         const answered = recs.filter(r => r.answered === true || r.talkTime > 0).length;
+        const hasNewSchema = recs.length > 0 && (recs[0].talkTime !== undefined || recs[0].answered !== undefined);
         return {
           name: d.name, ext: d.ext,
           totalRecords: recs.length,
           actuallyAnswered: answered,
           ringedButDidntAnswer: recs.length - answered,
+          hasNewSchema,
           synced_at: d.synced_at,
           truncated: d.truncated || false,
           totalAvailable: d.totalAvailable,
+          sync_error: d.sync_error || "",
         };
       }),
     }), { headers: CORS });
@@ -347,43 +397,28 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ users }), { headers: CORS });
   }
 
-  // ── Sync ONE user ────────────────────────────────────────────────────────
+  // ── Sync ONE user with INCREMENTAL writes ───────────────────────────────
   if (action === "sync-user") {
     const userId   = u.searchParams.get("userId") || "";
     const userName = u.searchParams.get("name")   || "";
     const userEmail= u.searchParams.get("email")  || "";
     const userExt  = u.searchParams.get("ext")    || "";
     if (!userId) return new Response(JSON.stringify({ error: "userId required" }), { status: 400, headers: CORS });
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({ error: "Firebase not configured" }), { status: 500, headers: CORS });
 
     const syncFrom = u.searchParams.get("from") || new Date(Date.now()-35*86400000).toISOString().split("T")[0];
     const syncTo   = u.searchParams.get("to")   || new Date().toISOString().split("T")[0];
 
     try {
-      const token  = await getToken(ACCT, CID, CSEC);
-      const result = await getUserCalls(token, userId, syncFrom, syncTo);
-      const owner  = { name: userName, email: userEmail, ext: userExt };
-      const normalized = result.records.map(r => normalizeRecord(r, owner));
-
-      let action_taken = "wrote";
-      if (FB_KEY && FB_PROJ) {
-        if (normalized.length === 0 && result.error) {
-          action_taken = "failed-kept-cache";
-        } else {
-          await fsSet(FB_PROJ, FB_KEY, "zoom_sync_users", userId, {
-            name: userName, email: userEmail, ext: userExt,
-            records: normalized, count: normalized.length,
-            synced_at: new Date().toISOString(),
-            from: syncFrom, to: syncTo,
-            truncated: result.truncated || false,
-            totalAvailable: result.totalAvailable || 0,
-            sync_error: result.error || "",
-          });
-        }
-      }
+      const token = await getToken(ACCT, CID, CSEC);
+      const owner = { name: userName, email: userEmail, ext: userExt };
+      // Wipe first to guarantee no stale data sneaks through
+      await fsDelete(FB_PROJ, FB_KEY, "zoom_sync_users", userId);
+      const result = await syncUserIncremental(token, userId, owner, syncFrom, syncTo, FB_PROJ, FB_KEY);
       return new Response(JSON.stringify({
-        ok: !result.error, name: userName, count: normalized.length,
+        ok: !result.error, name: userName, count: result.count,
         truncated: result.truncated, totalAvailable: result.totalAvailable,
-        error: result.error || null, action: action_taken, ms: Date.now()-t0,
+        error: result.error || null, ms: Date.now()-t0,
       }), { headers: CORS });
     } catch(e: any) {
       return new Response(JSON.stringify({ error: String(e?.message||e), name: userName }), { status: 500, headers: CORS });
