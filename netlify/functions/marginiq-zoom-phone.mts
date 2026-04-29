@@ -1,13 +1,5 @@
 import type { Context } from "@netlify/functions";
 
-// Zoom Phone proxy for MarginIQ
-// Tries /phone/call_history first, falls back to /phone/call_logs on 403/404.
-// Both endpoints normalize to the same output including answeredBy per call.
-//
-// Env vars: ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET
-// GET ?action=status
-// GET ?action=history&from=YYYY-MM-DD&to=YYYY-MM-DD&direction=inbound|outbound
-
 const TOKEN_URL = "https://zoom.us/oauth/token";
 const API       = "https://api.zoom.us/v2";
 const MAX_PAGES = 20;
@@ -39,7 +31,6 @@ async function paginate(token: string, baseUrl: string): Promise<any[]> {
 
 async function fetchCalls(token: string, from: string, to: string, dir: string) {
   const d = dir ? `&type=${dir}` : "";
-  // Try new call_history endpoint
   try {
     const recs = await paginate(token, `${API}/phone/call_history?from=${from}&to=${to}&page_size=100${d}`);
     return { recs, endpoint: "call_history" };
@@ -47,9 +38,37 @@ async function fetchCalls(token: string, from: string, to: string, dir: string) 
     if (e.status !== 403 && e.status !== 404) throw e;
     console.log("[zoom-phone] call_history =>", e.status, "falling back to call_logs");
   }
-  // Fall back to old call_logs endpoint
   const recs = await paginate(token, `${API}/phone/call_logs?from=${from}&to=${to}&type=all&page_size=100${d}`);
   return { recs, endpoint: "call_logs" };
+}
+
+function extractName(raw: any): string {
+  // Walk every possible field path Zoom might use for the answering employee
+  const direction = (raw.direction || "").toLowerCase();
+  const candidates: (string|undefined)[] = [];
+
+  if (direction === "inbound") {
+    // Inbound: callee = person who answered
+    candidates.push(
+      raw.callee?.name, raw.callee?.display_name, raw.callee?.user_name,
+      raw.callee?.user?.name, raw.callee?.user?.display_name,
+      raw.answerer?.name, raw.answerer?.display_name,
+      raw.user?.name, raw.user?.display_name, raw.user_name, raw.user_display_name,
+      raw.owner?.name, raw.owner?.display_name, raw.owner_name,
+      raw.caller?.name  // last resort
+    );
+  } else {
+    // Outbound: caller = employee
+    candidates.push(
+      raw.caller?.name, raw.caller?.display_name, raw.caller?.user_name,
+      raw.caller?.user?.name,
+      raw.user?.name, raw.user?.display_name, raw.user_name, raw.user_display_name,
+      raw.owner?.name, raw.owner?.display_name, raw.owner_name,
+      raw.callee?.name
+    );
+  }
+
+  return candidates.find(c => c && c.trim() !== "") || "Unknown";
 }
 
 function normalize(raw: any, endpoint: string) {
@@ -59,15 +78,14 @@ function normalize(raw: any, endpoint: string) {
   let talkTime = 0, waitTime = 0;
   let viaQueue = false, queueName = "", chain: string[] = [];
 
-  if (endpoint === "call_history" && (raw.call_elements?.length)) {
-    // New API — parse call_elements for per-leg attribution
+  if (endpoint === "call_history" && raw.call_elements?.length) {
     const elems: any[] = raw.call_elements;
     const top = elems[0] || {};
     const leg =
       elems.find(e => e.event === "ring_to_member" && e.callee_ext_type === "user" && e.result === "answered") ||
       elems.find(e => e.callee_ext_type === "user");
-    answeredBy    = leg?.callee_name  || raw.callee?.name || raw.owner?.name || raw.user_name || "Unknown";
-    answeredEmail = leg?.callee_email || raw.callee?.email || raw.owner?.email || "";
+    answeredBy    = leg?.callee_name || leg?.callee_display_name || extractName(raw);
+    answeredEmail = leg?.callee_email || raw.callee?.email || "";
     answeredExt   = leg?.callee_ext_number || raw.callee?.extension_number || "";
     viaQueue      = elems.some(e => ["call_queue","auto_receptionist"].includes(e.callee_ext_type));
     queueName     = elems.find(e => ["call_queue","auto_receptionist"].includes(e.callee_ext_type))?.callee_name || "";
@@ -79,26 +97,15 @@ function normalize(raw: any, endpoint: string) {
     callerName    = top.caller_name || raw.caller?.name || "";
     calleeNum     = top.callee_did_number || raw.callee?.phone_number || "";
   } else {
-    // Old call_logs API — flat record, one per user per call
-    // Each record belongs to the user whose log it is.
-    // For inbound: callee = employee who answered
-    // For outbound: caller = employee who dialed
-    if (direction === "inbound") {
-      answeredBy    = raw.callee?.name || raw.callee?.display_name || raw.user_name || raw.owner?.name || raw.owner_name || "Unknown";
-      answeredEmail = raw.callee?.email || raw.owner?.email || "";
-      answeredExt   = raw.callee?.extension_number || raw.owner?.extension_number || "";
-    } else {
-      answeredBy    = raw.caller?.name || raw.caller?.display_name || raw.user_name || raw.owner?.name || raw.owner_name || "Unknown";
-      answeredEmail = raw.caller?.email || raw.owner?.email || "";
-      answeredExt   = raw.caller?.extension_number || raw.owner?.extension_number || "";
-    }
-    talkTime  = Number(raw.duration ?? raw.talk_time ?? 0);
-    callerNum  = raw.caller?.phone_number  || raw.caller?.did_number  || raw.caller_number  || "";
-    callerName = raw.caller?.name          || raw.caller_name         || "";
-    calleeNum  = raw.callee?.phone_number  || raw.callee?.did_number  || raw.callee_number  || "";
+    answeredBy    = extractName(raw);
+    answeredEmail = (direction === "inbound" ? raw.callee?.email : raw.caller?.email) || raw.user?.email || raw.owner?.email || "";
+    answeredExt   = (direction === "inbound" ? raw.callee?.extension_number : raw.caller?.extension_number) || raw.user?.extension_number || "";
+    talkTime      = Number(raw.duration ?? raw.talk_time ?? 0);
+    callerNum     = raw.caller?.phone_number || raw.caller?.did_number || raw.caller_number || "";
+    callerName    = raw.caller?.name || raw.caller_name || "";
+    calleeNum     = raw.callee?.phone_number || raw.callee?.did_number || raw.callee_number || "";
   }
 
-  // Result normalization
   const rStr = (raw.result || raw.call_result || "").toLowerCase().replace(/_/g, " ");
   const result =
     rStr.includes("connect") || rStr === "answered" ? "answered" :
@@ -106,23 +113,9 @@ function normalize(raw: any, endpoint: string) {
     rStr.includes("miss") || rStr.includes("no answer") || rStr.includes("abandon") ? "missed" :
     raw.result || "unknown";
 
-  return {
-    id:           raw.id || raw.call_id || raw.call_history_uuid || "",
-    date:         raw.date_time || raw.start_time || "",
-    direction,
-    answeredBy,
-    answeredEmail,
-    answeredExt,
-    callerNum,
-    callerName,
-    calleeNum,
-    result,
-    talkTime,
-    waitTime,
-    viaQueue,
-    queueName,
-    chain,
-  };
+  return { id: raw.id||raw.call_id||"", date: raw.date_time||raw.start_time||"", direction,
+    answeredBy, answeredEmail, answeredExt, callerNum, callerName, calleeNum,
+    result, talkTime, waitTime, viaQueue, queueName, chain };
 }
 
 export default async (req: Request, _ctx: Context) => {
@@ -130,20 +123,39 @@ export default async (req: Request, _ctx: Context) => {
   const ACCT = process.env["ZOOM_ACCOUNT_ID"];
   const CID  = process.env["ZOOM_CLIENT_ID"];
   const CSEC = process.env["ZOOM_CLIENT_SECRET"];
-
-  const u      = new URL(req.url);
+  const u    = new URL(req.url);
   const action = u.searchParams.get("action") || "history";
 
   if (action === "status") {
     return new Response(JSON.stringify({
       configured: !!(ACCT && CID && CSEC),
-      missing: [!ACCT && "ZOOM_ACCOUNT_ID", !CID && "ZOOM_CLIENT_ID", !CSEC && "ZOOM_CLIENT_SECRET"].filter(Boolean),
+      missing: [!ACCT&&"ZOOM_ACCOUNT_ID",!CID&&"ZOOM_CLIENT_ID",!CSEC&&"ZOOM_CLIENT_SECRET"].filter(Boolean),
     }), { headers: CORS });
   }
 
-  if (!ACCT || !CID || !CSEC) {
-    return new Response(JSON.stringify({ error: "Missing Zoom env vars." }), { status: 500, headers: CORS });
+  // ── debug: return 3 raw records so we can see exact field structure ────────
+  if (action === "debug") {
+    if (!ACCT || !CID || !CSEC) return new Response(JSON.stringify({error:"Missing env vars"}),{status:500,headers:CORS});
+    const from = u.searchParams.get("from") || new Date(Date.now()-2*86400000).toISOString().split("T")[0];
+    const to   = u.searchParams.get("to")   || new Date().toISOString().split("T")[0];
+    try {
+      const token = await getToken(ACCT, CID, CSEC);
+      const { recs, endpoint } = await fetchCalls(token, from, to, "");
+      // Return first 3 raw records + keys of first record
+      const sample = recs.slice(0, 3);
+      const keys   = sample[0] ? Object.keys(sample[0]) : [];
+      const callerKeys  = sample[0]?.caller  ? Object.keys(sample[0].caller)  : [];
+      const calleeKeys  = sample[0]?.callee  ? Object.keys(sample[0].callee)  : [];
+      const ownerKeys   = sample[0]?.owner   ? Object.keys(sample[0].owner)   : [];
+      const userKeys    = sample[0]?.user    ? Object.keys(sample[0].user)    : [];
+      return new Response(JSON.stringify({ endpoint, total: recs.length, topLevelKeys: keys,
+        callerKeys, calleeKeys, ownerKeys, userKeys, sample }), { headers: CORS });
+    } catch(e:any) {
+      return new Response(JSON.stringify({error:String(e.message)}),{status:500,headers:CORS});
+    }
   }
+
+  if (!ACCT || !CID || !CSEC) return new Response(JSON.stringify({error:"Missing env vars"}),{status:500,headers:CORS});
 
   const from = u.searchParams.get("from") || new Date(Date.now()-7*86400000).toISOString().split("T")[0];
   const to   = u.searchParams.get("to")   || new Date().toISOString().split("T")[0];
@@ -154,14 +166,11 @@ export default async (req: Request, _ctx: Context) => {
     const token              = await getToken(ACCT, CID, CSEC);
     const { recs, endpoint } = await fetchCalls(token, from, to, dir);
     const records            = recs.map(r => normalize(r, endpoint));
-
-    // Log employee spread to Netlify function logs for debugging
-    const employees = [...new Set(records.map(r => r.answeredBy))];
-    console.log(`[zoom-phone] ${endpoint} | ${records.length} records | employees: ${employees.slice(0,10).join(", ")}`);
-
-    return new Response(JSON.stringify({ records, count: records.length, endpoint, from, to, ms: Date.now()-t0 }), { headers: CORS });
+    const employees          = [...new Set(records.map(r => r.answeredBy))];
+    console.log(`[zoom-phone] ${endpoint} | ${records.length} records | employees: ${employees.join(", ")}`);
+    return new Response(JSON.stringify({ records, count: records.length, endpoint, employees, from, to, ms: Date.now()-t0 }), { headers: CORS });
   } catch (e: any) {
     console.error("[zoom-phone]", e?.message);
-    return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500, headers: CORS });
+    return new Response(JSON.stringify({ error: String(e?.message||e) }), { status: 500, headers: CORS });
   }
 };
