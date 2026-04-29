@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.43.0";
+const APP_VERSION = "2.43.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -10474,7 +10474,7 @@ function ZoomPhoneTab() {
   const [histDir, setHistDir]       = React.useState("");
   const [histCalls, setHistCalls]   = React.useState([]);        // fetched history records
   const [syncedAt, setSyncedAt]     = React.useState(null);      // when cache was last synced
-  const [dataSource, setDataSource] = React.useState("");        // "cache" | "direct"
+  const [dataSource, setDataSource] = React.useState("");        // "cache" | "direct" | "warming"
   // Live call log filters
   const [empFilter, setEmpFilter]   = React.useState("");
   const [resFilter, setResFilter]   = React.useState("");
@@ -10541,6 +10541,7 @@ function ZoomPhoneTab() {
       setHistCalls(d.records || []);
       setSyncedAt(d.synced_at || null);
       setDataSource(d.source || "");
+      if (d.source === "warming") setError("Cache is empty — click 🔄 Sync Now to load data from Zoom for the first time. This takes ~30 seconds but only needs to happen once.");
     } catch(e) { setError(String(e.message||e)); }
     finally { setHistLoading(false); }
   }
@@ -10970,7 +10971,16 @@ function ZoomPhoneTab() {
               <button style={{...btnPrimary,alignSelf:"flex-end"}} onClick={fetchHistory} disabled={histLoading}>
                 {histLoading?"Loading…":"Run Report"}
               </button>
-              <button style={{...btnSec,alignSelf:"flex-end"}} onClick={()=>{const u=new URL(window.location.href); fetch(`/.netlify/functions/marginiq-zoom-phone?action=refresh&from=${histFrom}&to=${histTo}`).then(()=>fetchHistory());}} disabled={histLoading} title="Force re-fetch from Zoom (bypasses cache)">
+              <button style={{...btnSec,alignSelf:"flex-end",color:T.brand,borderColor:T.brand}} onClick={async()=>{
+                setHistLoading(true); setError("Syncing from Zoom — fetching each employee's call history. This takes ~30 seconds…");
+                try {
+                  const r = await fetch("/.netlify/functions/marginiq-zoom-phone?action=sync");
+                  const d = await r.json();
+                  if (!r.ok) throw new Error(d.error||"Sync failed");
+                  setError("");
+                  await fetchHistory();
+                } catch(e) { setError("Sync error: "+String(e.message||e)); setHistLoading(false); }
+              }} disabled={histLoading} title="Pull fresh data from Zoom and update cache">
                 🔄 Sync Now
               </button>
             </div>
