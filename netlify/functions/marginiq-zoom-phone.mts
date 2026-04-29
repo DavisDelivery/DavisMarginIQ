@@ -1,15 +1,22 @@
 import type { Context } from "@netlify/functions";
 
-// Zoom Phone API — cache-first reads, per-user sync endpoint
+// Zoom Phone API — clean rewrite based on actual Zoom response shape
+//
+// Key Zoom fields (verified from real API responses):
+//   talk_time      — number, seconds. ONLY non-zero on the leg that actually answered.
+//   answer_time    — timestamp. Empty string on rings that didn't connect.
+//   wait_time      — seconds caller waited.
+//   hold_time      — seconds put on hold.
+//   result         — "answered", "no_answer", "ring_timeout", "voicemail", "missed"
+//   event          — "ring_to_member" for queue-routed calls
+//   callee_name    — the human's name on this leg
+//   callee_ext_type— "user" | "call_queue" | "auto_receptionist"
+//   call_path_id   — unique ID for the logical call (same across all legs)
+//   operator_name  — the queue/receptionist name that routed the call
+//   operator_ext_type — "call_queue" | "auto_receptionist"
 //
 // Actions:
-//   status     — check credentials configured
-//   history    — read from Firebase cache (instant)
-//   users      — return list of phone users (for UI to iterate)
-//   sync-user  — sync ONE user and write to cache
-//
-// IMPORTANT: dedup uses call_path_id (one per logical inbound call)
-// not id (which is per-leg as the call routes through receptionist → queue → user)
+//   status, history, users, sync-user, debug-zoomraw, debug-cache
 
 const TOKEN_URL = "https://zoom.us/oauth/token";
 const API       = "https://api.zoom.us/v2";
@@ -52,107 +59,123 @@ async function getPhoneUsers(token: string) {
   });
 }
 
-async function getUserCalls(token: string, userId: string, from: string, to: string): Promise<{records: any[], truncated: boolean, error?: string}> {
+async function getUserCalls(token: string, userId: string, from: string, to: string): Promise<{records: any[], truncated: boolean, error?: string, totalAvailable?: number}> {
   const records: any[] = [];
   let npt = "", pages = 0;
-  let truncated = false;
-  const MAX_PAGES = 30;  // 3000 records max — keeps us under Netlify timeout
+  let totalAvailable: number | undefined;
+  const MAX_PAGES = 50;  // 5000 records max
   const MAX_RETRIES_PER_PAGE = 3;
 
   while (true) {
     const url = `${API}/phone/users/${userId}/call_history?from=${from}&to=${to}&page_size=100${npt ? "&next_page_token=" + encodeURIComponent(npt) : ""}`;
     let res: Response | null = null;
-    let lastErr = "";
     let success = false;
 
-    // Retry on 429 with exponential backoff
     for (let attempt = 0; attempt < MAX_RETRIES_PER_PAGE; attempt++) {
       try {
         res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-        if (res.status === 429) {
-          await sleep(2000 * (attempt + 1));
-          continue;
-        }
+        if (res.status === 429) { await sleep(2000 * (attempt + 1)); continue; }
         success = true;
         break;
-      } catch(e: any) {
-        lastErr = e?.message || "fetch failed";
-        await sleep(1000);
-      }
+      } catch(e: any) { await sleep(1000); }
     }
 
-    if (!success || !res) return { records, truncated: true, error: lastErr || "max retries on 429" };
+    if (!success || !res) return { records, truncated: true, error: "fetch failed", totalAvailable };
 
     const d: any = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if (res.status === 404 || res.status === 400) return { records, truncated: false };
-      return { records, truncated: true, error: d.message || `HTTP ${res.status}` };
+      if (res.status === 404 || res.status === 400) return { records, truncated: false, totalAvailable };
+      return { records, truncated: true, error: d.message || `HTTP ${res.status}`, totalAvailable };
     }
 
-    records.push(...(d.call_logs || d.call_history || d.records || []));
+    if (totalAvailable === undefined) totalAvailable = d.total_records;
+    records.push(...(d.call_logs || []));
     npt = d.next_page_token || "";
     pages++;
 
     if (!npt) break;
-    if (pages >= MAX_PAGES) { truncated = true; break; }
+    if (pages >= MAX_PAGES) return { records, truncated: true, totalAvailable };
   }
 
-  return { records, truncated };
+  return { records, truncated: false, totalAvailable };
 }
 
-function normalizeRecord(raw: any, user: { name: string; email: string; ext: string }) {
-  const rStr = (raw.call_result || raw.result || "").toLowerCase().replace(/_/g, " ");
-  const result =
-    rStr.includes("answer") || rStr.includes("connect") ? "answered" :
-    rStr.includes("voicemail")                           ? "voicemail" :
-    rStr.includes("miss") || rStr.includes("no answer") || rStr.includes("abandon") ? "missed" :
-    raw.call_result || "unknown";
+// ── Normalize: read the ACTUAL fields Zoom returns ──────────────────────────
+function normalizeRecord(raw: any, owner: { name: string; email: string; ext: string }) {
+  const talkTime    = Number(raw.talk_time) || 0;
+  const waitTime    = Number(raw.wait_time) || 0;
+  const holdTime    = Number(raw.hold_time) || 0;
+  const answered    = !!raw.answer_time && talkTime > 0;
+  const calleeType  = raw.callee_ext_type || "";
+  const operatorType= raw.operator_ext_type || "";
 
-  // Detect leg type: was this leg the auto-receptionist/queue, or a real user?
-  const calleeType = raw.callee_ext_type || "";
-  const isHumanLeg = calleeType === "user" || (!calleeType && user.name && user.name !== "Unknown");
+  // The result field from Zoom: "answered" | "no_answer" | "ring_timeout" | "voicemail" | "missed"
+  const rawResult = String(raw.result || "").toLowerCase();
+  let result: string;
+  if (rawResult === "answered" && answered)     result = "answered";
+  else if (rawResult === "voicemail")           result = "voicemail";
+  else if (rawResult === "no_answer" || rawResult === "ring_timeout") result = "missed";
+  else if (rawResult === "missed")              result = "missed";
+  else if (answered)                             result = "answered";
+  else                                            result = rawResult || "unknown";
+
+  // Was this call routed via a queue or auto-receptionist?
+  const viaQueue  = operatorType === "call_queue" || operatorType === "auto_receptionist"
+                  || calleeType === "call_queue"  || calleeType === "auto_receptionist";
+  const queueName = raw.operator_name || (calleeType !== "user" ? raw.callee_name : "") || "";
+
+  // The actual person on this leg — could be the user (if callee_ext_type=user) or the queue/auto
+  const isHumanLeg = calleeType === "user";
+  const personName = isHumanLeg
+    ? (raw.callee_name || owner.name)
+    : (raw.callee_name || owner.name);  // fall back to owner if leg is opaque
 
   return {
-    // Use call_path_id as the unique call identifier (same for every leg of one call)
-    callPathId: raw.call_path_id || raw.id || "",
-    legId:      raw.id || "",
-    date:       raw.start_time || raw.date_time || "",
-    direction:  (raw.direction || "").toLowerCase(),
-    answeredBy: user.name,
-    answeredEmail: user.email,
-    answeredExt: user.ext || raw.callee_ext_number || "",
-    callerNum:  raw.caller_did_number || raw.caller_number || "",
-    callerName: raw.caller_name || "",
-    calleeNum:  raw.callee_did_number || raw.callee_number || "",
-    calleeType,            // "user" | "auto_receptionist" | "call_queue" | etc.
-    isHumanLeg,            // true if this leg represents a real person
-    result,
-    talkTime:   Number(raw.duration ?? 0),
-    waitTime:   0,
-    viaQueue:   calleeType === "auto_receptionist" || calleeType === "call_queue",
-    queueName:  (calleeType === "auto_receptionist" || calleeType === "call_queue") ? (raw.callee_name || "") : "",
-    chain:      [],
-    // Keep `id` field too for back-compat with UI (which may still reference it)
-    id:         raw.call_path_id || raw.id || "",
+    callPathId:    raw.call_path_id || raw.id || "",
+    legId:         raw.id || "",
+    callId:        raw.call_id || "",
+    date:          raw.start_time || "",
+    answerTime:    raw.answer_time || "",
+    endTime:       raw.end_time || "",
+    direction:     String(raw.direction || "").toLowerCase(),
+
+    // Attribution
+    answeredBy:    personName,
+    answeredEmail: raw.callee_email || owner.email || "",
+    answeredExt:   String(raw.callee_ext_number || owner.ext || ""),
+    isHumanLeg,
+    answered,                     // boolean: did this leg actually have a conversation?
+
+    // Caller
+    callerNum:     raw.caller_did_number || raw.caller_number || "",
+    callerName:    raw.caller_name || "",
+
+    // Routing context
+    calleeType,                  // user | call_queue | auto_receptionist
+    operatorType,                // queue/receptionist that routed it
+    viaQueue,
+    queueName,
+    department:    raw.department || "",
+    event:         raw.event || "",   // ring_to_member, etc.
+
+    // Timing
+    result,                       // answered | missed | voicemail
+    rawResult,                    // original Zoom string
+    talkTime,
+    waitTime,
+    holdTime,
+
+    // Back-compat
+    id:            raw.call_path_id || raw.id || "",
   };
 }
 
-// ── Dedup logic — one record per logical call ───────────────────────────────
-// When a call rings multiple phones simultaneously (queue), each ringer's user history
-// gets a record with their name. But only ONE actually picked up. The signal of
-// "actually talked" is talk_time > 0. We also collect the names of all ringers
-// for the chain field.
-//
-// Scoring (highest wins):
-//   100 = had real talk_time (this person actually conversed)
-//    50 = is a human leg + result=answered (fallback if talk_time missing)
-//    10 = is a human leg
-//     1 = has a non-Unknown name
+// ── Dedup by call_path_id, picking the leg that actually answered ───────────
 function dedupeByCall(records: any[]): any[] {
   const byPath = new Map<string, { winner: any; ringers: Set<string> }>();
 
   for (const r of records) {
-    const key = r.callPathId || `${r.date}-${r.callerNum}`;
+    const key = r.callPathId || r.legId || `${r.date}-${r.callerNum}`;
     let bucket = byPath.get(key);
     if (!bucket) {
       bucket = { winner: r, ringers: new Set() };
@@ -160,34 +183,22 @@ function dedupeByCall(records: any[]): any[] {
     }
 
     // Track everyone whose phone rang for this call
-    if (r.isHumanLeg && r.answeredBy && r.answeredBy !== "Unknown") {
-      bucket.ringers.add(r.answeredBy);
-    }
+    if (r.isHumanLeg && r.answeredBy) bucket.ringers.add(r.answeredBy);
 
+    // Score each leg — answerer wins
     const score = (rec: any) => {
-      const talkTime = Number(rec.talkTime) || 0;
-      const isHuman = rec.isHumanLeg ? 1 : 0;
-      const answered = rec.result === "answered" ? 1 : 0;
-      const hasName = (rec.answeredBy && rec.answeredBy !== "Unknown") ? 1 : 0;
-
-      // Strongest signal: this leg has actual talk time AND is a human leg
-      if (talkTime > 0 && isHuman) return 1000 + talkTime;
-      // Next: any human leg with talk_time
-      if (talkTime > 0) return 500 + talkTime;
-      // Next: human leg + answered
-      if (isHuman && answered) return 50 + hasName;
-      // Next: any human leg
-      if (isHuman) return 10 + hasName;
-      // Last resort
-      return hasName;
+      let s = 0;
+      if (rec.answered)              s += 10000;  // had answer_time AND talk_time>0 — definitive
+      if (rec.talkTime > 0)          s += 5000 + rec.talkTime;  // at minimum spoke
+      if (rec.result === "answered") s += 100;
+      if (rec.isHumanLeg)            s += 50;
+      if (rec.answeredBy && rec.answeredBy !== "Unknown") s += 1;
+      return s;
     };
 
-    if (score(r) > score(bucket.winner)) {
-      bucket.winner = r;
-    }
+    if (score(r) > score(bucket.winner)) bucket.winner = r;
   }
 
-  // Build final records, attaching the chain of who rang
   return Array.from(byPath.values()).map(({ winner, ringers }) => ({
     ...winner,
     chain: Array.from(ringers),
@@ -272,11 +283,9 @@ export default async (req: Request, _ctx: Context) => {
               if (ms >= fromMs && ms <= toMs && (!dir || r.direction === dir)) allRecs.push(r);
             }
           }
-          // Dedup by call_path_id, preferring human-answered legs
           const deduped = dedupeByCall(allRecs);
           deduped.sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime());
           const synced_at = userDocs.map(d=>d.synced_at).filter(Boolean).sort().reverse()[0] || null;
-          console.log(`[zoom-phone] cache: ${allRecs.length} legs → ${deduped.length} unique calls`);
           return new Response(JSON.stringify({
             records: deduped, count: deduped.length,
             source: "cache", synced_at, from, to,
@@ -289,9 +298,9 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ records: [], count: 0, source: "warming", synced_at: null, from, to, ms: Date.now()-t0 }), { headers: CORS });
   }
 
-  // ── Debug: pull RAW Zoom data for one user (bypasses normalize) ──────────
+  // ── Debug: pull RAW Zoom data for one user ───────────────────────────────
   if (action === "debug-zoomraw") {
-    const userId = u.searchParams.get("userId") || "UgG02EaxRauMiyuJ4Hixag"; // Jessica
+    const userId = u.searchParams.get("userId") || "UgG02EaxRauMiyuJ4Hixag";
     const dFrom  = u.searchParams.get("from") || new Date(Date.now()-2*86400000).toISOString().split("T")[0];
     const dTo    = u.searchParams.get("to")   || new Date().toISOString().split("T")[0];
     const token  = await getToken(ACCT, CID, CSEC);
@@ -299,168 +308,35 @@ export default async (req: Request, _ctx: Context) => {
     const res    = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
     const d: any = await res.json();
     if (!res.ok) return new Response(JSON.stringify({error: d.message, status: res.status}), { headers: CORS });
-    const records = d.call_logs || d.call_history || d.records || [];
+    const records = d.call_logs || [];
     return new Response(JSON.stringify({
-      userId,
-      from: dFrom, to: dTo,
-      totalReturned: records.length,
-      // Top-level fields
+      userId, from: dFrom, to: dTo,
+      totalAvailable: d.total_records,
+      returned: records.length,
       topLevelKeys: records[0] ? Object.keys(records[0]) : [],
-      // First 3 raw records UNTOUCHED
       rawSample: records.slice(0, 3),
     }), { headers: CORS });
   }
 
-  // ── Debug: dump raw cached records for one user ─────────────────────────
-  if (action === "debug-userraw") {
-    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
-    const userName = u.searchParams.get("name") || "Brandi Bradberry";
-    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
-    const doc = userDocs.find((d:any) => d.name === userName);
-    if (!doc) return new Response(JSON.stringify({error:"User not found in cache",available:userDocs.map((d:any)=>d.name)}), { headers: CORS });
-    const recs = (doc.records || []) as any[];
-    // Stats
-    const totalCount = recs.length;
-    const withTalk = recs.filter(r => Number(r.talkTime) > 0);
-    const zeroTalk = recs.filter(r => !Number(r.talkTime) || Number(r.talkTime) === 0);
-    const byResult: Record<string, number> = {};
-    recs.forEach(r => { byResult[r.result||"(none)"] = (byResult[r.result||"(none)"]||0) + 1; });
-    const byCalleeType: Record<string, number> = {};
-    recs.forEach(r => { byCalleeType[r.calleeType||"(none)"] = (byCalleeType[r.calleeType||"(none)"]||0) + 1; });
-    return new Response(JSON.stringify({
-      user: userName,
-      totalCount,
-      withTalkTime: withTalk.length,
-      zeroTalkTime: zeroTalk.length,
-      byResult,
-      byCalleeType,
-      // First 3 with talk_time > 0 (real calls)
-      sampleAnswered: withTalk.slice(0, 3),
-      // First 3 with talk_time = 0 (rang but didn't answer)
-      sampleNotAnswered: zeroTalk.slice(0, 3),
-      dateRange: {
-        oldest: recs.length ? recs[recs.length-1].date : null,
-        newest: recs.length ? recs[0].date : null,
-      },
-    }), { headers: CORS });
-  }
-
-  // ── Debug: pull raw record for a specific call_path_id ──────────────────
-  // Shows EVERY leg of one call so we can see actual field values
-  if (action === "debug-rawcall") {
-    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
-    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
-    // Find a call_path_id that appears in BOTH Brandi and Jessica's caches
-    const pathToLegs = new Map<string, any[]>();
-    for (const doc of userDocs) {
-      for (const r of (doc.records || [])) {
-        if (!r.callPathId) continue;
-        if (!pathToLegs.has(r.callPathId)) pathToLegs.set(r.callPathId, []);
-        pathToLegs.get(r.callPathId)!.push({ ...r, _ownerCache: doc.name });
-      }
-    }
-    // Find calls that appear in 3+ different user caches (queue rang multiple)
-    const multi = Array.from(pathToLegs.entries())
-      .filter(([_, legs]) => {
-        const owners = new Set(legs.map(l => l._ownerCache));
-        return owners.size >= 2;
-      })
-      .slice(0, 5);
-    return new Response(JSON.stringify({
-      sampleCallsWithMultipleRingers: multi.map(([path, legs]) => ({
-        callPathId: path,
-        legCount: legs.length,
-        legs: legs.map(l => ({
-          ownerCache: l._ownerCache,
-          answeredBy: l.answeredBy,
-          result: l.result,
-          talkTime: l.talkTime,
-          calleeType: l.calleeType,
-          isHumanLeg: l.isHumanLeg,
-          date: l.date,
-        })),
-      })),
-    }), { headers: CORS });
-  }
-
-  // ── Debug: show employee distribution after dedup ───────────────────────
-  if (action === "debug-employees") {
-    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
-    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
-    const fromMs = new Date(from + "T00:00:00Z").getTime();
-    const toMs   = new Date(to   + "T23:59:59Z").getTime();
-    const allRecs: any[] = [];
-    for (const doc of userDocs) {
-      for (const r of (doc.records || [])) {
-        const ms = new Date(r.date).getTime();
-        if (ms >= fromMs && ms <= toMs) allRecs.push(r);
-      }
-    }
-    // Count by answeredBy BEFORE dedup
-    const beforeDedup: Record<string, number> = {};
-    allRecs.forEach((r:any) => { beforeDedup[r.answeredBy||"(blank)"] = (beforeDedup[r.answeredBy||"(blank)"]||0) + 1; });
-    // After dedup
-    const deduped = dedupeByCall(allRecs);
-    const afterDedup: Record<string, number> = {};
-    deduped.forEach((r:any) => { afterDedup[r.answeredBy||"(blank)"] = (afterDedup[r.answeredBy||"(blank)"]||0) + 1; });
-    return new Response(JSON.stringify({
-      from, to,
-      totalLegs: allRecs.length,
-      uniqueCalls: deduped.length,
-      beforeDedup,
-      afterDedup,
-      sampleJessica: allRecs.filter((r:any)=>r.answeredBy==="Jessica Sage").slice(0,3),
-    }), { headers: CORS });
-  }
-
-  // ── Debug: show what's in Firebase cache for each user ──────────────────
+  // ── Debug: cache state per user ─────────────────────────────────────────
   if (action === "debug-cache") {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
     const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
     return new Response(JSON.stringify({
       total: userDocs.length,
-      summary: userDocs.map((d:any) => ({
-        name: d.name,
-        email: d.email,
-        ext: d.ext,
-        recordCount: (d.records || []).length,
-        synced_at: d.synced_at,
-        from: d.from,
-        to: d.to,
-        sampleDates: (d.records || []).slice(0, 3).map((r:any) => r.date),
-      })),
-    }), { headers: CORS });
-  }
-
-  // ── Debug: return raw user list with all fields ──────────────────────────
-  if (action === "debug-users") {
-    const token = await getToken(ACCT, CID, CSEC);
-    const users: any[] = [];
-    let npt = "", pages = 0;
-    do {
-      const url = `${API}/phone/users?page_size=100${npt ? "&next_page_token=" + encodeURIComponent(npt) : ""}`;
-      const res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-      const d: any = await res.json();
-      if (!res.ok) return new Response(JSON.stringify({error: d.message, status: res.status}), { status: 500, headers: CORS });
-      users.push(...(d.users || []));
-      npt = d.next_page_token || "";
-      if (++pages >= 5) break;
-    } while (npt);
-    return new Response(JSON.stringify({
-      total: users.length,
-      keys: users[0] ? Object.keys(users[0]) : [],
-      users: users.map(u => ({
-        id: u.id,
-        email: u.email,
-        first_name: u.first_name,
-        last_name: u.last_name,
-        display_name: u.display_name,
-        name: u.name,
-        status: u.status,
-        extension_number: u.extension_number,
-        phone_user_id: u.phone_user_id,
-        type: u.type,
-      })),
+      summary: userDocs.map((d:any) => {
+        const recs = (d.records || []) as any[];
+        const answered = recs.filter(r => r.answered === true || r.talkTime > 0).length;
+        return {
+          name: d.name, ext: d.ext,
+          totalRecords: recs.length,
+          actuallyAnswered: answered,
+          ringedButDidntAnswer: recs.length - answered,
+          synced_at: d.synced_at,
+          truncated: d.truncated || false,
+          totalAvailable: d.totalAvailable,
+        };
+      }),
     }), { headers: CORS });
   }
 
@@ -479,35 +355,35 @@ export default async (req: Request, _ctx: Context) => {
     const userExt  = u.searchParams.get("ext")    || "";
     if (!userId) return new Response(JSON.stringify({ error: "userId required" }), { status: 400, headers: CORS });
 
-    const syncFrom = new Date(Date.now()-35*86400000).toISOString().split("T")[0];
-    const syncTo   = new Date().toISOString().split("T")[0];
+    const syncFrom = u.searchParams.get("from") || new Date(Date.now()-35*86400000).toISOString().split("T")[0];
+    const syncTo   = u.searchParams.get("to")   || new Date().toISOString().split("T")[0];
 
     try {
       const token  = await getToken(ACCT, CID, CSEC);
       const result = await getUserCalls(token, userId, syncFrom, syncTo);
-      const user   = { name: userName, email: userEmail, ext: userExt };
-      const normalized = result.records.map(r => normalizeRecord(r, user));
+      const owner  = { name: userName, email: userEmail, ext: userExt };
+      const normalized = result.records.map(r => normalizeRecord(r, owner));
 
-      // Don't overwrite a populated cache with empty results unless we know it's intentional
       let action_taken = "wrote";
       if (FB_KEY && FB_PROJ) {
         if (normalized.length === 0 && result.error) {
-          // Sync failed — keep existing cache, just report error
           action_taken = "failed-kept-cache";
         } else {
           await fsSet(FB_PROJ, FB_KEY, "zoom_sync_users", userId, {
             name: userName, email: userEmail, ext: userExt,
             records: normalized, count: normalized.length,
-            synced_at: new Date().toISOString(), from: syncFrom, to: syncTo,
+            synced_at: new Date().toISOString(),
+            from: syncFrom, to: syncTo,
             truncated: result.truncated || false,
+            totalAvailable: result.totalAvailable || 0,
             sync_error: result.error || "",
           });
         }
       }
       return new Response(JSON.stringify({
         ok: !result.error, name: userName, count: normalized.length,
-        truncated: result.truncated, error: result.error || null,
-        action: action_taken, ms: Date.now()-t0,
+        truncated: result.truncated, totalAvailable: result.totalAvailable,
+        error: result.error || null, action: action_taken, ms: Date.now()-t0,
       }), { headers: CORS });
     } catch(e: any) {
       return new Response(JSON.stringify({ error: String(e?.message||e), name: userName }), { status: 500, headers: CORS });
