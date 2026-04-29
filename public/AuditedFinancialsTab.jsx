@@ -407,68 +407,82 @@ function GmailSyncPanel({ onImported }) {
 
   const processEmail = async (email) => {
     const emailId = email.emailId;
-    const pdfs = (email.attachments || []).filter(a => a.filename?.toLowerCase().endsWith(".pdf"));
+    // Only Financial Statements PDFs — skip invoice PDFs (Invoice #XXXXX)
+    const pdfs = (email.attachments || []).filter(a => { const fn=(a.filename||"").toLowerCase(); return fn.endsWith(".pdf") && fn.includes("financial"); });
     if (!pdfs.length) {
       setProcessing(p => ({ ...p, [emailId]:"✗ No PDF attachment found" }));
       return;
     }
 
-    setProcessing(p => ({ ...p, [emailId]:"Fetching PDF..." }));
+    // Load pdf.js once up front if needed
+    if (!window.pdfjsLib) {
+      setProcessing(p => ({ ...p, [emailId]:"Loading PDF engine..." }));
+      await new Promise((res, rej) => {
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+        s.onload = res; s.onerror = rej;
+        document.head.appendChild(s);
+      });
+    }
+
+    // Process each financial PDF in this email (sometimes 2 arrive together e.g. March + April)
+    const savedPeriods = [];
     try {
-      // Use first PDF (CPA usually sends one combined PDF)
-      const att = pdfs[0];
-      const pdfBytes = await fetchAttachment(emailId, att.attachmentId, email.account_email, email.account_doc_id);
+      for (let pi = 0; pi < pdfs.length; pi++) {
+        const att = pdfs[pi];
+        const label = pdfs.length > 1 ? ` (${pi+1}/${pdfs.length}: ${att.filename})` : "";
 
-      setProcessing(p => ({ ...p, [emailId]:"Converting PDF to images..." }));
-      if (!window.pdfjsLib) {
-        // Dynamically load pdf.js if not present
-        await new Promise((res, rej) => {
-          const s = document.createElement("script");
-          s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-          s.onload = res; s.onerror = rej;
-          document.head.appendChild(s);
-        });
+        setProcessing(p => ({ ...p, [emailId]:`Fetching PDF${label}...` }));
+        const pdfBytes = await fetchAttachment(emailId, att.attachmentId, email.account_email, email.account_doc_id);
+
+        setProcessing(p => ({ ...p, [emailId]:`Converting to images${label}...` }));
+        const pages = await pdfToPages(pdfBytes, 30);
+
+        setProcessing(p => ({ ...p, [emailId]:`Extracting financials (${pages.length} pages)${label}...` }));
+        const extracted = await extractFinancials(pages);
+
+        // Determine period — try Claude extraction first, then filename, then subject
+        let period = (extracted.period && /^\d{4}-\d{2}$/.test(extracted.period))
+          ? extracted.period
+          : extractMonthFromSubject(att.filename) || extractMonthFromSubject(email.emailSubject);
+
+        if (!period) {
+          setProcessing(p => ({ ...p, [emailId]:`✗ Could not determine period for ${att.filename}` }));
+          continue;
+        }
+
+        const record = {
+          ...extracted,
+          period,
+          email_id: emailId,
+          email_subject: email.emailSubject,
+          email_date: email.emailDate,
+          from: email.from,
+          filename: att.filename,
+        };
+
+        setProcessing(p => ({ ...p, [emailId]:`Saving ${monthLabel(period)}...` }));
+        const ok = await saveFinancial(period, record);
+        if (!ok) throw new Error("Firestore write failed");
+
+        await saveEmailProcessed(emailId, { period, filename: att.filename, subject: email.emailSubject });
+        setProcessedIds(prev => new Set([...prev, emailId]));
+        savedPeriods.push(period);
+      } // end for each PDF
+
+      if (savedPeriods.length > 0) {
+        setProcessing(p => ({ ...p, [emailId]:`✓ Saved ${savedPeriods.map(monthLabel).join(", ")}` }));
+        onImported();
+      } else {
+        setProcessing(p => ({ ...p, [emailId]:"✗ No financial statements could be saved" }));
       }
-      const pages = await pdfToPages(pdfBytes, 30);
-
-      setProcessing(p => ({ ...p, [emailId]:`Extracting financials (${pages.length} pages)...` }));
-      const extracted = await extractFinancials(pages);
-
-      // Determine period — try extraction first, then subject line
-      const period = (extracted.period && /^\d{4}-\d{2}$/.test(extracted.period))
-        ? extracted.period
-        : extractMonthFromSubject(email.emailSubject);
-
-      if (!period) {
-        setProcessing(p => ({ ...p, [emailId]:"✗ Could not determine period. Check subject line." }));
-        return;
-      }
-
-      const record = {
-        ...extracted,
-        period,
-        email_id: emailId,
-        email_subject: email.emailSubject,
-        email_date: email.emailDate,
-        from: email.from,
-        filename: att.filename,
-      };
-
-      setProcessing(p => ({ ...p, [emailId]:"Saving to Firestore..." }));
-      const ok = await saveFinancial(period, record);
-      if (!ok) throw new Error("Firestore write failed");
-
-      await saveEmailProcessed(emailId, { period, filename: att.filename, subject: email.emailSubject });
-      setProcessedIds(prev => new Set([...prev, emailId]));
-      setProcessing(p => ({ ...p, [emailId]:`✓ Saved — ${monthLabel(period)}` }));
-      onImported();
     } catch (e) {
       setProcessing(p => ({ ...p, [emailId]:"✗ " + e.message }));
     }
   };
 
   const processAll = async () => {
-    const unprocessed = emails.filter(e => !processedIds.has(e.emailId) && (e.attachments||[]).some(a=>a.filename?.toLowerCase().endsWith(".pdf")));
+    const unprocessed = emails.filter(e => !processedIds.has(e.emailId) && (e.attachments||[]).some(a=>{ const fn=(a.filename||"").toLowerCase(); return fn.endsWith(".pdf") && fn.includes("financial"); }));
     for (const email of unprocessed) {
       await processEmail(email);
     }
@@ -509,7 +523,7 @@ function GmailSyncPanel({ onImported }) {
             </thead>
             <tbody>
               {emails.map(email => {
-                const pdfs = (email.attachments||[]).filter(a=>a.filename?.toLowerCase().endsWith(".pdf"));
+                const pdfs = (email.attachments||[]).filter(a=>{ const fn=(a.filename||"").toLowerCase(); return fn.endsWith(".pdf") && fn.includes("financial"); });
                 const alreadyDone = processedIds.has(email.emailId);
                 const status = processing[email.emailId] || (alreadyDone ? "✓ Already imported" : "");
                 const isOk  = status.startsWith("✓");

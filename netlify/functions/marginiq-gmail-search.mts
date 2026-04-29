@@ -28,9 +28,10 @@ const VENDOR_QUERIES: Record<string, string> = {
   quickfuel: 'from:ebilling@4flyers.com has:attachment',
 
   // AMP CPAs: monthly audited financials (P&L, Balance Sheet, Cash Flow).
-  // Subject always contains the month + year (e.g. "March 2025").
-  // PDF attachment from any sender at ampcpas.com.
-  ampcpas: 'from:@ampcpas.com has:attachment filename:pdf',
+  // Filename always starts with "Financial Statements" and ends with "DDS.pdf".
+  // Invoices from the same sender (Invoice #XXXXX) are intentionally excluded
+  // by filtering on the "Financial" filename keyword.
+  ampcpas: 'from:@ampcpas.com filename:"Financial Statements" filename:pdf',
 
   // v2.40.2: billing@ → Uline. Only emails billing@davisdelivery.com sent
   // out to an @uline.com recipient, with an attachment. Focuses on outbound
