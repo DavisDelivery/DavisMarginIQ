@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.46.1";
+const APP_VERSION = "2.46.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3757,7 +3757,15 @@ function parseNuVizz(rows) {
     const city = r["ship to - city"] ? String(r["ship to - city"]).trim() : null;
     const zip = r["ship to - zip code"] ? String(r["ship to - zip code"]).trim() : null;
     const payBase = parseMoney(r["stop sealnbr"]);
-    const contractorPay = payBase * CONTRACTOR_PAY_PCT; // applied only if driver is 1099
+    // NOTE: We do NOT pre-compute a 40% contractor pay value here. The 40%
+    // rate is only meaningful for drivers actually classified 1099 in the
+    // driver_classifications collection. Storing pay_at_40 on every stop
+    // would be a hypothetical "if this driver were 1099" figure for W2
+    // drivers (who are paid hourly via CyberPay) — misleading and unused.
+    // The real cost calculation happens at query time by joining stop pay
+    // against driver_classifications. The weekly rollup keeps a hypothetical
+    // pay_at_40 per driver since downstream LaborReality already gates it
+    // by classification before summing.
     const pro = normalizePro(stopNum); // cross-reference to Uline PRO
     // Redelivery detection — two independent signals:
     //   1. stop_number ends in "-N" (e.g. "12345-1")  → re-attempt suffix
@@ -3779,7 +3787,6 @@ function parseNuVizz(rows) {
       ship_to: shipTo,
       city, zip,
       contractor_pay_base: payBase,         // raw $ from SealNbr column
-      contractor_pay_at_40: contractorPay,  // 40% — actual cost IF driver is 1099
       is_redelivery: isRedelivery,          // v2.46.1: see redelivery comment above
       raw: r,                               // v2.46.0: every CSV column verbatim — for
                                             //         addresses (mileage), weight,
@@ -3822,14 +3829,17 @@ function buildNuVizzWeekly(stops) {
     if (isEffective) {
       bw.stops_effective++;
       bw.pay_base_total += s.contractor_pay_base || 0;
-      bw.contractor_pay_if_all_1099 += s.contractor_pay_at_40 || 0;
+      bw.contractor_pay_if_all_1099 += (s.contractor_pay_base || 0) * CONTRACTOR_PAY_PCT;
     }
     if (s.driver_name && isEffective) {
       bw.unique_drivers.add(s.driver_name);
       if (!bw.drivers[s.driver_name]) bw.drivers[s.driver_name] = { stops:0, pay_base:0, pay_at_40:0 };
       bw.drivers[s.driver_name].stops++;
       bw.drivers[s.driver_name].pay_base += s.contractor_pay_base || 0;
-      bw.drivers[s.driver_name].pay_at_40 += s.contractor_pay_at_40 || 0;
+      // pay_at_40 is the per-driver "if 1099" figure; LaborReality &
+      // DriverPerformanceTab filter it through driver_classifications
+      // before treating it as actual cost.
+      bw.drivers[s.driver_name].pay_at_40 += (s.contractor_pay_base || 0) * CONTRACTOR_PAY_PCT;
     }
     if (s.ship_to && isEffective) bw.unique_customers.add(s.ship_to);
   }

@@ -45,6 +45,10 @@ import { gunzipSync } from "node:zlib";
 const PROJECT_ID = "davismarginiq";
 const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
 const BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+// 1099 contractors are paid 40% of each stop's SealNbr base. W2 drivers are
+// paid hourly via CyberPay — pay_at_40 is meaningless for them. Used at
+// rollup time only; per-stop docs no longer carry a precomputed pay_at_40.
+const CONTRACTOR_PAY_PCT = 0.40;
 
 // ─── Firestore REST helpers ──────────────────────────────────────────────────
 
@@ -237,16 +241,21 @@ function buildWeeklyRollup(stops: any[]): any {
     if (isManual) stops_manually_completed++;
     if (isEffective) {
       stops_effective++;
-      pay_base_total += Number(s.contractor_pay_base) || 0;
-      contractor_pay_if_all_1099 += Number(s.contractor_pay_at_40) || 0;
+      const stopBase = Number(s.contractor_pay_base) || 0;
+      pay_base_total += stopBase;
+      contractor_pay_if_all_1099 += stopBase * CONTRACTOR_PAY_PCT;
       if (s.driver_name) {
         unique_drivers.add(s.driver_name);
         if (!drivers[s.driver_name]) {
           drivers[s.driver_name] = { stops: 0, pay_base: 0, pay_at_40: 0 };
         }
         drivers[s.driver_name].stops++;
-        drivers[s.driver_name].pay_base += Number(s.contractor_pay_base) || 0;
-        drivers[s.driver_name].pay_at_40 += Number(s.contractor_pay_at_40) || 0;
+        drivers[s.driver_name].pay_base += stopBase;
+        // v2.46.2: pay_at_40 computed inline from base ratio. Per-driver
+        // figure remains in the rollup as a "pay if 1099" hypothetical;
+        // LaborReality and DriverPerformanceTab gate it on
+        // driver_classifications before treating as actual cost.
+        drivers[s.driver_name].pay_at_40 += stopBase * CONTRACTOR_PAY_PCT;
       }
       if (s.ship_to) unique_customers.add(s.ship_to);
     }
@@ -410,7 +419,6 @@ export default async (req: Request, _context: Context) => {
 
   try {
     // ── Step 1: Filter ──────────────────────────────────────────────────────
-    const CONTRACTOR_PAY_PCT = 0.40;
     const toSave: Array<{ docId: string; fields: Record<string, any> }> = [];
     let filterDropped = 0;
     const prefixCounts: Record<string, number> = {};
@@ -433,6 +441,9 @@ export default async (req: Request, _context: Context) => {
       // delivery_end_at, delivery_start_at, and any future additions),
       // then override with server-canonical/derived fields. This means we
       // don't have to update this function every time we add a stop attribute.
+      // v2.46.2: contractor_pay_at_40 is no longer written per-stop — the
+      // 40% rate is only meaningful for 1099-classified drivers, applied
+      // downstream at query time. Per-stop we keep only the base (SealNbr).
       const fields: Record<string, any> = {
         ...s,
         stop_number: stopNum,
@@ -441,8 +452,9 @@ export default async (req: Request, _context: Context) => {
         week_ending: weekEnding,
         month: weekEnding ? dateToMonth(weekEnding) : null,
         contractor_pay_base: payBase,
-        contractor_pay_at_40: Math.round(payBase * CONTRACTOR_PAY_PCT * 10000) / 10000,
       };
+      // Strip any inbound contractor_pay_at_40 from older clients
+      delete (fields as any).contractor_pay_at_40;
       toSave.push({ docId, fields });
     }
 
