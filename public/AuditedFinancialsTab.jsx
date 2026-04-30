@@ -504,7 +504,7 @@ function Dashboard({ records, onSelect }) {
     <div style={{ ...card, textAlign:"center", padding:"60px 20px", color:T.textMuted }}>
       <div style={{ fontSize:36, marginBottom:8 }}>📋</div>
       <div style={{ fontSize:13, fontWeight:600 }}>No audited financials yet</div>
-      <div style={{ fontSize:11, marginTop:6 }}>Use 📧 Gmail Sync to import statements from AMP CPAs</div>
+      <div style={{ fontSize:11, marginTop:6 }}>Open the 📧 Gmail Sync tab → AMP CPAs vendor card to import statements</div>
     </div>
   );
 
@@ -758,7 +758,7 @@ function StatementsList({ records, onSelect }) {
     <div style={{ ...card, textAlign:"center", padding:"40px 20px", color:T.textMuted }}>
       <div style={{ fontSize:36, marginBottom:8 }}>📋</div>
       <div style={{ fontSize:13, fontWeight:600 }}>No audited financials yet</div>
-      <div style={{ fontSize:11, marginTop:6 }}>Use 📧 Gmail Sync to import statements from AMP CPAs</div>
+      <div style={{ fontSize:11, marginTop:6 }}>Open the 📧 Gmail Sync tab → AMP CPAs vendor card to import statements</div>
     </div>
   );
   return (
@@ -1059,7 +1059,6 @@ function AuditedFinancialsTab() {
     { id:"dashboard",  icon:"📊", label:"Dashboard",  count:null },
     { id:"statements", icon:"📋", label:"Statements", count:records.length },
     { id:"chat",       icon:"💬", label:"Ask AI",     count:null },
-    { id:"gmail",      icon:"📧", label:"Gmail Sync", count:null },
   ];
 
   if (loading) return (
@@ -1107,7 +1106,6 @@ function AuditedFinancialsTab() {
       {view === "dashboard"  && <Dashboard records={records} onSelect={setSelected} />}
       {view === "statements" && <StatementsList records={records} onSelect={setSelected} />}
       {view === "chat"       && <AIChat records={records} />}
-      {view === "gmail"      && <GmailSyncPanel onImported={load} />}
 
       {selected && <DetailModal record={selected} onClose={() => setSelected(null)} onDelete={handleDelete} />}
     </div>

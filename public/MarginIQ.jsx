@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.47.5";
+const APP_VERSION = "2.48.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2081,6 +2081,175 @@ function GmailSync({ onRefresh }) {
     setImporting(prev => ({...prev, [refKey]: false}));
   };
 
+  // ─── AMP CPAs audited-financial PDFs ──────────────────────────────────────
+  // PDF → pages → Claude vision → structured P&L/BS/CF JSON → audited_financials
+  // collection. Mirrors the dedicated processor previously in
+  // AuditedFinancialsTab::GmailSyncPanel. Lives here in the main Gmail Sync
+  // tab so all email parsers are in one place — Audited Financials is now
+  // a pure read-only dashboard.
+  const importAuditedFinancial = async (email, attachment) => {
+    const refKey = `${email.emailId}:${attachment.attachmentId}`;
+    setImporting(prev => ({...prev, [refKey]: true}));
+    setImportStatus(`Downloading ${attachment.filename}...`);
+    try {
+      // 1. Download PDF bytes
+      const dlData = await downloadGmailAttachment(email, attachment.attachmentId, attachment.filename);
+      const binary = atob(dlData.data);
+      const pdfBytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) pdfBytes[i] = binary.charCodeAt(i);
+
+      // 2. Render PDF pages to PNGs via pdf.js
+      setImportStatus(`Rendering PDF (${attachment.filename})...`);
+      await loadPdfJs();
+      const loadingTask = window.pdfjsLib.getDocument({ data: pdfBytes });
+      const pdf = await loadingTask.promise;
+      const numPages = Math.min(pdf.numPages, 30);
+      const pages = [];
+      for (let p = 1; p <= numPages; p++) {
+        const page = await pdf.getPage(p);
+        const viewport = page.getViewport({ scale: 1.8 });
+        const canvas = document.createElement("canvas");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext("2d");
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        pages.push(canvas.toDataURL("image/png").split(",")[1]);
+      }
+
+      // 3. Claude vision extraction
+      setImportStatus(`Extracting financials (${pages.length} pages)...`);
+      const EXTRACTION_PROMPT = `You are extracting financial data from audited financial statements prepared by a CPA firm for a trucking/delivery company.
+
+Extract ALL of the following from the PDF pages provided. Return ONLY valid JSON, no markdown, no explanation.
+
+{
+  "period": "YYYY-MM",
+  "report_date": "YYYY-MM-DD or null",
+  "company": "company name or null",
+  "pl": {
+    "revenue": number,
+    "cost_of_goods_sold": number,
+    "gross_profit": number,
+    "operating_expenses": number,
+    "operating_income": number,
+    "other_income": number,
+    "other_expenses": number,
+    "net_income": number,
+    "line_items": [{"label": "...", "amount": number, "section": "revenue|cogs|operating_expense|other"}]
+  },
+  "balance_sheet": {
+    "total_assets": number, "current_assets": number, "fixed_assets": number,
+    "total_liabilities": number, "current_liabilities": number, "long_term_liabilities": number,
+    "equity": number,
+    "line_items": [{"label": "...", "amount": number, "section": "current_asset|fixed_asset|current_liability|long_term_liability|equity"}]
+  },
+  "cash_flow": {
+    "operating": number, "investing": number, "financing": number,
+    "net_change": number, "beginning_cash": number, "ending_cash": number
+  },
+  "notes": "any important notes or caveats from the document"
+}
+
+Rules:
+- All amounts in dollars as plain numbers (no $ signs, no commas)
+- Expenses are POSITIVE numbers (don't negate them)
+- If a statement type is not present in the PDF, set its value to null
+- If a line item label is not clear, use your best judgment
+- period should be the month these statements cover (YYYY-MM format)`;
+      const imageBlocks = pages.map(b64 => ({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: b64 },
+      }));
+      const sfResp = await fetch("/.netlify/functions/marginiq-scan-financials", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          max_tokens: 8192,
+          messages: [{ role: "user", content: [...imageBlocks, { type: "text", text: EXTRACTION_PROMPT }] }],
+        }),
+      });
+      if (!sfResp.ok) throw new Error(`Scan failed (${sfResp.status})`);
+      const sfData = await sfResp.json();
+      const text = (sfData.content || []).map(b => b.text || "").join("").trim();
+      const extracted = JSON.parse(text.replace(/```json|```/g, "").trim());
+
+      // 4. Determine period — extracted JSON wins, fallback to filename/subject
+      const monthFromString = (s) => {
+        if (!s) return null;
+        const lower = s.toLowerCase();
+        const monthsFull  = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+        const monthsShort = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+        for (let i = 0; i < 12; i++) {
+          if (lower.includes(monthsFull[i]) || lower.includes(monthsShort[i])) {
+            const yMatch = s.match(/\b(20\d{2})\b/);
+            const y = yMatch ? yMatch[1] : new Date().getFullYear().toString();
+            return `${y}-${String(i+1).padStart(2,"0")}`;
+          }
+        }
+        const m1 = s.match(/\b(\d{1,2})[\/-](20\d{2})\b/); if (m1) return `${m1[2]}-${m1[1].padStart(2,"0")}`;
+        const m2 = s.match(/\b(20\d{2})[\/-](\d{1,2})\b/); if (m2) return `${m2[1]}-${m2[2].padStart(2,"0")}`;
+        return null;
+      };
+      const period = (extracted.period && /^\d{4}-\d{2}$/.test(extracted.period))
+        ? extracted.period
+        : (monthFromString(attachment.filename) || monthFromString(email.emailSubject));
+      if (!period) throw new Error(`Could not determine period from "${attachment.filename}"`);
+
+      // 5. Upload PDF to Storage (best effort) + write to Firestore
+      setImportStatus(`Saving ${period} financials...`);
+      let pdfMeta = null;
+      if (window.fbStorage) {
+        try {
+          const path = `audited_financials/${period}.pdf`;
+          const ref = window.fbStorage.ref(path);
+          const blob = new Blob([pdfBytes], { type: "application/pdf" });
+          await ref.put(blob, { contentType: "application/pdf", customMetadata: { original_filename: attachment.filename } });
+          const url = await ref.getDownloadURL();
+          pdfMeta = { storage_path: path, download_url: url };
+        } catch (e) { console.warn("PDF storage upload failed:", e); }
+      }
+      const record = {
+        ...extracted,
+        period,
+        email_id: email.emailId,
+        email_subject: email.emailSubject,
+        email_date: email.emailDate,
+        from: email.from,
+        filename: attachment.filename,
+        pdf_storage_path: pdfMeta?.storage_path || null,
+        pdf_download_url: pdfMeta?.download_url || null,
+        updated_at: new Date().toISOString(),
+      };
+      await window.db.collection("audited_financials").doc(period).set(record, { merge: true });
+
+      // 6. Log filename for dedupe + processed-emails ledger
+      await FS.saveFileLog(`audited_${period}_${email.emailId}`, {
+        file_id: `audited_${period}_${email.emailId}`,
+        filename: attachment.filename,
+        kind: "audited-financials",
+        group: "financials",
+        row_count: 0,
+        source: "ampcpas",
+        email_from: email.from,
+        period,
+        uploaded_at: new Date().toISOString(),
+      });
+      try {
+        await window.db.collection("audited_financials_emails").doc(email.emailId)
+          .set({ period, filename: attachment.filename, subject: email.emailSubject, processed_at: new Date().toISOString() }, { merge: true });
+      } catch(e) { console.warn("audited_financials_emails write failed:", e); }
+
+      setImported(prev => ({...prev, [refKey]: { ok: true, period }}));
+      setImportStatus(`✓ ${period} extracted (${attachment.filename})`);
+      if (onRefresh) onRefresh();
+    } catch(e) {
+      console.error("importAuditedFinancial failed:", e);
+      setImported(prev => ({...prev, [refKey]: { error: e.message }}));
+      setImportStatus(`✗ Audited financials failed: ${e.message}`);
+    }
+    setImporting(prev => ({...prev, [refKey]: false}));
+  };
+
   // Import All — bulk-import every email in the current vendor's search results.
   // Skips anything whose filename is already in file_log (idempotent on re-runs).
   // Honors vendor-specific handlers: FuelFox uses pair import, Quick Fuel PDFs
@@ -2124,14 +2293,17 @@ function GmailSync({ onRefresh }) {
             // Only handle data file types the vendor parses
             const isData = lcName.endsWith(".xlsx") || lcName.endsWith(".xls") || lcName.endsWith(".csv") || lcName.endsWith(".pdf");
             if (!isData) { skipped++; continue; }
+            // For ampcpas, also gate on filename containing "financial" so we
+            // don't accidentally process invoices from the same sender.
+            if (vendor === "ampcpas" && !lcName.includes("financial")) { skipped++; continue; }
             setImportStatus(`[${current}/${total}] ${a.filename}...`);
             try {
-              // Quick Fuel PDFs need special handler
               const isQuickFuelPdf = vendor === "quickfuel" && lcName.endsWith(".pdf");
-              if (isQuickFuelPdf) await importQuickFuel(em, a);
+              const isAuditedPdf = vendor === "ampcpas" && lcName.endsWith(".pdf");
+              if (isAuditedPdf) await importAuditedFinancial(em, a);
+              else if (isQuickFuelPdf) await importQuickFuel(em, a);
               else await importAttachment(em, a);
               imported++;
-              // Remember for subsequent iterations in this run
               setAlreadyImportedFilenames(prev => new Set([...prev, dk]));
             } catch(e) {
               console.error("Import All: attachment failed", a.filename, e);
@@ -2302,6 +2474,7 @@ function GmailSync({ onRefresh }) {
           { key:"fuelfox", icon:"⛽", label:"FuelFox", desc:"Fuel delivery — summary + service log PDFs from accounting@fuelfox.net", color:"#dc2626", mode:"pair" },
           { key:"quickfuel", icon:"⛽", label:"Quick Fuel", desc:"Fuel card statements from ebilling@4flyers.com", color:"#2563eb", mode:"quickfuel" },
           { key:"billing_sent", icon:"📤", label:"Billing@ → Uline", desc:"Emails billing@davisdelivery.com sent to any @uline.com recipient with an attachment. Disputes, corrections, POD replies, reshipments — outbound Uline correspondence only.", color:"#8b5cf6", mode:"per-attachment", accountFilter:"billing@davisdelivery.com" },
+          { key:"ampcpas", icon:"📊", label:"AMP CPAs (Audited Financials)", desc:"Monthly audited P&L, Balance Sheet, and Cash Flow PDFs from @ampcpas.com. Each PDF is rendered, scanned by Claude vision, and stored in audited_financials. Visible in the 📋 Financials tab.", color:"#0d9488", mode:"audited-financials" },
         ].map(v => {
           const r = results[v.key];
           const isLoading = loading[v.key];
@@ -2551,6 +2724,7 @@ function GmailSync({ onRefresh }) {
                               const imp = imported[refKey];
                               const disabled = v.comingSoon;
                               const isQuickFuelPdf = v.mode === "quickfuel" && a.filename.toLowerCase().endsWith(".pdf");
+                              const isAuditedPdf = v.mode === "audited-financials" && a.filename.toLowerCase().endsWith(".pdf");
                               // Detect if this filename has already been ingested in a prior session.
                               // Gmail message IDs aren't stored in file_log, so filename is the
                               // practical dedupe key. v2.40.3 uses a structural
@@ -2582,7 +2756,9 @@ function GmailSync({ onRefresh }) {
                                     <button
                                       onClick={() => {
                                         if (!confirm(`"${a.filename}" has already been imported. Re-importing is safe (max-merge guarantees no data is destroyed), but it's usually redundant.\n\nAre you sure you want to re-import?`)) return;
-                                        isQuickFuelPdf ? importQuickFuel(em, a) : importAttachment(em, a);
+                                        if (isAuditedPdf) importAuditedFinancial(em, a);
+                                        else if (isQuickFuelPdf) importQuickFuel(em, a);
+                                        else importAttachment(em, a);
                                       }}
                                       disabled={isImp}
                                       title="Already imported — click to re-import anyway (safe, max-merge)"
@@ -2591,10 +2767,14 @@ function GmailSync({ onRefresh }) {
                                     </button>
                                   ) : (
                                     <button
-                                      onClick={() => isQuickFuelPdf ? importQuickFuel(em, a) : importAttachment(em, a)}
+                                      onClick={() => {
+                                        if (isAuditedPdf) importAuditedFinancial(em, a);
+                                        else if (isQuickFuelPdf) importQuickFuel(em, a);
+                                        else importAttachment(em, a);
+                                      }}
                                       disabled={isImp}
                                       style={{padding:"4px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${v.color}`,background:isImp?T.bgSurface:v.color,color:isImp?T.text:"#fff",cursor:isImp?"wait":"pointer",opacity:isImp?0.6:1}}>
-                                      {isImp ? "..." : isQuickFuelPdf ? "⛽ Scan" : "→ Import"}
+                                      {isImp ? "..." : isAuditedPdf ? "📊 Scan" : isQuickFuelPdf ? "⛽ Scan" : "→ Import"}
                                     </button>
                                   )}
                                 </div>
