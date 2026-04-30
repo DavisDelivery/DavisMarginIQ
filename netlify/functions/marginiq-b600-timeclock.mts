@@ -314,6 +314,7 @@ function rollupWeekly(rows: Record<string, string>[]): any[] {
 
 interface DailyEntry {
   date: string;          // YYYY-MM-DD
+  driver_key: string;    // v2.47.4 — universal join key
   display_name: string;
   display_id: string;
   payroll_id: string;
@@ -325,7 +326,7 @@ interface DailyEntry {
   total_hours: number;
   reg_hours: number;
   ot_hours: number;
-  doc_id: string;        // {date}_{sanitized display_id} — Firestore doc ID
+  doc_id: string;        // {driver_key}_{date} — Firestore doc ID
 }
 
 // Convert "06:33a" / "11:34p" / "12:00a" → "06:33" / "23:34" / "00:00" (24h HH:MM).
@@ -352,6 +353,26 @@ function safeDocId(s: string): string {
     .slice(0, 100); // hard cap, Firestore allows up to ~1500 chars but be sane
 }
 
+// v2.47.4: must match MarginIQ.jsx driverKey() / normalizeName() byte-for-byte
+// so timeclock_daily, driver_classifications, and nuvizz_stops all join on the
+// SAME slug — irrespective of which writer produced the doc.
+function normalizeName(v: string | null | undefined): string | null {
+  if (!v) return null;
+  let s = String(v).trim();
+  if (!s) return null;
+  if (s.includes(",")) {
+    const [last, first] = s.split(",").map(x => x.trim());
+    if (first && last) s = `${first} ${last}`;
+  }
+  return s.replace(/\s+/g, " ").split(" ")
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+}
+function driverKey(name: string | null | undefined): string | null {
+  if (!name) return null;
+  return String(name).trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 140) || null;
+}
+
 function rollupDaily(rows: Record<string, string>[]): DailyEntry[] {
   // Key by (date, display_id) — display_id is unique per employee in B600.
   // Fall back to display_name if display_id is empty (rare).
@@ -371,8 +392,16 @@ function rollupDaily(rows: Record<string, string>[]): DailyEntry[] {
     const tot = parseHours(r["total"]) || reg + ot;
 
     if (!map[key]) {
+      // v2.47.4: doc_id and driver_key now align with MarginIQ.jsx + driver_classifications.
+      // Doc ID = `${driver_key}_${date}` (was `${date}_${safeDocId(display_id)}`).
+      // The legacy id format produced docs like "2025-01-05_A_Kostner" which
+      // didn't join cleanly to NuVizz's normalized name slugs. The new format
+      // matches what driver_classifications uses and what nuvizz_stops carries
+      // in its driver_key field.
+      const dKey = driverKey(normalizeName(dispName)) || safeDocId(dispId).toLowerCase();
       map[key] = {
         date: dateStr,
+        driver_key: dKey,
         display_name: dispName,
         display_id: dispId,
         payroll_id: (r["payroll id"] || "").trim(),
@@ -384,7 +413,7 @@ function rollupDaily(rows: Record<string, string>[]): DailyEntry[] {
         total_hours: 0,
         reg_hours: 0,
         ot_hours: 0,
-        doc_id: `${dateStr}_${safeDocId(dispId)}`,
+        doc_id: `${dKey}_${dateStr}`,
       };
     }
     const e = map[key];
@@ -521,15 +550,23 @@ export default async (req: Request, _context: Context) => {
     const CONCURRENCY = 10;
     async function writeOne(e: DailyEntry): Promise<boolean> {
       return await fsWrite("timeclock_daily", e.doc_id, {
-        date: e.date,
+        // v2.47.4: schema unified with MarginIQ.jsx::buildTimeClockDaily.
+        // Both writers now produce: driver_key, employee, display_name,
+        // display_id, payroll_id, day_of_week, date, week_ending, month,
+        // punches, clock_in/out, hours/total_hours, reg/ot_hours, source.
+        driver_key: e.driver_key,
+        employee: e.display_name, // alias for cross-writer queries
         display_name: e.display_name,
         display_id: e.display_id,
         payroll_id: e.payroll_id,
         day_of_week: e.day_of_week,
+        date: e.date,
         week_ending: e.week_ending,
+        month: e.date ? e.date.slice(0, 7) : null,
         punches: e.punches,
         clock_in: e.clock_in,
         clock_out: e.clock_out,
+        hours: e.total_hours,        // alias to match MarginIQ.jsx
         total_hours: e.total_hours,
         reg_hours: e.reg_hours,
         ot_hours: e.ot_hours,

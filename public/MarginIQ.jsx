@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.47.3";
+const APP_VERSION = "2.47.4";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3886,6 +3886,9 @@ function buildNuVizzWeekly(stops) {
 // Supports both generic timeclock format AND CyberPay/B600 format (Display Name, In Time, Out Time, REG, OT1, OT2, Total)
 // v2.47.0: emits driver_key for joining to driver_classifications and
 //          (downstream) nuvizz_stops; preserves raw row for future use.
+// v2.47.4: extracts display_id, payroll_id, day_of_week so the union schema
+//          matches what marginiq-b600-timeclock.mts produces. Multiple punches
+//          per driver per day collapse into a punches[] array on the daily doc.
 function parseTimeClock(rows) {
   const entries = [];
   for (const r of rows) {
@@ -3902,9 +3905,17 @@ function parseTimeClock(rows) {
     const totalExplicit = parseHours(r["total"] ?? r["total hours"] ?? r["hours"] ?? r["worked"] ?? r["duration"]);
     const hours = totalExplicit || (regHrs + ot1Hrs + ot2Hrs) || 0;
     const employee = normalizeName(rawName);
+    const displayName = (r["display name"] || rawName || "").toString().trim();
+    const displayId = (r["display id"] || "").toString().trim() || displayName;
+    const payrollId = (r["payroll id"] || "").toString().trim();
+    const dayOfWeek = (r["in day"] || r["day of week"] || "").toString().trim();
     entries.push({
       employee,
       driver_key: driverKey(employee), // join key — same slug used in driver_classifications
+      display_name: displayName,
+      display_id: displayId,
+      payroll_id: payrollId,
+      day_of_week: dayOfWeek,
       date,
       week_ending: date ? weekEndingSaturday(date) : null,
       month: date ? dateToMonth(date) : null,
@@ -3923,28 +3934,55 @@ function parseTimeClock(rows) {
 // Per-shift docs for clock-in→first-stop / last-stop→clock-out forensics.
 // Doc ID  : `${driver_key}_${date}` — same slug used by driver_classifications,
 //           so consumer-side joins are exact.
-// Strategy: emit one doc per shift; merge:true upserts on re-ingest.
+// Strategy: emit one doc per (driver_key, date); merge:true upserts on re-ingest.
+//
+// v2.47.4: schema unified with marginiq-b600-timeclock.mts. Multiple punches
+// (lunch breaks, splits) collapse into a punches[] array on the single doc.
+// clock_in = earliest "in" across all punches; clock_out = latest "out".
 function buildTimeClockDaily(entries) {
-  const daily = [];
+  const map = {}; // doc_id -> aggregated daily entry
   for (const e of entries) {
     if (!e.driver_key || !e.date) continue;
-    daily.push({
-      doc_id: `${e.driver_key}_${e.date}`,
-      employee: e.employee,
-      driver_key: e.driver_key,
-      date: e.date,
-      week_ending: e.week_ending,
-      month: e.month,
-      clock_in: e.clock_in,
-      clock_out: e.clock_out,
-      hours: e.hours,
-      reg_hours: e.reg_hours,
-      ot_hours: e.ot_hours,
-      department: e.department,
-      raw: e.raw,
+    const docId = `${e.driver_key}_${e.date}`;
+    if (!map[docId]) {
+      map[docId] = {
+        doc_id: docId,
+        employee: e.employee,
+        driver_key: e.driver_key,
+        display_name: e.display_name || e.employee || null,
+        display_id: e.display_id || null,
+        payroll_id: e.payroll_id || null,
+        day_of_week: e.day_of_week || null,
+        date: e.date,
+        week_ending: e.week_ending,
+        month: e.month,
+        clock_in: e.clock_in || null,
+        clock_out: e.clock_out || null,
+        punches: [],
+        hours: 0,
+        total_hours: 0, // alias for cross-writer compat
+        reg_hours: 0,
+        ot_hours: 0,
+        department: e.department || null,
+        raw_first: e.raw, // first row's raw — for inspection; punches[].raw has all
+      };
+    }
+    const d = map[docId];
+    d.punches.push({
+      in: e.clock_in || null,
+      out: e.clock_out || null,
+      hours: e.hours || 0,
+      raw: e.raw || null,
     });
+    d.hours += e.hours || 0;
+    d.total_hours += e.hours || 0;
+    d.reg_hours += e.reg_hours || 0;
+    d.ot_hours += e.ot_hours || 0;
+    // Earliest in / latest out across all punches
+    if (e.clock_in && (!d.clock_in || e.clock_in < d.clock_in)) d.clock_in = e.clock_in;
+    if (e.clock_out && (!d.clock_out || e.clock_out > d.clock_out)) d.clock_out = e.clock_out;
   }
-  return daily;
+  return Object.values(map);
 }
 
 function buildTimeClockWeekly(entries) {
