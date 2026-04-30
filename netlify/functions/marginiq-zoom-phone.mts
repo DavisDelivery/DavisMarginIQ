@@ -1,51 +1,14 @@
 import type { Context } from "@netlify/functions";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Zoom Phone Reporting — CLEAN REBUILD
+// Zoom Phone Reporting — v2 (fixes math + missing employees)
 // ═══════════════════════════════════════════════════════════════════════════
-//
-// Approach (after researching Zoom's API docs):
-//
-// 1. ACCOUNT-LEVEL TOTALS: Use legacy `GET /phone/call_logs` for total call
-//    volume (one record per logical call, no queue-leg noise). This gives us
-//    accurate total counts and busiest-day analytics.
-//
-// 2. PER-EMPLOYEE ATTRIBUTION: Use legacy `GET /phone/users/{id}/call_logs`.
-//    This endpoint returns clean records with these critical fields:
-//      - result: "Call connected" → this user actually answered
-//      - result: "Answered by Other Member" → rang user's queue but someone
-//        else picked up (DO NOT count as their answered call)
-//      - result: "No Answer" / "Call Cancel" / "Rejected" → other miss types
-//      - duration: actual talk time in seconds
-//      - direction: inbound | outbound
-//      - answer_start_time: timestamp when they picked up (set only when
-//        they personally answered)
-//
-// 3. DEDUPLICATION: We use call_id as the unique key. The user-level endpoint
-//    already returns one record per leg the user was involved in, but only
-//    counts as their "answered" call when result === "Call connected".
-//
-// 4. NOTE ON DEPRECATION: Zoom plans to deprecate the legacy `call_logs`
-//    endpoints (was scheduled for 2025, extended to May 2026). We're using
-//    them today because they give cleaner per-user attribution. The newer
-//    `call_history` endpoint is fundamentally a different data model that
-//    returns one row per call leg/event, not per call.
-//
-// Actions:
-//   status     — check credentials configured
-//   users      — list phone-licensed users
-//   sync-user  — fetch one user's call logs and write to Firebase
-//   history    — read aggregated history from Firebase cache (instant)
-//   debug-cache — show what's in cache per user
-//   debug-raw  — show raw Zoom response for one user
-//   wipe-all   — clear all user caches (clean reset)
 
 const TOKEN_URL = "https://zoom.us/oauth/token";
 const API       = "https://api.zoom.us/v2";
 const CORS      = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
 const sleep     = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// ── Auth ─────────────────────────────────────────────────────────────────────
 async function getToken(acct: string, cid: string, csec: string): Promise<string> {
   const res = await fetch(
     `${TOKEN_URL}?grant_type=account_credentials&account_id=${encodeURIComponent(acct)}`,
@@ -56,7 +19,6 @@ async function getToken(acct: string, cid: string, csec: string): Promise<string
   return d.access_token;
 }
 
-// ── Phone users ──────────────────────────────────────────────────────────────
 async function getPhoneUsers(token: string) {
   const users: any[] = [];
   let npt = "", pages = 0;
@@ -77,28 +39,26 @@ async function getPhoneUsers(token: string) {
   }));
 }
 
-// ── Get one user's call logs (LEGACY ENDPOINT — clean data) ─────────────────
 async function getUserCallLogs(
   token: string, userId: string, from: string, to: string
 ): Promise<{ records: any[]; truncated: boolean; error?: string }> {
   const records: any[] = [];
   let npt = "", pages = 0;
-  const MAX_PAGES = 100;
+  const MAX_PAGES = 30;  // 9000 records max — must complete within Netlify timeout
 
   while (true) {
     const url = `${API}/phone/users/${userId}/call_logs?from=${from}&to=${to}&type=all&page_size=300${npt ? "&next_page_token=" + encodeURIComponent(npt) : ""}`;
 
     let res: Response | null = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
         res = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-        if (res.status === 429) { await sleep(2000 * (attempt + 1)); continue; }
+        if (res.status === 429) { await sleep(1500); continue; }
         break;
-      } catch (e) { await sleep(1000); }
+      } catch (e) { await sleep(500); }
     }
 
     if (!res) return { records, truncated: true, error: "fetch failed" };
-
     const d: any = await res.json().catch(() => ({}));
     if (!res.ok) {
       if (res.status === 404 || res.status === 400) return { records, truncated: false };
@@ -113,18 +73,41 @@ async function getUserCallLogs(
   }
 }
 
-// ── Normalize one user-level call_log record ────────────────────────────────
 function normalizeRecord(raw: any, owner: { name: string; email: string; ext: string }) {
-  // Result interpretation per Zoom's actual values:
   const rawResult = String(raw.result || "");
   let result: string;
-  if (rawResult === "Call connected") result = "answered";          // user truly answered
-  else if (rawResult === "Answered by Other Member") result = "answered_elsewhere"; // queue rang but someone else picked up
-  else if (rawResult === "No Answer") result = "missed";            // user didn't pick up
-  else if (rawResult === "Call Cancel") result = "cancelled";       // caller hung up before answer
-  else if (rawResult === "Rejected") result = "rejected";           // user declined
-  else if (rawResult.toLowerCase().includes("voicemail")) result = "voicemail";
-  else result = "other";
+  let isAnsweredCall: boolean;  // true = call WAS answered (by anyone)
+  let isAttributedToUser: boolean;  // true = THIS user personally answered
+
+  if (rawResult === "Call connected") {
+    result = "answered";
+    isAnsweredCall = true;
+    isAttributedToUser = true;
+  } else if (rawResult === "Answered by Other Member") {
+    result = "answered";  // count as answered in totals
+    isAnsweredCall = true;
+    isAttributedToUser = false;  // not by THIS user though
+  } else if (rawResult === "No Answer") {
+    result = "missed";
+    isAnsweredCall = false;
+    isAttributedToUser = false;
+  } else if (rawResult === "Call Cancel") {
+    result = "missed";
+    isAnsweredCall = false;
+    isAttributedToUser = false;
+  } else if (rawResult === "Rejected") {
+    result = "missed";
+    isAnsweredCall = false;
+    isAttributedToUser = false;
+  } else if (rawResult.toLowerCase().includes("voicemail")) {
+    result = "voicemail";
+    isAnsweredCall = false;
+    isAttributedToUser = false;
+  } else {
+    result = "other";
+    isAnsweredCall = false;
+    isAttributedToUser = false;
+  }
 
   return {
     callId:        raw.call_id || raw.id || "",
@@ -132,43 +115,30 @@ function normalizeRecord(raw: any, owner: { name: string; email: string; ext: st
     answerTime:    raw.answer_start_time || "",
     endTime:       raw.call_end_time || "",
     direction:     String(raw.direction || "").toLowerCase(),
-
-    // The owner of this call_logs feed is the user — that's who answered
-    // (when result === "Call connected") or had their queue ring (when "Answered by Other Member")
-    answeredBy:    owner.name,
+    answeredBy:    isAttributedToUser ? owner.name : "",   // empty if not this user's answer
     answeredEmail: owner.email,
     answeredExt:   owner.ext,
-
-    // Caller / callee for display
+    cacheOwner:    owner.name,                              // user whose cache this came from
     callerName:    raw.caller_name || "",
     callerNum:     raw.caller_number || raw.caller_did_number || "",
     calleeName:    raw.callee_name || "",
     calleeNum:     raw.callee_number || raw.callee_did_number || "",
-
-    // Routing
-    path:          raw.path || "",          // pstn, autoReceptionist, callQueue, etc.
+    path:          raw.path || "",
     department:    raw.department || "",
-
-    // Outcome
     result,
-    rawResult,                                // keep original for debugging
+    rawResult,
+    isAnsweredCall,
+    isAttributedToUser,
     duration:      Number(raw.duration) || 0,
-    talkTime:      Number(raw.duration) || 0, // alias for UI back-compat
-
-    // Was this counted as the user's answered call?
-    isUserAnswered: result === "answered",    // only true when user personally took it
+    talkTime:      Number(raw.duration) || 0,
   };
 }
 
-// ── Aggregate cached records by ACCOUNT-LEVEL totals + per-employee ─────────
-// Returns:
-//   - one record per unique callId (account-level dedup)
-//   - employee attribution to whoever has result === "answered" for that callId
+// ── Aggregate: dedup by callId, attributing to the actual answerer ──────────
 function aggregateForReport(allRecords: any[], from: string, to: string, dir: string): any[] {
   const fromMs = new Date(from + "T00:00:00Z").getTime();
   const toMs   = new Date(to   + "T23:59:59.999Z").getTime();
 
-  // Filter by date and direction
   const inRange = allRecords.filter(r => {
     if (!r || !r.date) return false;
     const ms = new Date(r.date).getTime();
@@ -177,31 +147,38 @@ function aggregateForReport(allRecords: any[], from: string, to: string, dir: st
     return true;
   });
 
-  // Group by call_id
-  const byCallId = new Map<string, any>();
+  // Group records by callId
+  const byCallId = new Map<string, any[]>();
   for (const r of inRange) {
     const key = r.callId;
     if (!key) continue;
-    const existing = byCallId.get(key);
-    if (!existing) {
-      byCallId.set(key, r);
-      continue;
-    }
-    // If we have multiple records for the same call_id (one per user that
-    // saw it), prefer the one where the user truly answered (result === "answered")
-    if (r.isUserAnswered && !existing.isUserAnswered) {
-      byCallId.set(key, r);
-    }
-    // Otherwise keep first (typically the user-level endpoint returns same
-    // result for all involved users on inbound queue calls)
+    if (!byCallId.has(key)) byCallId.set(key, []);
+    byCallId.get(key)!.push(r);
   }
 
-  return Array.from(byCallId.values()).sort((a, b) =>
-    new Date(b.date).getTime() - new Date(a.date).getTime()
-  );
+  // For each call, build ONE final record with correct attribution
+  const result: any[] = [];
+  for (const [callId, recs] of byCallId.entries()) {
+    // Find the user who personally answered (if anyone in cache did)
+    const answerer = recs.find(r => r.isAttributedToUser);
+
+    if (answerer) {
+      // We know exactly who answered
+      result.push({ ...answerer, answeredBy: answerer.cacheOwner });
+    } else {
+      // No one in our cache directly answered. Take any record and:
+      // - if isAnsweredCall=true (someone did answer, just not in our cache),
+      //   leave answeredBy blank but count as answered
+      // - otherwise it's a missed/voicemail/etc
+      const sample = recs[0];
+      result.push({ ...sample, answeredBy: sample.isAnsweredCall ? "" : sample.cacheOwner });
+    }
+  }
+
+  return result.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 }
 
-// ── Firebase REST helpers ───────────────────────────────────────────────────
+// ── Firebase ────────────────────────────────────────────────────────────────
 function toFV(v: any): any {
   if (v === null || v === undefined) return { nullValue: null };
   if (typeof v === "boolean")        return { booleanValue: v };
@@ -260,12 +237,10 @@ export default async (req: Request, _ctx: Context) => {
   const dir    = u.searchParams.get("direction") || "";
   const t0     = Date.now();
 
-  // ── Status ────────────────────────────────────────────────────────────────
   if (action === "status") {
     return new Response(JSON.stringify({
       configured: !!(ACCT && CID && CSEC),
       missing: [!ACCT&&"ZOOM_ACCOUNT_ID",!CID&&"ZOOM_CLIENT_ID",!CSEC&&"ZOOM_CLIENT_SECRET"].filter(Boolean),
-      hasFirebase: !!(FB_KEY && FB_PROJ),
     }), { headers: CORS });
   }
 
@@ -273,15 +248,10 @@ export default async (req: Request, _ctx: Context) => {
     return new Response(JSON.stringify({ error: "Missing Zoom credentials." }), { status: 500, headers: CORS });
   }
 
-  // ── History — read aggregated data from cache ────────────────────────────
   if (action === "history") {
-    if (!FB_KEY || !FB_PROJ) {
-      return new Response(JSON.stringify({ error: "Firebase not configured", source: "error" }), { status: 500, headers: CORS });
-    }
-
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({ error: "Firebase not configured", source: "error" }), { status: 500, headers: CORS });
     try {
       const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_user_logs");
-
       if (userDocs.length === 0) {
         return new Response(JSON.stringify({
           records: [], count: 0, source: "empty",
@@ -289,35 +259,21 @@ export default async (req: Request, _ctx: Context) => {
           synced_at: null, from, to, ms: Date.now()-t0,
         }), { headers: CORS });
       }
-
-      // Flatten all records from all users
       const all: any[] = [];
-      for (const doc of userDocs) {
-        for (const r of (doc.records || [])) all.push(r);
-      }
-
-      // Aggregate: one row per unique callId, prefer record where user truly answered
+      for (const doc of userDocs) for (const r of (doc.records || [])) all.push(r);
       const aggregated = aggregateForReport(all, from, to, dir);
-
       const synced_at = userDocs.map((d:any) => d.synced_at).filter(Boolean).sort().reverse()[0] || null;
-
       return new Response(JSON.stringify({
-        records:    aggregated,
-        count:      aggregated.length,
-        source:     "cache",
-        synced_at,
-        from, to,
-        rawLegs:    all.length,
-        users:      userDocs.length,
+        records: aggregated, count: aggregated.length,
+        source: "cache", synced_at, from, to,
+        rawLegs: all.length, users: userDocs.length,
         ms: Date.now()-t0,
       }), { headers: CORS });
-
     } catch(e: any) {
       return new Response(JSON.stringify({ error: e?.message, source: "error" }), { status: 500, headers: CORS });
     }
   }
 
-  // ── List phone users ─────────────────────────────────────────────────────
   if (action === "users") {
     try {
       const token = await getToken(ACCT, CID, CSEC);
@@ -328,7 +284,6 @@ export default async (req: Request, _ctx: Context) => {
     }
   }
 
-  // ── Sync ONE user (called by UI in a loop, with progress) ────────────────
   if (action === "sync-user") {
     const userId   = u.searchParams.get("userId") || "";
     const userName = u.searchParams.get("name")   || "";
@@ -336,28 +291,21 @@ export default async (req: Request, _ctx: Context) => {
     const userExt  = u.searchParams.get("ext")    || "";
     const syncFrom = u.searchParams.get("from") || new Date(Date.now()-35*86400000).toISOString().slice(0,10);
     const syncTo   = u.searchParams.get("to")   || new Date().toISOString().slice(0,10);
-
     if (!userId) return new Response(JSON.stringify({ error: "userId required" }), { status: 400, headers: CORS });
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({ error: "Firebase not configured" }), { status: 500, headers: CORS });
 
     try {
       const token = await getToken(ACCT, CID, CSEC);
       const owner = { name: userName, email: userEmail, ext: userExt };
-
-      // Wipe stale cache for this user before writing fresh data
-      await fsDelete(FB_PROJ, FB_KEY, "zoom_user_logs", userId);
-
+      // Don't pre-wipe — keep old data if new sync fails
       const result = await getUserCallLogs(token, userId, syncFrom, syncTo);
       const normalized = result.records.map((r: any) => normalizeRecord(r, owner));
+      const trulyAnswered = normalized.filter(r => r.isAttributedToUser).length;
 
-      // Count truly-answered for reporting
-      const trulyAnswered = normalized.filter(r => r.isUserAnswered).length;
-
+      // Always write — even if zero records (so user appears in cache list)
       await fsSet(FB_PROJ, FB_KEY, "zoom_user_logs", userId, {
         userId, name: userName, email: userEmail, ext: userExt,
-        records: normalized,
-        count: normalized.length,
-        trulyAnswered,
+        records: normalized, count: normalized.length, trulyAnswered,
         synced_at: new Date().toISOString(),
         from: syncFrom, to: syncTo,
         truncated: result.truncated || false,
@@ -366,34 +314,36 @@ export default async (req: Request, _ctx: Context) => {
 
       return new Response(JSON.stringify({
         ok: !result.error, name: userName,
-        records: normalized.length,
-        trulyAnswered,
-        truncated: result.truncated,
-        error: result.error || null,
+        records: normalized.length, trulyAnswered,
+        truncated: result.truncated, error: result.error || null,
         ms: Date.now()-t0,
       }), { headers: CORS });
     } catch(e: any) {
+      // Write error doc so we know this user failed
+      try {
+        await fsSet(FB_PROJ, FB_KEY, "zoom_user_logs", userId, {
+          userId, name: userName, email: userEmail, ext: userExt,
+          records: [], count: 0, trulyAnswered: 0,
+          synced_at: new Date().toISOString(),
+          from: syncFrom, to: syncTo,
+          truncated: false,
+          sync_error: String(e?.message || e),
+        });
+      } catch (_) {}
       return new Response(JSON.stringify({ error: e?.message, name: userName }), { status: 500, headers: CORS });
     }
   }
 
-  // ── Wipe all user caches ─────────────────────────────────────────────────
   if (action === "wipe-all") {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
     const token = await getToken(ACCT, CID, CSEC);
     const users = await getPhoneUsers(token);
-    for (const user of users) {
-      await fsDelete(FB_PROJ, FB_KEY, "zoom_user_logs", user.id);
-    }
-    // Also wipe old collection from previous architecture
+    for (const user of users) await fsDelete(FB_PROJ, FB_KEY, "zoom_user_logs", user.id);
     const oldDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_sync_users");
-    for (const doc of oldDocs) {
-      if (doc.userId) await fsDelete(FB_PROJ, FB_KEY, "zoom_sync_users", doc.userId);
-    }
+    for (const doc of oldDocs) if (doc.userId) await fsDelete(FB_PROJ, FB_KEY, "zoom_sync_users", doc.userId);
     return new Response(JSON.stringify({ ok: true, wiped: users.length, oldWiped: oldDocs.length }), { headers: CORS });
   }
 
-  // ── Debug: cache state per user ─────────────────────────────────────────
   if (action === "debug-cache") {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
     const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_user_logs");
@@ -401,9 +351,9 @@ export default async (req: Request, _ctx: Context) => {
       total: userDocs.length,
       summary: userDocs.map((d: any) => {
         const recs = (d.records || []) as any[];
-        const truly = recs.filter(r => r.isUserAnswered).length;
-        const elsewhere = recs.filter(r => r.result === "answered_elsewhere").length;
-        const missed = recs.filter(r => r.result === "missed" || r.result === "cancelled" || r.result === "rejected").length;
+        const truly = recs.filter(r => r.isAttributedToUser).length;
+        const elsewhere = recs.filter(r => r.rawResult === "Answered by Other Member").length;
+        const missed = recs.filter(r => r.result === "missed").length;
         return {
           name: d.name, ext: d.ext,
           totalRecords: recs.length,
@@ -419,19 +369,24 @@ export default async (req: Request, _ctx: Context) => {
     }), { headers: CORS });
   }
 
-  // ── Debug: raw Zoom response ─────────────────────────────────────────────
-  if (action === "debug-raw") {
-    const userId = u.searchParams.get("userId") || "UgG02EaxRauMiyuJ4Hixag";
-    const dFrom  = u.searchParams.get("from") || new Date(Date.now()-2*86400000).toISOString().slice(0,10);
-    const dTo    = u.searchParams.get("to")   || new Date().toISOString().slice(0,10);
-    const token  = await getToken(ACCT, CID, CSEC);
-    const url    = `${API}/phone/users/${userId}/call_logs?from=${dFrom}&to=${dTo}&type=all&page_size=10`;
-    const res    = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
-    const d: any = await res.json();
+  if (action === "debug-aggregated") {
+    if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
+    const userDocs = await fsListDocs(FB_PROJ, FB_KEY, "zoom_user_logs");
+    const all: any[] = [];
+    for (const doc of userDocs) for (const r of (doc.records || [])) all.push(r);
+    const agg = aggregateForReport(all, from, to, dir);
+    const stats: Record<string, number> = {};
+    const byEmployee: Record<string, number> = {};
+    for (const r of agg) {
+      stats[r.result] = (stats[r.result] || 0) + 1;
+      if (r.answeredBy) byEmployee[r.answeredBy] = (byEmployee[r.answeredBy] || 0) + 1;
+      else if (r.isAnsweredCall) byEmployee["(answered by uncached user)"] = (byEmployee["(answered by uncached user)"] || 0) + 1;
+    }
     return new Response(JSON.stringify({
-      userId, from: dFrom, to: dTo, status: res.status,
-      total: d.total_records,
-      sample: (d.call_logs || []).slice(0, 3),
+      totalUniqueCalls: agg.length,
+      rawLegsAcrossAllUsers: all.length,
+      byResult: stats,
+      byEmployee,
     }), { headers: CORS });
   }
 
