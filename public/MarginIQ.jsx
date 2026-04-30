@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.47.1";
+const APP_VERSION = "2.47.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -6657,12 +6657,23 @@ function DataIngest({ weeklyRollups, reconMeta, fileLog, onRefresh }) {
       }
       // v2.47.0: also persist per-shift entries to timeclock_daily for the
       // clock-in→first-stop forensics on DriverPerformanceTab.
-      setStatus(`Saving time clock daily shifts (${timeClockEntries.length} entries)...`);
+      // v2.47.2: parallel batches of 25 with UI yield between batches —
+      // matches the pattern used for ddisPayments above. The earlier
+      // sequential for-loop locked up mobile Safari for ~8 min on a
+      // 3,408-entry file.
       const tcDaily = buildTimeClockDaily(timeClockEntries);
-      for (const d of tcDaily) {
-        const { doc_id, ...fields } = d;
-        const ok = await FS.saveTimeClockDaily(doc_id, {...fields, updated_at:new Date().toISOString()});
-        if (ok) tcDaysSaved++;
+      setStatus(`Saving time clock daily shifts (0/${tcDaily.length})...`);
+      const TC_BATCH = 25;
+      for (let i = 0; i < tcDaily.length; i += TC_BATCH) {
+        const batch = tcDaily.slice(i, i + TC_BATCH);
+        const results = await Promise.all(batch.map(d => {
+          const { doc_id, ...fields } = d;
+          return FS.saveTimeClockDaily(doc_id, {...fields, updated_at:new Date().toISOString()});
+        }));
+        tcDaysSaved += results.filter(r => r).length;
+        // Status + UI yield every batch so the tab stays responsive on mobile
+        setStatus(`Saving time clock daily shifts (${Math.min(i+TC_BATCH, tcDaily.length)}/${tcDaily.length})...`);
+        await new Promise(r => setTimeout(r, 0));
       }
     }
 
