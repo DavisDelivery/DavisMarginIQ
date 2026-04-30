@@ -249,7 +249,7 @@ async function saveUserRecordsByDay(
   for (const [dk, dayRecs] of byDate.entries()) {
     const docId = `${dk}_${userId}`;
     try {
-      await fsSet(proj, key, "zoom_calls", docId, {
+      await fsSet(proj, key, "zoom_history_days", docId, {
         date: dk,
         userId, name: owner.name, ext: owner.ext,
         records: dayRecs,
@@ -267,11 +267,11 @@ async function saveUserRecordsByDay(
 
 // Wipe all of a user's day-docs
 async function wipeUserDays(proj: string, key: string, userId: string) {
-  const all = await fsListAllDocs(proj, key, "zoom_calls");
+  const all = await fsListAllDocs(proj, key, "zoom_history_days");
   for (const doc of all) {
     if (doc.userId === userId && doc._name) {
       const docId = doc._name.split("/").pop();
-      await fsDelete(proj, key, "zoom_calls", docId);
+      await fsDelete(proj, key, "zoom_history_days", docId);
     }
   }
 }
@@ -306,7 +306,7 @@ export default async (req: Request, _ctx: Context) => {
   if (action === "history") {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({ error: "Firebase not configured", source: "error" }), { status: 500, headers: CORS });
     try {
-      const allDayDocs = await fsListAllDocs(FB_PROJ, FB_KEY, "zoom_calls");
+      const allDayDocs = await fsListAllDocs(FB_PROJ, FB_KEY, "zoom_history_days");
       if (allDayDocs.length === 0) {
         return new Response(JSON.stringify({
           records: [], count: 0, source: "empty",
@@ -416,12 +416,12 @@ export default async (req: Request, _ctx: Context) => {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
 
     // Wipe new collections
-    const dayDocs = await fsListAllDocs(FB_PROJ, FB_KEY, "zoom_calls");
+    const dayDocs = await fsListAllDocs(FB_PROJ, FB_KEY, "zoom_history_days");
     let wipedCalls = 0;
     for (const doc of dayDocs) {
       if (doc._name) {
         const docId = doc._name.split("/").pop();
-        await fsDelete(FB_PROJ, FB_KEY, "zoom_calls", docId);
+        await fsDelete(FB_PROJ, FB_KEY, "zoom_history_days", docId);
         wipedCalls++;
       }
     }
@@ -473,7 +473,7 @@ export default async (req: Request, _ctx: Context) => {
 
   if (action === "debug-aggregated") {
     if (!FB_KEY || !FB_PROJ) return new Response(JSON.stringify({error:"Firebase not configured"}), { status: 500, headers: CORS });
-    const dayDocs = await fsListAllDocs(FB_PROJ, FB_KEY, "zoom_calls");
+    const dayDocs = await fsListAllDocs(FB_PROJ, FB_KEY, "zoom_history_days");
     const all: any[] = [];
     for (const doc of dayDocs) for (const r of (doc.records || [])) all.push(r);
     const agg = aggregateForReport(all, from, to, dir);
