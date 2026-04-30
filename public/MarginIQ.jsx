@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.48.0";
+const APP_VERSION = "2.48.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2625,15 +2625,59 @@ Rules:
                     </div>
                     {duplicateFiles.length > 0 && (
                       <details style={{marginBottom:8,padding:"6px 10px",background:"#fef9c3",borderRadius:6,border:`1px solid ${T.yellow}40`,fontSize:11}}>
-                        <summary style={{cursor:"pointer",fontWeight:700,color:"#78350f",listStyle:"none",display:"flex",alignItems:"center",gap:6}}>
+                        <summary style={{cursor:"pointer",fontWeight:700,color:"#78350f",listStyle:"none",display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
                           <span>⚠ {duplicateFiles.length} duplicate{duplicateFiles.length>1?"s":""} detected — already in file_log, will be auto-skipped</span>
                           <span style={{fontSize:10,fontWeight:400,color:T.textMuted}}>(click to view)</span>
+                          <button
+                            onClick={(e) => {
+                              e.preventDefault(); e.stopPropagation();
+                              const dupCount = duplicateFiles.length;
+                              if (!confirm(`Re-run all ${dupCount} duplicate-flagged file${dupCount>1?"s":""} through the parser?\n\nUse this when the parser has been updated since the original import (e.g. v2.48.0 added the audited-financials extractor) and existing file_log entries don't have the data they should.\n\nMax-merge means this is safe — no data will be destroyed.`)) return;
+                              (async () => {
+                                let done = 0, failed = 0;
+                                const total = displayList.reduce((acc, em) => {
+                                  return acc + (em.attachments || []).filter(a => alreadyImportedFilenames.has(dedupKey(a.filename))).length;
+                                }, 0);
+                                setImportStatus(`Re-importing ${total} duplicate${total>1?"s":""}...`);
+                                for (const em of displayList) {
+                                  for (const a of (em.attachments || [])) {
+                                    const dk = dedupKey(a.filename);
+                                    if (!alreadyImportedFilenames.has(dk)) continue;
+                                    const lcName = a.filename.toLowerCase();
+                                    // Skip non-data attachments
+                                    const isData = lcName.endsWith(".xlsx") || lcName.endsWith(".xls") || lcName.endsWith(".csv") || lcName.endsWith(".pdf");
+                                    if (!isData) continue;
+                                    // Vendor-specific gate (same as Import All)
+                                    if (v.key === "ampcpas" && !lcName.includes("financial")) continue;
+                                    done++;
+                                    setImportStatus(`Re-importing [${done}/${total}] ${a.filename}...`);
+                                    try {
+                                      const isQuickFuelPdf = v.mode === "quickfuel" && lcName.endsWith(".pdf");
+                                      const isAuditedPdf = v.mode === "audited-financials" && lcName.endsWith(".pdf");
+                                      if (isAuditedPdf) await importAuditedFinancial(em, a);
+                                      else if (isQuickFuelPdf) await importQuickFuel(em, a);
+                                      else await importAttachment(em, a);
+                                    } catch(err) {
+                                      console.error("Re-import failed:", a.filename, err);
+                                      failed++;
+                                    }
+                                  }
+                                }
+                                setImportStatus(`✓ Re-import done — ${done - failed}/${done} succeeded${failed?`, ${failed} failed`:""}`);
+                                await loadImportedFilenames();
+                                if (onRefresh) onRefresh();
+                              })();
+                            }}
+                            style={{padding:"3px 10px",fontSize:10,fontWeight:700,borderRadius:6,border:`1px solid ${T.yellow}`,background:"#fde68a",color:"#78350f",cursor:"pointer",marginLeft:"auto"}}
+                            title="Re-run every duplicate-flagged file through the current parser. Use after a parser upgrade.">
+                            🔁 Re-import All ({duplicateFiles.length})
+                          </button>
                         </summary>
                         <div style={{marginTop:6,paddingLeft:4,display:"flex",flexDirection:"column",gap:2,fontFamily:"monospace",fontSize:10,color:"#78350f"}}>
                           {duplicateFiles.map((fn, i) => <div key={i}>• {fn}</div>)}
                         </div>
                         <div style={{marginTop:6,fontSize:10,color:T.textMuted,fontStyle:"italic"}}>
-                          Import All automatically skips these. Max-merge ensures re-importing can't corrupt data if you do choose to re-import.
+                          Import All automatically skips these. Max-merge ensures re-importing can't corrupt data if you do choose to re-import. Use the Re-import All button above when the parser has been updated and existing data needs to be re-extracted.
                         </div>
                       </details>
                     )}
