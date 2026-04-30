@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.47.2";
+const APP_VERSION = "2.47.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -4942,7 +4942,7 @@ function LaborReality({ margins }) {
     return (
       <div style={{...cardStyle, background:T.bgSurface, borderLeft:`3px solid ${T.textDim}`, marginBottom:12}}>
         <div style={{fontSize:12,fontWeight:700,marginBottom:4}}>💡 Labor Reality Check</div>
-        <div style={{fontSize:11,color:T.textMuted}}>Upload NuVizz + Payroll files (or connect Gmail) to see actual labor cost vs your cost-structure estimate. Then classify drivers in the Drivers tab to unlock accurate margins.</div>
+        <div style={{fontSize:11,color:T.textMuted}}>Upload NuVizz + Payroll files (or connect Gmail) to see actual labor cost vs your cost-structure estimate. Then classify employees in the Employees tab to unlock accurate margins.</div>
       </div>
     );
   }
@@ -4974,7 +4974,7 @@ function LaborReality({ margins }) {
           {data.avgUnclNv > 0 && ` ${fmtK(data.avgUnclNv)} NuVizz pay`}
           {data.avgUnclNv > 0 && data.avgUnclPay > 0 && " +"}
           {data.avgUnclPay > 0 && ` ${fmtK(data.avgUnclPay)} payroll`}
-          {" "}from drivers/employees not yet tagged W2 or 1099. Classify them in the Drivers tab for accurate actual-cost math.
+          {" "}from employees not yet tagged W2 or 1099. Classify them in the Employees tab for accurate actual-cost math.
         </div>
       )}
     </div>
@@ -9069,13 +9069,13 @@ function Drivers() {
 
   if (drivers.length === 0) {
     return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-      <SectionTitle icon="👥" text="Drivers" />
-      <EmptyState icon="👥" title="No Drivers Found" sub="Upload NuVizz or Payroll files in Data Ingest. Drivers appearing there will show up here for classification." />
+      <SectionTitle icon="👥" text="Employees" />
+      <EmptyState icon="👥" title="No Employees Found" sub="Upload NuVizz or Payroll files in Data Ingest. Employees appearing there will show up here for classification." />
     </div>;
   }
 
   return <div style={{padding:"16px",maxWidth:1200,margin:"0 auto"}} className="fade-in">
-    <SectionTitle icon="👥" text="Drivers — W2 / 1099 Classification" />
+    <SectionTitle icon="👥" text="Employees — W2 / 1099 Classification" />
 
     <div style={{...cardStyle, background:T.brandPale, borderColor:T.brand}}>
       <div style={{fontSize:12,color:T.text,lineHeight:1.6}}>
@@ -10627,7 +10627,7 @@ function MarginIQ() {
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
     { id:"nvrecon", icon:"🔄", label:"Uline↔NuVizz" },
-    { id:"drivers", icon:"👥", label:"Drivers" },
+    { id:"employees", icon:"👥", label:"Employees" },
     { id:"drivers-perf", icon:"🏁", label:"Driver Perf" },
     { id:"timeclock", icon:"⏰", label:"Time Clock" },
     { id:"fuel", icon:"⛽", label:"Fuel" },
@@ -10671,7 +10671,7 @@ function MarginIQ() {
     {!loading && tab==="recon" && <Audit reconWeekly={reconWeekly} weeklyRollups={weeklyRollups} />}
     {!loading && tab==="nvrecon" && <UlineNuVizzRecon weeklyRollups={weeklyRollups} />}
     {!loading && tab==="runsheet" && <RunSheet />}
-    {!loading && tab==="drivers" && <Drivers />}
+    {!loading && tab==="employees" && <Drivers />}
     {!loading && tab==="timeclock" && (typeof window !== "undefined" && window.TimeClockTab ? React.createElement(window.TimeClockTab) : <EmptyState icon="⏰" title="Time Clock module not loaded" sub="TimeClockTab.jsx did not load. Check console." />)}
     {!loading && tab==="fuel" && <Fuel />}
     {!loading && tab==="completeness" && <DataCompleteness weeklyRollups={weeklyRollups} completeness={completeness} fileLog={fileLog} />}
