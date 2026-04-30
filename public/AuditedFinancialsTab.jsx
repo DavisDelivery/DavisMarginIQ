@@ -811,6 +811,9 @@ function GmailSyncPanel({ onImported }) {
   const [searchErr, setSearchErr] = useState("");
   const [processing, setProcessing] = useState({});
   const [processedIds, setProcessedIds] = useState(new Set());
+  // v2.47.5: aggregate progress so Import All has a single visible counter
+  // instead of relying on per-row status that's easy to miss on a long list.
+  const [bulkProgress, setBulkProgress] = useState(null); // null | { current, total, label, failures }
 
   const searchEmails = async () => {
     setSearching(true); setSearchErr(""); setEmails([]);
@@ -825,6 +828,14 @@ function GmailSyncPanel({ onImported }) {
     }
     setSearching(false);
   };
+
+  // v2.47.5: auto-search when the panel mounts so the user doesn't have to
+  // click Search every time. Same behavior whether reopening the tab or
+  // landing here for the first time after Gmail OAuth.
+  useEffect(() => {
+    searchEmails();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const processEmail = async (email) => {
     const emailId = email.emailId;
@@ -897,7 +908,26 @@ function GmailSyncPanel({ onImported }) {
 
   const processAll = async () => {
     const unprocessed = emails.filter(e => !processedIds.has(e.emailId) && (e.attachments||[]).some(a=>{ const fn=(a.filename||"").toLowerCase(); return fn.endsWith(".pdf") && fn.includes("financial"); }));
-    for (const email of unprocessed) await processEmail(email);
+    if (!unprocessed.length) return;
+    const failures = [];
+    for (let i = 0; i < unprocessed.length; i++) {
+      const email = unprocessed[i];
+      const label = email.emailSubject || email.attachments?.[0]?.filename || `Email ${i+1}`;
+      setBulkProgress({ current: i + 1, total: unprocessed.length, label, failures: [...failures] });
+      try {
+        await processEmail(email);
+        // Inspect the per-email status to detect silent failures.
+        // processEmail sets processing[emailId] starting with "✗" on error.
+        // We can't read state synchronously, so check after a microtask flush.
+        await new Promise(r => setTimeout(r, 0));
+      } catch (e) {
+        failures.push({ subject: label, error: e.message });
+      }
+    }
+    setBulkProgress({ current: unprocessed.length, total: unprocessed.length, label: "Done", failures });
+    // Clear progress banner after 8s so it doesn't linger forever, but keep
+    // failures visible — the per-row Status column has them too.
+    setTimeout(() => setBulkProgress(null), 8000);
   };
 
   const unprocessedCount = emails.filter(e => !processedIds.has(e.emailId)).length;
@@ -919,6 +949,28 @@ function GmailSyncPanel({ onImported }) {
       </div>
 
       {searchErr && <div style={{ fontSize:12, color:T.red, marginBottom:12, padding:"10px 14px", background:T.redBg, borderRadius:T.radiusSm }}>{searchErr}</div>}
+
+      {bulkProgress && (
+        <div style={{ marginBottom:12, padding:"12px 14px", background:bulkProgress.current >= bulkProgress.total ? T.greenBg : T.blueBg, borderRadius:T.radiusSm, border:`1px solid ${bulkProgress.current >= bulkProgress.total ? T.green : T.blueText}` }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
+            <div style={{ fontSize:13, fontWeight:600, color:bulkProgress.current >= bulkProgress.total ? T.greenText : T.blueText }}>
+              {bulkProgress.current >= bulkProgress.total
+                ? `✓ Imported ${bulkProgress.total - (bulkProgress.failures?.length||0)} of ${bulkProgress.total} financials`
+                : `Processing ${bulkProgress.current}/${bulkProgress.total}: ${bulkProgress.label}`}
+            </div>
+            <div style={{ fontSize:11, color:T.textMuted }}>{Math.round((bulkProgress.current / bulkProgress.total) * 100)}%</div>
+          </div>
+          <div style={{ marginTop:8, height:6, background:"rgba(0,0,0,0.06)", borderRadius:3, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${(bulkProgress.current / bulkProgress.total) * 100}%`, background:bulkProgress.current >= bulkProgress.total ? T.green : T.blueText, transition:"width 0.3s" }} />
+          </div>
+          {bulkProgress.failures && bulkProgress.failures.length > 0 && (
+            <div style={{ marginTop:10, fontSize:11, color:T.redText }}>
+              <strong>{bulkProgress.failures.length} failure{bulkProgress.failures.length>1?"s":""}:</strong>{" "}
+              {bulkProgress.failures.slice(0,3).map(f => f.subject).join(", ")}{bulkProgress.failures.length > 3 ? ` and ${bulkProgress.failures.length - 3} more` : ""}
+            </div>
+          )}
+        </div>
+      )}
 
       {emails.length > 0 && (
         <div style={{ ...card, padding:0, overflow:"hidden" }}>
