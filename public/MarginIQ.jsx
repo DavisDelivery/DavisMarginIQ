@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.48.1";
+const APP_VERSION = "2.48.2";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2160,6 +2160,14 @@ Rules:
         type: "image",
         source: { type: "base64", media_type: "image/png", data: b64 },
       }));
+      // v2.48.2: surface the actual failure mode. Three things can fail here:
+      //  (1) Anthropic returns non-2xx (rate limit, oversized payload, model error)
+      //  (2) Anthropic returns 200 but text isn't parseable JSON
+      //  (3) The response shape is unexpected (no content array)
+      // Each gets a distinct error message so the per-row "✗ <error>" is
+      // actionable instead of a generic "Scan failed (500)".
+      const totalB64Bytes = pages.reduce((acc, p) => acc + p.length, 0);
+      console.log(`[scan-financials] ${pages.length} page(s), ~${(totalB64Bytes/1024/1024).toFixed(1)}MB base64 payload`);
       const sfResp = await fetch("/.netlify/functions/marginiq-scan-financials", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2168,10 +2176,33 @@ Rules:
           messages: [{ role: "user", content: [...imageBlocks, { type: "text", text: EXTRACTION_PROMPT }] }],
         }),
       });
-      if (!sfResp.ok) throw new Error(`Scan failed (${sfResp.status})`);
-      const sfData = await sfResp.json();
-      const text = (sfData.content || []).map(b => b.text || "").join("").trim();
-      const extracted = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const sfBody = await sfResp.text();
+      if (!sfResp.ok) {
+        let errMsg = `Vision API ${sfResp.status}`;
+        try {
+          const j = JSON.parse(sfBody);
+          if (j.error?.message) errMsg += `: ${j.error.message}`;
+          else if (j.error) errMsg += `: ${typeof j.error === "string" ? j.error : JSON.stringify(j.error).slice(0,200)}`;
+          else errMsg += `: ${sfBody.slice(0,200)}`;
+        } catch { errMsg += `: ${sfBody.slice(0,200)}`; }
+        console.error("[scan-financials] failed:", errMsg, sfBody);
+        throw new Error(errMsg);
+      }
+      let sfData;
+      try { sfData = JSON.parse(sfBody); }
+      catch (e) { throw new Error(`Vision API returned non-JSON: ${sfBody.slice(0,200)}`); }
+      if (!sfData.content || !Array.isArray(sfData.content)) {
+        throw new Error(`Vision API response missing content array: ${JSON.stringify(sfData).slice(0,200)}`);
+      }
+      const text = sfData.content.map(b => b.text || "").join("").trim();
+      if (!text) throw new Error(`Vision API returned empty text. stop_reason=${sfData.stop_reason || "unknown"}`);
+      let extracted;
+      try {
+        extracted = JSON.parse(text.replace(/```json|```/g, "").trim());
+      } catch (e) {
+        console.error("[scan-financials] JSON parse failed. Raw text:", text);
+        throw new Error(`Vision returned text but not JSON. First 300 chars: ${text.slice(0,300)}`);
+      }
 
       // 4. Determine period — extracted JSON wins, fallback to filename/subject
       const monthFromString = (s) => {
