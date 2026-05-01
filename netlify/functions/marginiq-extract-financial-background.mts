@@ -440,9 +440,14 @@ export default async (req: Request, _context: Context) => {
     if (batchId) {
       const batch = await readDoc(`extract_batches/${batchId}`);
       if (batch) {
+        const newCompleted = (batch.completed_count || 0) + 1;
+        const failed = batch.failed_count || 0;
+        const total = batch.total_count || 0;
+        const finished = total > 0 && (newCompleted + failed) >= total;
         await writeDoc(`extract_batches/${batchId}`, {
-          completed_count: (batch.completed_count || 0) + 1,
+          completed_count: newCompleted,
           updated_at: new Date().toISOString(),
+          ...(finished ? { state: failed > 0 ? "complete_with_errors" : "complete", finished_at: new Date().toISOString() } : {}),
         });
       }
     }
@@ -464,9 +469,14 @@ export default async (req: Request, _context: Context) => {
     if (batchId) {
       const batch = await readDoc(`extract_batches/${batchId}`);
       if (batch) {
+        const completed = batch.completed_count || 0;
+        const newFailed = (batch.failed_count || 0) + 1;
+        const total = batch.total_count || 0;
+        const finished = total > 0 && (completed + newFailed) >= total;
         await writeDoc(`extract_batches/${batchId}`, {
-          failed_count: (batch.failed_count || 0) + 1,
+          failed_count: newFailed,
           updated_at: new Date().toISOString(),
+          ...(finished ? { state: completed > 0 ? "complete_with_errors" : "failed", finished_at: new Date().toISOString() } : {}),
         });
       }
     }
