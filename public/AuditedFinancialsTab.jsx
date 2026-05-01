@@ -392,7 +392,7 @@ function DetailModal({ record, onClose, onDelete }) {
     <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }} onClick={onClose}>
       <div style={{ background:T.bgWhite, borderRadius:T.radius, padding:24, maxWidth:900, width:"100%", maxHeight:"90vh", overflowY:"auto" }} onClick={e => e.stopPropagation()}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
-          <div style={{ fontSize:16, fontWeight:800 }}>📋 {monthLabel(record.period)} — Audited Financials</div>
+          <div style={{ fontSize:16, fontWeight:800 }}>📋 {monthLabel(record.period)} — Financials</div>
           <div style={{ display:"flex", gap:8 }}>
             <button onClick={() => onDelete(record)} style={{ background:T.redBg, border:`1px solid ${T.red}`, color:T.red, padding:"6px 12px", borderRadius:T.radiusSm, fontSize:11, fontWeight:600, cursor:"pointer" }}>Delete</button>
             <button onClick={onClose} style={{ background:"none", border:"none", fontSize:20, cursor:"pointer", color:T.textMuted }}>✕</button>
@@ -1075,7 +1075,7 @@ function AuditedFinancialsTab() {
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexWrap:"wrap", gap:10 }}>
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
           <span style={{ fontSize:18 }}>📋</span>
-          <span style={{ fontSize:15, fontWeight:700, color:T.text }}>Audited Financials</span>
+          <span style={{ fontSize:15, fontWeight:700, color:T.text }}>Financials</span>
           <span style={{ fontSize:11, color:T.textDim, marginLeft:4 }}>AMP CPAs · {records.length} month(s)</span>
         </div>
         <button onClick={load} title="Reload from Firestore"

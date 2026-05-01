@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.49.0";
+const APP_VERSION = "2.49.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -5376,7 +5376,7 @@ function AuditedKpiStrip({ setTab }) {
       <div style={{...cardStyle, background:T.bgSurface, borderLeft:`3px solid ${T.textDim}`, marginBottom:12}}>
         <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", gap:8, flexWrap:"wrap"}}>
           <div>
-            <div style={{fontSize:13, fontWeight:700, marginBottom:4}}>📋 Audited Financials</div>
+            <div style={{fontSize:13, fontWeight:700, marginBottom:4}}>📋 Financials</div>
             <div style={{fontSize:11, color:T.textMuted}}>No CPA-audited statements imported yet. Connect Gmail Sync to pull from @ampcpas.com.</div>
           </div>
           <button onClick={() => setTab("gmail")} style={{padding:"6px 14px", borderRadius:8, border:`1px solid ${T.brand}`, background:"transparent", color:T.brand, fontSize:12, fontWeight:600, cursor:"pointer"}}>Connect →</button>
@@ -5401,7 +5401,7 @@ function AuditedKpiStrip({ setTab }) {
       <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8, marginBottom:10}}>
         <div>
           <div style={{fontSize:13, fontWeight:700, display:"flex", alignItems:"center", gap:6}}>
-            📋 Audited Financials
+            📋 Financials
             <span style={{fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:10, background:T.green, color:"#fff"}}>AUDITED</span>
           </div>
           <div style={{fontSize:10, color:T.textMuted, marginTop:2}}>TTM ({data.ttm.length} months) · latest: {latestLabel}</div>
@@ -10982,7 +10982,7 @@ function MarginIQ() {
 
   const tabs = [
     { id:"command", icon:"🎯", label:"Command" },
-    { id:"audited", icon:"📋", label:"Audited" },
+    { id:"audited", icon:"📋", label:"Financials" },
     { id:"customers", icon:"📊", label:"Customers" },
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
@@ -11024,7 +11024,7 @@ function MarginIQ() {
       <div style={{fontSize:14,fontWeight:600}}>Loading MarginIQ...</div>
     </div>}
     {!loading && tab==="command" && <CommandCenter margins={margins} weeklyRollups={weeklyRollups} completeness={completeness} qboConnected={qboConnected} reconMeta={reconMeta} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
-    {!loading && tab==="audited" && (typeof window !== "undefined" && window.AuditedFinancialsTab ? React.createElement(window.AuditedFinancialsTab) : <EmptyState icon="📋" title="Audited Financials module not loaded" sub="AuditedFinancialsTab.jsx did not load. Check console." />)}
+    {!loading && tab==="audited" && (typeof window !== "undefined" && window.AuditedFinancialsTab ? React.createElement(window.AuditedFinancialsTab) : <EmptyState icon="📋" title="Financials module not loaded" sub="AuditedFinancialsTab.jsx did not load. Check console." />)}
     {!loading && tab==="customers" && (typeof window !== "undefined" && window.CustomerAnalysisTab ? React.createElement(window.CustomerAnalysisTab) : <EmptyState icon="📊" title="Customer Analysis module not loaded" sub="CustomerAnalysisTab.jsx did not load. Check console." />)}
     {!loading && tab==="drivers-perf" && (typeof window !== "undefined" && window.DriverPerformanceTab ? React.createElement(window.DriverPerformanceTab) : <EmptyState icon="🏁" title="Driver Performance module not loaded" sub="DriverPerformanceTab.jsx did not load. Check console." />)}
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
