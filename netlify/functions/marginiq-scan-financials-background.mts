@@ -152,10 +152,10 @@ export default async (req: Request, _context: Context) => {
 
   // Read max_tokens from the status doc (the dispatcher recorded it there)
   const statusDocResp = await fetch(`${BASE}/scan_jobs/${jobId}?key=${FIREBASE_API_KEY}`);
-  let maxTokens = 8192;
+  let maxTokens = 16384;
   if (statusDocResp.ok) {
     const sd: any = await statusDocResp.json();
-    maxTokens = Number(sd.fields?.max_tokens?.integerValue || 8192);
+    maxTokens = Number(sd.fields?.max_tokens?.integerValue || 16384);
   }
 
   await writeJobDoc(jobId, {
@@ -173,7 +173,7 @@ export default async (req: Request, _context: Context) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-6",
-        max_tokens: Math.min(maxTokens, 8192),
+        max_tokens: Math.min(maxTokens, 16384),
         messages,
       }),
     });
