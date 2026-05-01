@@ -199,10 +199,19 @@ async function refreshPdfUrl(storagePath) {
 // FIXED v2.0.0: Don't use orderBy — if any doc lacks `period`, Firestore
 // silently returns 0 results. Just .get() everything and sort client-side.
 async function getFinancials() {
+  // v2.50.0: prefer audited_financials_v2 (full line-item extraction with
+  // separate month vs YTD columns and EBITDA inputs). Fall back to legacy
+  // audited_financials only when v2 is empty (during cutover).
   try {
+    const sV2 = await db().collection("audited_financials_v2").limit(120).get();
+    if (sV2.docs.length > 0) {
+      const docs = sV2.docs.map(d => ({ id: d.id, ...d.data(), _source: "v2" }));
+      const withPeriod = docs.map(d => ({ ...d, period: d.period || d.id }));
+      return withPeriod.sort((a, b) => (b.period || "").localeCompare(a.period || ""));
+    }
+    // Empty v2 → fall back to legacy
     const s = await db().collection("audited_financials").limit(120).get();
-    const docs = s.docs.map(d => ({ id: d.id, ...d.data() }));
-    // Fall back to doc id (which is the period key) if the period field is missing
+    const docs = s.docs.map(d => ({ id: d.id, ...d.data(), _source: "v1" }));
     const withPeriod = docs.map(d => ({ ...d, period: d.period || d.id }));
     return withPeriod.sort((a, b) => (b.period || "").localeCompare(a.period || ""));
   } catch (e) {
@@ -1417,6 +1426,174 @@ function GmailSyncPanel({ onImported }) {
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
+
+// ─── v2.50.0 server-side batch extraction panel ─────────────────────────────
+// Kicks off marginiq-extract-financials-batch which fans out per-PDF
+// background workers. The browser can close after the click — progress
+// continues server-side. Polls for status while open.
+function ExtractAllPanel({ onExtractionComplete }) {
+  const [status, setStatus] = useState(null); // null | "starting" | "running" | "done" | "error"
+  const [batchId, setBatchId] = useState(null);
+  const [batch, setBatch] = useState(null);
+  const [jobs, setJobs] = useState([]);
+  const [error, setError] = useState("");
+  const [pollInterval, setPollInterval] = useState(null);
+
+  // Resume polling for any in-flight batch on mount (so refresh doesn't lose progress)
+  useEffect(() => {
+    const stored = window.localStorage?.getItem("marginiq_extract_batch_id");
+    if (stored) {
+      setBatchId(stored);
+      setStatus("running");
+      pollOnce(stored);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Poll loop
+  useEffect(() => {
+    if (!batchId || status === "done" || status === "error") return;
+    const id = setInterval(() => pollOnce(batchId), 5000);
+    setPollInterval(id);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchId, status]);
+
+  const pollOnce = async (id) => {
+    try {
+      const resp = await fetch(`/.netlify/functions/marginiq-extract-financials-batch?action=status&batch_id=${encodeURIComponent(id)}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setBatch(data.batch || null);
+      setJobs(data.jobs || []);
+      const completed = data.batch?.completed_count || 0;
+      const failed = data.batch?.failed_count || 0;
+      const total = data.batch?.total_count || 0;
+      if (total > 0 && completed + failed >= total) {
+        setStatus("done");
+        window.localStorage?.removeItem("marginiq_extract_batch_id");
+        if (onExtractionComplete) onExtractionComplete();
+      }
+    } catch (e) { console.error("poll error", e); }
+  };
+
+  const startBatch = async () => {
+    setStatus("starting"); setError(""); setJobs([]); setBatch(null);
+    try {
+      const resp = await fetch("/.netlify/functions/marginiq-extract-financials-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skip_existing: true }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        if (data.message) {
+          setStatus("done");
+          setError(data.message);
+          return;
+        }
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      setBatchId(data.batch_id);
+      setStatus("running");
+      window.localStorage?.setItem("marginiq_extract_batch_id", data.batch_id);
+    } catch (e) {
+      setError(e.message || String(e));
+      setStatus("error");
+    }
+  };
+
+  const startBatchForceAll = async () => {
+    if (!window.confirm("Re-extract ALL financials, including ones already extracted? This re-runs the model on every PDF (≈30 PDFs × ~30 sec each).")) return;
+    setStatus("starting"); setError(""); setJobs([]); setBatch(null);
+    try {
+      const resp = await fetch("/.netlify/functions/marginiq-extract-financials-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skip_existing: false }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      setBatchId(data.batch_id);
+      setStatus("running");
+      window.localStorage?.setItem("marginiq_extract_batch_id", data.batch_id);
+    } catch (e) {
+      setError(e.message || String(e));
+      setStatus("error");
+    }
+  };
+
+  const total = batch?.total_count || 0;
+  const completed = batch?.completed_count || 0;
+  const failed = batch?.failed_count || 0;
+  const pct = total > 0 ? Math.round(((completed + failed) / total) * 100) : 0;
+
+  const failedJobs = jobs.filter(j => j.state === "failed");
+
+  return (
+    <div style={{ ...card, marginBottom: 16, padding: "14px 18px", background: T.bgSurface }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+        <div>
+          <div style={{ fontSize:13, fontWeight:700 }}>⚡ Server-Side Extraction</div>
+          <div style={{ fontSize:11, color:T.textMuted, marginTop:2 }}>Re-extract every imported PDF with the v2.50 schema (line items, EBITDA inputs, MoM/YoY columns). Runs server-side — you can close this tab.</div>
+        </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          {(status === null || status === "done" || status === "error") && (
+            <>
+              <button onClick={startBatch}
+                      style={{ padding:"7px 14px", fontSize:12, fontWeight:700, borderRadius:6, border:`1px solid ${T.brand}`, background:T.brand, color:"#fff", cursor:"pointer" }}>
+                ⚡ Extract Missing
+              </button>
+              <button onClick={startBatchForceAll}
+                      style={{ padding:"7px 14px", fontSize:12, fontWeight:700, borderRadius:6, border:`1px solid ${T.border}`, background:"#fff", color:T.text, cursor:"pointer" }}>
+                Re-extract All
+              </button>
+            </>
+          )}
+          {(status === "starting" || status === "running") && (
+            <div style={{ fontSize:12, fontWeight:700, color:T.brand, padding:"7px 14px" }}>
+              {status === "starting" ? "Starting…" : `Running… ${completed + failed}/${total}`}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {status === "running" && total > 0 && (
+        <div style={{ marginTop:12 }}>
+          <div style={{ height:8, background:"rgba(0,0,0,0.06)", borderRadius:4, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${pct}%`, background:T.brand, transition:"width 0.4s" }} />
+          </div>
+          <div style={{ fontSize:11, color:T.textMuted, marginTop:6, display:"flex", gap:14 }}>
+            <span><strong>{completed}</strong> done</span>
+            {failed > 0 && <span style={{ color:T.red }}><strong>{failed}</strong> failed</span>}
+            <span>{total - completed - failed} pending</span>
+            <span style={{ marginLeft:"auto" }}>{pct}%</span>
+          </div>
+        </div>
+      )}
+
+      {status === "done" && (
+        <div style={{ marginTop:10, fontSize:12, color:T.greenText, fontWeight:600 }}>
+          ✓ {error ? error : `Done. ${completed} extracted${failed > 0 ? `, ${failed} failed` : ""}.`}
+        </div>
+      )}
+
+      {status === "error" && (
+        <div style={{ marginTop:10, fontSize:12, color:T.red, fontWeight:600 }}>✗ {error}</div>
+      )}
+
+      {failedJobs.length > 0 && (
+        <details style={{ marginTop:10, fontSize:11 }}>
+          <summary style={{ cursor:"pointer", color:T.red, fontWeight:600 }}>{failedJobs.length} failed — click for details</summary>
+          <ul style={{ marginTop:6, paddingLeft:20, color:T.textMuted, fontFamily:"monospace" }}>
+            {failedJobs.map(j => <li key={j.id}><strong>{j.id}</strong>: {j.error}</li>)}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
 function AuditedFinancialsTab() {
   const [view, setView]         = useState("dashboard"); // dashboard | statements | chat | gmail
   const [records, setRecords]   = useState([]);
@@ -1460,6 +1637,8 @@ function AuditedFinancialsTab() {
   return (
     <div style={{ padding:"20px", maxWidth:1400, margin:"0 auto" }} className="fade-in">
       <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+
+      <ExtractAllPanel onExtractionComplete={load} />
 
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexWrap:"wrap", gap:10 }}>
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
