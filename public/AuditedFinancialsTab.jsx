@@ -2246,11 +2246,719 @@ function ExtractAllPanel({ onExtractionComplete }) {
   );
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// CFO-grade page-level matrix views.
+//
+// Three new tabs that complement the per-month DetailModal:
+//   • P&L Detail    — full line-item × month matrix, sortable, filterable
+//                     by section, with YoY %, % of revenue, click-to-drill
+//   • Balance Sheet — full account × month matrix grouped by section, with
+//                     YoY $ + %, plus current-ratio / debt-to-equity ratios
+//   • Cash Flow     — derived indirect-method cash flow per month with
+//                     Operating CF, CapEx, FCF, financing, and a reconcile
+//                     gap column showing where derivation diverges from
+//                     the actual ΔCash on the balance sheet
+//
+// All read v2-shape fields preserved at the top level of each adapted record:
+//   r.pl_line_items_v2          — array of { label, section, month, ytd, prior_month, prior_ytd }
+//   r.balance_sheet.line_items  — array of { label, section, amount }
+//   r.balance_sheet.subtotals   — { total_assets, total_equity, ... }
+//   r.ebitda_inputs             — { depreciation_month, depreciation_ytd, ... }
+// ──────────────────────────────────────────────────────────────────────────────
+
+function fmtMoney(v, opts={}) {
+  if (v == null || isNaN(v)) return opts.zeroDash ? "—" : "$0";
+  const n = Number(v);
+  const abs = Math.abs(n);
+  if (abs < 0.005 && opts.zeroDash) return "—";
+  const sign = n < 0 ? "-" : "";
+  return sign + "$" + abs.toLocaleString("en-US", { maximumFractionDigits: opts.cents ? 2 : 0 });
+}
+
+function fmtPctSigned(v, d=1) {
+  if (v == null || isNaN(v)) return "—";
+  return (v >= 0 ? "+" : "") + Number(v).toFixed(d) + "%";
+}
+
+// Build ranked list of P&L line items: latest YTD, prior YTD, YoY %, % of rev,
+// plus full per-period history for drilling down.
+function buildLineItemRanking(records) {
+  if (!records.length) return [];
+  const latest = records[0];
+  const latestRev = latest?.pl_totals?.total_revenue?.ytd
+                || latest?.pl?.revenue
+                || 0;
+
+  const byLabel = new Map();
+  for (const r of records) {
+    const items = r.pl_line_items_v2 || [];
+    for (const li of items) {
+      const key = (li.label || "").trim();
+      if (!key) continue;
+      if (!byLabel.has(key)) {
+        byLabel.set(key, { label: key, section: li.section, history: [] });
+      }
+      byLabel.get(key).history.push({
+        period: r.period,
+        month: typeof li.month === "number" ? li.month : null,
+        ytd:   typeof li.ytd   === "number" ? li.ytd   : null,
+        prior_month: typeof li.prior_month === "number" ? li.prior_month : null,
+        prior_ytd:   typeof li.prior_ytd   === "number" ? li.prior_ytd   : null,
+      });
+    }
+  }
+
+  const out = [];
+  for (const [label, info] of byLabel) {
+    const latestEntry = info.history.find(h => h.period === latest.period);
+    if (!latestEntry) continue;
+    const latestYtd = latestEntry.ytd;
+    const priorYtd  = latestEntry.prior_ytd;
+    const latestMonth = latestEntry.month;
+    const yoyPct = (priorYtd != null && priorYtd !== 0 && latestYtd != null)
+      ? ((latestYtd - priorYtd) / Math.abs(priorYtd)) * 100 : null;
+    const pctOfRev = (latestRev > 0 && latestYtd != null) ? (latestYtd / latestRev) * 100 : null;
+
+    out.push({
+      label, section: info.section,
+      latestYtd, priorYtd, latestMonth, yoyPct, pctOfRev,
+      history: info.history,
+    });
+  }
+  return out;
+}
+
+// ─── P&L Detail Matrix ────────────────────────────────────────────────────────
+function PLDetail({ records, onSelectLineItem }) {
+  const [sortKey, setSortKey]   = useState("latestYtd");
+  const [sortDir, setSortDir]   = useState("desc");
+  const [sectionFilter, setSectionFilter] = useState("all");
+  const [hideZeros, setHideZeros] = useState(true);
+
+  const ranking = useMemo(() => buildLineItemRanking(records), [records]);
+
+  if (!records.length || !ranking.length) {
+    return (
+      <div style={{ ...card, textAlign:"center", padding:"40px 20px", color:T.textMuted }}>
+        <div style={{ fontSize:36, marginBottom:8 }}>📊</div>
+        <div style={{ fontSize:13, fontWeight:600 }}>No line-item data yet</div>
+      </div>
+    );
+  }
+
+  const latest = records[0];
+  const latestPeriod = latest.period;
+  const latestRev = latest?.pl_totals?.total_revenue?.ytd || latest?.pl?.revenue || 0;
+
+  let filtered = ranking;
+  if (sectionFilter !== "all") filtered = filtered.filter(r => r.section === sectionFilter);
+  if (hideZeros) filtered = filtered.filter(r => r.latestYtd && Math.abs(r.latestYtd) > 0.5);
+
+  filtered = [...filtered].sort((a, b) => {
+    let av = a[sortKey], bv = b[sortKey];
+    if (sortKey === "label" || sortKey === "section") {
+      av = av || ""; bv = bv || "";
+      return sortDir === "asc" ? av.localeCompare(bv) : bv.localeCompare(av);
+    }
+    av = typeof av === "number" ? av : (sortDir === "asc" ? Infinity : -Infinity);
+    bv = typeof bv === "number" ? bv : (sortDir === "asc" ? Infinity : -Infinity);
+    return sortDir === "asc" ? av - bv : bv - av;
+  });
+
+  const setSort = (k) => {
+    if (sortKey === k) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(k); setSortDir("desc"); }
+  };
+  const sortIcon = (k) => sortKey === k ? (sortDir === "asc" ? " ↑" : " ↓") : "";
+
+  const sections = [
+    { id: "all",                 label: "All",            color: T.text },
+    { id: "revenue",             label: "Revenue",        color: T.brand },
+    { id: "cost_of_sales",       label: "COGS",           color: T.red },
+    { id: "operating_expense",   label: "Operating Exp",  color: T.red },
+    { id: "other_income",        label: "Other Income",   color: T.green },
+    { id: "other_expense",       label: "Other Expense",  color: T.red },
+  ];
+
+  const totalLatest = filtered.reduce((s, r) => s + (r.latestYtd || 0), 0);
+  const totalPrior  = filtered.reduce((s, r) => s + (r.priorYtd || 0), 0);
+  const totalYoY    = totalPrior !== 0 ? ((totalLatest - totalPrior) / Math.abs(totalPrior)) * 100 : null;
+
+  return (
+    <div>
+      <div style={{ display:"flex", gap:12, alignItems:"center", marginBottom:12, flexWrap:"wrap" }}>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase" }}>Section</div>
+        <div style={{ display:"flex", gap:4, flexWrap:"wrap" }}>
+          {sections.map(s => (
+            <button key={s.id} onClick={() => setSectionFilter(s.id)} style={{
+              padding:"6px 12px", borderRadius:T.radiusSm, fontSize:11, fontWeight:600,
+              border:`1px solid ${sectionFilter===s.id?s.color:T.border}`,
+              background:sectionFilter===s.id?s.color:"transparent",
+              color:sectionFilter===s.id?"#fff":T.textMuted,
+              cursor:"pointer",
+            }}>{s.label}</button>
+          ))}
+        </div>
+        <div style={{ flex:1 }} />
+        <label style={{ fontSize:11, color:T.textMuted, display:"flex", alignItems:"center", gap:6 }}>
+          <input type="checkbox" checked={hideZeros} onChange={e => setHideZeros(e.target.checked)} /> Hide zero rows
+        </label>
+      </div>
+
+      <div style={{ fontSize:11, color:T.textMuted, marginBottom:8 }}>
+        Showing {filtered.length} of {ranking.length} lines · Anchor period: <strong>{monthLabel(latestPeriod)}</strong> · Latest YTD revenue: <strong>{fmtMoney(latestRev)}</strong>
+        <span style={{ marginLeft:8, color:T.textDim }}>· click any row to drill down across all months</span>
+      </div>
+
+      <div style={{ ...card, padding:0, overflow:"auto" }}>
+        <table style={{ width:"100%", borderCollapse:"collapse" }}>
+          <thead>
+            <tr>
+              <th style={{ ...tblH, cursor:"pointer", minWidth:200 }} onClick={() => setSort("label")}>Line Item{sortIcon("label")}</th>
+              <th style={{ ...tblH, cursor:"pointer" }} onClick={() => setSort("section")}>Section{sortIcon("section")}</th>
+              <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("latestMonth")}>{(monthLabel(latestPeriod)||"").split(" ")[0]} Mo{sortIcon("latestMonth")}</th>
+              <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("latestYtd")}>YTD {(monthLabel(latestPeriod)||"").split(" ")[1]||""}{sortIcon("latestYtd")}</th>
+              <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("priorYtd")}>Prior YTD{sortIcon("priorYtd")}</th>
+              <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("yoyPct")}>YoY %{sortIcon("yoyPct")}</th>
+              <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("pctOfRev")}>% of Rev{sortIcon("pctOfRev")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((r) => {
+              const sectColor = r.section === "revenue" ? T.brand
+                              : r.section === "cost_of_sales" ? T.red
+                              : r.section === "operating_expense" ? T.red
+                              : r.section === "other_income" ? T.green
+                              : T.textMuted;
+              const yoyColor = r.yoyPct == null ? T.textMuted
+                             : r.section === "revenue" ? (r.yoyPct >= 0 ? T.green : T.red)
+                             : (r.yoyPct >= 0 ? T.red : T.green);
+              return (
+                <tr key={r.label} style={{ cursor:"pointer" }} onClick={() => onSelectLineItem && onSelectLineItem(r)}>
+                  <td style={{ ...tblD, fontWeight:500 }}>{r.label}</td>
+                  <td style={{ ...tblD, fontSize:10, color:sectColor, textTransform:"uppercase", fontWeight:700 }}>{(r.section||"").replace(/_/g," ")}</td>
+                  <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.latestMonth, {zeroDash:true})}</td>
+                  <td style={{ ...tblDR, fontWeight:600 }}>{fmtMoney(r.latestYtd, {zeroDash:true})}</td>
+                  <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.priorYtd, {zeroDash:true})}</td>
+                  <td style={{ ...tblDR, color:yoyColor, fontWeight:600 }}>{fmtPctSigned(r.yoyPct)}</td>
+                  <td style={{ ...tblDR, color:T.textMuted }}>{r.pctOfRev != null ? r.pctOfRev.toFixed(1) + "%" : "—"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colSpan={3} style={{ ...tblD, fontWeight:700, background:T.bgSurface }}>Total ({filtered.length} lines)</td>
+              <td style={{ ...tblDR, fontWeight:700, background:T.bgSurface }}>{fmtMoney(totalLatest)}</td>
+              <td style={{ ...tblDR, fontWeight:700, background:T.bgSurface }}>{fmtMoney(totalPrior)}</td>
+              <td style={{ ...tblDR, fontWeight:700, background:T.bgSurface, color: totalYoY == null ? T.textMuted : totalYoY >= 0 ? T.green : T.red }}>{fmtPctSigned(totalYoY)}</td>
+              <td style={{ ...tblDR, fontWeight:700, background:T.bgSurface, color:T.textMuted }}>{latestRev > 0 ? (totalLatest/latestRev*100).toFixed(1)+"%" : "—"}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Per-Line-Item Drill-Down Modal ──────────────────────────────────────────
+function LineItemDrillModal({ item, onClose }) {
+  if (!item) return null;
+  const series = [...item.history].sort((a, b) => (a.period||"").localeCompare(b.period||""));
+  const monthVals = series.map(s => s.month).filter(v => typeof v === "number");
+  const ytdVals = series.map(s => s.ytd).filter(v => typeof v === "number");
+
+  const stats = (arr) => {
+    if (!arr.length) return { mean: null, max: null, min: null, total: null };
+    const total = arr.reduce((a,b) => a+b, 0);
+    return { total, mean: total/arr.length, max: Math.max(...arr), min: Math.min(...arr) };
+  };
+  const monthStats = stats(monthVals);
+
+  const W = 600, H = 120, P = 16;
+  const allVals = monthVals.length ? monthVals : ytdVals;
+  if (!allVals.length) return null;
+  const minV = Math.min(0, ...allVals);
+  const maxV = Math.max(0, ...allVals);
+  const range = (maxV - minV) || 1;
+  const xStep = (W - P*2) / Math.max(1, series.length - 1);
+  const yFor = (v) => H - P - ((v - minV) / range) * (H - P*2);
+  const path = series.map((s, i) => {
+    const v = s.month != null ? s.month : (s.ytd != null ? s.ytd : 0);
+    return `${i===0?"M":"L"} ${P + i*xStep} ${yFor(v)}`;
+  }).join(" ");
+  const zeroY = yFor(0);
+
+  return (
+    <div onClick={onClose} style={{
+      position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(0,0,0,0.5)",
+      display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999, padding:20,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background:T.bgWhite, borderRadius:T.radius, padding:24,
+        maxWidth:900, width:"100%", maxHeight:"90vh", overflow:"auto",
+      }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:16 }}>
+          <div>
+            <div style={{ fontSize:18, fontWeight:700 }}>{item.label}</div>
+            <div style={{ fontSize:11, color:T.textMuted, textTransform:"uppercase", fontWeight:600, marginTop:2 }}>{(item.section||"").replace(/_/g," ")}</div>
+          </div>
+          <button onClick={onClose} style={{ border:"none", background:"transparent", fontSize:20, color:T.textMuted, cursor:"pointer" }}>✕</button>
+        </div>
+
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(120px, 1fr))", gap:8, marginBottom:16 }}>
+          <div style={{ ...card, padding:10 }}>
+            <div style={{ fontSize:9, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Latest YTD</div>
+            <div style={{ fontSize:16, fontWeight:700, color:T.text }}>{fmtMoney(item.latestYtd)}</div>
+          </div>
+          <div style={{ ...card, padding:10 }}>
+            <div style={{ fontSize:9, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Prior YTD</div>
+            <div style={{ fontSize:16, fontWeight:700, color:T.textMuted }}>{fmtMoney(item.priorYtd)}</div>
+          </div>
+          <div style={{ ...card, padding:10 }}>
+            <div style={{ fontSize:9, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>YoY</div>
+            <div style={{ fontSize:16, fontWeight:700, color: item.yoyPct == null ? T.textMuted : (item.section === "revenue" ? (item.yoyPct >= 0 ? T.green : T.red) : (item.yoyPct >= 0 ? T.red : T.green)) }}>{fmtPctSigned(item.yoyPct)}</div>
+          </div>
+          <div style={{ ...card, padding:10 }}>
+            <div style={{ fontSize:9, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Avg Month</div>
+            <div style={{ fontSize:16, fontWeight:700, color:T.text }}>{fmtMoney(monthStats.mean)}</div>
+          </div>
+          <div style={{ ...card, padding:10 }}>
+            <div style={{ fontSize:9, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Peak Month</div>
+            <div style={{ fontSize:16, fontWeight:700, color:T.text }}>{fmtMoney(monthStats.max)}</div>
+          </div>
+        </div>
+
+        <div style={{ ...card, padding:16, marginBottom:16 }}>
+          <div style={{ fontSize:12, fontWeight:700, marginBottom:8 }}>Monthly Trend ({series.length} months)</div>
+          <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display:"block" }}>
+            <line x1={P} y1={zeroY} x2={W-P} y2={zeroY} stroke={T.borderLight} strokeDasharray="3,3" />
+            <path d={path} fill="none" stroke={T.brand} strokeWidth="2" />
+            {series.map((s, i) => {
+              const v = s.month != null ? s.month : (s.ytd != null ? s.ytd : 0);
+              return (
+                <circle key={i} cx={P + i*xStep} cy={yFor(v)} r="3" fill={v >= 0 ? T.green : T.red} stroke={T.bgWhite} strokeWidth="1" />
+              );
+            })}
+          </svg>
+        </div>
+
+        <div style={{ ...card, padding:0, overflow:"auto", maxHeight:300 }}>
+          <table style={{ width:"100%", borderCollapse:"collapse" }}>
+            <thead style={{ position:"sticky", top:0 }}>
+              <tr>
+                <th style={tblH}>Period</th>
+                <th style={{ ...tblH, textAlign:"right" }}>Month</th>
+                <th style={{ ...tblH, textAlign:"right" }}>YTD</th>
+                <th style={{ ...tblH, textAlign:"right" }}>Prior Mo</th>
+                <th style={{ ...tblH, textAlign:"right" }}>Prior YTD</th>
+              </tr>
+            </thead>
+            <tbody>
+              {series.slice().reverse().map((s) => (
+                <tr key={s.period}>
+                  <td style={{ ...tblD, fontWeight:600 }}>{monthLabel(s.period)}</td>
+                  <td style={tblDR}>{fmtMoney(s.month, {zeroDash:true})}</td>
+                  <td style={tblDR}>{fmtMoney(s.ytd, {zeroDash:true})}</td>
+                  <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(s.prior_month, {zeroDash:true})}</td>
+                  <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(s.prior_ytd, {zeroDash:true})}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Balance Sheet Detail (multi-month matrix) ──────────────────────────────
+function BSDetail({ records }) {
+  if (!records.length) return null;
+
+  const byLabel = new Map();
+  for (const r of records) {
+    const items = r?.balance_sheet?.line_items || [];
+    for (const li of items) {
+      const key = (li.label || "").trim();
+      if (!key) continue;
+      if (!byLabel.has(key)) byLabel.set(key, { label: key, section: li.section, byPeriod: {} });
+      byLabel.get(key).byPeriod[r.period] = li.amount;
+    }
+  }
+
+  const latest = records[0];
+  const oneYearAgo = (() => {
+    const [y, m] = latest.period.split("-").map(x => parseInt(x, 10));
+    return `${y-1}-${String(m).padStart(2, "0")}`;
+  })();
+  const twoYearsAgo = (() => {
+    const [y, m] = latest.period.split("-").map(x => parseInt(x, 10));
+    return `${y-2}-${String(m).padStart(2, "0")}`;
+  })();
+
+  const rows = [];
+  for (const [label, info] of byLabel) {
+    const cur = info.byPeriod[latest.period];
+    const prior = info.byPeriod[oneYearAgo];
+    const prior2 = info.byPeriod[twoYearsAgo];
+    if (cur == null && prior == null) continue;
+    const yoyDollar = (typeof cur === "number" && typeof prior === "number") ? cur - prior : null;
+    const yoyPct = (typeof cur === "number" && typeof prior === "number" && prior !== 0)
+      ? ((cur - prior) / Math.abs(prior)) * 100 : null;
+    rows.push({ label, section: info.section, cur, prior, prior2, yoyDollar, yoyPct });
+  }
+
+  const sectionOrder = ["current_asset", "fixed_asset", "other_asset", "current_liability", "long_term_liability", "equity"];
+  const sectionLabels = {
+    current_asset:        "Current Assets",
+    fixed_asset:          "Fixed Assets",
+    other_asset:          "Other Assets",
+    current_liability:    "Current Liabilities",
+    long_term_liability:  "Long-Term Liabilities",
+    equity:               "Equity",
+  };
+  const sectionColors = {
+    current_asset:        T.brand,
+    fixed_asset:          T.brand,
+    other_asset:          T.brand,
+    current_liability:    T.red,
+    long_term_liability:  T.red,
+    equity:               T.green,
+  };
+
+  const sub = latest?.balance_sheet?.subtotals || {};
+  const ratios = (() => {
+    const ca = sub.total_current_assets;
+    const cl = sub.total_current_liabilities;
+    const tl = sub.total_liabilities;
+    const te = sub.total_equity;
+    const ta = sub.total_assets;
+    return {
+      currentRatio: (ca && cl) ? ca / cl : null,
+      debtToEquity: (tl && te) ? tl / te : null,
+      equityRatio:  (te && ta) ? te / ta : null,
+    };
+  })();
+
+  const priorSub = records.find(r => r.period === oneYearAgo)?.balance_sheet?.subtotals || {};
+  const subYoY = (key) => {
+    const c = sub[key], p = priorSub[key];
+    if (typeof c !== "number" || typeof p !== "number" || p === 0) return null;
+    return ((c - p)/Math.abs(p)) * 100;
+  };
+
+  return (
+    <div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))", gap:10, marginBottom:16 }}>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Total Assets</div>
+          <div style={{ fontSize:18, fontWeight:800, color:T.brand }}>{fmtK(sub.total_assets)}</div>
+          <div style={{ fontSize:10, color: subYoY("total_assets") == null ? T.textMuted : subYoY("total_assets") >= 0 ? T.green : T.red }}>{fmtPctSigned(subYoY("total_assets"))} YoY</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Total Liabilities</div>
+          <div style={{ fontSize:18, fontWeight:800, color:T.red }}>{fmtK(sub.total_liabilities)}</div>
+          <div style={{ fontSize:10, color: subYoY("total_liabilities") == null ? T.textMuted : subYoY("total_liabilities") <= 0 ? T.green : T.red }}>{fmtPctSigned(subYoY("total_liabilities"))} YoY</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Total Equity</div>
+          <div style={{ fontSize:18, fontWeight:800, color:T.green }}>{fmtK(sub.total_equity)}</div>
+          <div style={{ fontSize:10, color: subYoY("total_equity") == null ? T.textMuted : subYoY("total_equity") >= 0 ? T.green : T.red }}>{fmtPctSigned(subYoY("total_equity"))} YoY</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Current Ratio</div>
+          <div style={{ fontSize:18, fontWeight:800, color: ratios.currentRatio == null ? T.textMuted : ratios.currentRatio >= 1.5 ? T.green : ratios.currentRatio >= 1 ? T.yellow : T.red }}>
+            {ratios.currentRatio != null ? ratios.currentRatio.toFixed(2) : "—"}
+          </div>
+          <div style={{ fontSize:10, color:T.textMuted }}>CA / CL · target ≥ 1.5</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Debt / Equity</div>
+          <div style={{ fontSize:18, fontWeight:800, color: ratios.debtToEquity == null ? T.textMuted : ratios.debtToEquity <= 1 ? T.green : ratios.debtToEquity <= 2 ? T.yellow : T.red }}>
+            {ratios.debtToEquity != null ? ratios.debtToEquity.toFixed(2) : "—"}
+          </div>
+          <div style={{ fontSize:10, color:T.textMuted }}>lower = stronger</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Equity Ratio</div>
+          <div style={{ fontSize:18, fontWeight:800, color: ratios.equityRatio == null ? T.textMuted : ratios.equityRatio >= 0.4 ? T.green : ratios.equityRatio >= 0.2 ? T.yellow : T.red }}>
+            {ratios.equityRatio != null ? (ratios.equityRatio * 100).toFixed(1) + "%" : "—"}
+          </div>
+          <div style={{ fontSize:10, color:T.textMuted }}>equity / assets</div>
+        </div>
+      </div>
+
+      <div style={{ fontSize:11, color:T.textMuted, marginBottom:8 }}>
+        Anchor: <strong>{monthLabel(latest.period)}</strong> · YoY vs <strong>{monthLabel(oneYearAgo)}</strong>
+      </div>
+      <div style={{ ...card, padding:0, overflow:"auto" }}>
+        <table style={{ width:"100%", borderCollapse:"collapse" }}>
+          <thead>
+            <tr>
+              <th style={{ ...tblH, minWidth:240 }}>Account</th>
+              <th style={{ ...tblH, textAlign:"right" }}>{monthLabel(latest.period)}</th>
+              <th style={{ ...tblH, textAlign:"right" }}>{monthLabel(oneYearAgo)}</th>
+              <th style={{ ...tblH, textAlign:"right" }}>{monthLabel(twoYearsAgo)}</th>
+              <th style={{ ...tblH, textAlign:"right" }}>YoY $</th>
+              <th style={{ ...tblH, textAlign:"right" }}>YoY %</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sectionOrder.map(sec => {
+              const sectionRows = rows.filter(r => r.section === sec);
+              if (!sectionRows.length) return null;
+              sectionRows.sort((a, b) => Math.abs(b.cur || 0) - Math.abs(a.cur || 0));
+              const sectionTotal = sectionRows.reduce((s, r) => s + (r.cur || 0), 0);
+              const priorTotal   = sectionRows.reduce((s, r) => s + (r.prior || 0), 0);
+              const totalYoY = priorTotal !== 0 ? ((sectionTotal - priorTotal)/Math.abs(priorTotal)) * 100 : null;
+              return (
+                <React.Fragment key={sec}>
+                  <tr>
+                    <td colSpan={6} style={{
+                      padding:"8px 12px", fontSize:10, fontWeight:700, textTransform:"uppercase",
+                      background:T.bgSurface, color:sectionColors[sec], borderBottom:`1px solid ${T.border}`,
+                    }}>
+                      {sectionLabels[sec]}
+                    </td>
+                  </tr>
+                  {sectionRows.map(r => (
+                    <tr key={r.label}>
+                      <td style={tblD}>{r.label}</td>
+                      <td style={tblDR}>{fmtMoney(r.cur, {zeroDash:true})}</td>
+                      <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.prior, {zeroDash:true})}</td>
+                      <td style={{ ...tblDR, color:T.textDim }}>{fmtMoney(r.prior2, {zeroDash:true})}</td>
+                      <td style={{ ...tblDR, fontWeight:500 }}>{fmtMoney(r.yoyDollar, {zeroDash:true})}</td>
+                      <td style={{ ...tblDR, color: r.yoyPct == null ? T.textMuted : r.yoyPct >= 0 ? T.green : T.red, fontWeight:600 }}>{fmtPctSigned(r.yoyPct)}</td>
+                    </tr>
+                  ))}
+                  <tr style={{ background:T.bgSurface }}>
+                    <td style={{ ...tblD, fontWeight:700 }}>Subtotal {sectionLabels[sec]}</td>
+                    <td style={{ ...tblDR, fontWeight:700 }}>{fmtMoney(sectionTotal)}</td>
+                    <td style={{ ...tblDR, fontWeight:700, color:T.textMuted }}>{fmtMoney(priorTotal)}</td>
+                    <td style={tblDR}></td>
+                    <td style={tblDR}></td>
+                    <td style={{ ...tblDR, fontWeight:700, color: totalYoY == null ? T.textMuted : totalYoY >= 0 ? T.green : T.red }}>{fmtPctSigned(totalYoY)}</td>
+                  </tr>
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── Cash Flow Detail (Indirect Method, multi-month) ─────────────────────────
+function computeCashFlow(records) {
+  const asc = [...records].sort((a, b) => (a.period||"").localeCompare(b.period||""));
+  const out = [];
+
+  const sumByPattern = (lineItems, regex) => (lineItems || [])
+    .filter(li => regex.test(li.label || ""))
+    .reduce((s, li) => s + (typeof li.amount === "number" ? li.amount : 0), 0);
+
+  const sumBySection = (lineItems, sections) => (lineItems || [])
+    .filter(li => sections.includes(li.section))
+    .reduce((s, li) => s + (typeof li.amount === "number" ? li.amount : 0), 0);
+
+  const sumCash = (lineItems) => sumByPattern(lineItems, /^cash|petty cash/i);
+  const sumDistributions = (lineItems) => sumByPattern(lineItems, /distribution/i);
+
+  for (let i = 1; i < asc.length; i++) {
+    const r = asc[i];
+    const prev = asc[i-1];
+    const bs    = r?.balance_sheet?.line_items || [];
+    const bsP   = prev?.balance_sheet?.line_items || [];
+    const ei    = r?.ebitda_inputs || {};
+
+    const ni = (() => {
+      const m = r?.pl_totals?.net_income?.month;
+      if (typeof m === "number") return m;
+      if ((r.period||"").endsWith("-01")) return r?.pl_totals?.net_income?.ytd || 0;
+      return 0;
+    })();
+
+    const dep = (typeof ei.depreciation_month === "number")
+      ? ei.depreciation_month
+      : ((r.period||"").endsWith("-01") ? (ei.depreciation_ytd || 0) : 0);
+    const amort = (typeof ei.amortization_month === "number")
+      ? ei.amortization_month
+      : ((r.period||"").endsWith("-01") ? (ei.amortization_ytd || 0) : 0);
+
+    const cashCur  = sumCash(bs);
+    const cashPrev = sumCash(bsP);
+    const dCash    = cashCur - cashPrev;
+
+    const fixedCur  = sumBySection(bs, ["fixed_asset"]);
+    const fixedPrev = sumBySection(bsP, ["fixed_asset"]);
+    const capex = (fixedCur - fixedPrev) + dep + amort;
+
+    const ltdCur  = sumBySection(bs, ["long_term_liability"]);
+    const ltdPrev = sumBySection(bsP, ["long_term_liability"]);
+    const dLtd    = ltdCur - ltdPrev;
+
+    const clCur  = sumBySection(bs, ["current_liability"]);
+    const clPrev = sumBySection(bsP, ["current_liability"]);
+    const dCl    = clCur - clPrev;
+
+    const arCur  = sumByPattern(bs, /^a\/?r|account receivable|receivable/i);
+    const arPrev = sumByPattern(bsP, /^a\/?r|account receivable|receivable/i);
+    const dAr    = arCur - arPrev;
+
+    const distCur  = sumDistributions(bs);
+    const distPrev = sumDistributions(bsP);
+    const dDist    = distCur - distPrev;
+
+    const operatingCF = ni + dep + amort - dAr + dCl;
+    const investingCF = -capex;
+    const financingCF = dLtd + dDist;
+    const netChange   = operatingCF + investingCF + financingCF;
+    const fcf = operatingCF - capex;
+
+    out.push({
+      period: r.period,
+      ni, dep, amort,
+      cashCur, cashPrev, dCash,
+      capex, dAr, dCl, dLtd, dDist,
+      operatingCF, investingCF, financingCF, netChange, fcf,
+      reconcileGap: dCash - netChange,
+    });
+  }
+  return out;
+}
+
+function CashFlowDetail({ records }) {
+  const cf = useMemo(() => computeCashFlow(records), [records]);
+
+  if (!cf.length) {
+    return (
+      <div style={{ ...card, textAlign:"center", padding:"40px 20px", color:T.textMuted }}>
+        <div style={{ fontSize:36, marginBottom:8 }}>💸</div>
+        <div style={{ fontSize:13, fontWeight:600 }}>Need ≥ 2 months of data to derive cash flow</div>
+      </div>
+    );
+  }
+
+  const ttm = cf.slice(-12);
+  const sumTtm = (key) => ttm.reduce((s, r) => s + (r[key] || 0), 0);
+  const ttmOp  = sumTtm("operatingCF");
+  const ttmInv = sumTtm("investingCF");
+  const ttmFin = sumTtm("financingCF");
+  const ttmFcf = sumTtm("fcf");
+  const ttmCapex = sumTtm("capex");
+  const ttmNi = sumTtm("ni");
+  const cashConvRatio = ttmNi !== 0 ? ttmOp / ttmNi : null;
+
+  const latestRecord = records[0];
+  const ttmRev = latestRecord?.pl_totals?.total_revenue?.ytd || (latestRecord?.pl?.revenue || 0) * 12;
+  const fcfMargin = ttmRev > 0 ? (ttmFcf / ttmRev) * 100 : null;
+
+  return (
+    <div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))", gap:10, marginBottom:16 }}>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>TTM Operating CF</div>
+          <div style={{ fontSize:18, fontWeight:800, color: ttmOp >= 0 ? T.green : T.red }}>{fmtK(ttmOp)}</div>
+          <div style={{ fontSize:10, color:T.textMuted }}>NI + D&amp;A − ΔWC</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>TTM CapEx</div>
+          <div style={{ fontSize:18, fontWeight:800, color:T.red }}>{fmtK(ttmCapex)}</div>
+          <div style={{ fontSize:10, color:T.textMuted }}>fleet + equipment</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>TTM Free Cash Flow</div>
+          <div style={{ fontSize:18, fontWeight:800, color: ttmFcf >= 0 ? T.green : T.red }}>{fmtK(ttmFcf)}</div>
+          <div style={{ fontSize:10, color:T.textMuted }}>{fcfMargin != null ? fcfMargin.toFixed(1) + "% of revenue" : ""}</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Cash Conversion</div>
+          <div style={{ fontSize:18, fontWeight:800, color: cashConvRatio == null ? T.textMuted : cashConvRatio >= 1 ? T.green : cashConvRatio >= 0.7 ? T.yellow : T.red }}>
+            {cashConvRatio != null ? cashConvRatio.toFixed(2) + "x" : "—"}
+          </div>
+          <div style={{ fontSize:10, color:T.textMuted }}>Operating CF / Net Income</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>TTM Investing CF</div>
+          <div style={{ fontSize:18, fontWeight:800, color: ttmInv <= 0 ? T.text : T.red }}>{fmtK(ttmInv)}</div>
+          <div style={{ fontSize:10, color:T.textMuted }}>negative = investing</div>
+        </div>
+        <div style={{ ...card, padding:12 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>TTM Financing CF</div>
+          <div style={{ fontSize:18, fontWeight:800, color: ttmFin <= 0 ? T.text : T.red }}>{fmtK(ttmFin)}</div>
+          <div style={{ fontSize:10, color:T.textMuted }}>debt + distributions</div>
+        </div>
+      </div>
+
+      <div style={{ fontSize:11, color:T.textMuted, marginBottom:8 }}>
+        Indirect method · derived from line items. Reconcile column shows gap between derived net change and actual ΔCash on the balance sheet (smaller = better data; larger = uncategorized BS items).
+      </div>
+
+      <div style={{ ...card, padding:0, overflow:"auto" }}>
+        <table style={{ width:"100%", borderCollapse:"collapse" }}>
+          <thead>
+            <tr>
+              <th style={tblH}>Period</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Net Income</th>
+              <th style={{ ...tblH, textAlign:"right" }}>+ D&amp;A</th>
+              <th style={{ ...tblH, textAlign:"right" }}>− ΔAR</th>
+              <th style={{ ...tblH, textAlign:"right" }}>+ ΔCL</th>
+              <th style={{ ...tblH, textAlign:"right" }}>= Op CF</th>
+              <th style={{ ...tblH, textAlign:"right" }}>− CapEx</th>
+              <th style={{ ...tblH, textAlign:"right" }}>= FCF</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Δ LTD</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Δ Dist.</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Net Change</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Actual ΔCash</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Reconcile</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cf.slice().reverse().map(r => (
+              <tr key={r.period}>
+                <td style={{ ...tblD, fontWeight:600 }}>{monthLabel(r.period)}</td>
+                <td style={{ ...tblDR, color: r.ni >= 0 ? T.green : T.red, fontWeight:500 }}>{fmtMoney(r.ni, {zeroDash:true})}</td>
+                <td style={tblDR}>{fmtMoney((r.dep || 0) + (r.amort || 0), {zeroDash:true})}</td>
+                <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(-r.dAr, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.dCl, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, fontWeight:700, color: r.operatingCF >= 0 ? T.green : T.red }}>{fmtMoney(r.operatingCF, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, color:T.red }}>{fmtMoney(-Math.abs(r.capex), {zeroDash:true})}</td>
+                <td style={{ ...tblDR, fontWeight:700, color: r.fcf >= 0 ? T.green : T.red }}>{fmtMoney(r.fcf, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.dLtd, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.dDist, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, fontWeight:600 }}>{fmtMoney(r.netChange, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.dCash, {zeroDash:true})}</td>
+                <td style={{ ...tblDR, color: Math.abs(r.reconcileGap) < 1000 ? T.green : Math.abs(r.reconcileGap) < 10000 ? T.yellow : T.red }}>{fmtMoney(r.reconcileGap, {zeroDash:true})}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr style={{ background:T.bgSurface }}>
+              <td style={{ ...tblD, fontWeight:700 }}>TTM ({ttm.length} mo)</td>
+              <td style={{ ...tblDR, fontWeight:700, color: ttmNi >= 0 ? T.green : T.red }}>{fmtMoney(ttmNi)}</td>
+              <td style={tblDR}></td>
+              <td style={tblDR}></td>
+              <td style={tblDR}></td>
+              <td style={{ ...tblDR, fontWeight:700, color: ttmOp >= 0 ? T.green : T.red }}>{fmtMoney(ttmOp)}</td>
+              <td style={{ ...tblDR, color:T.red, fontWeight:700 }}>{fmtMoney(-Math.abs(ttmCapex))}</td>
+              <td style={{ ...tblDR, fontWeight:700, color: ttmFcf >= 0 ? T.green : T.red }}>{fmtMoney(ttmFcf)}</td>
+              <td colSpan={5} style={tblDR}></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function AuditedFinancialsTab() {
-  const [view, setView]         = useState("dashboard"); // dashboard | statements | chat | gmail
+  const [view, setView]         = useState("dashboard"); // dashboard | pl | bs | cf | statements | chat
   const [records, setRecords]   = useState([]);
   const [loading, setLoading]   = useState(true);
   const [selected, setSelected] = useState(null);
+  const [selectedLine, setSelectedLine] = useState(null);
   const [loadErr, setLoadErr]   = useState("");
 
   const load = useCallback(async () => {
@@ -2275,6 +2983,9 @@ function AuditedFinancialsTab() {
 
   const views = [
     { id:"dashboard",  icon:"📊", label:"Dashboard",  count:null },
+    { id:"pl",         icon:"💵", label:"P&L Detail", count:null },
+    { id:"bs",         icon:"📒", label:"Balance Sheet", count:null },
+    { id:"cf",         icon:"💸", label:"Cash Flow",  count:null },
     { id:"statements", icon:"📋", label:"Statements", count:records.length },
     { id:"chat",       icon:"💬", label:"Ask AI",     count:null },
   ];
@@ -2324,8 +3035,15 @@ function AuditedFinancialsTab() {
       </div>
 
       {view === "dashboard"  && <Dashboard records={records} onSelect={setSelected} />}
+      {view === "pl"         && <PLDetail records={records} onSelectLineItem={setSelectedLine} />}
+      {view === "bs"         && <BSDetail records={records} />}
+      {view === "cf"         && <CashFlowDetail records={records} />}
       {view === "statements" && <StatementsList records={records} onSelect={setSelected} />}
       {view === "chat"       && <AIChat records={records} />}
+
+      {selectedLine && (
+        <LineItemDrillModal item={selectedLine} onClose={() => setSelectedLine(null)} />
+      )}
 
       {selected && (() => {
         // Find the prior period's record for derived-cash-flow MoM deltas.
