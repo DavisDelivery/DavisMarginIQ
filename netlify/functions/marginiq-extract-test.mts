@@ -405,6 +405,10 @@ async function extractOne(
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
       max_tokens: 16384,
+      // NOTE: Sonnet 4.6 / Opus 4.6 / Opus 4.7 reject assistant-message
+      // prefill with a 400. We rely on the prompt's "Start your response
+      // with the opening brace {" instruction + defensive fence stripping
+      // below. Do NOT add a trailing assistant turn here.
       messages: [
         {
           role: "user",
@@ -415,10 +419,6 @@ async function extractOne(
             },
             { type: "text", text: EXTRACTION_PROMPT },
           ],
-        },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "{" }],
         },
       ],
     }),
@@ -460,9 +460,13 @@ async function extractOne(
     };
   }
 
-  // 5. Reconstruct + parse JSON (we prefilled "{")
-  const fullJson = "{" + modelText;
-  const cleaned = fullJson.replace(/```json\s*$/i, "").replace(/```\s*$/, "").trim();
+  // 5. Parse JSON. Model is instructed to start with "{" — strip any
+  // markdown fences the model added (rare but possible without prefill).
+  const cleaned = modelText
+    .replace(/^```json\s*\n?/i, "")
+    .replace(/^```\s*\n?/, "")
+    .replace(/```\s*$/, "")
+    .trim();
 
   let extracted: any;
   let parseError: string | null = null;
