@@ -336,43 +336,29 @@ async function listAmpCpaPdfs(): Promise<GmailPdfRef[]> {
   return Object.values(byPeriod).sort((a, b) => a.period.localeCompare(b.period));
 }
 
-// ── Worker dispatch with bounded concurrency ────────────────────────────────
-async function dispatchWorkers(origin: string, batchId: string, periods: string[]): Promise<void> {
-  const workerUrl = `${origin}/.netlify/functions/marginiq-extract-financial-background`;
-  const queue = [...periods];
-  const inFlight: Promise<any>[] = [];
-
-  const fireOne = async (period: string) => {
-    try {
-      // Fire and forget: background worker writes its own status to Firestore
-      await fetch(workerUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ period, batch_id: batchId }),
-      });
-    } catch (e) {
-      // Background functions return 202 immediately; if even the dispatch
-      // fails, mark the job failed so the batch progresses.
-      console.error(`Dispatch failed for ${period}:`, e);
+// ── Hand off to background dispatch coordinator ─────────────────────────────
+// The coordinator (marginiq-extract-financials-dispatch-background) runs
+// up to 15 minutes and paces worker firings to respect Anthropic ITPM.
+async function handoffToCoordinator(origin: string, batchId: string, periods: string[]): Promise<void> {
+  const coordinatorUrl = `${origin}/.netlify/functions/marginiq-extract-financials-dispatch-background`;
+  try {
+    await fetch(coordinatorUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ batch_id: batchId, periods }),
+    });
+    // Coordinator returns 202 instantly. We don't await the actual fanout.
+  } catch (e: any) {
+    console.error(`Coordinator handoff failed for ${batchId}:`, e.message || e);
+    // Best-effort: mark all jobs as failed so the batch state reflects reality.
+    for (const period of periods) {
       await writeDoc(`extract_jobs/${period}`, {
         state: "failed",
-        error: `Dispatch to background function failed: ${(e as Error).message}`,
+        error: `Coordinator handoff failed: ${e.message || e}`,
         completed_at: new Date().toISOString(),
       });
     }
-  };
-
-  // For background functions, the dispatch itself returns 202 instantly,
-  // so we can fire all of them — the runtime concurrency is enforced by
-  // Netlify's own scaling, not by us. But to keep Anthropic rate limits
-  // happy we throttle dispatch with a short delay between firings.
-  for (const period of queue) {
-    inFlight.push(fireOne(period));
-    // Stagger by 500ms so the first batch hits Anthropic at slightly different
-    // moments, avoiding any per-second rate spike.
-    await new Promise(r => setTimeout(r, 500));
   }
-  await Promise.all(inFlight);
 }
 
 export default async (req: Request, context: Context) => {
@@ -508,9 +494,10 @@ export default async (req: Request, context: Context) => {
     });
   }
 
-  // 5. Fire all background workers
+  // 5. Hand off to the background coordinator (it paces the worker firings
+  //    to stay under Anthropic's per-minute token limit).
   context.waitUntil(
-    dispatchWorkers(url.origin, batchId, toProcess.map(p => p.period))
+    handoffToCoordinator(url.origin, batchId, toProcess.map(p => p.period))
   );
 
   return json({
