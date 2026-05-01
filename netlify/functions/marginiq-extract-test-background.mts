@@ -44,8 +44,18 @@ function toFsFields(obj: Record<string, any>): Record<string, any> {
   return out;
 }
 
-async function writeDoc(path: string, fields: Record<string, any>, apiKey: string): Promise<boolean> {
-  const resp = await fetch(`${fsBase()}/${path}?key=${apiKey}`, {
+async function writeDoc(
+  path: string,
+  fields: Record<string, any>,
+  apiKey: string,
+  merge: boolean = true,
+): Promise<boolean> {
+  const params = new URLSearchParams();
+  params.set("key", apiKey);
+  if (merge) {
+    for (const k of Object.keys(fields)) params.append("updateMask.fieldPaths", k);
+  }
+  const resp = await fetch(`${fsBase()}/${path}?${params.toString()}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ fields: toFsFields(fields) }),

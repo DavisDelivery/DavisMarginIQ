@@ -91,9 +91,24 @@ async function readDoc(path: string): Promise<any | null> {
   return out;
 }
 
-async function writeDoc(path: string, fields: Record<string, any>): Promise<boolean> {
+// Writes (PATCHes) a Firestore doc. Defaults to MERGE semantics — only the
+// fields you pass in are touched; everything else is preserved. Set
+// merge=false to replace the entire document.
+//
+// Why this matters: Firestore REST's PATCH replaces the whole document
+// unless `updateMask.fieldPaths` is specified.
+async function writeDoc(
+  path: string,
+  fields: Record<string, any>,
+  merge: boolean = true,
+): Promise<boolean> {
   const apiKey = Netlify.env.get("FIREBASE_API_KEY");
-  const resp = await fetch(`${fsBase()}/${path}?key=${apiKey}`, {
+  const params = new URLSearchParams();
+  params.set("key", apiKey || "");
+  if (merge) {
+    for (const k of Object.keys(fields)) params.append("updateMask.fieldPaths", k);
+  }
+  const resp = await fetch(`${fsBase()}/${path}?${params.toString()}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ fields: toFsFields(fields) }),
