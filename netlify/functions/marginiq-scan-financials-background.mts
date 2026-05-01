@@ -1,23 +1,17 @@
 import type { Context } from "@netlify/functions";
 
 /**
- * Davis MarginIQ — Audited Financials PDF scanner (BACKGROUND worker, v2.48.3).
+ * Davis MarginIQ — Audited Financials PDF scanner BACKGROUND worker (v2.49.3).
  *
- * Why this exists: synchronous Netlify Functions have a 10s wall, but vision
- * calls against multi-page CPA financial PDFs routinely take 30-60s. Every
- * scan past ~10s was returning HTTP 504 "Inactivity Timeout" with HTML body.
+ * Reassembles chunked payload from scan_job_payloads/{jobId}__NNN docs,
+ * calls Anthropic vision, writes result to scan_jobs/{jobId}.
  *
- * Architecture (mirrors marginiq-nuvizz-ingest pattern):
- *   1. Client POSTs { messages, max_tokens } to /marginiq-scan-financials
- *      → dispatcher writes scan_job_payloads/{jobId} with the messages,
- *        scan_jobs/{jobId} with state=queued, fires this background function
- *        via context.waitUntil(), returns { jobId } 202.
- *   2. This function reads the payload doc, calls Anthropic, writes result
- *      back to scan_jobs/{jobId} with state=complete or failed.
- *   3. Client polls /marginiq-scan-financials?action=status&job_id=xxx
- *      until state !== "queued"|"running".
+ * Background functions get a 15-minute wall — vision will fit comfortably.
  *
- * Background functions get a 15-min wall clock. Vision calls won't blow that.
+ * v2.49.3 change: payload now arrives as N chunks (was 1 doc). Worker lists
+ * scan_job_payloads filtered by job_id prefix, sorts by chunk_index,
+ * concatenates data_b64, then base64-decodes the result to get back the
+ * original messages JSON.
  */
 
 const PROJECT_ID = "davismarginiq";
@@ -54,6 +48,63 @@ async function writeJobDoc(jobId: string, data: Record<string, any>): Promise<vo
   });
 }
 
+// Walk scan_job_payloads listing and pick out chunks whose docId starts with
+// `${jobId}__`. Firestore REST has no docId-prefix filter, so we paginate
+// the listing and filter client-side. The whole payload is bounded by what
+// the dispatcher just wrote (typically 1-10 chunks per job), so this is fast.
+async function loadPayloadChunks(jobId: string): Promise<{ chunks: any[]; chunkDocIds: string[]; chunkCount: number }> {
+  const chunks: any[] = [];
+  const chunkDocIds: string[] = [];
+  let expectedCount: number | null = null;
+  let pageToken: string | undefined;
+  const prefix = `${jobId}__`;
+
+  for (let safety = 0; safety < 200; safety++) {
+    const params = new URLSearchParams({
+      key: FIREBASE_API_KEY || "",
+      pageSize: "100",
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    const url = `${BASE}/scan_job_payloads?${params.toString()}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      throw new Error(`Failed to list payload chunks: HTTP ${resp.status}`);
+    }
+    const data: any = await resp.json();
+    for (const doc of (data.documents || [])) {
+      const id: string = String(doc.name).split("/").pop() || "";
+      if (!id.startsWith(prefix)) continue;
+      chunkDocIds.push(id);
+      const f = doc.fields || {};
+      const idx = Number(f.chunk_index?.integerValue || 0);
+      const total = Number(f.chunk_count?.integerValue || 0);
+      const data_b64: string = f.data_b64?.stringValue || "";
+      if (expectedCount === null && total > 0) expectedCount = total;
+      chunks.push({ idx, data_b64 });
+    }
+    if (!data.nextPageToken) break;
+    pageToken = data.nextPageToken;
+  }
+
+  // Sort by chunk_index (ascending) so concatenation order is correct
+  chunks.sort((a, b) => a.idx - b.idx);
+  chunkDocIds.sort();
+
+  return {
+    chunks,
+    chunkDocIds,
+    chunkCount: expectedCount ?? chunks.length,
+  };
+}
+
+async function deleteChunks(chunkDocIds: string[]): Promise<void> {
+  // Best effort, parallel — chunks are independent
+  await Promise.all(chunkDocIds.map(async (id) => {
+    const url = `${BASE}/scan_job_payloads/${encodeURIComponent(id)}?key=${FIREBASE_API_KEY}`;
+    await fetch(url, { method: "DELETE" }).catch(() => {});
+  }));
+}
+
 export default async (req: Request, _context: Context) => {
   if (req.method !== "POST") return new Response("POST required", { status: 405 });
   if (!ANTHROPIC_API_KEY) return new Response("ANTHROPIC_API_KEY not set", { status: 500 });
@@ -65,40 +116,46 @@ export default async (req: Request, _context: Context) => {
   const jobId: string = body.job_id;
   if (!jobId) return new Response("job_id required", { status: 400 });
 
-  // Inbound payload staged in scan_job_payloads/{jobId}. Separate collection
-  // because Firestore doc fields max ~1MB and we may be passing several MB
-  // of base64 image data — payload doc holds messages JSON, scan_jobs doc
-  // holds status fields.
-  const payloadUrl = `${BASE}/scan_job_payloads/${jobId}?key=${FIREBASE_API_KEY}`;
-  const payloadResp = await fetch(payloadUrl);
-  if (!payloadResp.ok) {
-    await writeJobDoc(jobId, {
-      state: "failed",
-      error: `Payload doc not found (${payloadResp.status})`,
-      completed_at: new Date().toISOString(),
-    });
-    return new Response("Payload not found", { status: 404 });
-  }
-  const payloadDoc: any = await payloadResp.json();
-  const messagesB64 = payloadDoc.fields?.messages_b64?.stringValue;
-  const maxTokens = Number(payloadDoc.fields?.max_tokens?.integerValue || 8192);
-  if (!messagesB64) {
-    await writeJobDoc(jobId, {
-      state: "failed",
-      error: "Payload missing messages_b64 field",
-      completed_at: new Date().toISOString(),
-    });
-    return new Response("Bad payload", { status: 400 });
-  }
+  // Reassemble payload from chunked docs
   let messages: any;
-  try { messages = JSON.parse(Buffer.from(messagesB64, "base64").toString("utf8")); }
-  catch (e: any) {
+  let chunkDocIds: string[] = [];
+  try {
+    const { chunks, chunkDocIds: ids, chunkCount } = await loadPayloadChunks(jobId);
+    chunkDocIds = ids;
+    if (chunks.length === 0) {
+      await writeJobDoc(jobId, {
+        state: "failed",
+        error: `No payload chunks found for job ${jobId}`,
+        completed_at: new Date().toISOString(),
+      });
+      return new Response("Payload not found", { status: 404 });
+    }
+    if (chunkCount > 0 && chunks.length < chunkCount) {
+      await writeJobDoc(jobId, {
+        state: "failed",
+        error: `Expected ${chunkCount} chunks but only loaded ${chunks.length}`,
+        completed_at: new Date().toISOString(),
+      });
+      return new Response("Incomplete payload", { status: 500 });
+    }
+    const messagesB64 = chunks.map(c => c.data_b64).join("");
+    const messagesJson = Buffer.from(messagesB64, "base64").toString("utf8");
+    messages = JSON.parse(messagesJson);
+  } catch (e: any) {
     await writeJobDoc(jobId, {
       state: "failed",
-      error: `Could not decode messages: ${e.message}`,
+      error: `Could not load/decode payload: ${e.message}`,
       completed_at: new Date().toISOString(),
     });
-    return new Response("Bad payload", { status: 400 });
+    return new Response(`Bad payload: ${e.message}`, { status: 400 });
+  }
+
+  // Read max_tokens from the status doc (the dispatcher recorded it there)
+  const statusDocResp = await fetch(`${BASE}/scan_jobs/${jobId}?key=${FIREBASE_API_KEY}`);
+  let maxTokens = 8192;
+  if (statusDocResp.ok) {
+    const sd: any = await statusDocResp.json();
+    maxTokens = Number(sd.fields?.max_tokens?.integerValue || 8192);
   }
 
   await writeJobDoc(jobId, {
@@ -124,7 +181,6 @@ export default async (req: Request, _context: Context) => {
     const respText = await anthropicResp.text();
 
     if (!anthropicResp.ok) {
-      // Surface the actual error from Anthropic so the client can react.
       let errMsg = `Vision API ${anthropicResp.status}`;
       try {
         const j = JSON.parse(respText);
@@ -138,18 +194,19 @@ export default async (req: Request, _context: Context) => {
         http_status: anthropicResp.status,
         completed_at: new Date().toISOString(),
       });
-      await fetch(payloadUrl, { method: "DELETE" }).catch(() => {});
+      await deleteChunks(chunkDocIds);
       return new Response(JSON.stringify({ error: errMsg }), { status: 500 });
     }
 
-    // Success — store full Anthropic response (a few hundred KB at most,
-    // well under Firestore's 1MB doc limit).
+    // Anthropic responses are typically a few hundred KB — well under
+    // Firestore's 1MiB single-doc-field cap. If a future model adds verbose
+    // output that pushes over, we'll need to chunk this too. Not now.
     await writeJobDoc(jobId, {
       state: "complete",
       response_b64: Buffer.from(respText, "utf8").toString("base64"),
       completed_at: new Date().toISOString(),
     });
-    await fetch(payloadUrl, { method: "DELETE" }).catch(() => {});
+    await deleteChunks(chunkDocIds);
 
     return new Response(JSON.stringify({ ok: true, job_id: jobId }), {
       status: 200,
