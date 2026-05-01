@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.49.4";
+const APP_VERSION = "2.50.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2118,44 +2118,109 @@ function GmailSync({ onRefresh }) {
 
       // 3. Claude vision extraction
       setImportStatus(`Extracting financials (${pages.length} pages)...`);
-      const EXTRACTION_PROMPT = `You are extracting financial data from audited financial statements prepared by a CPA firm for a trucking/delivery company.
+      const EXTRACTION_PROMPT = `You are extracting financial data from audited financial statements prepared by a CPA firm for a trucking/delivery company (Davis Delivery Services Inc).
 
-Extract ALL of the following from the PDF pages provided. Return ONLY valid JSON, no markdown, no explanation.
+Read every page carefully. Return ONLY valid JSON, no markdown, no explanation.
+
+CRITICAL COLUMN RULES — these statements typically have multiple numeric columns. You MUST distinguish them:
+  - "1 Month Ended" or "Current Month" or "Month" column → store as "month" value
+  - "12 Months Ended" or "Year-To-Date" or "YTD" or "Year to Date" column → store as "ytd" value
+  - "%" columns → store as "month_pct" or "ytd_pct" (these are percent of revenue)
+  - Prior-year comparison columns ("December 31, 2024" when statement date is December 31, 2025) → store as "prior_month" or "prior_ytd"
+  - "Variance" columns → store as "month_variance" or "ytd_variance"
+
+If a column does not exist on the page, omit that field (do not invent zero). If only ONE numeric column exists per line, store it as "month" (NOT "ytd").
+
+Schema:
 
 {
   "period": "YYYY-MM",
-  "report_date": "YYYY-MM-DD or null",
-  "company": "company name or null",
-  "pl": {
-    "revenue": number,
-    "cost_of_goods_sold": number,
-    "gross_profit": number,
-    "operating_expenses": number,
-    "operating_income": number,
-    "other_income": number,
-    "other_expenses": number,
-    "net_income": number,
-    "line_items": [{"label": "...", "amount": number, "section": "revenue|cogs|operating_expense|other"}]
+  "period_end_date": "YYYY-MM-DD",
+  "company": "...",
+
+  "pl_line_items": [
+    {
+      "label": "exact label from the PDF",
+      "section": "revenue | cost_of_sales | operating_expense | other_income | other_expense",
+      "month": number | null,
+      "month_pct": number | null,
+      "ytd": number | null,
+      "ytd_pct": number | null,
+      "prior_month": number | null,
+      "prior_ytd": number | null,
+      "month_variance": number | null,
+      "ytd_variance": number | null
+    }
+  ],
+
+  "pl_totals": {
+    "total_revenue":          { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... },
+    "total_cost_of_sales":    { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... },
+    "gross_profit":           { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... },
+    "total_operating_expenses": { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... },
+    "operating_income":       { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... },
+    "total_other_income":     { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... },
+    "total_other_expense":    { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... },
+    "net_income":             { "month": ..., "ytd": ..., "prior_month": ..., "prior_ytd": ... }
   },
+
+  "ebitda_inputs": {
+    "depreciation_month": number | null,
+    "depreciation_ytd": number | null,
+    "amortization_month": number | null,
+    "amortization_ytd": number | null,
+    "interest_expense_month": number | null,
+    "interest_expense_ytd": number | null,
+    "income_tax_month": number | null,
+    "income_tax_ytd": number | null
+  },
+
   "balance_sheet": {
-    "total_assets": number, "current_assets": number, "fixed_assets": number,
-    "total_liabilities": number, "current_liabilities": number, "long_term_liabilities": number,
-    "equity": number,
-    "line_items": [{"label": "...", "amount": number, "section": "current_asset|fixed_asset|current_liability|long_term_liability|equity"}]
+    "as_of_date": "YYYY-MM-DD",
+    "line_items": [
+      {
+        "label": "exact label from the PDF",
+        "section": "current_asset | fixed_asset | other_asset | current_liability | long_term_liability | equity",
+        "amount": number
+      }
+    ],
+    "subtotals": {
+      "total_current_assets": number | null,
+      "total_fixed_assets": number | null,
+      "total_other_assets": number | null,
+      "total_assets": number | null,
+      "total_current_liabilities": number | null,
+      "total_long_term_liabilities": number | null,
+      "total_liabilities": number | null,
+      "total_equity": number | null,
+      "total_liabilities_and_equity": number | null
+    }
   },
+
   "cash_flow": {
-    "operating": number, "investing": number, "financing": number,
-    "net_change": number, "beginning_cash": number, "ending_cash": number
+    "operating_activities": number | null,
+    "investing_activities": number | null,
+    "financing_activities": number | null,
+    "net_change_in_cash": number | null,
+    "beginning_cash": number | null,
+    "ending_cash": number | null
   },
-  "notes": "any important notes or caveats from the document"
+
+  "notes": "anything noteworthy: comparative pages present? cash flow statement present? unusual items?"
 }
 
-Rules:
-- All amounts in dollars as plain numbers (no $ signs, no commas)
-- Expenses are POSITIVE numbers (don't negate them)
-- If a statement type is not present in the PDF, set its value to null
-- If a line item label is not clear, use your best judgment
-- period should be the month these statements cover (YYYY-MM format)`;
+EXTRACTION RULES:
+- All amounts in dollars as plain numbers (no $ signs, no commas, no parentheses)
+- Negative numbers stay negative: a loss of (341,118.33) becomes -341118.33
+- Accumulated Depreciation in balance sheet typically shows as negative
+- Net Income (Loss): if the line shows (loss) or parentheses, it is negative
+- pl_line_items must include EVERY line on the income statement, including zero-value rows. Do not aggregate, do not skip lines, do not normalize labels.
+- For ebitda_inputs: pull these specific values from the operating expenses (Depreciation, Amortization) and other income/expense (Interest Expense, Income Tax) line items. Set null if the line is not present.
+- For income_tax: include only federal/state INCOME taxes. Do NOT include payroll taxes, property taxes, sales tax, or franchise tax — those stay in regular operating expenses. If the company is an S-corp with no income tax line, set null.
+- period: YYYY-MM derived from the period end date (e.g., December 31, 2025 → "2025-12")
+- If the comparative pages do not show prior-period columns, set prior_month and prior_ytd to null on every line item rather than guessing.
+
+Cross-check before responding: total_revenue.ytd should equal the sum of all pl_line_items where section="revenue" of their .ytd values. If they don't match, recheck your column assignment.`;
       const imageBlocks = pages.map(b64 => ({
         type: "image",
         source: { type: "base64", media_type: "image/png", data: b64 },
@@ -2274,7 +2339,7 @@ Rules:
       let pdfMeta = null;
       if (window.fbStorage) {
         try {
-          const path = `audited_financials/${period}.pdf`;
+          const path = `audited_financials_v2/${period}.pdf`;
           const ref = window.fbStorage.ref(path);
           const blob = new Blob([pdfBytes], { type: "application/pdf" });
           await ref.put(blob, { contentType: "application/pdf", customMetadata: { original_filename: attachment.filename } });
@@ -2294,7 +2359,7 @@ Rules:
         pdf_download_url: pdfMeta?.download_url || null,
         updated_at: new Date().toISOString(),
       };
-      await window.db.collection("audited_financials").doc(period).set(record, { merge: true });
+      await window.db.collection("audited_financials_v2").doc(period).set(record, { merge: true });
 
       // 6. Log filename for dedupe + processed-emails ledger
       await FS.saveFileLog(`audited_${period}_${email.emailId}`, {
