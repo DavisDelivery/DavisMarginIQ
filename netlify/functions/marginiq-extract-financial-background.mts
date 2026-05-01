@@ -1,16 +1,19 @@
 import type { Context } from "@netlify/functions";
 
 /**
- * Davis MarginIQ — Single-PDF financial extraction worker (v2.50.0).
+ * Davis MarginIQ — Single-PDF financial extraction worker (v2.50.1).
  *
  * Background function (15-min wall clock). Runs ONE financial PDF through
  * the full pipeline:
  *
- *   1. Read extract_jobs/{period} doc to get { pdf_storage_path, period, ... }
- *   2. Download PDF bytes from Firebase Storage
- *   3. POST to Anthropic with native PDF document block (no rendering)
- *   4. Parse extracted JSON, write audited_financials_v2/{period}
- *   5. Update extract_jobs/{period} state -> complete | failed
+ *   1. Read extract_jobs/{period} doc.
+ *   2. Acquire PDF bytes — preferred path is Gmail-direct (job carries
+ *      gmail_message_id + gmail_attachment_id + gmail_account_doc_id).
+ *      Falls back to Firebase Storage if the job has pdf_storage_path
+ *      instead (legacy path).
+ *   3. POST to Anthropic with native PDF document block.
+ *   4. Parse extracted JSON, write audited_financials_v2/{period}.
+ *   5. Update extract_jobs/{period} state -> complete | failed.
  *
  * Triggered by: marginiq-extract-financials-batch dispatcher, one
  * invocation per PDF, up to N concurrent (controlled by the dispatcher).
@@ -214,11 +217,26 @@ export default async (req: Request, _context: Context) => {
     if (!job) {
       return new Response(`Job ${period} not found`, { status: 404 });
     }
-    const pdfPath: string = job.pdf_storage_path;
-    if (!pdfPath) {
+
+    // Two source modes:
+    //   (A) Gmail-direct (preferred): job has gmail_message_id +
+    //       gmail_attachment_id + gmail_account_doc_id (and optionally
+    //       gmail_account_email). The worker refreshes the OAuth token
+    //       and pulls the PDF bytes from Gmail.
+    //   (B) Storage (legacy): job has pdf_storage_path pointing at
+    //       Firebase Storage. Kept for backward compatibility.
+    const gmailMessageId: string = job.gmail_message_id || "";
+    const gmailAttachmentId: string = job.gmail_attachment_id || "";
+    const gmailAccountDocId: string = job.gmail_account_doc_id || "";
+    const gmailAccountEmail: string = job.gmail_account_email || "";
+    const pdfPath: string = job.pdf_storage_path || "";
+
+    const useGmail = Boolean(gmailMessageId && gmailAttachmentId);
+
+    if (!useGmail && !pdfPath) {
       await writeDoc(jobPath, {
         state: "failed",
-        error: "Job missing pdf_storage_path",
+        error: "Job missing both gmail_message_id and pdf_storage_path",
         completed_at: new Date().toISOString(),
       });
       return new Response("Bad job", { status: 400 });
@@ -229,15 +247,82 @@ export default async (req: Request, _context: Context) => {
       started_at: new Date().toISOString(),
     });
 
-    // 2. Download PDF bytes from Firebase Storage
-    const pdfResp = await fetch(storageUrl(pdfPath));
-    if (!pdfResp.ok) {
-      const errText = await pdfResp.text();
-      throw new Error(`PDF download failed (${pdfResp.status}): ${errText.slice(0, 200)}`);
+    // 2. Acquire PDF bytes (Gmail or Storage)
+    let pdfBytes: Uint8Array;
+    if (useGmail) {
+      const fbKey2 = Netlify.env.get("FIREBASE_API_KEY")!;
+      const clientId = Netlify.env.get("GOOGLE_CLIENT_ID");
+      const clientSecret = Netlify.env.get("GOOGLE_CLIENT_SECRET");
+      if (!clientId || !clientSecret) {
+        throw new Error("Gmail OAuth env vars missing (GOOGLE_CLIENT_ID/SECRET)");
+      }
+
+      // Resolve refresh token: prefer the docId stored on the job, then a
+      // computed slug from the email, then the legacy singleton.
+      const candidates: string[] = [];
+      if (gmailAccountDocId) candidates.push(gmailAccountDocId);
+      if (gmailAccountEmail) {
+        const slug = gmailAccountEmail.toLowerCase()
+          .replace(/@/g, "_at_").replace(/[^a-z0-9_]/g, "_").slice(0, 100);
+        candidates.push(`gmail_tokens_${slug}`);
+      }
+      candidates.push("gmail_tokens"); // legacy fallback
+
+      let refreshToken: string | null = null;
+      for (const docId of candidates) {
+        const r = await fetch(
+          `${fsBase()}/marginiq_config/${docId}?key=${fbKey2}`
+        );
+        if (!r.ok) continue;
+        const d: any = await r.json();
+        const tok = d?.fields?.refresh_token?.stringValue;
+        if (tok) { refreshToken = tok; break; }
+      }
+      if (!refreshToken) throw new Error("Gmail not connected. Reconnect.");
+
+      // Refresh access token
+      const refreshResp = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: refreshToken,
+          grant_type: "refresh_token",
+        }),
+      });
+      const refreshData: any = await refreshResp.json();
+      if (!refreshResp.ok || !refreshData.access_token) {
+        throw new Error("Token refresh failed: " + JSON.stringify(refreshData).substring(0, 300));
+      }
+
+      // Fetch attachment bytes (Gmail returns base64url)
+      const attResp = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${gmailMessageId}/attachments/${gmailAttachmentId}`,
+        { headers: { Authorization: `Bearer ${refreshData.access_token}` } }
+      );
+      const attData: any = await attResp.json();
+      if (!attResp.ok) {
+        throw new Error("Attachment fetch failed: " + JSON.stringify(attData).substring(0, 300));
+      }
+      const b64url: string = attData.data || "";
+      if (!b64url) throw new Error("Empty attachment data");
+      const stdB64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+      pdfBytes = Uint8Array.from(Buffer.from(stdB64, "base64"));
+      console.log(`[extract ${period}] PDF (Gmail): ${pdfBytes.length} bytes`);
+    } else {
+      // Legacy Storage path
+      const pdfResp = await fetch(storageUrl(pdfPath));
+      if (!pdfResp.ok) {
+        const errText = await pdfResp.text();
+        throw new Error(`PDF download failed (${pdfResp.status}): ${errText.slice(0, 200)}`);
+      }
+      pdfBytes = new Uint8Array(await pdfResp.arrayBuffer());
+      console.log(`[extract ${period}] PDF (Storage): ${pdfBytes.length} bytes`);
     }
-    const pdfBytes = new Uint8Array(await pdfResp.arrayBuffer());
+
     const pdfB64 = Buffer.from(pdfBytes).toString("base64");
-    console.log(`[extract ${period}] PDF: ${pdfBytes.length} bytes`);
+
 
     // 3. Call Anthropic with native PDF document block.
     // NOTE: Sonnet 4.6 / Opus 4.6 / Opus 4.7 reject assistant-message prefill
@@ -309,9 +394,14 @@ export default async (req: Request, _context: Context) => {
     const record = {
       ...extracted,
       period,
-      pdf_storage_path: pdfPath,
+      // Source provenance — useful for re-extraction debugging.
+      pdf_storage_path: pdfPath || null,
+      gmail_message_id: gmailMessageId || null,
+      gmail_attachment_id: gmailAttachmentId || null,
+      gmail_account_doc_id: gmailAccountDocId || null,
+      source: useGmail ? "gmail" : "storage",
       extracted_at: new Date().toISOString(),
-      extraction_version: "2.50.0-native-pdf",
+      extraction_version: "2.50.1-gmail-direct",
       anthropic_input_tokens: anthropicJson.usage?.input_tokens || null,
       anthropic_output_tokens: anthropicJson.usage?.output_tokens || null,
     };
