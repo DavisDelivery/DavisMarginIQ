@@ -344,183 +344,64 @@ EXTRACTION RULES:
 
 Cross-check: total_revenue.ytd should equal the sum of pl_line_items where section="revenue" of their .ytd values. If not, recheck columns.`;
 
-// ── Pull a Gmail attachment, run Claude, return JSON ───────────────────────
-async function extractOne(
-  clientId: string,
-  clientSecret: string,
-  firebaseKey: string,
-  anthropicKey: string,
+// ── Extract: trigger background worker, return job_id immediately ─────────
+async function triggerBackgroundExtract(
+  origin: string,
+  jobId: string,
   messageId: string,
   attachmentId: string,
   accountDocId: string,
   accountEmail: string
-): Promise<any> {
-  const t0 = Date.now();
-
-  // 1. Resolve refresh token (mirror marginiq-gmail-attachment.mts logic)
-  const candidates: string[] = [];
-  if (accountDocId) candidates.push(accountDocId);
-  if (accountEmail) candidates.push(`gmail_tokens_${emailSlug(accountEmail)}`);
-  candidates.push("gmail_tokens"); // legacy fallback
-
-  const tokenInfo = await readTokenByCandidates(firebaseKey, candidates);
-  if (!tokenInfo) {
-    return { error: "Gmail not connected for this account. Reconnect Gmail." };
-  }
-
-  // 2. Refresh access token
-  const at = await getAccessToken(clientId, clientSecret, tokenInfo.refreshToken);
-  if (!at.accessToken) {
-    return { error: at.error || "Token refresh failed", account_doc_id: tokenInfo.resolvedDocId };
-  }
-
-  // 3. Fetch attachment bytes
-  const attResp = await fetch(
-    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`,
-    { headers: { Authorization: `Bearer ${at.accessToken}` } }
-  );
-  const attData: any = await attResp.json();
-  if (!attResp.ok) {
-    return { error: "Attachment fetch failed: " + JSON.stringify(attData).substring(0, 300) };
-  }
-
-  // Gmail returns base64url — convert to standard base64 for Anthropic
-  const pdfB64 = String(attData.data || "").replace(/-/g, "+").replace(/_/g, "/");
-  const pdfSize = attData.size || 0;
-  const tFetch = Date.now() - t0;
-
-  if (!pdfB64) {
-    return { error: "Empty attachment data", attachment_size: pdfSize };
-  }
-
-  // 4. Call Anthropic with native PDF document block + JSON prefill
-  const t1 = Date.now();
-  const anthropicResp = await fetch("https://api.anthropic.com/v1/messages", {
+): Promise<{ ok: boolean; status: number; body: string }> {
+  // Background functions return 202 immediately. Fire-and-forget.
+  const url = `${origin}/.netlify/functions/marginiq-extract-test-background`;
+  const r = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": anthropicKey,
-      "anthropic-version": "2023-06-01",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 16384,
-      // NOTE: Sonnet 4.6 / Opus 4.6 / Opus 4.7 reject assistant-message
-      // prefill with a 400. We rely on the prompt's "Start your response
-      // with the opening brace {" instruction + defensive fence stripping
-      // below. Do NOT add a trailing assistant turn here.
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "document",
-              source: { type: "base64", media_type: "application/pdf", data: pdfB64 },
-            },
-            { type: "text", text: EXTRACTION_PROMPT },
-          ],
-        },
-      ],
+      job_id: jobId,
+      message_id: messageId,
+      attachment_id: attachmentId,
+      account_doc_id: accountDocId,
+      account_email: accountEmail,
     }),
   });
-  const respText = await anthropicResp.text();
-  const tClaude = Date.now() - t1;
+  const text = await r.text();
+  return { ok: r.ok, status: r.status, body: text.slice(0, 300) };
+}
 
-  if (!anthropicResp.ok) {
-    let errMsg = `Anthropic API ${anthropicResp.status}`;
-    try {
-      const j = JSON.parse(respText);
-      if (j.error?.message) errMsg = `Anthropic API ${anthropicResp.status}: ${j.error.message}`;
-    } catch { /* fall through */ }
-    return {
-      error: errMsg,
-      attachment_size: pdfSize,
-      timing_ms: { gmail_fetch: tFetch, claude: tClaude },
-    };
+// ── Fetch result: read extract_test_results/{job_id} from Firestore ───────
+async function readResult(firebaseKey: string, jobId: string): Promise<any> {
+  const r = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/extract_test_results/${jobId}?key=${firebaseKey}`
+  );
+  if (r.status === 404) {
+    return { state: "pending", note: "job doc not yet created — try again in a few seconds" };
   }
-
-  let anthropicJson: any;
-  try {
-    anthropicJson = JSON.parse(respText);
-  } catch (e: any) {
-    return { error: "Anthropic response not JSON: " + e.message, raw: respText.slice(0, 500) };
+  if (!r.ok) {
+    return { error: `Firestore read failed (${r.status})`, body: (await r.text()).slice(0, 300) };
   }
+  const data: any = await r.json();
+  // Decode every field to JS — small enough to do generically here
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(data.fields || {})) out[k] = decodeFs(v);
+  return out;
+}
 
-  if (!anthropicJson.content || !Array.isArray(anthropicJson.content)) {
-    return {
-      error: "Anthropic response missing content",
-      raw: respText.slice(0, 500),
-    };
+function decodeFs(v: any): any {
+  if (!v) return null;
+  if ("stringValue" in v) return v.stringValue;
+  if ("integerValue" in v) return Number(v.integerValue);
+  if ("doubleValue" in v) return Number(v.doubleValue);
+  if ("booleanValue" in v) return v.booleanValue;
+  if ("nullValue" in v) return null;
+  if ("arrayValue" in v) return (v.arrayValue.values || []).map(decodeFs);
+  if ("mapValue" in v) {
+    const out: Record<string, any> = {};
+    for (const [k, val] of Object.entries(v.mapValue.fields || {})) out[k] = decodeFs(val);
+    return out;
   }
-  const modelText = anthropicJson.content.map((b: any) => b.text || "").join("").trim();
-  if (!modelText) {
-    return {
-      error: `Anthropic returned empty text. stop_reason=${anthropicJson.stop_reason || "?"}`,
-      usage: anthropicJson.usage || null,
-    };
-  }
-
-  // 5. Parse JSON. Model is instructed to start with "{" — strip any
-  // markdown fences the model added (rare but possible without prefill).
-  const cleaned = modelText
-    .replace(/^```json\s*\n?/i, "")
-    .replace(/^```\s*\n?/, "")
-    .replace(/```\s*$/, "")
-    .trim();
-
-  let extracted: any;
-  let parseError: string | null = null;
-  try {
-    extracted = JSON.parse(cleaned);
-  } catch (e: any) {
-    parseError = e.message;
-  }
-
-  // 6. Spot-check against Dec 2025 targets if applicable (informational only)
-  const targets =
-    extracted?.period === "2025-12"
-      ? {
-          sales_month_target: 1281356.12,
-          sales_ytd_target: 13922075.72,
-          net_income_month_target: -341118.33,
-          net_income_ytd_target: 1165230.70,
-          depreciation_month_target: 108546.57,
-          depreciation_ytd_target: 450767.43,
-          interest_expense_ytd_target: 18638.64,
-          actual: {
-            sales_month: extracted?.pl_totals?.total_revenue?.month ?? null,
-            sales_ytd: extracted?.pl_totals?.total_revenue?.ytd ?? null,
-            net_income_month: extracted?.pl_totals?.net_income?.month ?? null,
-            net_income_ytd: extracted?.pl_totals?.net_income?.ytd ?? null,
-            depreciation_month: extracted?.ebitda_inputs?.depreciation_month ?? null,
-            depreciation_ytd: extracted?.ebitda_inputs?.depreciation_ytd ?? null,
-            interest_expense_ytd: extracted?.ebitda_inputs?.interest_expense_ytd ?? null,
-            income_tax_ytd: extracted?.ebitda_inputs?.income_tax_ytd ?? null,
-          },
-        }
-      : null;
-
-  return {
-    ok: !parseError,
-    parse_error: parseError,
-    parse_error_tail: parseError ? cleaned.slice(-200) : null,
-    period: extracted?.period ?? null,
-    period_end_date: extracted?.period_end_date ?? null,
-    pl_line_count: (extracted?.pl_line_items || []).length,
-    bs_line_count: (extracted?.balance_sheet?.line_items || []).length,
-    pl_totals: extracted?.pl_totals ?? null,
-    ebitda_inputs: extracted?.ebitda_inputs ?? null,
-    balance_sheet_subtotals: extracted?.balance_sheet?.subtotals ?? null,
-    cash_flow: extracted?.cash_flow ?? null,
-    notes: extracted?.notes ?? null,
-    spot_check_dec_2025: targets,
-    extracted, // full payload — useful for diffing the prompt
-    timing_ms: { gmail_fetch: tFetch, claude: tClaude, total: Date.now() - t0 },
-    pdf_size_bytes: pdfSize,
-    anthropic_usage: anthropicJson.usage || null,
-    anthropic_stop_reason: anthropicJson.stop_reason || null,
-    account_doc_id: tokenInfo.resolvedDocId,
-  };
+  return null;
 }
 
 // ── Router ─────────────────────────────────────────────────────────────────
@@ -546,7 +427,8 @@ export default async (req: Request, _context: Context) => {
       },
       usage: {
         list_emails: "?action=list-cpa-emails[&limit=50]",
-        extract: "?action=extract&message_id=...&attachment_id=...&account_doc_id=...",
+        extract: "?action=extract&message_id=...&attachment_id=...&account_doc_id=... → returns job_id",
+        fetch_result: "?action=fetch-result&job_id=... → poll until state=complete|failed",
       },
     });
   }
@@ -574,16 +456,43 @@ export default async (req: Request, _context: Context) => {
     if (!messageId || !attachmentId) {
       return json({ error: "message_id and attachment_id are required" }, 400);
     }
+
+    // Generate a short job ID. Firestore doc IDs forbid `/` but allow most else.
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const origin = `${url.protocol}//${url.host}`;
+
     try {
-      const result = await extractOne(
-        clientId, clientSecret, firebaseKey, anthropicKey,
-        messageId, attachmentId, accountDocId, accountEmail
+      const trigger = await triggerBackgroundExtract(
+        origin, jobId, messageId, attachmentId, accountDocId, accountEmail
       );
-      return json(result);
+      // Background functions return 202 immediately. Anything else is a problem.
+      return json({
+        ok: trigger.status === 202 || trigger.status === 200,
+        job_id: jobId,
+        background_status: trigger.status,
+        background_body_preview: trigger.body,
+        poll_url: `${origin}/.netlify/functions/marginiq-extract-test?action=fetch-result&job_id=${jobId}`,
+      });
     } catch (e: any) {
-      return json({ error: e.message || "extract failed" }, 500);
+      return json({ error: "trigger failed: " + (e.message || String(e)) }, 500);
     }
   }
 
-  return json({ error: `unknown action: ${action}`, valid: ["health", "list-cpa-emails", "extract"] }, 400);
+  if (action === "fetch-result") {
+    const jobId = url.searchParams.get("job_id") || "";
+    if (!jobId) return json({ error: "job_id required" }, 400);
+    try {
+      const result = await readResult(firebaseKey, jobId);
+      // If the job has an extracted_json string, parse it back into an object
+      // for friendlier display.
+      if (result && typeof result.extracted_json === "string") {
+        try { result.extracted = JSON.parse(result.extracted_json); } catch { /* ignore */ }
+      }
+      return json(result);
+    } catch (e: any) {
+      return json({ error: e.message || "fetch failed" }, 500);
+    }
+  }
+
+  return json({ error: `unknown action: ${action}`, valid: ["health", "list-cpa-emails", "extract", "fetch-result"] }, 400);
 };
