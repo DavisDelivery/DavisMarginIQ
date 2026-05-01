@@ -21,8 +21,9 @@ import type { Context } from "@netlify/functions";
  *     image-based OCR, no client rendering, no scale tuning
  *   - Per-job state: failures don't kill the batch, retryable individually
  *   - 16K max_tokens: full line-item schema fits without truncation
- *   - JSON prefill: assistant turn starts with "{" so model can't add
- *     code fences or preamble
+ *   - Sonnet 4.6 / Opus 4.6 / Opus 4.7 reject assistant-message prefill
+ *     with a 400. Rely on the prompt's "Start with {" instruction plus
+ *     two-sided markdown-fence stripping in the parser.
  */
 
 const PROJECT_ID = "davismarginiq";
@@ -239,9 +240,9 @@ export default async (req: Request, _context: Context) => {
     console.log(`[extract ${period}] PDF: ${pdfBytes.length} bytes`);
 
     // 3. Call Anthropic with native PDF document block.
-    // PREFILL the assistant turn with "{" so the model cannot prepend
-    // markdown fences or prose. Combined with the explicit prompt rule
-    // ("Start your response with the opening brace") this is robust.
+    // NOTE: Sonnet 4.6 / Opus 4.6 / Opus 4.7 reject assistant-message prefill
+    // with a 400. We rely on the prompt's "Start your response with the
+    // opening brace {" instruction plus two-sided fence stripping below.
     const anthropicResp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -262,10 +263,6 @@ export default async (req: Request, _context: Context) => {
               },
               { type: "text", text: EXTRACTION_PROMPT },
             ],
-          },
-          {
-            role: "assistant",
-            content: [{ type: "text", text: "{" }],
           },
         ],
       }),
@@ -288,13 +285,13 @@ export default async (req: Request, _context: Context) => {
     let modelText = anthropicJson.content.map((b: any) => b.text || "").join("").trim();
     if (!modelText) throw new Error(`Vision returned empty text. stop_reason=${anthropicJson.stop_reason || "?"}`);
 
-    // Because we prefilled "{", the model's response continues from there.
-    // Reconstruct the full JSON by prepending the "{" we sent.
-    const fullJson = "{" + modelText;
-
-    // Defensive cleanup: strip trailing markdown if the model added it
-    // anyway (rare but possible). Also handle truncation diagnostics.
-    let cleaned = fullJson.replace(/```json\s*$/i, "").replace(/```\s*$/, "").trim();
+    // Parse JSON. Model is instructed to start with "{" — strip any
+    // markdown fences the model may have added on either side.
+    let cleaned = modelText
+      .replace(/^```json\s*\n?/i, "")
+      .replace(/^```\s*\n?/, "")
+      .replace(/```\s*$/, "")
+      .trim();
     let extracted: any;
     try {
       extracted = JSON.parse(cleaned);
@@ -303,7 +300,8 @@ export default async (req: Request, _context: Context) => {
         `JSON parse failed: ${e.message}. ` +
         `stop_reason=${anthropicJson.stop_reason || "?"}, ` +
         `output_tokens=${anthropicJson.usage?.output_tokens || "?"}, ` +
-        `last 100 chars: ${cleaned.slice(-100)}`
+        `head=${cleaned.slice(0, 80)}, ` +
+        `tail=${cleaned.slice(-80)}`
       );
     }
 
