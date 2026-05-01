@@ -499,105 +499,290 @@ function MiniLineChart({ data, height=180, colors={ revenue:T.brand, expenses:T.
 }
 
 // ─── Dashboard view ───────────────────────────────────────────────────────────
+// ─── CFO Dashboard ───────────────────────────────────────────────────────────
+// Analytical dashboard intended for executive review of monthly audited
+// financials. Strict mode: only successfully-extracted records (those with
+// a parsed pl object) appear here. Records still pending or failed
+// extraction live in the Statements list with "Re-extract" affordances.
+//
+// Layout sections (top to bottom):
+//   1. Period selector + Compare-vs selector
+//   2. Executive KPI strip with sparklines
+//   3. Revenue · Net Income trend chart (24mo or all available)
+//   4. Auto-generated Strengths / Flags panel
+//   5. Expense category waterfall (top movers month-over-month)
+//   6. Full statement index (clickable)
+
 function Dashboard({ records, onSelect }) {
-  if (!records.length) return (
+  const [windowKey, setWindowKey] = useState("ttm"); // ttm | ytd | last1 | last3 | last6 | all
+  const [compareKey, setCompareKey] = useState("prior"); // prior | yoy
+
+  // STRICT mode: only records with a parsed pl object are dashboard-eligible
+  const extracted = records.filter(r => r.period && r.pl && Object.keys(r.pl).length > 0);
+  if (!extracted.length) return (
     <div style={{ ...card, textAlign:"center", padding:"60px 20px", color:T.textMuted }}>
-      <div style={{ fontSize:36, marginBottom:8 }}>📋</div>
-      <div style={{ fontSize:13, fontWeight:600 }}>No audited financials yet</div>
-      <div style={{ fontSize:11, marginTop:6 }}>Open the 📧 Gmail Sync tab → AMP CPAs vendor card to import statements</div>
+      <div style={{ fontSize:36, marginBottom:8 }}>📊</div>
+      <div style={{ fontSize:13, fontWeight:600 }}>No extracted financials yet</div>
+      <div style={{ fontSize:11, marginTop:6 }}>Open the 📧 Gmail Sync tab → AMP CPAs vendor card to import statements.</div>
+      <div style={{ fontSize:10, marginTop:4, color:T.textDim }}>The dashboard shows only fully-extracted months. Pending/failed extractions appear in the Statements tab.</div>
     </div>
   );
 
-  // Sort ascending by period for trend computation
-  const asc = [...records].filter(r => r.period).sort((a,b) => a.period.localeCompare(b.period));
-  const latest   = asc[asc.length-1];
-  const previous = asc[asc.length-2] || null;
+  // Sort ascending so [last] is most recent
+  const asc = [...extracted].sort((a,b) => a.period.localeCompare(b.period));
+  const latest = asc[asc.length - 1];
 
-  // Trend chart data
-  const trendData = asc.map(r => ({
+  // ── Window selection ─────────────────────────────────────────────────────
+  // Returns { current: [], prior: [], label: string, priorLabel: string }
+  const selectWindows = () => {
+    const n = asc.length;
+    const periodToDate = (p) => {
+      const [y, m] = p.split("-").map(x => parseInt(x));
+      return new Date(y, m - 1, 1);
+    };
+    const subtractMonths = (date, months) => {
+      const d = new Date(date);
+      d.setMonth(d.getMonth() - months);
+      return d;
+    };
+    const periodOf = (date) => `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}`;
+    const inWindow = (p, start, end) => p >= start && p <= end;
+
+    const latestDate = periodToDate(latest.period);
+
+    if (windowKey === "ttm") {
+      const current = asc.slice(-12);
+      const priorEnd = periodOf(subtractMonths(latestDate, 12));
+      const priorStart = periodOf(subtractMonths(latestDate, 23));
+      const prior = asc.filter(r => inWindow(r.period, priorStart, priorEnd));
+      return { current, prior, label:"Trailing 12 Months", priorLabel: compareKey === "yoy" ? "Prior 12 Months" : "Previous TTM" };
+    }
+    if (windowKey === "ytd") {
+      const yr = latest.period.slice(0,4);
+      const current = asc.filter(r => r.period.startsWith(yr));
+      const priorYr = String(parseInt(yr) - 1);
+      const lastMonthNum = parseInt(latest.period.slice(5,7));
+      const prior = asc.filter(r => {
+        if (!r.period.startsWith(priorYr)) return false;
+        return parseInt(r.period.slice(5,7)) <= lastMonthNum;
+      });
+      return { current, prior, label:`${yr} YTD (${current.length} mo)`, priorLabel:`${priorYr} same period` };
+    }
+    if (windowKey === "last1") {
+      const current = asc.slice(-1);
+      const prior = compareKey === "yoy"
+        ? asc.filter(r => r.period === periodOf(subtractMonths(latestDate, 12)))
+        : asc.slice(-2, -1);
+      return { current, prior, label: monthLabel(latest.period), priorLabel: compareKey === "yoy" ? "Same month last year" : "Prior month" };
+    }
+    if (windowKey === "last3") {
+      const current = asc.slice(-3);
+      const prior = asc.slice(-6, -3);
+      return { current, prior, label:"Last 3 Months", priorLabel:"Prior 3 Months" };
+    }
+    if (windowKey === "last6") {
+      const current = asc.slice(-6);
+      const prior = asc.slice(-12, -6);
+      return { current, prior, label:"Last 6 Months", priorLabel:"Prior 6 Months" };
+    }
+    // all
+    return { current: asc, prior: [], label: `All (${n} months)`, priorLabel: "" };
+  };
+
+  const { current, prior, label: windowLabel, priorLabel } = selectWindows();
+
+  // ── Aggregations ─────────────────────────────────────────────────────────
+  const sumPl = (recs, key) => recs.reduce((s, r) => s + (r.pl?.[key] || 0), 0);
+  const avgMargin = (recs) => {
+    const valid = recs.filter(r => r.pl?.revenue);
+    if (!valid.length) return 0;
+    return valid.reduce((s, r) => s + ((r.pl.net_income || 0) / r.pl.revenue) * 100, 0) / valid.length;
+  };
+  const ebitda = (recs) => recs.reduce((s, r) => {
+    const pl = r.pl || {};
+    // Approximation: operating_income + depreciation/amortization from line items.
+    // Most CPA P&Ls separate these as line items under operating expenses.
+    const opInc = pl.operating_income || 0;
+    const depItems = (pl.line_items || []).filter(li => /deprec|amort/i.test(li.label || ""));
+    const depAmort = depItems.reduce((acc, li) => acc + Math.abs(li.amount || 0), 0);
+    return s + opInc + depAmort;
+  }, 0);
+  const grossMarginPct = (recs) => {
+    const rev = sumPl(recs, "revenue");
+    const cogs = sumPl(recs, "cost_of_goods_sold");
+    return rev > 0 ? ((rev - cogs) / rev) * 100 : 0;
+  };
+  const opMarginPct = (recs) => {
+    const rev = sumPl(recs, "revenue");
+    const opInc = sumPl(recs, "operating_income");
+    return rev > 0 ? (opInc / rev) * 100 : 0;
+  };
+
+  const cur = {
+    revenue: sumPl(current, "revenue"),
+    cogs: sumPl(current, "cost_of_goods_sold"),
+    grossProfit: sumPl(current, "gross_profit"),
+    opEx: sumPl(current, "operating_expenses"),
+    opInc: sumPl(current, "operating_income"),
+    netIncome: sumPl(current, "net_income"),
+    ebitda: ebitda(current),
+    grossMargin: grossMarginPct(current),
+    opMargin: opMarginPct(current),
+    netMargin: avgMargin(current),
+  };
+  const pre = {
+    revenue: sumPl(prior, "revenue"),
+    netIncome: sumPl(prior, "net_income"),
+    grossProfit: sumPl(prior, "gross_profit"),
+    opEx: sumPl(prior, "operating_expenses"),
+    opInc: sumPl(prior, "operating_income"),
+    ebitda: ebitda(prior),
+    grossMargin: grossMarginPct(prior),
+    opMargin: opMarginPct(prior),
+  };
+
+  const pctDelta = (curV, preV) => {
+    if (!prior.length || preV == null || preV === 0) return null;
+    const d = ((curV - preV) / Math.abs(preV)) * 100;
+    return (d >= 0 ? "+" : "") + d.toFixed(1) + "%";
+  };
+  const ppDelta = (curV, preV) => {
+    if (!prior.length || preV == null) return null;
+    const d = curV - preV;
+    return (d >= 0 ? "+" : "") + d.toFixed(1) + "pp";
+  };
+
+  // ── Sparkline data: last 12 months of asc (for KPI cards) ────────────────
+  const sparkSource = asc.slice(-12);
+  const sparkRev = sparkSource.map(r => r.pl?.revenue || 0);
+  const sparkNet = sparkSource.map(r => r.pl?.net_income || 0);
+  const sparkGM  = sparkSource.map(r => r.pl?.revenue ? ((r.pl.revenue - (r.pl.cost_of_goods_sold||0)) / r.pl.revenue) * 100 : 0);
+  const sparkOM  = sparkSource.map(r => r.pl?.revenue ? ((r.pl.operating_income||0) / r.pl.revenue) * 100 : 0);
+  const sparkEB  = sparkSource.map(r => {
+    const pl = r.pl || {};
+    const dep = (pl.line_items || []).filter(li => /deprec|amort/i.test(li.label||"")).reduce((s,li) => s + Math.abs(li.amount||0), 0);
+    return (pl.operating_income || 0) + dep;
+  });
+
+  // ── Trend chart data: last 24 months ─────────────────────────────────────
+  const trendSource = asc.slice(-24);
+  const trendData = trendSource.map(r => ({
     period: r.period,
     revenue: r.pl?.revenue || 0,
     expenses: (r.pl?.cost_of_goods_sold || 0) + (r.pl?.operating_expenses || 0),
     netIncome: r.pl?.net_income || 0,
   }));
 
-  // Aggregates
-  const ttmAsc = asc.slice(-12); // trailing 12 months
-  const ttmRevenue   = ttmAsc.reduce((s,r) => s + (r.pl?.revenue||0), 0);
-  const ttmNet       = ttmAsc.reduce((s,r) => s + (r.pl?.net_income||0), 0);
-  const ttmExpenses  = ttmAsc.reduce((s,r) => s + ((r.pl?.cost_of_goods_sold||0) + (r.pl?.operating_expenses||0)), 0);
-  const avgMargin    = ttmAsc.length ? (ttmAsc.reduce((s,r) => { const rev=r.pl?.revenue||0; return s + (rev>0?(r.pl?.net_income||0)/rev*100:0); }, 0) / ttmAsc.length) : 0;
+  // ── Auto-generated insights (Strengths / Flags) ──────────────────────────
+  const insights = generateInsights(asc, current, prior, cur, pre, prior.length > 0);
 
-  // MoM change
-  const momChange = (cur, prev) => {
-    if (!prev || prev === 0) return null;
-    const pct = ((cur - prev) / Math.abs(prev)) * 100;
-    return (pct >= 0 ? "+" : "") + pct.toFixed(1) + "% vs " + monthLabel(previous.period);
-  };
+  // ── Expense category analysis (top movers, latest month vs. prior) ───────
+  const expenseMovers = computeExpenseMovers(asc);
 
   return (
     <div>
-      {/* Latest month KPIs */}
-      <div style={{ marginBottom:20 }}>
-        <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase", marginBottom:8 }}>Latest — {monthLabel(latest.period)}</div>
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(170px, 1fr))", gap:12 }}>
-          <KPI label="Revenue"
-               value={fmtK(latest.pl?.revenue)}
-               color={T.brand}
-               trend={previous ? momChange(latest.pl?.revenue||0, previous.pl?.revenue||0) : null} />
-          <KPI label="Net Income"
-               value={fmtK(latest.pl?.net_income)}
-               color={(latest.pl?.net_income||0)>=0?T.green:T.red}
-               trend={previous ? momChange(latest.pl?.net_income||0, previous.pl?.net_income||0) : null} />
-          <KPI label="Net Margin"
-               value={fmtPct(latest.pl?.revenue ? (latest.pl.net_income/latest.pl.revenue)*100 : 0)}
-               color={(latest.pl?.net_income||0)>=0?T.green:T.red} />
-          <KPI label="Operating Income"
-               value={fmtK(latest.pl?.operating_income)}
-               color={(latest.pl?.operating_income||0)>=0?T.green:T.red} />
-          <KPI label="Total Assets"
-               value={fmtK(latest.balance_sheet?.total_assets)}
-               color={T.brand}
-               sub={latest.balance_sheet?.equity ? `Equity: ${fmtK(latest.balance_sheet.equity)}` : ""} />
-          <KPI label="Ending Cash"
-               value={fmtK(latest.cash_flow?.ending_cash)}
-               color={T.purple} />
+      {/* ── Period + Compare selectors ──────────────────────────────────── */}
+      <div style={{ display:"flex", gap:12, marginBottom:16, flexWrap:"wrap", alignItems:"center" }}>
+        <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase" }}>Period</div>
+        <SegmentedControl
+          options={[
+            { key:"ttm",   label:"TTM" },
+            { key:"ytd",   label:"YTD" },
+            { key:"last1", label:"Last Month" },
+            { key:"last3", label:"3 mo" },
+            { key:"last6", label:"6 mo" },
+            { key:"all",   label:"All" },
+          ]}
+          value={windowKey}
+          onChange={setWindowKey}
+        />
+        <div style={{ width:1, height:24, background:T.border, margin:"0 4px" }} />
+        <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase" }}>Compare vs</div>
+        <SegmentedControl
+          options={[
+            { key:"prior", label:"Prior period" },
+            { key:"yoy",   label:"Prior year" },
+          ]}
+          value={compareKey}
+          onChange={setCompareKey}
+        />
+      </div>
+
+      {/* ── Executive KPI strip ─────────────────────────────────────────── */}
+      <div style={{ marginBottom:24 }}>
+        <div style={{ display:"flex", alignItems:"baseline", justifyContent:"space-between", marginBottom:10 }}>
+          <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase", letterSpacing:"0.06em" }}>
+            Executive Summary — {windowLabel}
+          </div>
+          {priorLabel && <div style={{ fontSize:10, color:T.textDim }}>vs. {priorLabel}</div>}
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(200px, 1fr))", gap:12 }}>
+          <KPICard label="Revenue"
+                   value={fmtK(cur.revenue)}
+                   delta={pctDelta(cur.revenue, pre.revenue)}
+                   spark={sparkRev}
+                   sparkColor={T.brand} />
+          <KPICard label="Net Income"
+                   value={fmtK(cur.netIncome)}
+                   valueColor={cur.netIncome >= 0 ? T.green : T.red}
+                   delta={pctDelta(cur.netIncome, pre.netIncome)}
+                   spark={sparkNet}
+                   sparkColor={cur.netIncome >= 0 ? T.green : T.red} />
+          <KPICard label="Gross Margin"
+                   value={fmtPct(cur.grossMargin)}
+                   delta={ppDelta(cur.grossMargin, pre.grossMargin)}
+                   spark={sparkGM}
+                   sparkColor={T.purple} />
+          <KPICard label="Operating Margin"
+                   value={fmtPct(cur.opMargin)}
+                   delta={ppDelta(cur.opMargin, pre.opMargin)}
+                   spark={sparkOM}
+                   sparkColor={T.brand} />
+          <KPICard label="EBITDA"
+                   value={fmtK(cur.ebitda)}
+                   delta={pctDelta(cur.ebitda, pre.ebitda)}
+                   spark={sparkEB}
+                   sparkColor={cur.ebitda >= 0 ? T.green : T.red} />
         </div>
       </div>
 
-      {/* Trend chart */}
-      <div style={{ ...card, marginBottom:20 }}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:8 }}>
-          <div style={{ fontSize:13, fontWeight:700 }}>📈 Revenue · Expenses · Net Income — Monthly Trend</div>
-          <div style={{ fontSize:10, color:T.textDim }}>{asc.length} months</div>
+      {/* ── Revenue & profit trend chart ────────────────────────────────── */}
+      <div style={{ ...card, marginBottom:24 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:10 }}>
+          <div style={{ fontSize:13, fontWeight:700 }}>📈 Revenue · Expenses · Net Income</div>
+          <div style={{ fontSize:10, color:T.textDim }}>{trendData.length} months</div>
         </div>
-        <MiniLineChart data={trendData} height={220} />
+        <MiniLineChart data={trendData} height={240} />
       </div>
 
-      {/* TTM aggregates */}
-      <div style={{ marginBottom:20 }}>
-        <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, textTransform:"uppercase", marginBottom:8 }}>
-          {ttmAsc.length === 12 ? "Trailing 12 Months" : `Last ${ttmAsc.length} Month${ttmAsc.length===1?"":"s"}`}
-        </div>
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(170px, 1fr))", gap:12 }}>
-          <KPI label="Total Revenue"   value={fmtK(ttmRevenue)}  color={T.brand} />
-          <KPI label="Total Expenses"  value={fmtK(ttmExpenses)} color={T.red}   />
-          <KPI label="Total Net"       value={fmtK(ttmNet)}      color={ttmNet>=0?T.green:T.red} />
-          <KPI label="Avg Net Margin"  value={fmtPct(avgMargin)} color={avgMargin>=0?T.green:T.red} />
-        </div>
+      {/* ── Insights panel ──────────────────────────────────────────────── */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(280px, 1fr))", gap:12, marginBottom:24 }}>
+        <InsightCard title="🟢 Strengths" items={insights.strengths} emptyText="No notable strengths to flag." color={T.green} bg={T.greenBg} />
+        <InsightCard title="⚠️ Flags"     items={insights.flags}     emptyText="No flags — financials look clean." color={T.yellowText} bg={T.yellowBg} />
       </div>
 
-      {/* Period table at bottom */}
+      {/* ── Expense category movers ─────────────────────────────────────── */}
+      {expenseMovers.length > 0 && (
+        <div style={{ ...card, marginBottom:24 }}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:4 }}>💸 Expense Movers — {monthLabel(latest.period)} vs. Prior Month</div>
+          <div style={{ fontSize:10, color:T.textDim, marginBottom:12 }}>Largest changes by category (categories appearing in both months only)</div>
+          <ExpenseMoversTable rows={expenseMovers} />
+        </div>
+      )}
+
+      {/* ── Full period index ───────────────────────────────────────────── */}
       <div style={{ ...card, padding:0, overflow:"auto" }}>
-        <div style={{ padding:"12px 16px", fontSize:12, fontWeight:700, borderBottom:`1px solid ${T.border}` }}>📋 All Periods</div>
+        <div style={{ padding:"12px 16px", fontSize:13, fontWeight:700, borderBottom:`1px solid ${T.border}` }}>
+          📋 All Periods <span style={{ fontSize:10, fontWeight:500, color:T.textDim, marginLeft:6 }}>{asc.length} extracted</span>
+        </div>
         <table style={{ width:"100%", borderCollapse:"collapse" }}>
           <thead>
             <tr>
               <th style={tblH}>Period</th>
               <th style={{ ...tblH, textAlign:"right" }}>Revenue</th>
               <th style={{ ...tblH, textAlign:"right" }}>Expenses</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Net</th>
-              <th style={{ ...tblH, textAlign:"right" }}>Margin</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Net Income</th>
+              <th style={{ ...tblH, textAlign:"right" }}>Net Margin</th>
               <th style={{ ...tblH, textAlign:"right" }}>Cash</th>
               <th style={tblH}></th>
             </tr>
@@ -608,7 +793,7 @@ function Dashboard({ records, onSelect }) {
               const exp = (pl.cost_of_goods_sold||0) + (pl.operating_expenses||0);
               const margin = pl.revenue ? (pl.net_income/pl.revenue)*100 : 0;
               return (
-                <tr key={r.id} style={{ cursor:"pointer" }} onClick={() => onSelect(r)}>
+                <tr key={r.id || r.period} style={{ cursor:"pointer" }} onClick={() => onSelect(r)}>
                   <td style={{ ...tblD, fontWeight:600 }}>{monthLabel(r.period)}</td>
                   <td style={tblDR}>{fmt(pl.revenue)}</td>
                   <td style={{ ...tblDR, color:T.red }}>{fmt(exp)}</td>
@@ -624,6 +809,210 @@ function Dashboard({ records, onSelect }) {
       </div>
     </div>
   );
+}
+
+// ─── Dashboard support components ────────────────────────────────────────────
+
+function SegmentedControl({ options, value, onChange }) {
+  return (
+    <div style={{ display:"inline-flex", background:T.bgSurface, border:`1px solid ${T.border}`, borderRadius:8, padding:2, gap:2 }}>
+      {options.map(o => (
+        <button key={o.key} onClick={() => onChange(o.key)}
+                style={{
+                  padding:"5px 10px", fontSize:11, fontWeight:600,
+                  border:"none", borderRadius:6, cursor:"pointer",
+                  background: value === o.key ? T.bgWhite : "transparent",
+                  color: value === o.key ? T.text : T.textMuted,
+                  boxShadow: value === o.key ? T.shadow : "none",
+                }}>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function KPICard({ label, value, valueColor, delta, spark, sparkColor }) {
+  const deltaColor = !delta ? T.textMuted
+                   : delta.startsWith("+") ? T.green
+                   : delta.startsWith("-") ? T.red
+                   : T.textMuted;
+  return (
+    <div style={{ ...card, padding:"14px 16px", display:"flex", flexDirection:"column", gap:6 }}>
+      <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.05em" }}>{label}</div>
+      <div style={{ fontSize:24, fontWeight:800, color: valueColor || T.text, fontVariantNumeric:"tabular-nums" }}>{value}</div>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:8 }}>
+        <div style={{ fontSize:11, fontWeight:600, color: deltaColor }}>
+          {delta || <span style={{ color:T.textDim, fontWeight:400 }}>—</span>}
+        </div>
+        {spark && spark.length > 1 && <Sparkline values={spark} color={sparkColor || T.brand} width={70} height={22} />}
+      </div>
+    </div>
+  );
+}
+
+function Sparkline({ values, color = "#1e5b92", width = 80, height = 24 }) {
+  if (!values || values.length < 2) return null;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const points = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * width;
+    const y = height - ((v - min) / range) * height;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return (
+    <svg width={width} height={height} style={{ display:"block" }}>
+      <polyline fill="none" stroke={color} strokeWidth={1.5} points={points} />
+      <circle cx={width} cy={height - ((values[values.length-1] - min) / range) * height} r={2} fill={color} />
+    </svg>
+  );
+}
+
+function InsightCard({ title, items, emptyText, color, bg }) {
+  return (
+    <div style={{ ...card, background: bg || T.bgCard, borderColor: color, padding:"14px 16px" }}>
+      <div style={{ fontSize:13, fontWeight:700, color: color, marginBottom:8 }}>{title}</div>
+      {items.length === 0 ? (
+        <div style={{ fontSize:11, color:T.textMuted }}>{emptyText}</div>
+      ) : (
+        <ul style={{ margin:0, padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:6 }}>
+          {items.map((s, i) => (
+            <li key={i} style={{ fontSize:12, color:T.text, lineHeight:1.4, paddingLeft:14, position:"relative" }}>
+              <span style={{ position:"absolute", left:0, color:color }}>•</span>
+              {s}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ExpenseMoversTable({ rows }) {
+  return (
+    <table style={{ width:"100%", borderCollapse:"collapse" }}>
+      <thead>
+        <tr>
+          <th style={tblH}>Category</th>
+          <th style={{ ...tblH, textAlign:"right" }}>Latest</th>
+          <th style={{ ...tblH, textAlign:"right" }}>Prior</th>
+          <th style={{ ...tblH, textAlign:"right" }}>Δ $</th>
+          <th style={{ ...tblH, textAlign:"right" }}>Δ %</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r, i) => (
+          <tr key={i}>
+            <td style={{ ...tblD, fontWeight:600 }}>{r.label}</td>
+            <td style={tblDR}>{fmt(r.latest)}</td>
+            <td style={{ ...tblDR, color:T.textMuted }}>{fmt(r.prior)}</td>
+            <td style={{ ...tblDR, color: r.deltaAbs >= 0 ? T.red : T.green, fontWeight:700 }}>
+              {(r.deltaAbs >= 0 ? "+" : "") + fmt(r.deltaAbs)}
+            </td>
+            <td style={{ ...tblDR, color: r.deltaPct >= 0 ? T.red : T.green }}>
+              {r.deltaPct === Infinity ? "(new)" : (r.deltaPct >= 0 ? "+" : "") + r.deltaPct.toFixed(1) + "%"}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+// ─── Insight generator ───────────────────────────────────────────────────────
+
+function generateInsights(asc, current, prior, cur, pre, hasPrior) {
+  const strengths = [];
+  const flags = [];
+
+  if (hasPrior && pre.revenue > 0) {
+    const revGrowth = ((cur.revenue - pre.revenue) / pre.revenue) * 100;
+    if (revGrowth >= 10) strengths.push(`Revenue up ${revGrowth.toFixed(1)}% vs. prior period`);
+    else if (revGrowth <= -10) flags.push(`Revenue down ${Math.abs(revGrowth).toFixed(1)}% vs. prior period`);
+  }
+
+  if (hasPrior && pre.netIncome != null) {
+    if (cur.netIncome > 0 && pre.netIncome <= 0) strengths.push("Returned to profitability this period");
+    else if (cur.netIncome <= 0 && pre.netIncome > 0) flags.push("Net loss this period after profit in prior period");
+  }
+
+  // OpEx growing faster than revenue
+  if (hasPrior && pre.revenue > 0 && pre.opEx > 0) {
+    const revG = ((cur.revenue - pre.revenue) / pre.revenue) * 100;
+    const opG  = ((cur.opEx    - pre.opEx)    / pre.opEx)    * 100;
+    if (opG > revG + 5 && opG > 0) flags.push(`Operating expenses growing ${opG.toFixed(1)}% — faster than revenue (${revG.toFixed(1)}%)`);
+  }
+
+  // Margin compression
+  if (hasPrior && pre.grossMargin > 0) {
+    const marginDrop = pre.grossMargin - cur.grossMargin;
+    if (marginDrop >= 3) flags.push(`Gross margin compressed ${marginDrop.toFixed(1)}pp (${pre.grossMargin.toFixed(1)}% → ${cur.grossMargin.toFixed(1)}%)`);
+    else if (marginDrop <= -3) strengths.push(`Gross margin improved ${Math.abs(marginDrop).toFixed(1)}pp (${pre.grossMargin.toFixed(1)}% → ${cur.grossMargin.toFixed(1)}%)`);
+  }
+
+  // Cash trend (if balance sheet present)
+  const latestCash = current[current.length-1]?.cash_flow?.ending_cash;
+  const earliestCash = current[0]?.cash_flow?.ending_cash;
+  if (latestCash != null && earliestCash != null && current.length >= 3) {
+    const cashDelta = latestCash - earliestCash;
+    if (cashDelta < -0.05 * Math.abs(earliestCash) && Math.abs(cashDelta) > 5000) {
+      flags.push(`Cash balance down ${fmtK(Math.abs(cashDelta))} since start of window`);
+    } else if (cashDelta > 0.10 * Math.abs(earliestCash) && cashDelta > 5000) {
+      strengths.push(`Cash position improved by ${fmtK(cashDelta)} over window`);
+    }
+  }
+
+  // Consecutive losing months
+  let losingStreak = 0;
+  for (let i = asc.length - 1; i >= 0; i--) {
+    if ((asc[i].pl?.net_income || 0) < 0) losingStreak++;
+    else break;
+  }
+  if (losingStreak >= 3) flags.push(`Net loss for ${losingStreak} consecutive months`);
+
+  // Best month in window
+  const bestNet = current.reduce((b, r) => (r.pl?.net_income || -Infinity) > (b.pl?.net_income || -Infinity) ? r : b, current[0]);
+  if (bestNet?.pl?.net_income > 0) {
+    strengths.push(`Best month: ${monthLabel(bestNet.period)} — ${fmtK(bestNet.pl.net_income)} net income`);
+  }
+
+  return { strengths, flags };
+}
+
+// Top expense category movers — latest vs. prior month, line-item level
+function computeExpenseMovers(asc) {
+  if (asc.length < 2) return [];
+  const latest = asc[asc.length - 1];
+  const prior  = asc[asc.length - 2];
+  const latestItems = (latest.pl?.line_items || []).filter(li =>
+    li.section === "operating_expense" || li.section === "cogs" || /expense|cost/i.test(li.label || ""));
+  const priorItems = (prior.pl?.line_items || []).filter(li =>
+    li.section === "operating_expense" || li.section === "cogs" || /expense|cost/i.test(li.label || ""));
+  const map = {};
+  for (const li of latestItems) {
+    const key = (li.label || "").trim().toLowerCase();
+    if (!key) continue;
+    map[key] = { label: li.label, latest: Math.abs(li.amount || 0), prior: 0 };
+  }
+  for (const li of priorItems) {
+    const key = (li.label || "").trim().toLowerCase();
+    if (!key) continue;
+    if (map[key]) map[key].prior = Math.abs(li.amount || 0);
+    else map[key] = { label: li.label, latest: 0, prior: Math.abs(li.amount || 0) };
+  }
+  const rows = Object.values(map).map(r => ({
+    label: r.label,
+    latest: r.latest,
+    prior: r.prior,
+    deltaAbs: r.latest - r.prior,
+    deltaPct: r.prior > 0 ? ((r.latest - r.prior) / r.prior) * 100 : (r.latest > 0 ? Infinity : 0),
+  }));
+  // Show only categories present in both periods, sort by absolute $ change desc, top 8
+  return rows
+    .filter(r => r.latest > 0 && r.prior > 0)
+    .sort((a, b) => Math.abs(b.deltaAbs) - Math.abs(a.deltaAbs))
+    .slice(0, 8);
 }
 
 // ─── AI Chat view ─────────────────────────────────────────────────────────────
