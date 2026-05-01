@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.48.5";
+const APP_VERSION = "2.49.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2107,7 +2107,7 @@ function GmailSync({ onRefresh }) {
       const pages = [];
       for (let p = 1; p <= numPages; p++) {
         const page = await pdf.getPage(p);
-        const viewport = page.getViewport({ scale: 1.2 }); // v2.48.5: down from 1.8 — vision call was exceeding Netlify's 26s wall
+        const viewport = page.getViewport({ scale: 1.6 }); // v2.49.0: 1.6 with background-worker (no 26s pressure); compromise between 1.2 (legibility risk) and 1.8 (slow)
         const canvas = document.createElement("canvas");
         canvas.width = viewport.width;
         canvas.height = viewport.height;
@@ -2160,18 +2160,16 @@ Rules:
         type: "image",
         source: { type: "base64", media_type: "image/png", data: b64 },
       }));
-      // v2.48.2: surface the actual failure mode. Three things can fail here:
-      //  (1) Anthropic returns non-2xx (rate limit, oversized payload, model error)
-      //  (2) Anthropic returns 200 but text isn\'t parseable JSON
-      //  (3) The response shape is unexpected (no content array)
-      // Each gets a distinct error message so the per-row "✗ <error>" is
-      // actionable instead of a generic "Scan failed (500)".
-      // v2.48.4: server-side function now has a 26s wall (Config timeout: 26)
-      // which lets the median-case PDF complete; this client block is the
-      // original v2.48.2 synchronous fetch — no dispatcher/poll layer needed.
+      // v2.49.0: scan-financials is now a dispatcher+background-worker pair.
+      // Synchronous Netlify functions max out at 26s but vision routinely
+      // takes 30-60s on multi-page CPA PDFs. Background functions get a
+      // 15-min wall, fully covering the worst case.
+      //
+      // Flow: POST messages → get jobId → poll status until terminal →
+      //       decode response_b64 → parse JSON.
       const totalB64Bytes = pages.reduce((acc, p) => acc + p.length, 0);
       console.log(`[scan-financials] ${pages.length} page(s), ~${(totalB64Bytes/1024/1024).toFixed(1)}MB base64 payload`);
-      const sfResp = await fetch("/.netlify/functions/marginiq-scan-financials", {
+      const dispatchResp = await fetch("/.netlify/functions/marginiq-scan-financials", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2179,26 +2177,68 @@ Rules:
           messages: [{ role: "user", content: [...imageBlocks, { type: "text", text: EXTRACTION_PROMPT }] }],
         }),
       });
-      const sfBody = await sfResp.text();
-      if (!sfResp.ok) {
-        let errMsg = `Vision API ${sfResp.status}`;
+      const dispatchBody = await dispatchResp.text();
+      if (!dispatchResp.ok) {
+        let errMsg = `Dispatch ${dispatchResp.status}`;
         try {
-          const j = JSON.parse(sfBody);
-          if (j.error?.message) errMsg += `: ${j.error.message}`;
-          else if (j.error) errMsg += `: ${typeof j.error === "string" ? j.error : JSON.stringify(j.error).slice(0,200)}`;
-          else errMsg += `: ${sfBody.slice(0,200)}`;
-        } catch { errMsg += `: ${sfBody.slice(0,200)}`; }
-        console.error("[scan-financials] failed:", errMsg, sfBody);
+          const j = JSON.parse(dispatchBody);
+          if (j.error) errMsg += `: ${typeof j.error === "string" ? j.error : JSON.stringify(j.error).slice(0,200)}`;
+        } catch { errMsg += `: ${dispatchBody.slice(0,200)}`; }
         throw new Error(errMsg);
       }
+      let dispatchJson;
+      try { dispatchJson = JSON.parse(dispatchBody); }
+      catch (e) { throw new Error(`Dispatch returned non-JSON: ${dispatchBody.slice(0,200)}`); }
+      const jobId = dispatchJson.job_id;
+      if (!jobId) throw new Error(`Dispatch missing job_id: ${dispatchBody.slice(0,200)}`);
+
+      setImportStatus(`Scanning ${attachment.filename} (job ${jobId.slice(5,21)})...`);
+      // Poll scan_jobs/{jobId} until terminal. Background worker has 15min
+      // wall; we cap our wait at 5min (financial PDFs typically extract in
+      // 20-60s, anything past 5min indicates a stuck job).
+      const POLL_INTERVAL_MS = 2500;
+      const MAX_POLL_MS = 5 * 60 * 1000;
+      const startedAt = Date.now();
+      let job = null;
+      while (Date.now() - startedAt < MAX_POLL_MS) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        const pollResp = await fetch(`/.netlify/functions/marginiq-scan-financials?action=status&job_id=${encodeURIComponent(jobId)}`);
+        if (!pollResp.ok) {
+          // 404 right after dispatch can be Firestore eventual-consistency;
+          // tolerate the first 10s then bail.
+          if (pollResp.status === 404 && Date.now() - startedAt > 10000) {
+            throw new Error(`Scan job ${jobId} disappeared (404 after 10s)`);
+          }
+          continue;
+        }
+        const pollJson = await pollResp.json();
+        if (pollJson.state === "complete" || pollJson.state === "failed") {
+          job = pollJson;
+          break;
+        }
+      }
+      if (!job) throw new Error(`Scan timed out after ${MAX_POLL_MS / 1000}s (job ${jobId})`);
+      if (job.state === "failed") {
+        // Tag rate-limit failures distinctly so Re-import All can pause+retry
+        // instead of giving up on this file. usage_exceeded is Anthropic's
+        // monthly cap; 429 is short-window throttling; 503 is general overload.
+        const err = job.error || "Unknown scan failure";
+        if (err.includes("usage_exceeded") || err.includes("rate_limit") || err.includes("rate limit") || job.http_status === 429 || job.http_status === 503) {
+          throw new Error(`RATE_LIMITED: ${err}`);
+        }
+        throw new Error(err);
+      }
+      // state === "complete" — decode response_b64 → Anthropic JSON → extracted
+      if (!job.response_b64) throw new Error("Job complete but no response_b64 in scan_jobs doc");
+      const respText = atob(job.response_b64);
       let sfData;
-      try { sfData = JSON.parse(sfBody); }
-      catch (e) { throw new Error(`Vision API returned non-JSON: ${sfBody.slice(0,200)}`); }
+      try { sfData = JSON.parse(respText); }
+      catch (e) { throw new Error(`Vision response was not JSON: ${respText.slice(0,200)}`); }
       if (!sfData.content || !Array.isArray(sfData.content)) {
-        throw new Error(`Vision API response missing content array: ${JSON.stringify(sfData).slice(0,200)}`);
+        throw new Error(`Vision response missing content array: ${JSON.stringify(sfData).slice(0,200)}`);
       }
       const text = sfData.content.map(b => b.text || "").join("").trim();
-      if (!text) throw new Error(`Vision API returned empty text. stop_reason=${sfData.stop_reason || "unknown"}`);
+      if (!text) throw new Error(`Vision returned empty text. stop_reason=${sfData.stop_reason || "unknown"}`);
       let extracted;
       try {
         extracted = JSON.parse(text.replace(/```json|```/g, "").trim());
@@ -2673,6 +2713,14 @@ Rules:
                                   return acc + (em.attachments || []).filter(a => alreadyImportedFilenames.has(dedupKey(a.filename))).length;
                                 }, 0);
                                 setImportStatus(`Re-importing ${total} duplicate${total>1?"s":""}...`);
+                                // v2.49.0: vision-call vendors (ampcpas, quickfuel) require sequential
+                                // processing with cooldowns. The Anthropic API has aggressive rate limits
+                                // and a usage cap; parallel scans hit 'usage_exceeded' (HTTP 503) within
+                                // seconds. CSV-parser vendors (uline, nuvizz, ddis) don't need throttling.
+                                const isVisionVendor = v.mode === "audited-financials" || v.mode === "quickfuel";
+                                const COOLDOWN_MS = isVisionVendor ? 2000 : 0;
+                                const RATE_LIMIT_PAUSE_MS = 30000;
+                                const MAX_RETRIES = 2;
                                 for (const em of displayList) {
                                   for (const a of (em.attachments || [])) {
                                     const dk = dedupKey(a.filename);
@@ -2685,15 +2733,31 @@ Rules:
                                     if (v.key === "ampcpas" && !lcName.includes("financial")) continue;
                                     done++;
                                     setImportStatus(`Re-importing [${done}/${total}] ${a.filename}...`);
-                                    try {
-                                      const isQuickFuelPdf = v.mode === "quickfuel" && lcName.endsWith(".pdf");
-                                      const isAuditedPdf = v.mode === "audited-financials" && lcName.endsWith(".pdf");
-                                      if (isAuditedPdf) await importAuditedFinancial(em, a);
-                                      else if (isQuickFuelPdf) await importQuickFuel(em, a);
-                                      else await importAttachment(em, a);
-                                    } catch(err) {
-                                      console.error("Re-import failed:", a.filename, err);
-                                      failed++;
+                                    let attempt = 0;
+                                    while (attempt < MAX_RETRIES) {
+                                      attempt++;
+                                      try {
+                                        const isQuickFuelPdf = v.mode === "quickfuel" && lcName.endsWith(".pdf");
+                                        const isAuditedPdf = v.mode === "audited-financials" && lcName.endsWith(".pdf");
+                                        if (isAuditedPdf) await importAuditedFinancial(em, a);
+                                        else if (isQuickFuelPdf) await importQuickFuel(em, a);
+                                        else await importAttachment(em, a);
+                                        break; // success
+                                      } catch(err) {
+                                        const msg = String(err?.message || err);
+                                        if (msg.startsWith("RATE_LIMITED") && attempt < MAX_RETRIES) {
+                                          setImportStatus(`⏸ Rate limited — pausing ${RATE_LIMIT_PAUSE_MS/1000}s before retrying ${a.filename}...`);
+                                          await new Promise(r => setTimeout(r, RATE_LIMIT_PAUSE_MS));
+                                          continue;
+                                        }
+                                        console.error("Re-import failed:", a.filename, err);
+                                        failed++;
+                                        break;
+                                      }
+                                    }
+                                    // Cooldown between scans (vision vendors only)
+                                    if (COOLDOWN_MS && done < total) {
+                                      await new Promise(r => setTimeout(r, COOLDOWN_MS));
                                     }
                                   }
                                 }
