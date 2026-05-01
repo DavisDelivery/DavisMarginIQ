@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.50.2";
+const APP_VERSION = "2.50.3";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -5414,21 +5414,89 @@ function AuditedKpiStrip({ setTab }) {
     (async () => {
       if (!hasFirebase) { setLoading(false); return; }
       try {
-        const s = await window.db.collection("audited_financials").limit(60).get();
-        const records = s.docs.map(d => ({ id: d.id, period: d.id, ...d.data() }))
-          .filter(r => r.pl)
-          .sort((a,b) => (b.period||"").localeCompare(a.period||""));
+        // v2.50.x: read from audited_financials_v2 (correct column extraction).
+        // The v1 audited_financials collection was extracted with a prompt
+        // that didn't disambiguate Month vs YTD columns and produced a 7x
+        // overstated TTM revenue. v2 records have explicit pl_totals with
+        // .month / .ytd / .prior_month / .prior_ytd sub-fields.
+        const s = await window.db.collection("audited_financials_v2").limit(60).get();
+        const records = s.docs
+          .map(d => ({ id: d.id, period: d.id, ...d.data() }))
+          .filter(r => r.pl_totals)
+          .sort((a,b) => (b.period||"").localeCompare(a.period||"")); // newest first
         if (records.length === 0) { setData({ empty: true }); setLoading(false); return; }
+
         const latest = records[0];
         const previous = records[1] || null;
-        const ttm = records.slice(0, 12);
-        const ttmRev = ttm.reduce((s,r) => s + (r.pl?.revenue||0), 0);
-        const ttmNet = ttm.reduce((s,r) => s + (r.pl?.net_income||0), 0);
+
+        // Helper: reach into pl_totals.<key>.<col> defensively.
+        const getTotal = (rec, key, col) => {
+          const v = rec?.pl_totals?.[key]?.[col];
+          return typeof v === "number" ? v : 0;
+        };
+
+        // TTM math:
+        //
+        //   Each record has YTD as of its period end.
+        //   - If latest is a December record, TTM = latest.ytd directly.
+        //   - Otherwise: rolling 12 months ending at latest =
+        //         latest.ytd                                  (Jan..latest)
+        //       + (priorYearAnnual.ytd - priorYearSameMonth.ytd) (rest of prior year)
+        //
+        //   Where priorYearAnnual = the December record one year prior, and
+        //   priorYearSameMonth = the same-month record one year prior.
+        //
+        //   If the prior-year records aren't extracted yet we fall back to
+        //   showing latest.ytd labeled YTD (not TTM). Better honest YTD than
+        //   a misleading partial TTM.
+        const [latestYear, latestMonth] = (latest.period||"").split("-");
+        const isDecember = latestMonth === "12";
+
+        let ttmRev = 0, ttmNet = 0, ttmLabel = "TTM Revenue", ttmSubLabel = "rolling 12 months";
+        if (isDecember) {
+          ttmRev = getTotal(latest, "total_revenue", "ytd");
+          ttmNet = getTotal(latest, "net_income", "ytd");
+          ttmSubLabel = `FY${latestYear} (Jan-Dec)`;
+        } else {
+          const priorYear = String(parseInt(latestYear, 10) - 1);
+          const priorDecPeriod = `${priorYear}-12`;
+          const priorSamePeriod = `${priorYear}-${latestMonth}`;
+          const priorDec = records.find(r => r.period === priorDecPeriod);
+          const priorSame = records.find(r => r.period === priorSamePeriod);
+
+          if (priorDec && priorSame) {
+            const latestYtdRev = getTotal(latest, "total_revenue", "ytd");
+            const priorAnnualRev = getTotal(priorDec, "total_revenue", "ytd");
+            const priorSameYtdRev = getTotal(priorSame, "total_revenue", "ytd");
+            ttmRev = latestYtdRev + (priorAnnualRev - priorSameYtdRev);
+
+            const latestYtdNet = getTotal(latest, "net_income", "ytd");
+            const priorAnnualNet = getTotal(priorDec, "net_income", "ytd");
+            const priorSameYtdNet = getTotal(priorSame, "net_income", "ytd");
+            ttmNet = latestYtdNet + (priorAnnualNet - priorSameYtdNet);
+          } else {
+            // Fall back to YTD (not full TTM) and label it honestly.
+            ttmRev = getTotal(latest, "total_revenue", "ytd");
+            ttmNet = getTotal(latest, "net_income", "ytd");
+            ttmLabel = "YTD Revenue";
+            ttmSubLabel = `${latestYear} year-to-date`;
+          }
+        }
+
         const ttmMargin = ttmRev > 0 ? (ttmNet/ttmRev) * 100 : 0;
-        const latestNet = latest.pl?.net_income || 0;
-        const previousNet = previous?.pl?.net_income || 0;
-        const momChange = previous && previousNet !== 0 ? ((latestNet - previousNet) / Math.abs(previousNet)) * 100 : null;
-        setData({ records, latest, previous, ttm, ttmRev, ttmNet, ttmMargin, latestNet, previousNet, momChange });
+
+        // Latest-month KPI: use the .month column, not YTD.
+        const latestNet = getTotal(latest, "net_income", "month");
+        const previousNet = previous ? getTotal(previous, "net_income", "month") : 0;
+        const momChange = previous && previousNet !== 0 ?
+          ((latestNet - previousNet) / Math.abs(previousNet)) * 100 : null;
+
+        setData({
+          records, latest, previous,
+          ttmRev, ttmNet, ttmMargin,
+          latestNet, previousNet, momChange,
+          ttmLabel, ttmSubLabel,
+        });
       } catch (e) { console.error("AuditedKpiStrip load err:", e); }
       setLoading(false);
     })();
@@ -5469,14 +5537,14 @@ function AuditedKpiStrip({ setTab }) {
             📋 Financials
             <span style={{fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:10, background:T.green, color:"#fff"}}>AUDITED</span>
           </div>
-          <div style={{fontSize:10, color:T.textMuted, marginTop:2}}>TTM ({data.ttm.length} months) · latest: {latestLabel}</div>
+          <div style={{fontSize:10, color:T.textMuted, marginTop:2}}>{data.ttmSubLabel} · latest: {latestLabel}</div>
         </div>
         <button onClick={() => setTab("audited")} style={{padding:"6px 12px", borderRadius:8, border:`1px solid ${T.border}`, background:"transparent", color:T.text, fontSize:11, fontWeight:600, cursor:"pointer"}}>Details →</button>
       </div>
       <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10}}>
-        <KPI label="TTM Revenue"    value={fmtK(data.ttmRev)} sub={`${data.records.length} mo audited`} subColor={T.brand} />
-        <KPI label="TTM Net Income" value={fmtK(data.ttmNet)} subColor={data.ttmNet>=0?T.green:T.red} />
-        <KPI label="TTM Margin"     value={fmtPct(data.ttmMargin)} sub="net income / revenue" subColor={marginColor} />
+        <KPI label={data.ttmLabel}     value={fmtK(data.ttmRev)} sub={`${data.records.length} mo audited`} subColor={T.brand} />
+        <KPI label="Net Income"        value={fmtK(data.ttmNet)} sub={data.ttmSubLabel} subColor={data.ttmNet>=0?T.green:T.red} />
+        <KPI label="Margin"            value={fmtPct(data.ttmMargin)} sub="net income / revenue" subColor={marginColor} />
         <KPI label={`${latestLabel} Net`} value={fmtK(data.latestNet)} sub={data.momChange != null ? `${momSign}${fmtPct(data.momChange)} MoM` : "—"} subColor={momColor} />
       </div>
     </div>
