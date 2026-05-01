@@ -398,110 +398,650 @@ const KPI = ({ label, value, sub, color, bg, trend }) => (
   </div>
 );
 
-// ─── PL / BS / CF detail cards (from v1) ──────────────────────────────────────
-function PLCard({ pl }) {
+// ─── PL detail card: every line item, grouped by section ─────────────────────
+function PLCard({ pl, raw }) {
   if (!pl) return <div style={{ color:T.textMuted, fontSize:12 }}>No P&L data</div>;
-  const margin = pl.revenue > 0 ? (pl.net_income / pl.revenue) * 100 : 0;
-  const rows = [
-    { label:"Revenue",            val:pl.revenue,            color:T.brand, bold:true },
-    { label:"Cost of Goods Sold", val:-Math.abs(pl.cost_of_goods_sold||0), color:T.red },
-    { label:"Gross Profit",       val:pl.gross_profit,       color:pl.gross_profit>=0?T.green:T.red, bold:true, border:true },
-    { label:"Operating Expenses", val:-Math.abs(pl.operating_expenses||0), color:T.red },
-    { label:"Operating Income",   val:pl.operating_income,   color:pl.operating_income>=0?T.green:T.red, bold:true, border:true },
-    { label:"Other Income",       val:pl.other_income||0,    color:T.textMuted },
-    { label:"Other Expenses",     val:-Math.abs(pl.other_expenses||0), color:T.textMuted },
-    { label:"Net Income",         val:pl.net_income,         color:pl.net_income>=0?T.green:T.red, bold:true, border:true },
+
+  // raw is the original v2 record (passed through DetailModal). Pull the full
+  // line-item array. Each line is { label, section, month, ytd, ... }.
+  const lineItems = raw?.pl_line_items || raw?.pl_line_items_v2 || [];
+  const totals    = raw?.pl_totals || {};
+
+  const monthTotal = (key, fallback) => {
+    const v = totals?.[key]?.month;
+    return typeof v === "number" ? v : (fallback ?? 0);
+  };
+  const ytdTotal = (key, fallback) => {
+    const v = totals?.[key]?.ytd;
+    return typeof v === "number" ? v : (fallback ?? 0);
+  };
+
+  const revMo  = monthTotal("total_revenue", pl.revenue);
+  const revYtd = ytdTotal("total_revenue",   pl.revenue);
+  const niMo   = monthTotal("net_income",    pl.net_income);
+  const niYtd  = ytdTotal("net_income",      pl.net_income);
+  const moMargin  = revMo  > 0 ? (niMo  / revMo)  * 100 : 0;
+  const ytdMargin = revYtd > 0 ? (niYtd / revYtd) * 100 : 0;
+
+  // Group line items by section, preserving the order they appear in the PDF.
+  const sections = [
+    { key: "revenue",            label: "Revenue",            color: T.brand,   denom: revMo,  denomYtd: revYtd },
+    { key: "cost_of_sales",      label: "Cost of Sales",      color: T.red,     denom: revMo,  denomYtd: revYtd },
+    { key: "operating_expense",  label: "Operating Expenses", color: T.red,     denom: revMo,  denomYtd: revYtd },
+    { key: "other_income",       label: "Other Income",       color: T.green,   denom: revMo,  denomYtd: revYtd },
+    { key: "other_expense",      label: "Other Expense",      color: T.red,     denom: revMo,  denomYtd: revYtd },
   ];
+
+  const subtotalRows = [
+    { label: "Total Revenue",             monthKey: "total_revenue",            ytdKey: "total_revenue",            color: T.brand },
+    { label: "Total Cost of Sales",       monthKey: "total_cost_of_sales",      ytdKey: "total_cost_of_sales",      color: T.red },
+    { label: "Gross Profit",              monthKey: "gross_profit",             ytdKey: "gross_profit",             color: T.green, emphasis: true },
+    { label: "Total Operating Expenses",  monthKey: "total_operating_expenses", ytdKey: "total_operating_expenses", color: T.red },
+    { label: "Operating Income",          monthKey: "operating_income",         ytdKey: "operating_income",         color: T.green, emphasis: true },
+    { label: "Total Other Income",        monthKey: "total_other_income",       ytdKey: "total_other_income",       color: T.textMuted },
+    { label: "Total Other Expense",       monthKey: "total_other_expense",      ytdKey: "total_other_expense",      color: T.textMuted },
+    { label: "Net Income",                monthKey: "net_income",               ytdKey: "net_income",               color: T.brand,  emphasis: true, bigBorder: true },
+  ];
+
+  const pctOf = (v, denom) => denom > 0 ? (v / denom) * 100 : null;
+  const fmtPctSmall = (v) => v == null ? "—" : (v >= 0 ? "" : "") + v.toFixed(1) + "%";
+
+  // Render a single line-item row with month / YTD / % of revenue columns.
+  const Row = ({ label, monthVal, ytdVal, indent, color, bold, border, denom, denomYtd, ytdOnly }) => (
+    <div style={{
+      display:"grid",
+      gridTemplateColumns:"minmax(0,1fr) 110px 70px 110px 70px",
+      gap: 12,
+      padding:"6px 14px",
+      paddingLeft: 14 + (indent ? 16 : 0),
+      borderBottom: border === "big" ? `2px solid ${T.border}` : `1px solid ${T.borderLight}`,
+      fontWeight: bold ? 700 : 400,
+      background: bold ? T.bgSurface : "transparent",
+      fontSize: 12,
+    }}>
+      <span style={{ color: T.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={label}>{label}</span>
+      <span style={{ color, fontVariantNumeric:"tabular-nums", textAlign:"right" }}>
+        {ytdOnly ? "—" : fmt(monthVal)}
+      </span>
+      <span style={{ color: T.textMuted, fontVariantNumeric:"tabular-nums", textAlign:"right", fontSize: 11 }}>
+        {ytdOnly || denom == null ? "" : fmtPctSmall(pctOf(monthVal, denom))}
+      </span>
+      <span style={{ color, fontVariantNumeric:"tabular-nums", textAlign:"right" }}>{fmt(ytdVal)}</span>
+      <span style={{ color: T.textMuted, fontVariantNumeric:"tabular-nums", textAlign:"right", fontSize: 11 }}>
+        {denomYtd == null ? "" : fmtPctSmall(pctOf(ytdVal, denomYtd))}
+      </span>
+    </div>
+  );
+
   return (
     <div>
+      {/* Top KPI cards */}
       <div style={{ display:"flex", gap:12, marginBottom:12, flexWrap:"wrap" }}>
         <div style={{ ...card, flex:1, minWidth:140 }}>
-          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Revenue</div>
-          <div style={{ fontSize:20, fontWeight:800, color:T.brand }}>{fmtK(pl.revenue)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Revenue (mo)</div>
+          <div style={{ fontSize:20, fontWeight:800, color:T.brand }}>{fmtK(revMo)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>{fmtK(revYtd)} YTD</div>
         </div>
         <div style={{ ...card, flex:1, minWidth:140 }}>
-          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Net Income</div>
-          <div style={{ fontSize:20, fontWeight:800, color:pl.net_income>=0?T.green:T.red }}>{fmtK(pl.net_income)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Net Income (mo)</div>
+          <div style={{ fontSize:20, fontWeight:800, color:niMo>=0?T.green:T.red }}>{fmtK(niMo)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>{fmtK(niYtd)} YTD</div>
         </div>
         <div style={{ ...card, flex:1, minWidth:140 }}>
           <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Net Margin</div>
-          <div style={{ fontSize:20, fontWeight:800, color:margin>=0?T.green:T.red }}>{fmtPct(margin)}</div>
+          <div style={{ fontSize:20, fontWeight:800, color:moMargin>=0?T.green:T.red }}>{fmtPct(moMargin)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>{fmtPct(ytdMargin)} YTD</div>
         </div>
       </div>
+
+      {/* Full income statement: every line, grouped by section */}
       <div style={{ ...card, padding:0, overflow:"hidden" }}>
-        {rows.map((r, i) => (
-          <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 16px", borderBottom:r.border?`2px solid ${T.border}`:`1px solid ${T.borderLight}`, fontWeight:r.bold?700:400 }}>
-            <span style={{ fontSize:12, color:T.text }}>{r.label}</span>
-            <span style={{ fontSize:12, color:r.color, fontVariantNumeric:"tabular-nums" }}>{fmt(r.val)}</span>
-          </div>
-        ))}
+        {/* Header */}
+        <div style={{
+          display:"grid",
+          gridTemplateColumns:"minmax(0,1fr) 110px 70px 110px 70px",
+          gap: 12,
+          padding:"8px 14px",
+          background: T.bgSurface,
+          borderBottom: `2px solid ${T.border}`,
+          fontSize: 10,
+          fontWeight: 700,
+          color: T.textMuted,
+          textTransform: "uppercase",
+        }}>
+          <span>Account</span>
+          <span style={{ textAlign:"right" }}>Month</span>
+          <span style={{ textAlign:"right" }}>% Rev</span>
+          <span style={{ textAlign:"right" }}>YTD</span>
+          <span style={{ textAlign:"right" }}>% Rev</span>
+        </div>
+
+        {/* Render each section: header row, line items, then subtotal */}
+        {sections.map(sec => {
+          const items = lineItems.filter(li => li.section === sec.key);
+          if (items.length === 0) return null;
+          // Sort by absolute YTD descending so the biggest items come first
+          const sorted = [...items].sort((a,b) => Math.abs(b.ytd||0) - Math.abs(a.ytd||0));
+          const subtotalKeyForSection = {
+            revenue:           "total_revenue",
+            cost_of_sales:     "total_cost_of_sales",
+            operating_expense: "total_operating_expenses",
+            other_income:      "total_other_income",
+            other_expense:     "total_other_expense",
+          }[sec.key];
+          const sectionTotalMo  = monthTotal(subtotalKeyForSection, 0);
+          const sectionTotalYtd = ytdTotal(subtotalKeyForSection,   0);
+
+          return (
+            <div key={sec.key}>
+              {/* Section header */}
+              <div style={{
+                padding:"8px 14px",
+                background: T.bgSurface,
+                borderBottom: `1px solid ${T.border}`,
+                fontSize: 11,
+                fontWeight: 700,
+                color: sec.color,
+                textTransform: "uppercase",
+                letterSpacing: 0.3,
+              }}>
+                {sec.label} <span style={{ color:T.textMuted, fontWeight:400, textTransform:"none" }}>({items.length} {items.length === 1 ? "line" : "lines"})</span>
+              </div>
+              {sorted.map((li, i) => (
+                <Row
+                  key={`${sec.key}-${i}-${li.label}`}
+                  label={li.label}
+                  monthVal={li.month ?? 0}
+                  ytdVal={li.ytd ?? 0}
+                  indent
+                  color={
+                    sec.key === "revenue" ? T.brand :
+                    (sec.key === "other_income" ? T.green : T.text)
+                  }
+                  denom={sec.denom}
+                  denomYtd={sec.denomYtd}
+                />
+              ))}
+              {/* Section subtotal */}
+              <Row
+                label={`Total ${sec.label}`}
+                monthVal={sectionTotalMo}
+                ytdVal={sectionTotalYtd}
+                color={sec.color}
+                bold
+                border={sec.key === "operating_expense" || sec.key === "other_expense" ? "big" : undefined}
+                denom={sec.denom}
+                denomYtd={sec.denomYtd}
+              />
+            </div>
+          );
+        })}
+
+        {/* Bottom-line subtotals (Gross Profit, Operating Income, Net Income) */}
+        <div style={{ background: T.brandPale, padding:"6px 0" }}>
+          {subtotalRows.filter(r => ["gross_profit","operating_income","net_income"].includes(r.monthKey)).map((r, i) => (
+            <Row
+              key={r.monthKey}
+              label={r.label}
+              monthVal={monthTotal(r.monthKey, 0)}
+              ytdVal={ytdTotal(r.ytdKey, 0)}
+              color={r.color}
+              bold
+              border={r.bigBorder ? "big" : undefined}
+              denom={revMo}
+              denomYtd={revYtd}
+            />
+          ))}
+        </div>
       </div>
     </div>
   );
 }
 
-function BSCard({ bs }) {
+// ─── Balance Sheet detail card: every line item, grouped ────────────────────
+function BSCard({ bs, raw, priorRaw }) {
   if (!bs) return <div style={{ color:T.textMuted, fontSize:12 }}>No balance sheet data</div>;
-  return (
-    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
-      <div style={{ ...card, padding:0, overflow:"hidden" }}>
-        <div style={{ padding:"10px 16px", fontWeight:700, fontSize:12, background:T.bgSurface, borderBottom:`1px solid ${T.border}` }}>Assets</div>
-        {[
-          { label:"Current Assets",  val:bs.current_assets, color:T.brand },
-          { label:"Fixed Assets",    val:bs.fixed_assets,   color:T.brand },
-          { label:"Total Assets",    val:bs.total_assets,   color:T.brand, bold:true, border:true },
-        ].map((r,i) => (
-          <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 16px", borderBottom:r.border?`2px solid ${T.border}`:`1px solid ${T.borderLight}`, fontWeight:r.bold?700:400 }}>
-            <span style={{ fontSize:12, color:T.text }}>{r.label}</span>
-            <span style={{ fontSize:12, color:r.color||T.text, fontVariantNumeric:"tabular-nums" }}>{fmt(r.val)}</span>
-          </div>
-        ))}
+
+  // Pull line items from the raw v2 record. Build a map of label -> prior period
+  // amount for MoM delta column.
+  const items = raw?.balance_sheet?.line_items || [];
+  const subtotals = raw?.balance_sheet?.subtotals || {};
+  const priorItems = priorRaw?.balance_sheet?.line_items || [];
+  const priorByLabel = {};
+  for (const li of priorItems) priorByLabel[li.label || ""] = li.amount;
+
+  if (items.length === 0) {
+    // Fallback: show v1-shape summary if no line items present
+    return (
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
+        <div style={{ ...card, padding:0, overflow:"hidden" }}>
+          <div style={{ padding:"10px 16px", fontWeight:700, fontSize:12, background:T.bgSurface, borderBottom:`1px solid ${T.border}` }}>Assets</div>
+          {[
+            { label:"Current Assets", val:bs.current_assets },
+            { label:"Fixed Assets",   val:bs.fixed_assets },
+            { label:"Other Assets",   val:bs.other_assets },
+            { label:"Total Assets",   val:bs.total_assets, bold:true },
+          ].map((r,i) => (
+            <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 16px", borderBottom:`1px solid ${T.borderLight}`, fontWeight:r.bold?700:400 }}>
+              <span style={{ fontSize:12 }}>{r.label}</span>
+              <span style={{ fontSize:12, fontVariantNumeric:"tabular-nums" }}>{fmt(r.val)}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{ ...card, padding:0, overflow:"hidden" }}>
+          <div style={{ padding:"10px 16px", fontWeight:700, fontSize:12, background:T.bgSurface, borderBottom:`1px solid ${T.border}` }}>Liabilities & Equity</div>
+          {[
+            { label:"Current Liabilities",   val:bs.current_liabilities },
+            { label:"Long-Term Liabilities", val:bs.long_term_liabilities },
+            { label:"Total Liabilities",     val:bs.total_liabilities, bold:true },
+            { label:"Equity",                val:bs.equity, bold:true },
+          ].map((r,i) => (
+            <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 16px", borderBottom:`1px solid ${T.borderLight}`, fontWeight:r.bold?700:400 }}>
+              <span style={{ fontSize:12 }}>{r.label}</span>
+              <span style={{ fontSize:12, fontVariantNumeric:"tabular-nums" }}>{fmt(r.val)}</span>
+            </div>
+          ))}
+        </div>
       </div>
+    );
+  }
+
+  // Build full breakdown, every line item, grouped by section.
+  const sectionDef = [
+    { key:"current_asset",      label:"Current Assets",        side:"asset",     subtotalKey:"total_current_assets" },
+    { key:"fixed_asset",        label:"Fixed Assets",          side:"asset",     subtotalKey:"total_fixed_assets" },
+    { key:"other_asset",        label:"Other Assets",          side:"asset",     subtotalKey:"total_other_assets" },
+    { key:"current_liability",  label:"Current Liabilities",   side:"liab",      subtotalKey:"total_current_liabilities" },
+    { key:"long_term_liability",label:"Long-Term Liabilities", side:"liab",      subtotalKey:"total_long_term_liabilities" },
+    { key:"equity",             label:"Equity",                side:"equity",    subtotalKey:"total_equity" },
+  ];
+
+  const Row = ({ label, val, prior, indent, color, bold, border }) => {
+    const delta = (typeof prior === "number" && typeof val === "number") ? (val - prior) : null;
+    const deltaColor = delta == null ? T.textMuted : delta >= 0 ? T.green : T.red;
+    return (
+      <div style={{
+        display:"grid",
+        gridTemplateColumns:"minmax(0,1fr) 130px 130px 100px",
+        gap: 12,
+        padding:"6px 14px",
+        paddingLeft: 14 + (indent ? 14 : 0),
+        borderBottom: border === "big" ? `2px solid ${T.border}` : `1px solid ${T.borderLight}`,
+        fontWeight: bold ? 700 : 400,
+        background: bold ? T.bgSurface : "transparent",
+        fontSize: 12,
+      }}>
+        <span style={{ color: T.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={label}>{label}</span>
+        <span style={{ color: color || T.text, fontVariantNumeric:"tabular-nums", textAlign:"right" }}>{fmt(val)}</span>
+        <span style={{ color: T.textMuted, fontVariantNumeric:"tabular-nums", textAlign:"right", fontSize:11 }}>{prior != null ? fmt(prior) : "—"}</span>
+        <span style={{ color: deltaColor, fontVariantNumeric:"tabular-nums", textAlign:"right", fontSize:11 }}>
+          {delta == null ? "—" : (delta >= 0 ? "+" : "") + fmt(delta)}
+        </span>
+      </div>
+    );
+  };
+
+  const Header = () => (
+    <div style={{
+      display:"grid",
+      gridTemplateColumns:"minmax(0,1fr) 130px 130px 100px",
+      gap: 12,
+      padding:"8px 14px",
+      background: T.bgSurface,
+      borderBottom: `2px solid ${T.border}`,
+      fontSize: 10,
+      fontWeight: 700,
+      color: T.textMuted,
+      textTransform: "uppercase",
+    }}>
+      <span>Account</span>
+      <span style={{ textAlign:"right" }}>This Period</span>
+      <span style={{ textAlign:"right" }}>Prior Period</span>
+      <span style={{ textAlign:"right" }}>Δ MoM</span>
+    </div>
+  );
+
+  const renderSide = (sideKey, title) => {
+    const sectionsHere = sectionDef.filter(s => s.side === sideKey);
+    const sideItems = items.filter(li => sectionsHere.some(s => s.key === li.section));
+    if (sideItems.length === 0 && sideKey !== "equity" && sideKey !== "liab") return null;
+    return (
       <div style={{ ...card, padding:0, overflow:"hidden" }}>
-        <div style={{ padding:"10px 16px", fontWeight:700, fontSize:12, background:T.bgSurface, borderBottom:`1px solid ${T.border}` }}>Liabilities & Equity</div>
-        {[
-          { label:"Current Liabilities",    val:bs.current_liabilities,    color:T.red },
-          { label:"Long-Term Liabilities",  val:bs.long_term_liabilities,  color:T.red },
-          { label:"Total Liabilities",      val:bs.total_liabilities,      color:T.red, bold:true, border:true },
-          { label:"Equity",                 val:bs.equity,                 color:T.green, bold:true },
-        ].map((r,i) => (
-          <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 16px", borderBottom:r.border?`2px solid ${T.border}`:`1px solid ${T.borderLight}`, fontWeight:r.bold?700:400 }}>
-            <span style={{ fontSize:12, color:T.text }}>{r.label}</span>
-            <span style={{ fontSize:12, color:r.color||T.text, fontVariantNumeric:"tabular-nums" }}>{fmt(r.val)}</span>
-          </div>
-        ))}
+        <div style={{ padding:"10px 14px", fontWeight:700, fontSize:12, background:T.brandPale, color:T.brandDark }}>{title}</div>
+        <Header />
+        {sectionsHere.map(sec => {
+          const secItems = items.filter(li => li.section === sec.key);
+          if (secItems.length === 0) return null;
+          // Sort by absolute amount descending so the biggest items come first
+          const sorted = [...secItems].sort((a,b) => Math.abs(b.amount||0) - Math.abs(a.amount||0));
+          return (
+            <div key={sec.key}>
+              <div style={{
+                padding:"6px 14px",
+                background: T.bgSurface,
+                borderBottom: `1px solid ${T.border}`,
+                fontSize: 10,
+                fontWeight: 700,
+                color: T.textMuted,
+                textTransform: "uppercase",
+                letterSpacing: 0.3,
+              }}>
+                {sec.label}
+              </div>
+              {sorted.map((li, i) => (
+                <Row
+                  key={`${sec.key}-${i}`}
+                  label={li.label}
+                  val={li.amount}
+                  prior={priorByLabel[li.label]}
+                  indent
+                />
+              ))}
+              <Row
+                label={`Total ${sec.label}`}
+                val={subtotals[sec.subtotalKey]}
+                bold
+              />
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ display:"grid", gridTemplateColumns:"1fr", gap:16 }}>
+      {renderSide("asset", "🏦 Assets")}
+      <div style={{ ...card, padding:"12px 16px", background:T.brandPale, display:"flex", justifyContent:"space-between", fontWeight:700 }}>
+        <span style={{ fontSize:13, color:T.brandDark }}>TOTAL ASSETS</span>
+        <span style={{ fontSize:14, color:T.brand, fontVariantNumeric:"tabular-nums" }}>{fmt(subtotals.total_assets)}</span>
+      </div>
+      {renderSide("liab", "💳 Liabilities")}
+      <div style={{ ...card, padding:"12px 16px", display:"flex", justifyContent:"space-between", fontWeight:700 }}>
+        <span style={{ fontSize:13, color:T.text }}>Total Liabilities</span>
+        <span style={{ fontSize:14, color:T.red, fontVariantNumeric:"tabular-nums" }}>{fmt(subtotals.total_liabilities)}</span>
+      </div>
+      {renderSide("equity", "📊 Equity")}
+      <div style={{ ...card, padding:"12px 16px", background:T.brandPale, display:"flex", justifyContent:"space-between", fontWeight:700 }}>
+        <span style={{ fontSize:13, color:T.brandDark }}>TOTAL LIABILITIES + EQUITY</span>
+        <span style={{ fontSize:14, color:T.brand, fontVariantNumeric:"tabular-nums" }}>{fmt(subtotals.total_liabilities_and_equity)}</span>
       </div>
     </div>
   );
 }
 
-function CFCard({ cf }) {
-  if (!cf) return <div style={{ color:T.textMuted, fontSize:12 }}>No cash flow data</div>;
+// ─── Cash Flow detail card: derived via indirect method ────────────────────
+//
+// AMP CPA's tax-basis statements omit the cash flow page. We derive it from
+// data we already have: this period's P&L (net income, depreciation), this
+// and prior period balance sheets (working capital changes, fixed asset
+// changes, debt changes, equity / distributions).
+//
+// Indirect method:
+//   Operating CF  = NI + D&A + ΔAP + ΔAccruedLiab − ΔAR − ΔInventory − ΔPrepaid
+//   Investing CF  = − CapEx (= ΔGrossFixedAssets, before accumulated depreciation)
+//                   + Sales of assets (proceeds) [omitted unless detected]
+//   Financing CF  = ΔLong-term debt + ΔShort-term debt + Owner contributions − Distributions
+//
+// Reconciliation:  Operating CF + Investing CF + Financing CF ≈ ΔCash
+//   (Any plug is shown as "Reconciliation Difference" so user can see when
+//   the books don't tie cleanly — usually a sign of misclassified line items.)
+function deriveCashFlow(raw, priorRaw) {
+  if (!raw?.balance_sheet?.line_items) return null;
+
+  const period   = raw.period || "?";
+  const priorP   = priorRaw?.period || "(no prior)";
+  const niMo     = raw?.pl_totals?.net_income?.month;
+  const depMo    = raw?.ebitda_inputs?.depreciation_month;
+  const amMo     = raw?.ebitda_inputs?.amortization_month;
+  // For January where .month is missing, use ytd.
+  const isJan = period.endsWith("-01");
+  const ni  = (typeof niMo === "number") ? niMo  : (isJan ? raw?.pl_totals?.net_income?.ytd ?? 0 : 0);
+  const dep = (typeof depMo === "number") ? depMo : (isJan ? raw?.ebitda_inputs?.depreciation_ytd ?? 0 : 0);
+  const am  = (typeof amMo === "number") ? amMo  : (isJan ? raw?.ebitda_inputs?.amortization_ytd ?? 0 : 0);
+
+  if (!priorRaw?.balance_sheet?.line_items) {
+    // Without a prior balance sheet we can't compute deltas.
+    return {
+      derivable: false,
+      reason: "Need prior month balance sheet to derive cash flow (this is the earliest record on file).",
+      net_income: ni, depreciation: dep, amortization: am,
+      period, priorPeriod: priorP,
+    };
+  }
+
+  // Index BS items by label and section.
+  const indexBy = (items) => {
+    const byLabel = {};
+    for (const li of items) byLabel[(li.label||"").toLowerCase().trim()] = li;
+    return byLabel;
+  };
+  const cur = indexBy(raw.balance_sheet.line_items);
+  const pri = indexBy(priorRaw.balance_sheet.line_items);
+
+  // Pull a labeled item's amount (current or prior). Returns 0 if not present.
+  const amt = (idx, label) => {
+    const li = idx[(label||"").toLowerCase().trim()];
+    return typeof li?.amount === "number" ? li.amount : 0;
+  };
+
+  // Sum every item in a section. Used as fallback when subtotals missing.
+  const sumSection = (items, section) =>
+    (items || []).filter(li => li.section === section).reduce((s,li) => s + (li.amount||0), 0);
+  const sumSec = (raw, section) => {
+    const sub = raw?.balance_sheet?.subtotals || {};
+    if (section === "current_asset"      && typeof sub.total_current_assets === "number")      return sub.total_current_assets;
+    if (section === "fixed_asset"        && typeof sub.total_fixed_assets === "number")        return sub.total_fixed_assets;
+    if (section === "current_liability"  && typeof sub.total_current_liabilities === "number") return sub.total_current_liabilities;
+    if (section === "long_term_liability"&& typeof sub.total_long_term_liabilities === "number") return sub.total_long_term_liabilities;
+    if (section === "equity"             && typeof sub.total_equity === "number")              return sub.total_equity;
+    return sumSection(raw?.balance_sheet?.line_items || [], section);
+  };
+
+  // Cash detection — look for any current asset whose label contains "cash" or
+  // "petty". Negative cash (overdraft) stays negative; we want raw arithmetic.
+  const cashItems = (rec) => (rec?.balance_sheet?.line_items || [])
+    .filter(li => li.section === "current_asset" && /\bcash\b|petty/i.test(li.label || ""));
+  const totalCash = (rec) => cashItems(rec).reduce((s,li) => s + (li.amount||0), 0);
+  const cashStart = totalCash(priorRaw);
+  const cashEnd   = totalCash(raw);
+  const cashChange = cashEnd - cashStart;
+
+  // Working capital changes (operating)
+  // ΔAR (current assets that are receivables) — Davis doesn't seem to have an explicit AR line,
+  // but we'll catch any "receivable" account.
+  const arLabels = (rec) => (rec?.balance_sheet?.line_items || [])
+    .filter(li => li.section === "current_asset" && /receivable/i.test(li.label || ""));
+  const sumLabelMatch = (rec, sectionFilter, regex) => (rec?.balance_sheet?.line_items || [])
+    .filter(li => li.section === sectionFilter && regex.test(li.label || ""))
+    .reduce((s,li) => s + (li.amount||0), 0);
+
+  const arEnd   = sumLabelMatch(raw,      "current_asset", /receivable/i);
+  const arStart = sumLabelMatch(priorRaw, "current_asset", /receivable/i);
+  const dAR = arEnd - arStart;
+
+  // ΔPrepaid / Other CA (current assets that aren't cash and aren't receivables)
+  const otherCAEnd = sumSec(raw,      "current_asset") - cashEnd   - arEnd;
+  const otherCAStart = sumSec(priorRaw, "current_asset") - cashStart - arStart;
+  const dOtherCA = otherCAEnd - otherCAStart;
+
+  // ΔAP and other current liabilities (NOT including current portion of long-term debt
+  // — those are financing). For Davis the current liabilities are credit cards and retirement
+  // payable, which behave like AP.
+  const clEnd   = sumSec(raw,      "current_liability");
+  const clStart = sumSec(priorRaw, "current_liability");
+  const dCurLiab = clEnd - clStart;
+
+  // Operating CF = NI + D + A − ΔAR − ΔOtherCA + ΔCurLiab
+  const operating = ni + dep + am - dAR - dOtherCA + dCurLiab;
+
+  // Investing CF
+  // Need GROSS fixed assets (before accumulated depreciation) to isolate CapEx.
+  // Sum fixed_asset section excluding any item whose label contains "accumulated"
+  // or "depreciation".
+  const grossFixed = (rec) => (rec?.balance_sheet?.line_items || [])
+    .filter(li => li.section === "fixed_asset" && !/accumulated|depreciation/i.test(li.label||""))
+    .reduce((s,li) => s + (li.amount||0), 0);
+  const fixedEnd   = grossFixed(raw);
+  const fixedStart = grossFixed(priorRaw);
+  const capEx = fixedEnd - fixedStart; // positive = bought assets, negative = sold/disposed
+  const investing = -capEx; // CapEx is an outflow
+
+  // Financing CF
+  // ΔLong-term debt
+  const ltdEnd   = sumSec(raw,      "long_term_liability");
+  const ltdStart = sumSec(priorRaw, "long_term_liability");
+  const dLTD = ltdEnd - ltdStart;
+
+  // Equity changes excluding net income (since NI is in operating CF already).
+  // For each equity line, take the delta. Distributions show as a more-negative
+  // number when owner takes draws (so a delta in distributions represents new
+  // draws as a negative cash flow). Capital Stock + Paid In Capital deltas are
+  // contributions.
+  const eqContribEnd = sumLabelMatch(raw,      "equity", /paid in capital|capital stock/i);
+  const eqContribStart = sumLabelMatch(priorRaw, "equity", /paid in capital|capital stock/i);
+  const dContrib = eqContribEnd - eqContribStart;
+
+  // Distributions: more-negative this period means more was drawn out this period.
+  const distEnd   = sumLabelMatch(raw,      "equity", /distribution/i);
+  const distStart = sumLabelMatch(priorRaw, "equity", /distribution/i);
+  const draws = distEnd - distStart; // typically negative (more negative = more drawn)
+                                      // we want this as a cash outflow (so negative in CF).
+
+  const financing = dLTD + dContrib + draws;
+
+  // Reconcile
+  const sumOfThree = operating + investing + financing;
+  const reconciliationDiff = cashChange - sumOfThree;
+
+  return {
+    derivable: true,
+    period, priorPeriod: priorP,
+    operating,
+    investing,
+    financing,
+    net_income: ni,
+    depreciation: dep,
+    amortization: am,
+    delta_ar: -dAR,
+    delta_other_ca: -dOtherCA,
+    delta_cur_liab: dCurLiab,
+    capex: -capEx,
+    delta_ltd: dLTD,
+    contributions: dContrib,
+    distributions: draws,
+    cashStart, cashEnd, cashChange,
+    sumOfThree, reconciliationDiff,
+    freeCashFlow: operating - capEx,
+  };
+}
+
+function CFCard({ raw, priorRaw }) {
+  const cf = deriveCashFlow(raw, priorRaw);
+  if (!cf) return <div style={{ color:T.textMuted, fontSize:12 }}>No balance sheet data to derive cash flow from</div>;
+  if (!cf.derivable) {
+    return (
+      <div style={{ ...card, padding:14, background:T.bgSurface }}>
+        <div style={{ fontSize:12, color:T.textMuted, marginBottom:8 }}>Cash flow can't be derived for this period.</div>
+        <div style={{ fontSize:11, color:T.textMuted }}>{cf.reason}</div>
+      </div>
+    );
+  }
+
+  const Row = ({ label, val, bold, indent, color, border }) => (
+    <div style={{
+      display:"flex", justifyContent:"space-between",
+      padding:"8px 14px",
+      paddingLeft: 14 + (indent ? 16 : 0),
+      borderBottom: border === "big" ? `2px solid ${T.border}` : `1px solid ${T.borderLight}`,
+      fontWeight: bold ? 700 : 400,
+      background: bold ? T.bgSurface : "transparent",
+      fontSize: 12,
+    }}>
+      <span style={{ color: T.text }}>{label}</span>
+      <span style={{ color: color || (val >= 0 ? T.text : T.red), fontVariantNumeric:"tabular-nums" }}>{fmt(val)}</span>
+    </div>
+  );
+
+  const fcfMargin = (raw?.pl_totals?.total_revenue?.month && raw.pl_totals.total_revenue.month > 0)
+    ? (cf.freeCashFlow / raw.pl_totals.total_revenue.month) * 100
+    : null;
+
   return (
-    <div style={{ ...card, padding:0, overflow:"hidden" }}>
-      {[
-        { label:"Operating Activities",  val:cf.operating,  color:cf.operating>=0?T.green:T.red },
-        { label:"Investing Activities",  val:cf.investing,  color:cf.investing>=0?T.green:T.red },
-        { label:"Financing Activities",  val:cf.financing,  color:cf.financing>=0?T.green:T.red },
-        { label:"Net Change in Cash",    val:cf.net_change, color:cf.net_change>=0?T.green:T.red, bold:true, border:true },
-        { label:"Beginning Cash",        val:cf.beginning_cash, color:T.textMuted },
-        { label:"Ending Cash",           val:cf.ending_cash,    color:T.brand, bold:true },
-      ].map((r,i) => (
-        <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 16px", borderBottom:r.border?`2px solid ${T.border}`:`1px solid ${T.borderLight}`, fontWeight:r.bold?700:400 }}>
-          <span style={{ fontSize:12, color:T.text }}>{r.label}</span>
-          <span style={{ fontSize:12, color:r.color||T.text, fontVariantNumeric:"tabular-nums" }}>{fmt(r.val)}</span>
+    <div>
+      {/* Top-line cash flow KPIs */}
+      <div style={{ display:"flex", gap:12, marginBottom:12, flexWrap:"wrap" }}>
+        <div style={{ ...card, flex:1, minWidth:140 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Operating CF</div>
+          <div style={{ fontSize:18, fontWeight:800, color:cf.operating>=0?T.green:T.red }}>{fmtK(cf.operating)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>NI + D&A − ΔWC</div>
         </div>
-      ))}
+        <div style={{ ...card, flex:1, minWidth:140 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>CapEx</div>
+          <div style={{ fontSize:18, fontWeight:800, color:T.red }}>{fmtK(Math.abs(cf.capex))}</div>
+          <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>fixed-asset additions</div>
+        </div>
+        <div style={{ ...card, flex:1, minWidth:140 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Free Cash Flow</div>
+          <div style={{ fontSize:18, fontWeight:800, color:cf.freeCashFlow>=0?T.green:T.red }}>{fmtK(cf.freeCashFlow)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>{fcfMargin != null ? fmtPct(fcfMargin) + " of rev" : "—"}</div>
+        </div>
+        <div style={{ ...card, flex:1, minWidth:140 }}>
+          <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase", marginBottom:4 }}>Δ Cash</div>
+          <div style={{ fontSize:18, fontWeight:800, color:cf.cashChange>=0?T.green:T.red }}>{fmtK(cf.cashChange)}</div>
+          <div style={{ fontSize:10, color:T.textMuted, marginTop:2 }}>{fmtK(cf.cashStart)} → {fmtK(cf.cashEnd)}</div>
+        </div>
+      </div>
+
+      {/* Detailed indirect-method cash flow statement */}
+      <div style={{ ...card, padding:0, overflow:"hidden" }}>
+        <div style={{ padding:"8px 14px", background:T.bgSurface, borderBottom:`1px solid ${T.border}`, fontSize:10, fontWeight:700, color:T.textMuted, textTransform:"uppercase" }}>
+          Operating Activities
+        </div>
+        <Row label="Net Income"                          val={cf.net_income}    indent />
+        <Row label="+ Depreciation"                      val={cf.depreciation}  indent />
+        {cf.amortization !== 0 && <Row label="+ Amortization" val={cf.amortization} indent />}
+        <Row label="− Δ Accounts Receivable"             val={cf.delta_ar}      indent />
+        <Row label="− Δ Other Current Assets"            val={cf.delta_other_ca} indent />
+        <Row label="+ Δ Current Liabilities (AP, etc.)"  val={cf.delta_cur_liab} indent />
+        <Row label="Operating Cash Flow"                 val={cf.operating}     bold border="big" color={cf.operating>=0?T.green:T.red} />
+
+        <div style={{ padding:"8px 14px", background:T.bgSurface, borderBottom:`1px solid ${T.border}`, fontSize:10, fontWeight:700, color:T.textMuted, textTransform:"uppercase" }}>
+          Investing Activities
+        </div>
+        <Row label="CapEx (fixed asset additions)"       val={cf.capex}         indent />
+        <Row label="Investing Cash Flow"                 val={cf.investing}     bold border="big" color={cf.investing>=0?T.green:T.red} />
+
+        <div style={{ padding:"8px 14px", background:T.bgSurface, borderBottom:`1px solid ${T.border}`, fontSize:10, fontWeight:700, color:T.textMuted, textTransform:"uppercase" }}>
+          Financing Activities
+        </div>
+        <Row label="Δ Long-Term Debt (net)"              val={cf.delta_ltd}     indent />
+        {cf.contributions !== 0 && <Row label="Owner Contributions"     val={cf.contributions} indent />}
+        <Row label="Owner Distributions"                 val={cf.distributions} indent />
+        <Row label="Financing Cash Flow"                 val={cf.financing}     bold border="big" color={cf.financing>=0?T.green:T.red} />
+
+        <div style={{ background:T.brandPale }}>
+          <Row label="Net Change in Cash (computed)"     val={cf.sumOfThree}    bold />
+          <Row label="Net Change in Cash (actual Δ)"     val={cf.cashChange}    bold />
+          {Math.abs(cf.reconciliationDiff) > 1 && (
+            <Row label="Reconciliation Difference"       val={cf.reconciliationDiff} indent color={T.yellow} />
+          )}
+        </div>
+      </div>
+
+      <div style={{ marginTop:10, padding:"8px 12px", background:T.yellowBg, borderRadius:6, fontSize:10, color:T.yellowText, lineHeight:1.5 }}>
+        <strong>Derived from balance sheet deltas + P&L</strong> (indirect method). AMP CPA's tax-basis statements omit the cash flow page, so we compute it from the data they do provide. {Math.abs(cf.reconciliationDiff) > 100 && `A ${fmt(Math.abs(cf.reconciliationDiff))} reconciliation gap usually means a line item is misclassified — typically the current portion of long-term debt being shown in current liabilities or vice versa.`}
+      </div>
     </div>
   );
 }
 
 // ─── Detail Modal ─────────────────────────────────────────────────────────────
-function DetailModal({ record, onClose, onDelete }) {
+function DetailModal({ record, priorRecord, onClose, onDelete }) {
   if (!record) return null;
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:1000, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }} onClick={onClose}>
-      <div style={{ background:T.bgWhite, borderRadius:T.radius, padding:24, maxWidth:900, width:"100%", maxHeight:"90vh", overflowY:"auto" }} onClick={e => e.stopPropagation()}>
+      <div style={{ background:T.bgWhite, borderRadius:T.radius, padding:24, maxWidth:1100, width:"100%", maxHeight:"90vh", overflowY:"auto" }} onClick={e => e.stopPropagation()}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
           <div style={{ fontSize:16, fontWeight:800 }}>📋 {monthLabel(record.period)} — Financials</div>
           <div style={{ display:"flex", gap:8 }}>
@@ -511,15 +1051,15 @@ function DetailModal({ record, onClose, onDelete }) {
         </div>
         <div style={{ marginBottom:20 }}>
           <div style={{ fontSize:13, fontWeight:700, marginBottom:12 }}>📈 Profit & Loss</div>
-          <PLCard pl={record.pl} />
+          <PLCard pl={record.pl} raw={record} />
         </div>
         <div style={{ marginBottom:20 }}>
           <div style={{ fontSize:13, fontWeight:700, marginBottom:12 }}>🏦 Balance Sheet</div>
-          <BSCard bs={record.balance_sheet} />
+          <BSCard bs={record.balance_sheet} raw={record} priorRaw={priorRecord} />
         </div>
         <div style={{ marginBottom:20 }}>
-          <div style={{ fontSize:13, fontWeight:700, marginBottom:12 }}>💵 Cash Flow</div>
-          <CFCard cf={record.cash_flow} />
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:12 }}>💵 Cash Flow <span style={{fontSize:10, fontWeight:400, color:T.textMuted}}>(derived, indirect method)</span></div>
+          <CFCard raw={record} priorRaw={priorRecord} />
         </div>
         {record.notes && (
           <div style={{ ...card, background:T.yellowBg, borderColor:T.yellow }}>
@@ -1787,7 +2327,28 @@ function AuditedFinancialsTab() {
       {view === "statements" && <StatementsList records={records} onSelect={setSelected} />}
       {view === "chat"       && <AIChat records={records} />}
 
-      {selected && <DetailModal record={selected} onClose={() => setSelected(null)} onDelete={handleDelete} />}
+      {selected && (() => {
+        // Find the prior period's record for derived-cash-flow MoM deltas.
+        // records is sorted desc by period; the next-newer-period is at the
+        // index AFTER the selected one would be... wait — sorted desc means
+        // the prior period (older) is the index AFTER. Find by period string.
+        const [py, pm] = (selected.period||"").split("-").map(x => parseInt(x, 10));
+        let priorPeriod = null;
+        if (py && pm) {
+          let prevY = py, prevM = pm - 1;
+          if (prevM === 0) { prevM = 12; prevY -= 1; }
+          priorPeriod = `${prevY}-${String(prevM).padStart(2,"0")}`;
+        }
+        const priorRecord = priorPeriod ? records.find(r => r.period === priorPeriod) : null;
+        return (
+          <DetailModal
+            record={selected}
+            priorRecord={priorRecord}
+            onClose={() => setSelected(null)}
+            onDelete={handleDelete}
+          />
+        );
+      })()}
     </div>
   );
 }

@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.50.4";
+const APP_VERSION = "2.50.5";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -5709,12 +5709,23 @@ function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, rec
     <AuditedKpiStrip setTab={setTab} />
 
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
-      <KPI icon="💰" label="Op Revenue (NuVizz)" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.annualRevenue)}/yr from stops`} subColor={T.green} />
-      <KPI icon="🧮" label="Modeled Cost" value={fmt(m.dailyCost)} sub={`${fmtK(m.totalAnnualCost)}/yr (estimate)`} subColor={T.red} />
-      <KPI icon="📊" label="Modeled Margin" value={fmt(m.dailyMargin)} sub={fmtPct(m.dailyMarginPct)+" (vs estimate)"} subColor={marginColor} />
-      <KPI icon="🚚" label="Daily Stops" value={fmtNum(m.dailyStops)} sub={`${fmtNum(m.breakEvenStopsDaily)} break-even`} />
-      <KPI icon="🎯" label="Rev/Stop" value={fmt(m.revenuePerStop)} sub={`${fmt(m.costPerStop)} modeled cost`} subColor={T.blue} />
+      <KPI icon="💰" label="Op Revenue/Day" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.annualRevenue)}/yr from NuVizz stops`} subColor={T.green} />
+      <KPI icon="🚚" label="Daily Stops" value={fmtNum(m.dailyStops)} sub="from NuVizz" />
+      <KPI icon="🎯" label="Rev/Stop" value={fmt(m.revenuePerStop)} sub="billed revenue per stop" subColor={T.blue} />
       <KPI icon="👤" label="Rev/Driver" value={fmt(m.revenuePerDriver)} sub={`${fmtNum(m.stopsPerDriver)} stops/day`} />
+      <KPI icon="🚛" label="Trucks" value={String(m.totalTrucks||0)} sub={`${m.totalDrivers||0} drivers`} />
+    </div>
+
+    <div style={{
+      ...cardStyle,
+      marginBottom:16,
+      background:T.bgSurface,
+      borderLeft:`3px solid ${T.textDim}`,
+      padding:"10px 14px",
+    }}>
+      <div style={{fontSize:11, color:T.textMuted, lineHeight:1.5}}>
+        <strong>Note on costs:</strong> The audited financials above are the source of truth for all expense and profitability numbers. The bottom-up cost model below the Labor Reality Check is a "what should it cost" benchmark for diagnostic purposes only — it doesn't reflect your actual P&L.
+      </div>
     </div>
 
     <LaborReality margins={m} />
