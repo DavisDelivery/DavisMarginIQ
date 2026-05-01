@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.50.3";
+const APP_VERSION = "2.50.4";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -5415,10 +5415,6 @@ function AuditedKpiStrip({ setTab }) {
       if (!hasFirebase) { setLoading(false); return; }
       try {
         // v2.50.x: read from audited_financials_v2 (correct column extraction).
-        // The v1 audited_financials collection was extracted with a prompt
-        // that didn't disambiguate Month vs YTD columns and produced a 7x
-        // overstated TTM revenue. v2 records have explicit pl_totals with
-        // .month / .ytd / .prior_month / .prior_ytd sub-fields.
         const s = await window.db.collection("audited_financials_v2").limit(60).get();
         const records = s.docs
           .map(d => ({ id: d.id, period: d.id, ...d.data() }))
@@ -5429,73 +5425,142 @@ function AuditedKpiStrip({ setTab }) {
         const latest = records[0];
         const previous = records[1] || null;
 
-        // Helper: reach into pl_totals.<key>.<col> defensively.
         const getTotal = (rec, key, col) => {
           const v = rec?.pl_totals?.[key]?.[col];
-          return typeof v === "number" ? v : 0;
+          return typeof v === "number" ? v : null;
+        };
+        // Single-month value with January fallback (Jan often has only one
+        // populated column because YTD == month for the first month).
+        const getMonthValue = (rec, key) => {
+          const m = getTotal(rec, key, "month");
+          if (m != null) return m;
+          // Jan fallback — if .month null but .ytd exists for a January period,
+          // YTD IS the month value.
+          const period = rec?.period || "";
+          if (period.endsWith("-01")) {
+            const y = getTotal(rec, key, "ytd");
+            if (y != null) return y;
+          }
+          return 0;
         };
 
-        // TTM math:
-        //
-        //   Each record has YTD as of its period end.
-        //   - If latest is a December record, TTM = latest.ytd directly.
-        //   - Otherwise: rolling 12 months ending at latest =
-        //         latest.ytd                                  (Jan..latest)
-        //       + (priorYearAnnual.ytd - priorYearSameMonth.ytd) (rest of prior year)
-        //
-        //   Where priorYearAnnual = the December record one year prior, and
-        //   priorYearSameMonth = the same-month record one year prior.
-        //
-        //   If the prior-year records aren't extracted yet we fall back to
-        //   showing latest.ytd labeled YTD (not TTM). Better honest YTD than
-        //   a misleading partial TTM.
+        // ── TTM math: rolling 12 months ending at latest period ──────────
         const [latestYear, latestMonth] = (latest.period||"").split("-");
         const isDecember = latestMonth === "12";
+        const priorYear = String(parseInt(latestYear, 10) - 1);
+        const priorPriorYear = String(parseInt(latestYear, 10) - 2);
+        const priorDec = records.find(r => r.period === `${priorYear}-12`);
+        const priorSame = records.find(r => r.period === `${priorYear}-${latestMonth}`);
 
-        let ttmRev = 0, ttmNet = 0, ttmLabel = "TTM Revenue", ttmSubLabel = "rolling 12 months";
-        if (isDecember) {
-          ttmRev = getTotal(latest, "total_revenue", "ytd");
-          ttmNet = getTotal(latest, "net_income", "ytd");
-          ttmSubLabel = `FY${latestYear} (Jan-Dec)`;
-        } else {
-          const priorYear = String(parseInt(latestYear, 10) - 1);
-          const priorDecPeriod = `${priorYear}-12`;
-          const priorSamePeriod = `${priorYear}-${latestMonth}`;
-          const priorDec = records.find(r => r.period === priorDecPeriod);
-          const priorSame = records.find(r => r.period === priorSamePeriod);
-
-          if (priorDec && priorSame) {
-            const latestYtdRev = getTotal(latest, "total_revenue", "ytd");
-            const priorAnnualRev = getTotal(priorDec, "total_revenue", "ytd");
-            const priorSameYtdRev = getTotal(priorSame, "total_revenue", "ytd");
-            ttmRev = latestYtdRev + (priorAnnualRev - priorSameYtdRev);
-
-            const latestYtdNet = getTotal(latest, "net_income", "ytd");
-            const priorAnnualNet = getTotal(priorDec, "net_income", "ytd");
-            const priorSameYtdNet = getTotal(priorSame, "net_income", "ytd");
-            ttmNet = latestYtdNet + (priorAnnualNet - priorSameYtdNet);
-          } else {
-            // Fall back to YTD (not full TTM) and label it honestly.
-            ttmRev = getTotal(latest, "total_revenue", "ytd");
-            ttmNet = getTotal(latest, "net_income", "ytd");
-            ttmLabel = "YTD Revenue";
-            ttmSubLabel = `${latestYear} year-to-date`;
+        const computeTTM = (key) => {
+          if (isDecember) {
+            const ytd = getTotal(latest, key, "ytd");
+            return ytd != null ? ytd : null;
           }
-        }
+          if (priorDec && priorSame) {
+            const a = getTotal(latest, key, "ytd");
+            const b = getTotal(priorDec, key, "ytd");
+            const c = getTotal(priorSame, key, "ytd");
+            if (a != null && b != null && c != null) return a + b - c;
+          }
+          // Fallback: latest YTD — labelled "YTD" not "TTM" so user knows.
+          const ytd = getTotal(latest, key, "ytd");
+          return ytd != null ? ytd : null;
+        };
+        // Prior-period TTM = TTM ending one year before latest.
+        const computePriorTTM = (key) => {
+          if (isDecember && priorDec) {
+            const ytd = getTotal(priorDec, key, "ytd");
+            return ytd != null ? ytd : null;
+          }
+          // Need (prior_year same month YTD) + (year-2 December YTD) - (year-2 same month YTD)
+          const priorPriorDec  = records.find(r => r.period === `${priorPriorYear}-12`);
+          const priorPriorSame = records.find(r => r.period === `${priorPriorYear}-${latestMonth}`);
+          if (priorSame && priorPriorDec && priorPriorSame) {
+            const a = getTotal(priorSame, key, "ytd");
+            const b = getTotal(priorPriorDec, key, "ytd");
+            const c = getTotal(priorPriorSame, key, "ytd");
+            if (a != null && b != null && c != null) return a + b - c;
+          }
+          return null;
+        };
 
-        const ttmMargin = ttmRev > 0 ? (ttmNet/ttmRev) * 100 : 0;
+        const ttmRev   = computeTTM("total_revenue");
+        const ttmNet   = computeTTM("net_income");
+        const ttmCogs  = computeTTM("total_cost_of_sales");
+        const ttmOpEx  = computeTTM("total_operating_expenses");
+        const ttmGross = computeTTM("gross_profit");
+        const priorTtmRev = computePriorTTM("total_revenue");
+        const priorTtmNet = computePriorTTM("net_income");
 
-        // Latest-month KPI: use the .month column, not YTD.
-        const latestNet = getTotal(latest, "net_income", "month");
-        const previousNet = previous ? getTotal(previous, "net_income", "month") : 0;
-        const momChange = previous && previousNet !== 0 ?
-          ((latestNet - previousNet) / Math.abs(previousNet)) * 100 : null;
+        const ttmMargin   = (ttmRev && ttmRev > 0) ? (ttmNet/ttmRev) * 100 : null;
+        const ttmGrossMgn = (ttmRev && ttmRev > 0 && ttmGross != null) ? (ttmGross/ttmRev) * 100 : null;
+        const yoyRev      = (priorTtmRev && priorTtmRev !== 0 && ttmRev != null) ? ((ttmRev - priorTtmRev)/Math.abs(priorTtmRev)) * 100 : null;
+        const yoyNet      = (priorTtmNet && priorTtmNet !== 0 && ttmNet != null) ? ((ttmNet - priorTtmNet)/Math.abs(priorTtmNet)) * 100 : null;
+
+        // ── EBITDA TTM: sum month-level EBITDA across the 12-month window ──
+        // Walk the trailing 12 months in the records array.
+        const periodToTuple = (p) => p.split("-").map(x => parseInt(x, 10));
+        const monthsBetween = (latest_p, count) => {
+          const result = [];
+          let [y, m] = periodToTuple(latest_p);
+          for (let i = 0; i < count; i++) {
+            result.unshift(`${y}-${String(m).padStart(2,"0")}`);
+            m -= 1;
+            if (m === 0) { m = 12; y -= 1; }
+          }
+          return result;
+        };
+        const ttmPeriods = monthsBetween(latest.period, 12);
+        const ttmRecords = ttmPeriods.map(p => records.find(r => r.period === p)).filter(Boolean);
+        const monthEbitda = (rec) => {
+          const ei = rec?.ebitda_inputs || {};
+          const ni = getMonthValue(rec, "net_income");
+          // For each component prefer .month, fallback to .ytd if January
+          const period = rec.period || "";
+          const isJan = period.endsWith("-01");
+          const pick = (m, y) => (typeof m === "number" ? m : (isJan && typeof y === "number" ? y : 0));
+          const dep  = pick(ei.depreciation_month,   ei.depreciation_ytd);
+          const am   = pick(ei.amortization_month,   ei.amortization_ytd);
+          const intr = pick(ei.interest_expense_month, ei.interest_expense_ytd);
+          const tax  = pick(ei.income_tax_month,     ei.income_tax_ytd);
+          return ni + dep + am + intr + tax;
+        };
+        const ttmEbitda = ttmRecords.reduce((s, r) => s + monthEbitda(r), 0);
+        const ttmEbitdaMargin = (ttmRev && ttmRev > 0) ? (ttmEbitda/ttmRev) * 100 : null;
+
+        // ── Latest month (single-month value) ───────────────────────────
+        const latestRev = getMonthValue(latest, "total_revenue");
+        const latestNet = getMonthValue(latest, "net_income");
+        const latestMargin = latestRev > 0 ? (latestNet/latestRev) * 100 : null;
+
+        // YoY for latest month (latest month vs same month prior year)
+        const latestSameMonthPrior = records.find(r => r.period === `${priorYear}-${latestMonth}`);
+        const latestNetPrior = latestSameMonthPrior ? getMonthValue(latestSameMonthPrior, "net_income") : null;
+        const latestRevPrior = latestSameMonthPrior ? getMonthValue(latestSameMonthPrior, "total_revenue") : null;
+        const latestNetYoY = (latestNetPrior != null && latestNetPrior !== 0)
+          ? ((latestNet - latestNetPrior)/Math.abs(latestNetPrior)) * 100 : null;
+        const latestRevYoY = (latestRevPrior != null && latestRevPrior !== 0)
+          ? ((latestRev - latestRevPrior)/Math.abs(latestRevPrior)) * 100 : null;
+
+        // ── Sparkline data: last 12 months net income (single-month values) ─
+        const spark = ttmRecords.map(r => ({
+          period: r.period,
+          rev: getMonthValue(r, "total_revenue"),
+          net: getMonthValue(r, "net_income"),
+        }));
+
+        const ttmLabel    = isDecember ? `FY${latestYear} Revenue`  : (priorDec && priorSame ? "TTM Revenue" : "YTD Revenue");
+        const ttmSubLabel = isDecember ? `FY${latestYear} (Jan-Dec)` : (priorDec && priorSame ? "rolling 12 months" : `${latestYear} year-to-date`);
 
         setData({
-          records, latest, previous,
-          ttmRev, ttmNet, ttmMargin,
-          latestNet, previousNet, momChange,
-          ttmLabel, ttmSubLabel,
+          records,
+          latest, previous,
+          ttmRev, ttmNet, ttmCogs, ttmOpEx, ttmGross, ttmMargin, ttmGrossMgn,
+          ttmEbitda, ttmEbitdaMargin,
+          priorTtmRev, priorTtmNet, yoyRev, yoyNet,
+          latestRev, latestNet, latestMargin, latestNetYoY, latestRevYoY,
+          spark, ttmLabel, ttmSubLabel,
         });
       } catch (e) { console.error("AuditedKpiStrip load err:", e); }
       setLoading(false);
@@ -5519,34 +5584,76 @@ function AuditedKpiStrip({ setTab }) {
   }
   if (!data) return null;
 
-  const marginColor = data.ttmMargin >= 20 ? T.green : data.ttmMargin >= 10 ? T.yellow : T.red;
-  const momColor = data.momChange == null ? T.textMuted : data.momChange >= 0 ? T.green : T.red;
-  const momSign = data.momChange != null && data.momChange >= 0 ? "+" : "";
-  const latestLabel = (() => {
-    const parts = (data.latest.period||"").split("-");
-    if (parts.length < 2) return data.latest.period||"—";
+  const marginColor = data.ttmMargin == null ? T.textMuted : data.ttmMargin >= 15 ? T.green : data.ttmMargin >= 5 ? T.yellow : T.red;
+  const grossColor  = data.ttmGrossMgn == null ? T.textMuted : data.ttmGrossMgn >= 80 ? T.green : data.ttmGrossMgn >= 60 ? T.yellow : T.red;
+  const yoyRevColor = data.yoyRev == null ? T.textMuted : data.yoyRev >= 0 ? T.green : T.red;
+  const yoyNetColor = data.yoyNet == null ? T.textMuted : data.yoyNet >= 0 ? T.green : T.red;
+
+  const fmtSignedPct = (v) => v == null ? "—" : (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+  const monthName = (period) => {
+    const parts = (period||"").split("-");
+    if (parts.length < 2) return period || "—";
     const months = ["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
     return months[parseInt(parts[1])||0] + " " + parts[0];
-  })();
+  };
+  const latestLabel = monthName(data.latest.period);
+
+  // Mini-sparkline for monthly net income trend (last 12 months)
+  const sparkW = 220, sparkH = 32, sparkPad = 2;
+  const netVals = data.spark.map(s => s.net);
+  const minN = Math.min(0, ...netVals); // include 0 baseline
+  const maxN = Math.max(0, ...netVals);
+  const range = (maxN - minN) || 1;
+  const xStep = (sparkW - sparkPad*2) / Math.max(1, netVals.length - 1);
+  const yFor = (v) => sparkH - sparkPad - ((v - minN) / range) * (sparkH - sparkPad*2);
+  const path = netVals.map((v,i) => `${i===0?"M":"L"} ${sparkPad + i*xStep} ${yFor(v)}`).join(" ");
+  const zeroY = yFor(0);
 
   return (
     <div style={{...cardStyle, borderLeft:`3px solid ${T.green}`, marginBottom:12}}>
-      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8, marginBottom:10}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8, marginBottom:12}}>
         <div>
           <div style={{fontSize:13, fontWeight:700, display:"flex", alignItems:"center", gap:6}}>
-            📋 Financials
-            <span style={{fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:10, background:T.green, color:"#fff"}}>AUDITED</span>
+            📋 Audited Financials
+            <span style={{fontSize:9, fontWeight:700, padding:"2px 6px", borderRadius:10, background:T.green, color:"#fff"}}>CPA</span>
           </div>
-          <div style={{fontSize:10, color:T.textMuted, marginTop:2}}>{data.ttmSubLabel} · latest: {latestLabel}</div>
+          <div style={{fontSize:10, color:T.textMuted, marginTop:2}}>{data.ttmSubLabel} · {data.records.length} months on file · latest: {latestLabel}</div>
         </div>
         <button onClick={() => setTab("audited")} style={{padding:"6px 12px", borderRadius:8, border:`1px solid ${T.border}`, background:"transparent", color:T.text, fontSize:11, fontWeight:600, cursor:"pointer"}}>Details →</button>
       </div>
-      <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10}}>
-        <KPI label={data.ttmLabel}     value={fmtK(data.ttmRev)} sub={`${data.records.length} mo audited`} subColor={T.brand} />
-        <KPI label="Net Income"        value={fmtK(data.ttmNet)} sub={data.ttmSubLabel} subColor={data.ttmNet>=0?T.green:T.red} />
-        <KPI label="Margin"            value={fmtPct(data.ttmMargin)} sub="net income / revenue" subColor={marginColor} />
-        <KPI label={`${latestLabel} Net`} value={fmtK(data.latestNet)} sub={data.momChange != null ? `${momSign}${fmtPct(data.momChange)} MoM` : "—"} subColor={momColor} />
+
+      {/* Primary row: Revenue / Net / Margin / EBITDA */}
+      <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10, marginBottom:10}}>
+        <KPI label={data.ttmLabel}    value={fmtK(data.ttmRev)}    sub={data.yoyRev != null ? `${fmtSignedPct(data.yoyRev)} YoY` : "—"} subColor={yoyRevColor} />
+        <KPI label="Net Income"       value={fmtK(data.ttmNet)}    sub={data.yoyNet != null ? `${fmtSignedPct(data.yoyNet)} YoY` : "—"} subColor={yoyNetColor} />
+        <KPI label="Net Margin"       value={data.ttmMargin == null ? "—" : fmtPct(data.ttmMargin)} sub="net income / revenue" subColor={marginColor} />
+        <KPI label="EBITDA"           value={fmtK(data.ttmEbitda)} sub={data.ttmEbitdaMargin == null ? "—" : fmtPct(data.ttmEbitdaMargin) + " margin"} subColor={data.ttmEbitda>=0?T.green:T.red} />
       </div>
+
+      {/* Secondary row: Cost composition */}
+      <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10, marginBottom:10}}>
+        <KPI label="COGS"             value={fmtK(data.ttmCogs)}   sub="cost of sales" subColor={T.red} />
+        <KPI label="Gross Profit"     value={fmtK(data.ttmGross)}  sub={data.ttmGrossMgn == null ? "—" : fmtPct(data.ttmGrossMgn) + " margin"} subColor={grossColor} />
+        <KPI label="Operating Exp"    value={fmtK(data.ttmOpEx)}   sub="SG&A + ops" subColor={T.red} />
+        <KPI label={`${latestLabel} Net`} value={fmtK(data.latestNet)} sub={data.latestNetYoY != null ? `${fmtSignedPct(data.latestNetYoY)} YoY` : `${fmtK(data.latestRev)} rev`} subColor={data.latestNet>=0?T.green:T.red} />
+      </div>
+
+      {/* Trend strip */}
+      {data.spark.length >= 2 && (
+        <div style={{paddingTop:8, borderTop:`1px solid ${T.borderLight}`, display:"flex", alignItems:"center", justifyContent:"space-between", gap:12}}>
+          <div style={{fontSize:10, color:T.textMuted, fontWeight:600, textTransform:"uppercase", flexShrink:0}}>12-mo Net Income Trend</div>
+          <svg width={sparkW} height={sparkH} style={{flexShrink:0}}>
+            <line x1={sparkPad} y1={zeroY} x2={sparkW-sparkPad} y2={zeroY} stroke={T.borderLight} strokeDasharray="2,2" />
+            <path d={path} fill="none" stroke={T.brand} strokeWidth="1.5" />
+            {netVals.map((v,i) => (
+              <circle key={i} cx={sparkPad + i*xStep} cy={yFor(v)} r="1.8" fill={v>=0?T.green:T.red} />
+            ))}
+          </svg>
+          <div style={{fontSize:10, color:T.textMuted, flexShrink:0}}>
+            {data.spark[0]?.period?.split("-")[1]}/{data.spark[0]?.period?.split("-")[0]?.slice(2)} → {data.spark[data.spark.length-1]?.period?.split("-")[1]}/{data.spark[data.spark.length-1]?.period?.split("-")[0]?.slice(2)}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -5602,11 +5709,11 @@ function CommandCenter({ margins, weeklyRollups, completeness, qboConnected, rec
     <AuditedKpiStrip setTab={setTab} />
 
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
-      <KPI icon="💰" label="Daily Revenue" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.annualRevenue)}/yr projected`} subColor={T.green} />
-      <KPI icon="📉" label="Daily Cost" value={fmt(m.dailyCost)} sub={`${fmtK(m.totalAnnualCost)}/yr`} subColor={T.red} />
-      <KPI icon="📊" label="Daily Margin" value={fmt(m.dailyMargin)} sub={fmtPct(m.dailyMarginPct)+" margin"} subColor={marginColor} />
+      <KPI icon="💰" label="Op Revenue (NuVizz)" value={fmt(m.dailyRevenue)} sub={`${fmtK(m.annualRevenue)}/yr from stops`} subColor={T.green} />
+      <KPI icon="🧮" label="Modeled Cost" value={fmt(m.dailyCost)} sub={`${fmtK(m.totalAnnualCost)}/yr (estimate)`} subColor={T.red} />
+      <KPI icon="📊" label="Modeled Margin" value={fmt(m.dailyMargin)} sub={fmtPct(m.dailyMarginPct)+" (vs estimate)"} subColor={marginColor} />
       <KPI icon="🚚" label="Daily Stops" value={fmtNum(m.dailyStops)} sub={`${fmtNum(m.breakEvenStopsDaily)} break-even`} />
-      <KPI icon="🎯" label="Rev/Stop" value={fmt(m.revenuePerStop)} sub={`${fmt(m.costPerStop)} cost`} subColor={T.blue} />
+      <KPI icon="🎯" label="Rev/Stop" value={fmt(m.revenuePerStop)} sub={`${fmt(m.costPerStop)} modeled cost`} subColor={T.blue} />
       <KPI icon="👤" label="Rev/Driver" value={fmt(m.revenuePerDriver)} sub={`${fmtNum(m.stopsPerDriver)} stops/day`} />
     </div>
 

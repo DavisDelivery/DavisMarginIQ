@@ -197,17 +197,119 @@ async function refreshPdfUrl(storagePath) {
 }
 
 // FIXED v2.0.0: Don't use orderBy — if any doc lacks `period`, Firestore
+// v2.50.x: v2 records have a deeply nested schema (pl_totals.{key}.{month|ytd|...},
+// pl_line_items as a top-level array, ebitda_inputs top-level, balance_sheet
+// with line_items/subtotals split out, etc.). The Dashboard / StatementsList /
+// PLCard / BSCard / CFCard components were written for the v1 flat schema
+// (r.pl.revenue, r.balance_sheet.total_assets, etc.). Rather than rewrite
+// every read site, we map v2 records into v1 shape at the data-loading layer.
+//
+// Important: each monthly statement carries BOTH a "month" column (single-month)
+// and a "ytd" column (cumulative). The CFO-grade default is to view a month's
+// performance in isolation — so we map MONTH values to the flat fields. The
+// Dashboard's TTM/YTD windowing then sums those single-month values, which
+// gives the right answer (no double-counting like the original $88M bug).
+//
+// January edge case: AMP statements often show only a single column for January
+// (since YTD == month value), and the prompt fills "month" but leaves "ytd"
+// null. The adapter copies month -> ytd for January if ytd is null, so window
+// math that prefers ytd doesn't blank out.
+function adaptV2ToV1Shape(v2Doc) {
+  const out = { ...v2Doc };
+  if (!v2Doc.pl_totals && !v2Doc.balance_sheet && !v2Doc.ebitda_inputs) {
+    return out; // nothing to do — looks like v1 already
+  }
+
+  const pickMonth = (group) => {
+    const v = v2Doc.pl_totals?.[group];
+    if (!v) return 0;
+    // Prefer .month; if null/missing (typical for January), fall back to .ytd
+    if (typeof v.month === "number") return v.month;
+    if (typeof v.ytd === "number") return v.ytd;
+    return 0;
+  };
+
+  // Pass through raw v2 line items + EBITDA inputs for the dashboard's deeper
+  // analysis paths.
+  out.pl_line_items_v2 = v2Doc.pl_line_items || [];
+  out.ebitda_inputs    = v2Doc.ebitda_inputs || {};
+
+  // v1-shape pl: single-month values
+  out.pl = {
+    revenue:            pickMonth("total_revenue"),
+    cost_of_goods_sold: pickMonth("total_cost_of_sales"),
+    gross_profit:       pickMonth("gross_profit"),
+    operating_expenses: pickMonth("total_operating_expenses"),
+    operating_income:   pickMonth("operating_income"),
+    other_income:       pickMonth("total_other_income"),
+    other_expenses:     pickMonth("total_other_expense"),
+    net_income:         pickMonth("net_income"),
+    // Adapt v2 line items to v1 format. v2 uses .label/.section/.month/.ytd;
+    // v1 dashboard expects .label and .amount. Use month value.
+    line_items: (v2Doc.pl_line_items || []).map(li => ({
+      label:   li.label || "",
+      section: li.section || "",
+      amount:  typeof li.month === "number" ? li.month
+             : typeof li.ytd   === "number" ? li.ytd
+             : 0,
+      // Keep both columns accessible for dashboards that want YTD specifically.
+      month: li.month,
+      ytd: li.ytd,
+    })),
+  };
+
+  // v1-shape balance_sheet: pull from v2 subtotals
+  const bsSub = v2Doc.balance_sheet?.subtotals || {};
+  const bsItems = v2Doc.balance_sheet?.line_items || [];
+  // Sum line items by section as a fallback when subtotals are missing.
+  const sectionSum = (section) => bsItems
+    .filter(li => li.section === section)
+    .reduce((s, li) => s + (typeof li.amount === "number" ? li.amount : 0), 0);
+
+  out.balance_sheet = {
+    current_assets:       (bsSub.total_current_assets       ?? sectionSum("current_asset"))    || 0,
+    fixed_assets:         (bsSub.total_fixed_assets         ?? sectionSum("fixed_asset"))      || 0,
+    other_assets:         (bsSub.total_other_assets         ?? sectionSum("other_asset"))      || 0,
+    total_assets:         bsSub.total_assets               ?? 0,
+    current_liabilities:  (bsSub.total_current_liabilities  ?? sectionSum("current_liability")) || 0,
+    long_term_liabilities:(bsSub.total_long_term_liabilities ?? sectionSum("long_term_liability")) || 0,
+    total_liabilities:    bsSub.total_liabilities          ?? 0,
+    equity:               (bsSub.total_equity               ?? sectionSum("equity")) || 0,
+    total_liabilities_and_equity: bsSub.total_liabilities_and_equity ?? 0,
+    as_of_date:           v2Doc.balance_sheet?.as_of_date || null,
+    line_items:           bsItems,
+  };
+
+  // v1-shape cash_flow
+  const cf = v2Doc.cash_flow || {};
+  out.cash_flow = {
+    operating:      cf.operating_activities ?? null,
+    investing:      cf.investing_activities ?? null,
+    financing:      cf.financing_activities ?? null,
+    net_change:     cf.net_change_in_cash   ?? null,
+    beginning_cash: cf.beginning_cash       ?? null,
+    ending_cash:    cf.ending_cash          ?? null,
+  };
+
+  return out;
+}
+
 // silently returns 0 results. Just .get() everything and sort client-side.
 async function getFinancials() {
-  // v2.50.0: prefer audited_financials_v2 (full line-item extraction with
+  // v2.50.x: prefer audited_financials_v2 (full line-item extraction with
   // separate month vs YTD columns and EBITDA inputs). Fall back to legacy
-  // audited_financials only when v2 is empty (during cutover).
+  // audited_financials only when v2 is empty (during cutover). v2 records
+  // are mapped into v1-shape at this boundary so the rest of the UI works
+  // without changes.
   try {
     const sV2 = await db().collection("audited_financials_v2").limit(120).get();
     if (sV2.docs.length > 0) {
-      const docs = sV2.docs.map(d => ({ id: d.id, ...d.data(), _source: "v2" }));
-      const withPeriod = docs.map(d => ({ ...d, period: d.period || d.id }));
-      return withPeriod.sort((a, b) => (b.period || "").localeCompare(a.period || ""));
+      const docs = sV2.docs.map(d => {
+        const raw = { id: d.id, ...d.data(), _source: "v2" };
+        const adapted = adaptV2ToV1Shape(raw);
+        return { ...adapted, period: adapted.period || adapted.id };
+      });
+      return docs.sort((a, b) => (b.period || "").localeCompare(a.period || ""));
     }
     // Empty v2 → fall back to legacy
     const s = await db().collection("audited_financials").limit(120).get();
@@ -608,9 +710,19 @@ function Dashboard({ records, onSelect }) {
     return valid.reduce((s, r) => s + ((r.pl.net_income || 0) / r.pl.revenue) * 100, 0) / valid.length;
   };
   const ebitda = (recs) => recs.reduce((s, r) => {
+    // Prefer authoritative v2 ebitda_inputs (NI + Interest + Tax + D + A).
+    // Fall back to operating_income + D&A from line items for v1 records.
+    if (r.ebitda_inputs && (r.ebitda_inputs.depreciation_month != null || r.ebitda_inputs.depreciation_ytd != null)) {
+      const ei = r.ebitda_inputs;
+      // Use month columns since the rest of the dashboard sums single-month values.
+      const ni  = r.pl?.net_income || 0;
+      const dep = ei.depreciation_month   ?? ei.depreciation_ytd   ?? 0;
+      const am  = ei.amortization_month   ?? ei.amortization_ytd   ?? 0;
+      const intr = ei.interest_expense_month ?? ei.interest_expense_ytd ?? 0;
+      const tax = ei.income_tax_month     ?? ei.income_tax_ytd     ?? 0;
+      return s + ni + intr + tax + dep + am;
+    }
     const pl = r.pl || {};
-    // Approximation: operating_income + depreciation/amortization from line items.
-    // Most CPA P&Ls separate these as line items under operating expenses.
     const opInc = pl.operating_income || 0;
     const depItems = (pl.line_items || []).filter(li => /deprec|amort/i.test(li.label || ""));
     const depAmort = depItems.reduce((acc, li) => acc + Math.abs(li.amount || 0), 0);
