@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.48.4";
+const APP_VERSION = "2.48.5";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2107,7 +2107,7 @@ function GmailSync({ onRefresh }) {
       const pages = [];
       for (let p = 1; p <= numPages; p++) {
         const page = await pdf.getPage(p);
-        const viewport = page.getViewport({ scale: 1.8 });
+        const viewport = page.getViewport({ scale: 1.2 }); // v2.48.5: down from 1.8 — vision call was exceeding Netlify's 26s wall
         const canvas = document.createElement("canvas");
         canvas.width = viewport.width;
         canvas.height = viewport.height;
