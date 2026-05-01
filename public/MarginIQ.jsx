@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.49.2";
+const APP_VERSION = "2.49.4";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -2718,9 +2718,9 @@ Rules:
                                 // and a usage cap; parallel scans hit 'usage_exceeded' (HTTP 503) within
                                 // seconds. CSV-parser vendors (uline, nuvizz, ddis) don't need throttling.
                                 const isVisionVendor = v.mode === "audited-financials" || v.mode === "quickfuel";
-                                const COOLDOWN_MS = isVisionVendor ? 2000 : 0;
-                                const RATE_LIMIT_PAUSE_MS = 30000;
-                                const MAX_RETRIES = 2;
+                                const COOLDOWN_MS = isVisionVendor ? 8000 : 0;
+                                const RATE_LIMIT_PAUSE_MS = 60000;
+                                const MAX_RETRIES = 5;
                                 for (const em of displayList) {
                                   for (const a of (em.attachments || [])) {
                                     const dk = dedupKey(a.filename);
