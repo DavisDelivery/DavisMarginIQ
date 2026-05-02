@@ -278,8 +278,20 @@ function customerKey(c: string | null | undefined): string {
 }
 
 function isUlineCustomer(c: string | null | undefined): boolean {
+  // Legacy detection by name; not used as primary signal anymore.
+  // ship_to is the end recipient (e.g. "ATLANTA HAWKS"), not the carrier customer.
+  // Uline-as-carrier is detected via PRO format instead. See isUlinePro.
   if (!c) return false;
   return /uline/i.test(c);
+}
+
+// Uline PROs are 7-9 digit purely numeric (DAS=7-digit, DDIS=8-digit format).
+// Non-Uline PROs are alpha-prefixed: SHP, MCC, ARY, ATT (redelivery prefix), etc.
+// This is the authoritative way to attribute revenue source.
+function isUlinePro(pro: string | null | undefined): boolean {
+  if (!pro) return false;
+  const s = String(pro).trim();
+  return /^\d{7,9}$/.test(s);
 }
 
 async function batchWriteDocs(collection: string, docs: Array<{ docId: string; fields: any }>): Promise<{ ok: number; failed: number }> {
@@ -415,16 +427,16 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
     return { ...status, phase: "no_stops", elapsed_ms: Date.now() - startTime };
   }
 
-  // 2. Load all DDIS payments + unpaid_stops for this month's PROs
+  // 2. Load all DDIS payments + unpaid_stops for this month's Uline PROs
   status.phase = "loading_payments";
   const allPros: string[] = [];
   const ulineStops: any[] = [];
   for (const sd of stops) {
     const f = fieldsToObject(sd.fields);
     const pro = f.pro;
-    const ship = f.ship_to;
     if (pro) allPros.push(String(pro));
-    if (isUlineCustomer(ship) && pro) ulineStops.push({ pro: String(pro), stop: f });
+    // Uline detection by PRO format, not ship_to (which is the end recipient).
+    if (isUlinePro(pro)) ulineStops.push({ pro: String(pro), stop: f });
   }
   const ulinePros = ulineStops.map(x => x.pro);
   const [paymentsByPro, unpaidByPro] = await Promise.all([
@@ -454,7 +466,8 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
     const driverName = f.driver_name;
     const driverK = driverKey(driverName);
     const custK = customerKey(ship);
-    const isUline = isUlineCustomer(ship);
+    // Uline = numeric 7-9 digit PRO (DAS 7-digit / DDIS 8-digit), not by ship_to
+    const isUline = isUlinePro(pro);
     const payBase = typeof f.contractor_pay_base === "number" ? f.contractor_pay_base : 0;
 
     const paid   = isUline ? (paymentsByPro.get(pro) || 0) : 0;
