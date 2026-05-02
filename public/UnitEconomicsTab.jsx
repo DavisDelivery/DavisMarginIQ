@@ -823,7 +823,7 @@ function StopEconomicsPanel({ availableMonths }) {
           <div>
             <div style={{ fontSize:14, fontWeight:700 }}>📐 Stop Economics — ZIP / Driver / Customer Profitability</div>
             <div style={{ fontSize:11, color:T.textMuted, marginTop:2 }}>
-              Server-side rollup joining stops × payments × classifications. <strong>Uline revenue from DDIS payments + unpaid_stops</strong>; <strong>non-Uline revenue implied from contractor pay ÷ 0.4</strong> (no rate card yet). Revenue attributed to the month the <strong>stop was delivered</strong> (not when it was billed) — won't tie exactly to audited financials month-to-month due to billing timing.
+              Server-side rollup. <strong>Uline revenue from DAS billed (audit_items)</strong>, with unpaid_stops + DDIS as fallbacks for missing audit records. <strong>Non-Uline pricing not yet available</strong> — needs the NuVizz price column or a customer rate card. Revenue attributed to the month the <strong>stop was delivered</strong> (not when it was billed) — won't tie exactly to audited financials month-to-month due to billing timing.
             </div>
           </div>
           <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
@@ -853,8 +853,8 @@ function StopEconomicsPanel({ availableMonths }) {
         <div style={{ padding:"12px 16px", borderBottom:`1px solid ${T.border}`, background:T.bgSurface }}>
           <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10 }}>
             <KPI label="Total Stops" value={fmtNum(summary.stops_total)} sub={`${summary.uline_stops} Uline / ${summary.nonuline_stops} other`} />
-            <KPI label="Uline Revenue" value={fmtK(summary.uline_revenue)} sub={`${summary.uline_revenue_paid > 0 ? fmtK(summary.uline_revenue_paid)+" paid" : ""}${summary.uline_revenue_unpaid > 0 ? " + "+fmtK(summary.uline_revenue_unpaid)+" unpaid" : ""}`} accent={T.brand} />
-            <KPI label="Non-Uline Implied" value={fmtK(summary.nonuline_revenue_implied)} sub="contractor_pay ÷ 0.4" />
+            <KPI label="Uline Revenue (DAS billed)" value={fmtK(summary.uline_revenue)} sub={`${summary.uline_das_billed > 0 ? fmtK(summary.uline_das_billed)+" DAS" : ""}${summary.uline_das_accessorial > 0 ? " incl. "+fmtK(summary.uline_das_accessorial)+" accessorial" : ""}${summary.uline_paid_only > 0 ? " + "+fmtK(summary.uline_paid_only)+" paid-only" : ""}`} accent={T.brand} />
+            <KPI label="Non-Uline Pricing" value="not loaded" sub="awaiting rate card" subColor={T.yellow} />
             <KPI label="Total Revenue" value={fmtK(summary.total_revenue)} sub={summary.rev_per_stop != null ? fmt(summary.rev_per_stop)+"/stop" : ""} accent={T.green} />
             <KPI label="Gross Margin" value={fmtK(summary.gross_margin)} sub={summary.gross_margin_pct != null ? summary.gross_margin_pct.toFixed(0)+"%" : ""} accent={summary.gross_margin >= 0 ? T.green : T.red} />
           </div>
@@ -892,8 +892,8 @@ function StopEconomicsPanel({ availableMonths }) {
                   </th>
                   <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("stops_total")}>Stops{sortIcon("stops_total")}</th>
                   <th style={{ ...tblH, textAlign:"right" }}>Uline / Other</th>
-                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("uline_revenue")}>Uline Rev{sortIcon("uline_revenue")}</th>
-                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("nonuline_revenue_implied")}>Non-U Implied{sortIcon("nonuline_revenue_implied")}</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("uline_revenue")}>Uline Rev (DAS){sortIcon("uline_revenue")}</th>
+                  <th style={{ ...tblH, textAlign:"right" }}>Non-U $</th>
                   <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("total_revenue")}>Total Rev{sortIcon("total_revenue")}</th>
                   <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("rev_per_stop")}>$/Stop{sortIcon("rev_per_stop")}</th>
                   <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("contractor_cost_at_40")}>Driver Cost{sortIcon("contractor_cost_at_40")}</th>
@@ -913,7 +913,7 @@ function StopEconomicsPanel({ availableMonths }) {
                       <td style={tblDR}>{fmtNum(r.stops_total)}</td>
                       <td style={{ ...tblDR, color:T.textMuted, fontSize:10 }}>{r.uline_stops || 0} / {r.nonuline_stops || 0}</td>
                       <td style={{ ...tblDR, color: r.uline_revenue > 0 ? T.brand : T.textDim }}>{r.uline_revenue > 0 ? fmtK(r.uline_revenue) : "—"}</td>
-                      <td style={{ ...tblDR, color: r.nonuline_revenue_implied > 0 ? T.textMuted : T.textDim, fontStyle:"italic" }}>{r.nonuline_revenue_implied > 0 ? fmtK(r.nonuline_revenue_implied) : "—"}</td>
+                      <td style={{ ...tblDR, color: T.textDim, fontStyle:"italic" }}>{r.nonuline_stops > 0 ? `${r.nonuline_stops} stops, no $` : "—"}</td>
                       <td style={{ ...tblDR, fontWeight:600 }}>{fmtK(r.total_revenue)}</td>
                       <td style={{ ...tblDR, fontWeight:600 }}>{r.rev_per_stop != null ? fmt(r.rev_per_stop) : "—"}</td>
                       <td style={{ ...tblDR, color:T.red }}>{fmtK(r.contractor_cost_at_40)}</td>
@@ -1074,7 +1074,7 @@ function UnitEconomicsTab() {
 
       {/* Note about route-level analysis */}
       <div style={{ ...card, padding:14, background:T.bgSurface, fontSize:11, color:T.textMuted }}>
-        <strong style={{ color:T.text }}>About the data joins above:</strong> The Stop Economics matrices read from server-side rollups (collections <code style={{fontSize:10,background:T.borderLight,padding:"1px 4px",borderRadius:3}}>stop_economics_zip / _driver / _customer</code>). Click "Run Rollup" for a month before viewing. Uline revenue comes from DDIS payments + unpaid_stops; non-Uline revenue is implied from contractor pay × 2.5 (since 1099 drivers are paid 40%) and is flagged as estimated until a customer rate card is loaded.
+        <strong style={{ color:T.text }}>About the data joins above:</strong> The Stop Economics matrices read from server-side rollups (collections <code style={{fontSize:10,background:T.borderLight,padding:"1px 4px",borderRadius:3}}>stop_economics_zip / _driver / _customer</code>). Click "Run Rollup" for a month before viewing. <strong>Uline revenue is the DAS billed amount</strong> (the original price card before any disputes), pulled from <code>audit_items.billed</code>; for stops without an audit record, falls back to <code>unpaid_stops.billed</code> and then <code>ddis_payments.paid_amount</code>. <strong>Non-Uline customer pricing is not yet available</strong> in any data source — needs either the right column on NuVizz or a customer rate card.
       </div>
 
       {selectedDriver && <DriverDrillModal driver={selectedDriver} onClose={() => setSelectedDriver(null)} />}

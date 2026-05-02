@@ -241,6 +241,65 @@ async function loadUnpaidByPros(pros: string[]): Promise<Map<string, number>> {
   return result;
 }
 
+// Load DAS-billed amount per Uline PRO from audit_items.
+// audit_items is the most reliable source for DAS prices because:
+//   - It's populated by the recon process from DAS files (parseOriginalOrAccessorial)
+//   - billed = new_cost = the DAS revenue value (after reroute adjustments)
+//   - It exists for any stop with variance OR explicitly rebuilt audit data
+// For stops paid clean (paid==billed exactly), audit_items may not exist; fall
+// back to ddis_payments.paid_amount which equals billed in that case.
+async function loadAuditBilledByPros(pros: string[]): Promise<Map<string, { billed: number; accessorial: number }>> {
+  const result = new Map<string, { billed: number; accessorial: number }>();
+  if (!pros.length) return result;
+  const proSet = [...new Set(pros.map(String))];
+  const chunks: string[][] = [];
+  for (let i = 0; i < proSet.length; i += 30) chunks.push(proSet.slice(i, i + 30));
+
+  for (const chunk of chunks) {
+    const body = {
+      structuredQuery: {
+        from: [{ collectionId: "audit_items" }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: "pro" },
+            op: "IN",
+            value: { arrayValue: { values: chunk.map(p => toFsValue(p)) } },
+          },
+        },
+        select: { fields: [
+          { fieldPath: "pro" },
+          { fieldPath: "billed" },
+          { fieldPath: "accessorial_amount" },
+        ] },
+        limit: 300,
+      },
+    };
+    const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:runQuery?key=${FIREBASE_API_KEY}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) continue;
+    const rows: any[] = await resp.json();
+    for (const r of rows) {
+      if (!r.document) continue;
+      const f = fieldsToObject(r.document.fields);
+      const pro = String(f.pro);
+      const billed = typeof f.billed === "number" ? f.billed : 0;
+      const acc = typeof f.accessorial_amount === "number" ? f.accessorial_amount : 0;
+      // If multiple audit_items rows exist for the same PRO, take the max billed
+      // (defensive — there shouldn't be dupes but if so the higher one is more
+      // likely the full DAS line not a partial)
+      const existing = result.get(pro);
+      if (!existing || billed > existing.billed) {
+        result.set(pro, { billed, accessorial: acc });
+      }
+    }
+  }
+  return result;
+}
+
 async function loadDriverClassifications(): Promise<Map<string, string>> {
   const result = new Map<string, string>();
   let pageToken: string | undefined;
@@ -349,14 +408,20 @@ interface RollupBucket {
   nonuline_stops: number;
   // Cost
   contractor_pay_base: number;        // raw seal_nbr from NuVizz (all stops)
-  // Revenue (Uline)
-  uline_revenue_paid: number;
-  uline_revenue_unpaid: number;
-  // Revenue (non-Uline implied)
-  nonuline_contractor_pay_base: number; // for the deflator math
+  nonuline_contractor_pay_base: number; // contractor pay for non-Uline stops only
+  // Uline revenue (authoritative sources, in priority order):
+  //   1. DAS billed from audit_items (the original Uline price)
+  //   2. unpaid_stops.billed (DAS billed for unpaid stops)
+  //   3. ddis_payments.paid_amount (when no audit/unpaid record exists,
+  //      meaning the stop paid clean with no variance)
+  uline_das_billed: number;            // sum of DAS billed (sources 1+2)
+  uline_das_accessorial: number;       // accessorial portion of DAS billed
+  uline_paid_only: number;             // sum of DDIS paid (source 3, no DAS record found)
   // Tracking
-  pro_set: Set<string>;
-  // Optional: top items for context (can populate later)
+  pro_set_with_revenue: Set<string>;   // PROs that contributed any revenue
+  uline_pros_no_match: number;         // Uline PROs with no DAS or DDIS match
+  // Non-Uline revenue: NOT yet available in any data source.
+  // Will be populated when a non-Uline rate card / NuVizz price column is wired up.
   metadata?: Record<string, any>;
 }
 
@@ -366,21 +431,31 @@ function emptyBucket(): RollupBucket {
     uline_stops: 0,
     nonuline_stops: 0,
     contractor_pay_base: 0,
-    uline_revenue_paid: 0,
-    uline_revenue_unpaid: 0,
     nonuline_contractor_pay_base: 0,
-    pro_set: new Set(),
+    uline_das_billed: 0,
+    uline_das_accessorial: 0,
+    uline_paid_only: 0,
+    pro_set_with_revenue: new Set(),
+    uline_pros_no_match: 0,
   };
 }
 
 function bucketToFields(bucket: RollupBucket, extra: Record<string, any> = {}): Record<string, any> {
-  const uline_revenue = bucket.uline_revenue_paid + bucket.uline_revenue_unpaid;
-  const nonuline_revenue_implied = bucket.nonuline_contractor_pay_base / NONULINE_RATE_DEFLATOR;
-  const total_revenue = uline_revenue + nonuline_revenue_implied;
+  // Uline revenue = DAS billed (incl. accessorial) + paid-clean-no-DAS-record fallback
+  const uline_revenue = bucket.uline_das_billed + bucket.uline_paid_only;
+  // Non-Uline revenue is unknown until rate card / NuVizz price column is wired
+  const nonuline_revenue_unknown = true;
+  const total_revenue_known = uline_revenue;
+  const total_revenue_partial = total_revenue_known; // for sorting purposes; treats unknown as 0
   const contractor_cost_at_40 = bucket.contractor_pay_base * 0.4;
-  const gross_margin = total_revenue - contractor_cost_at_40;
-  const gross_margin_pct = total_revenue > 0 ? gross_margin / total_revenue * 100 : null;
-  const uline_match_rate = bucket.uline_stops > 0 ? bucket.pro_set.size / bucket.uline_stops : null;
+  // For Uline-only margin (which we CAN compute reliably), exclude non-Uline contractor pay
+  const uline_contractor_cost_at_40 = (bucket.contractor_pay_base - bucket.nonuline_contractor_pay_base) * 0.4;
+  const uline_gross_margin = uline_revenue - uline_contractor_cost_at_40;
+  const uline_gross_margin_pct = uline_revenue > 0 ? uline_gross_margin / uline_revenue * 100 : null;
+  const uline_match_rate = bucket.uline_stops > 0
+    ? bucket.pro_set_with_revenue.size / bucket.uline_stops : null;
+  const uline_rev_per_stop = bucket.uline_stops > 0
+    ? uline_revenue / bucket.uline_stops : null;
 
   const obj = {
     ...extra,
@@ -389,16 +464,28 @@ function bucketToFields(bucket: RollupBucket, extra: Record<string, any> = {}): 
     nonuline_stops: bucket.nonuline_stops,
     contractor_pay_base: round(bucket.contractor_pay_base),
     contractor_cost_at_40: round(contractor_cost_at_40),
-    uline_revenue_paid: round(bucket.uline_revenue_paid),
-    uline_revenue_unpaid: round(bucket.uline_revenue_unpaid),
+    nonuline_contractor_pay_base: round(bucket.nonuline_contractor_pay_base),
+    // Uline revenue (authoritative)
+    uline_das_billed: round(bucket.uline_das_billed),
+    uline_das_accessorial: round(bucket.uline_das_accessorial),
+    uline_paid_only: round(bucket.uline_paid_only),
     uline_revenue: round(uline_revenue),
-    nonuline_revenue_implied: round(nonuline_revenue_implied),
-    nonuline_revenue_source: "implied_from_contractor_pay_at_40pct",
-    total_revenue: round(total_revenue),
-    rev_per_stop: bucket.stops_total > 0 ? round(total_revenue / bucket.stops_total) : null,
-    gross_margin: round(gross_margin),
-    gross_margin_pct: gross_margin_pct != null ? round(gross_margin_pct) : null,
+    uline_rev_per_stop: uline_rev_per_stop != null ? round(uline_rev_per_stop) : null,
     uline_pro_match_rate: uline_match_rate,
+    uline_pros_no_match: bucket.uline_pros_no_match,
+    // Uline margin
+    uline_contractor_cost_at_40: round(uline_contractor_cost_at_40),
+    uline_gross_margin: round(uline_gross_margin),
+    uline_gross_margin_pct: uline_gross_margin_pct != null ? round(uline_gross_margin_pct) : null,
+    // Non-Uline: explicitly NOT available until rate card is loaded
+    nonuline_revenue_known: false,
+    // Total (known portion only)
+    total_revenue: round(total_revenue_known),
+    rev_per_stop: bucket.stops_total > 0 ? round(total_revenue_known / bucket.stops_total) : null,
+    gross_margin: round(total_revenue_known - contractor_cost_at_40),
+    gross_margin_pct: total_revenue_known > 0 ? round((total_revenue_known - contractor_cost_at_40) / total_revenue_known * 100) : null,
+    revenue_source: "uline_das_billed_plus_ddis_fallback",
+    nonuline_pricing_status: "not_available_pending_rate_card",
     computed_at: new Date().toISOString(),
   };
   // Convert to Firestore field map
@@ -462,12 +549,18 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
     if (isUlinePro(pro)) ulineStops.push({ pro: String(pro), stop: f });
   }
   const ulinePros = ulineStops.map(x => x.pro);
-  const [paymentsByPro, unpaidByPro] = await Promise.all([
-    loadPaymentsByPros(ulinePros),
+  // Load all three revenue sources in parallel for Uline PROs:
+  //   - audit_items.billed     (DAS billed = original price; AUTHORITATIVE)
+  //   - unpaid_stops.billed    (DAS billed for unpaid stops; AUTHORITATIVE)
+  //   - ddis_payments.paid     (only used as fallback when no DAS record)
+  const [auditBilledByPro, unpaidByPro, paymentsByPro] = await Promise.all([
+    loadAuditBilledByPros(ulinePros),
     loadUnpaidByPros(ulinePros),
+    loadPaymentsByPros(ulinePros),
   ]);
   status.payments_matched = paymentsByPro.size;
   status.unpaid_matched = unpaidByPro.size;
+  status.audit_billed_matched = auditBilledByPro.size;
 
   // 3. Load driver classifications (small)
   const driverClass = await loadDriverClassifications();
@@ -480,7 +573,6 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
   const driverNames: Map<string, string> = new Map();
   const customerNames: Map<string, string> = new Map();
 
-  // Cache: which stop has matched payment, used for accurate uline_pro_match_rate
   for (const sd of stops) {
     const f = fieldsToObject(sd.fields);
     const pro = f.pro ? String(f.pro) : "";
@@ -493,8 +585,28 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
     const isUline = isUlinePro(pro);
     const payBase = typeof f.contractor_pay_base === "number" ? f.contractor_pay_base : 0;
 
-    const paid   = isUline ? (paymentsByPro.get(pro) || 0) : 0;
-    const unpaid = isUline ? (unpaidByPro.get(pro)   || 0) : 0;
+    // Determine Uline revenue for this stop (priority: DAS audit > unpaid > paid)
+    let stopUlineDasBilled = 0;
+    let stopUlineDasAccessorial = 0;
+    let stopUlinePaidOnly = 0;
+    let stopHasRevenue = false;
+    if (isUline) {
+      const ai = auditBilledByPro.get(pro);
+      const unpaid = unpaidByPro.get(pro) || 0;
+      const paid = paymentsByPro.get(pro) || 0;
+      if (ai && ai.billed > 0) {
+        stopUlineDasBilled = ai.billed;
+        stopUlineDasAccessorial = ai.accessorial || 0;
+        stopHasRevenue = true;
+      } else if (unpaid > 0) {
+        stopUlineDasBilled = unpaid;
+        stopHasRevenue = true;
+      } else if (paid > 0) {
+        // Fallback: paid clean with no DAS record. paid_amount equals billed in that case.
+        stopUlinePaidOnly = paid;
+        stopHasRevenue = true;
+      }
+    }
 
     // Helper: update one bucket
     const update = (bucket: RollupBucket) => {
@@ -502,9 +614,11 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
       bucket.contractor_pay_base += payBase;
       if (isUline) {
         bucket.uline_stops += 1;
-        bucket.uline_revenue_paid += paid;
-        bucket.uline_revenue_unpaid += unpaid;
-        if (paid > 0 || unpaid > 0) bucket.pro_set.add(pro);
+        bucket.uline_das_billed += stopUlineDasBilled;
+        bucket.uline_das_accessorial += stopUlineDasAccessorial;
+        bucket.uline_paid_only += stopUlinePaidOnly;
+        if (stopHasRevenue) bucket.pro_set_with_revenue.add(pro);
+        else bucket.uline_pros_no_match += 1;
       } else {
         bucket.nonuline_stops += 1;
         bucket.nonuline_contractor_pay_base += payBase;
@@ -542,10 +656,12 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
     monthBucket.uline_stops += b.uline_stops;
     monthBucket.nonuline_stops += b.nonuline_stops;
     monthBucket.contractor_pay_base += b.contractor_pay_base;
-    monthBucket.uline_revenue_paid += b.uline_revenue_paid;
-    monthBucket.uline_revenue_unpaid += b.uline_revenue_unpaid;
     monthBucket.nonuline_contractor_pay_base += b.nonuline_contractor_pay_base;
-    for (const p of b.pro_set) monthBucket.pro_set.add(p);
+    monthBucket.uline_das_billed += b.uline_das_billed;
+    monthBucket.uline_das_accessorial += b.uline_das_accessorial;
+    monthBucket.uline_paid_only += b.uline_paid_only;
+    monthBucket.uline_pros_no_match += b.uline_pros_no_match;
+    for (const p of b.pro_set_with_revenue) monthBucket.pro_set_with_revenue.add(p);
   }
 
   if (dryRun) {
