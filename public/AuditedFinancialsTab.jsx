@@ -2953,8 +2953,682 @@ function CashFlowDetail({ records }) {
   );
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// CFO Insights — the "what's actually going on" tab.
+//
+// Six analytical panels that answer the questions a CFO asks first:
+//   1. Executive summary: plain-English narrative of the business state
+//   2. Revenue bridge: why current period revenue differs from prior period
+//   3. Margin trend: gross/operating/net/EBITDA margin over time
+//   4. Cost driver analysis: where the money is being spent and how it's
+//      moving relative to revenue
+//   5. Volatility: which lines swung most this month
+//   6. Quality of earnings: separating recurring core ops from noise
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ─── Analytics helpers ────────────────────────────────────────────────────────
+
+// Lines that are accounting noise — episodic, plugs, or non-operational.
+// Excluding these gives a "core operating" view a CFO trusts.
+const QOE_NOISE_PATTERNS = [
+  /unapplied cash payment/i,
+  /old uncashed/i,
+  /gain.?loss on sale/i,
+  /penalties.*settlements/i,
+  /interest income/i,            // small, not core ops
+  /promotional/i,                // typically one-off
+];
+
+function isNoiseLine(label) {
+  return QOE_NOISE_PATTERNS.some(rx => rx.test(label || ""));
+}
+
+// Pull single-month value for a P&L total with January fallback (.month is
+// null on January when statement only had one column populated).
+function getMonthTotal(rec, key) {
+  const m = rec?.pl_totals?.[key]?.month;
+  if (typeof m === "number") return m;
+  if ((rec?.period||"").endsWith("-01")) {
+    const y = rec?.pl_totals?.[key]?.ytd;
+    if (typeof y === "number") return y;
+  }
+  return 0;
+}
+
+function getYtdTotal(rec, key) {
+  const v = rec?.pl_totals?.[key]?.ytd;
+  return typeof v === "number" ? v : null;
+}
+
+// EBITDA for a single month: NI + Interest + Tax + Dep + Amort
+function getMonthEbitda(rec) {
+  const ei = rec?.ebitda_inputs || {};
+  const isJan = (rec?.period||"").endsWith("-01");
+  const pick = (m, y) => (typeof m === "number" ? m : (isJan && typeof y === "number" ? y : 0));
+  const ni  = getMonthTotal(rec, "net_income");
+  const dep = pick(ei.depreciation_month, ei.depreciation_ytd);
+  const am  = pick(ei.amortization_month, ei.amortization_ytd);
+  const intr = pick(ei.interest_expense_month, ei.interest_expense_ytd);
+  const tax = pick(ei.income_tax_month, ei.income_tax_ytd);
+  return ni + dep + am + intr + tax;
+}
+
+// Build map of YTD value per period for a given line label
+function buildLineHistory(records, label) {
+  const out = {};
+  for (const r of records) {
+    const items = r.pl_line_items_v2 || [];
+    const li = items.find(x => (x.label||"") === label);
+    if (li) out[r.period] = { month: li.month, ytd: li.ytd, prior_month: li.prior_month, prior_ytd: li.prior_ytd };
+  }
+  return out;
+}
+
+// Walk records (sorted desc), return full FY annual totals from December anchors.
+function getFyTotals(records) {
+  const fy = {};
+  for (const r of records) {
+    if (!(r.period||"").endsWith("-12")) continue;
+    const y = r.period.split("-")[0];
+    fy[y] = {
+      revenue: getYtdTotal(r, "total_revenue"),
+      cogs:    getYtdTotal(r, "total_cost_of_sales"),
+      gross:   getYtdTotal(r, "gross_profit"),
+      opex:    getYtdTotal(r, "total_operating_expenses"),
+      opInc:   getYtdTotal(r, "operating_income"),
+      netInc:  getYtdTotal(r, "net_income"),
+      record: r,
+    };
+  }
+  return fy;
+}
+
+// For each P&L line, build cross-year YTD bridge between current and prior FY.
+// records sorted desc, latest first.
+function buildLineBridge(currentRec, priorRec) {
+  if (!currentRec || !priorRec) return [];
+  const cur  = {};
+  const prev = {};
+  for (const li of (currentRec.pl_line_items_v2 || [])) {
+    cur[li.label] = { ytd: li.ytd, section: li.section };
+  }
+  for (const li of (priorRec.pl_line_items_v2 || [])) {
+    prev[li.label] = { ytd: li.ytd, section: li.section };
+  }
+  const labels = new Set([...Object.keys(cur), ...Object.keys(prev)]);
+  const rows = [];
+  for (const label of labels) {
+    const c = cur[label] || {};
+    const p = prev[label] || {};
+    const v_c = (typeof c.ytd === "number" ? c.ytd : 0);
+    const v_p = (typeof p.ytd === "number" ? p.ytd : 0);
+    const section = c.section || p.section || "";
+    const delta = v_c - v_p;
+    // NI impact: revenue & other_income increases help; expenses hurt
+    let niImpact;
+    if (section === "revenue" || section === "other_income") niImpact = delta;
+    else niImpact = -delta;
+    rows.push({ label, section, prior: v_p, current: v_c, delta, niImpact });
+  }
+  return rows;
+}
+
+// Generate executive-summary insights from the analytics
+function generateCFOInsights(records) {
+  const insights = [];
+  if (records.length < 2) return insights;
+
+  const latest = records[0];
+  const [latestY, latestM] = (latest.period||"").split("-");
+  const priorYear = String(parseInt(latestY, 10) - 1);
+  const fy = getFyTotals(records);
+  const fyYears = Object.keys(fy).sort();
+  const latestFY = fyYears[fyYears.length - 1];
+  const priorFY  = fyYears[fyYears.length - 2];
+
+  // Revenue trajectory
+  if (latestFY && priorFY && fy[latestFY]?.revenue && fy[priorFY]?.revenue) {
+    const a = fy[latestFY].revenue, b = fy[priorFY].revenue;
+    const pct = (a-b)/b*100;
+    const mA = (fy[latestFY].netInc/a)*100, mB = (fy[priorFY].netInc/b)*100;
+    insights.push({
+      kind: pct >= 0 ? "positive" : "negative",
+      title: `FY${latestFY} revenue ${pct >= 0 ? "grew" : "fell"} ${Math.abs(pct).toFixed(1)}% YoY`,
+      detail: `$${(a/1e6).toFixed(2)}M vs $${(b/1e6).toFixed(2)}M in FY${priorFY}. Net margin ${mA >= mB ? "expanded" : "compressed"} from ${mB.toFixed(1)}% to ${mA.toFixed(1)}% (${(mA-mB).toFixed(1)}pp).`,
+    });
+  }
+
+  // YTD comparison vs prior year same month
+  const samePriorPeriod = `${priorYear}-${latestM}`;
+  const priorRec = records.find(r => r.period === samePriorPeriod);
+  if (priorRec) {
+    const rev_c = getYtdTotal(latest, "total_revenue");
+    const rev_p = getYtdTotal(priorRec, "total_revenue");
+    const ni_c  = getYtdTotal(latest, "net_income");
+    const ni_p  = getYtdTotal(priorRec, "net_income");
+    if (rev_c != null && rev_p) {
+      const dPct = (rev_c-rev_p)/rev_p*100;
+      const dDoll = rev_c - rev_p;
+      insights.push({
+        kind: dPct >= -2 ? (dPct >= 5 ? "positive" : "neutral") : "negative",
+        title: `${latestY} YTD revenue is ${dPct >= 0 ? "up" : "down"} ${Math.abs(dPct).toFixed(1)}% vs same period ${priorYear}`,
+        detail: `${(dDoll/1000).toFixed(0)}K ${dDoll >= 0 ? "ahead" : "behind"} (${(rev_c/1e6).toFixed(2)}M vs ${(rev_p/1e6).toFixed(2)}M YTD-${monthLabel(latest.period).split(" ")[0]}).`,
+      });
+    }
+    if (ni_c != null && ni_p != null && ni_p !== 0) {
+      const dPct = (ni_c-ni_p)/Math.abs(ni_p)*100;
+      const dDoll = ni_c - ni_p;
+      if (Math.abs(dPct) > 10) {
+        insights.push({
+          kind: dPct >= 0 ? "positive" : "negative",
+          title: `Net income is ${dPct >= 0 ? "up" : "down"} ${Math.abs(dPct).toFixed(0)}% YTD vs ${priorYear}`,
+          detail: `${dDoll >= 0 ? "$" : "-$"}${Math.abs(dDoll/1000).toFixed(0)}K ${dDoll >= 0 ? "ahead" : "behind"} (${(ni_c/1000).toFixed(0)}K vs ${(ni_p/1000).toFixed(0)}K).`,
+        });
+      }
+    }
+  }
+
+  // Top cost driver: largest YoY $ increase that's an expense
+  if (latestFY && priorFY && fy[latestFY] && fy[priorFY]) {
+    const bridge = buildLineBridge(fy[latestFY].record, fy[priorFY].record);
+    const expIncreases = bridge.filter(r =>
+      (r.section === "operating_expense" || r.section === "cost_of_sales")
+      && r.delta > 0
+      && !isNoiseLine(r.label)
+    ).sort((a,b) => b.delta - a.delta);
+    if (expIncreases.length) {
+      const top = expIncreases[0];
+      const pctGrowth = top.prior !== 0 ? top.delta/Math.abs(top.prior)*100 : 0;
+      const revGrowthPct = fy[priorFY].revenue ? (fy[latestFY].revenue - fy[priorFY].revenue)/fy[priorFY].revenue*100 : 0;
+      insights.push({
+        kind: pctGrowth > revGrowthPct * 2 ? "negative" : "neutral",
+        title: `Biggest cost increase FY${latestFY}: ${top.label} +$${(top.delta/1000).toFixed(0)}K (+${pctGrowth.toFixed(0)}%)`,
+        detail: `${pctGrowth > revGrowthPct * 2 ? `Outpaced revenue growth (${revGrowthPct.toFixed(1)}%) by ${(pctGrowth/revGrowthPct).toFixed(1)}×. ` : ""}Now ${(top.current/fy[latestFY].revenue*100).toFixed(1)}% of revenue, was ${(top.prior/fy[priorFY].revenue*100).toFixed(1)}%.`,
+      });
+    }
+  }
+
+  // Cost flexibility: lines that crept up as % of revenue over 4 years
+  if (fyYears.length >= 3) {
+    const earliestFY = fyYears[0];
+    const latestRev = fy[latestFY].revenue;
+    const earliestRev = fy[earliestFY].revenue;
+    const earliestItems = {};
+    for (const li of (fy[earliestFY].record.pl_line_items_v2 || [])) earliestItems[li.label] = li.ytd || 0;
+    const latestItems = {};
+    for (const li of (fy[latestFY].record.pl_line_items_v2 || [])) latestItems[li.label] = li.ytd || 0;
+    const drifts = [];
+    for (const [label, latestVal] of Object.entries(latestItems)) {
+      const earliestVal = earliestItems[label] || 0;
+      if (latestVal < 50000) continue; // only material lines
+      if (isNoiseLine(label)) continue;
+      const pctL = latestVal/latestRev*100;
+      const pctE = earliestVal/earliestRev*100;
+      const drift = pctL - pctE;
+      if (drift > 1.5) drifts.push({ label, pctE, pctL, drift, dollarsAtCurrentRev: drift/100*latestRev });
+    }
+    drifts.sort((a,b) => b.drift - a.drift);
+    if (drifts.length >= 2) {
+      const top = drifts[0];
+      insights.push({
+        kind: "negative",
+        title: `Structural cost creep: ${top.label} now ${top.pctL.toFixed(1)}% of revenue (was ${top.pctE.toFixed(1)}% in FY${earliestFY})`,
+        detail: `${drifts.slice(0,3).map(d => `${d.label} +${d.drift.toFixed(1)}pp`).join(" · ")}. Combined ${drifts.slice(0,3).reduce((s,d) => s+d.drift, 0).toFixed(1)}pp of margin lost to these three lines vs FY${earliestFY}.`,
+      });
+    }
+  }
+
+  return insights;
+}
+
+// ─── CFO Insights tab ─────────────────────────────────────────────────────────
+function CFOInsights({ records, onSelectLineItem }) {
+  if (!records.length) {
+    return (
+      <div style={{ ...card, textAlign:"center", padding:"40px 20px", color:T.textMuted }}>
+        <div style={{ fontSize:36, marginBottom:8 }}>🔍</div>
+        <div style={{ fontSize:13, fontWeight:600 }}>No data yet</div>
+      </div>
+    );
+  }
+
+  const insights = useMemo(() => generateCFOInsights(records), [records]);
+  const fy = useMemo(() => getFyTotals(records), [records]);
+  const fyYears = Object.keys(fy).sort();
+  const latestFY = fyYears[fyYears.length - 1];
+  const priorFY  = fyYears[fyYears.length - 2];
+
+  // Bridge: latest FY vs prior FY, sorted by NI impact (most damaging first)
+  const fyBridge = useMemo(() => {
+    if (!latestFY || !priorFY) return [];
+    return buildLineBridge(fy[latestFY].record, fy[priorFY].record)
+      .filter(r => Math.abs(r.delta) > 1000) // material moves only
+      .sort((a, b) => a.niImpact - b.niImpact); // most negative impact first
+  }, [fy, latestFY, priorFY]);
+
+  // YTD bridge: latest period vs same period prior year
+  const latest = records[0];
+  const [latestY, latestM] = (latest.period||"").split("-");
+  const samePriorPeriod = `${parseInt(latestY,10)-1}-${latestM}`;
+  const priorYTDRec = records.find(r => r.period === samePriorPeriod);
+  const ytdBridge = useMemo(() => {
+    if (!priorYTDRec) return [];
+    return buildLineBridge(latest, priorYTDRec)
+      .filter(r => Math.abs(r.delta) > 500)
+      .sort((a, b) => a.niImpact - b.niImpact);
+  }, [latest, priorYTDRec]);
+
+  // Margin trend by month: gross / operating / net / EBITDA
+  const marginTrend = useMemo(() => {
+    const asc = [...records].sort((a,b) => (a.period||"").localeCompare(b.period||""));
+    return asc.map(r => {
+      const rev = getMonthTotal(r, "total_revenue");
+      const cogs = getMonthTotal(r, "total_cost_of_sales");
+      const gross = getMonthTotal(r, "gross_profit") || (rev - cogs);
+      const opInc = getMonthTotal(r, "operating_income");
+      const ni = getMonthTotal(r, "net_income");
+      const ebitda = getMonthEbitda(r);
+      return {
+        period: r.period,
+        rev, ni,
+        grossPct:  rev > 0 ? gross/rev*100 : null,
+        opPct:     rev > 0 ? opInc/rev*100 : null,
+        niPct:     rev > 0 ? ni/rev*100 : null,
+        ebitdaPct: rev > 0 ? ebitda/rev*100 : null,
+      };
+    }).filter(p => p.rev > 0);
+  }, [records]);
+
+  // Cost driver analysis: every operating expense line × 4 years × % of revenue
+  const costDrivers = useMemo(() => {
+    if (fyYears.length < 2) return [];
+    const allLabels = new Set();
+    for (const y of fyYears) {
+      for (const li of (fy[y].record?.pl_line_items_v2 || [])) {
+        if (li.section === "operating_expense" || li.section === "cost_of_sales") {
+          allLabels.add(li.label);
+        }
+      }
+    }
+    const rows = [];
+    for (const label of allLabels) {
+      const byYear = {};
+      let latestDollars = 0;
+      let priorDollars = 0;
+      let section = "";
+      for (const y of fyYears) {
+        const li = (fy[y].record?.pl_line_items_v2 || []).find(x => x.label === label);
+        const v = (li?.ytd) || 0;
+        const rev = fy[y].revenue || 0;
+        byYear[y] = { dollars: v, pctOfRev: rev > 0 ? v/rev*100 : 0 };
+        if (li?.section) section = li.section;
+        if (y === latestFY) latestDollars = v;
+        if (y === priorFY)  priorDollars = v;
+      }
+      const yoyDelta = latestDollars - priorDollars;
+      const yoyPct   = priorDollars !== 0 ? yoyDelta/Math.abs(priorDollars)*100 : null;
+      // 4-year drift in % of revenue
+      const earliestY = fyYears[0];
+      const drift = (byYear[latestFY]?.pctOfRev || 0) - (byYear[earliestY]?.pctOfRev || 0);
+      // Volatility: stddev of monthly values across all months
+      const allMonthVals = [];
+      const history = buildLineHistory(records, label);
+      for (const p in history) {
+        if (typeof history[p].month === "number") allMonthVals.push(history[p].month);
+      }
+      const mean = allMonthVals.length ? allMonthVals.reduce((s,v) => s+v, 0)/allMonthVals.length : 0;
+      const variance = allMonthVals.length ? allMonthVals.reduce((s,v) => s+(v-mean)**2, 0)/allMonthVals.length : 0;
+      const stddev = Math.sqrt(variance);
+      const cv = mean > 0 ? stddev/mean : 0; // coefficient of variation: high = volatile
+      rows.push({ label, section, byYear, latestDollars, priorDollars, yoyDelta, yoyPct, drift, mean, cv });
+    }
+    return rows.filter(r => r.latestDollars > 1000 || r.priorDollars > 1000);
+  }, [fy, fyYears, records, latestFY, priorFY]);
+
+  // Volatility: latest month vs trailing 6mo average for each line
+  const volatility = useMemo(() => {
+    const asc = [...records].sort((a,b) => (a.period||"").localeCompare(b.period||""));
+    if (asc.length < 4) return [];
+    const latestRec = asc[asc.length-1];
+    const trailing = asc.slice(-7, -1); // 6 months prior to latest
+    const allLabels = new Set();
+    for (const li of (latestRec.pl_line_items_v2 || [])) allLabels.add(li.label);
+
+    const rows = [];
+    for (const label of allLabels) {
+      if (isNoiseLine(label)) continue;
+      const latestLi = (latestRec.pl_line_items_v2 || []).find(x => x.label === label);
+      if (!latestLi || typeof latestLi.month !== "number") continue;
+      const latestVal = latestLi.month;
+      // Trailing 6-month avg
+      const trailingVals = [];
+      for (const tr of trailing) {
+        const li = (tr.pl_line_items_v2 || []).find(x => x.label === label);
+        if (li && typeof li.month === "number") trailingVals.push(li.month);
+      }
+      if (trailingVals.length < 3) continue;
+      const avg = trailingVals.reduce((s,v) => s+v, 0)/trailingVals.length;
+      if (Math.abs(avg) < 100) continue;
+      const delta = latestVal - avg;
+      const deltaPct = (delta/Math.abs(avg))*100;
+      if (Math.abs(deltaPct) < 25 || Math.abs(delta) < 1000) continue;
+      rows.push({
+        label, section: latestLi.section,
+        latestVal, avg, delta, deltaPct,
+      });
+    }
+    rows.sort((a,b) => Math.abs(b.delta) - Math.abs(a.delta));
+    return rows.slice(0, 10);
+  }, [records]);
+
+  // Quality of earnings: separate core vs noise
+  const qoe = useMemo(() => {
+    if (!latestFY || !priorFY) return null;
+    const splitFY = (rec) => {
+      const items = rec.pl_line_items_v2 || [];
+      let coreRev = 0, coreCost = 0, noiseRev = 0, noiseExp = 0;
+      for (const li of items) {
+        const v = li.ytd || 0;
+        if (isNoiseLine(li.label)) {
+          if (li.section === "revenue" || li.section === "other_income") noiseRev += v;
+          else noiseExp += v;
+        } else {
+          if (li.section === "revenue") coreRev += v;
+          else if (li.section === "cost_of_sales" || li.section === "operating_expense") coreCost += v;
+        }
+      }
+      return { coreRev, coreCost, coreOpInc: coreRev - coreCost, coreMargin: coreRev > 0 ? (coreRev - coreCost)/coreRev*100 : 0, noiseRev, noiseExp };
+    };
+    return {
+      latest: splitFY(fy[latestFY].record),
+      prior:  splitFY(fy[priorFY].record),
+    };
+  }, [fy, latestFY, priorFY]);
+
+  // ── Render the bridge as a horizontal bar chart ──
+  const renderBridgeChart = (rows, title, anchor1Label, anchor2Label) => {
+    if (!rows.length) return null;
+    // Sort: revenue first, then by NI impact magnitude
+    const sorted = [...rows].sort((a, b) => Math.abs(b.niImpact) - Math.abs(a.niImpact)).slice(0, 12);
+    const maxAbs = Math.max(...sorted.map(r => Math.abs(r.niImpact)));
+    return (
+      <div style={{ ...card, padding:16 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:12 }}>
+          <div>
+            <div style={{ fontSize:13, fontWeight:700 }}>{title}</div>
+            <div style={{ fontSize:11, color:T.textMuted, marginTop:2 }}>{anchor1Label} → {anchor2Label} · top 12 by NI impact · green helps NI, red hurts NI</div>
+          </div>
+        </div>
+        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+          {sorted.map((r, i) => {
+            const widthPct = (Math.abs(r.niImpact)/maxAbs)*45;
+            const isPositive = r.niImpact >= 0;
+            const sectionLabel = (r.section||"").replace(/_/g," ");
+            return (
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:8, fontSize:11 }}>
+                <div style={{ width:170, textAlign:"right", color:T.textMuted, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                  {r.label}
+                  <div style={{ fontSize:9, color:T.textDim, textTransform:"uppercase" }}>{sectionLabel}</div>
+                </div>
+                <div style={{ flex:1, position:"relative", height:22, display:"flex", alignItems:"center" }}>
+                  <div style={{ position:"absolute", left:"50%", top:0, bottom:0, width:1, background:T.border }} />
+                  <div style={{
+                    position:"absolute",
+                    left:isPositive ? "50%" : `calc(50% - ${widthPct}%)`,
+                    width:`${widthPct}%`,
+                    height:18,
+                    background: isPositive ? T.green : T.red,
+                    borderRadius:3,
+                    opacity:0.85,
+                  }} />
+                  <div style={{ position:"absolute", left:isPositive ? `calc(50% + ${widthPct}% + 4px)` : `calc(50% - ${widthPct}% - 4px)`, transform:isPositive?"none":"translateX(-100%)", fontSize:10, fontWeight:700, color:T.text, whiteSpace:"nowrap" }}>
+                    {(r.niImpact >= 0 ? "+" : "-")}${Math.abs(r.niImpact/1000).toFixed(0)}K
+                  </div>
+                </div>
+                <div style={{ width:90, textAlign:"right", fontSize:10, color:T.textMuted, fontVariantNumeric:"tabular-nums" }}>
+                  ${(r.prior/1000).toFixed(0)}K → ${(r.current/1000).toFixed(0)}K
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ borderTop:`1px solid ${T.borderLight}`, marginTop:10, paddingTop:8, display:"flex", justifyContent:"space-between", fontSize:11 }}>
+          <span style={{ color:T.textMuted }}>Net effect on NI:</span>
+          <span style={{ fontWeight:700, color: rows.reduce((s,r) => s+r.niImpact, 0) >= 0 ? T.green : T.red }}>
+            {rows.reduce((s,r) => s+r.niImpact, 0) >= 0 ? "+" : "-"}${Math.abs(rows.reduce((s,r) => s+r.niImpact, 0)/1000).toFixed(0)}K
+          </span>
+        </div>
+      </div>
+    );
+  };
+
+  // ── Render margin trend chart ──
+  const renderMarginTrend = () => {
+    if (marginTrend.length < 6) return null;
+    const W = 800, H = 220, P = 36;
+    const all = [];
+    marginTrend.forEach(m => {
+      if (m.grossPct  != null) all.push(m.grossPct);
+      if (m.opPct     != null) all.push(m.opPct);
+      if (m.niPct     != null) all.push(m.niPct);
+      if (m.ebitdaPct != null) all.push(m.ebitdaPct);
+    });
+    const minV = Math.min(0, ...all);
+    const maxV = Math.max(...all);
+    const range = (maxV - minV) || 1;
+    const xStep = (W - P*2) / Math.max(1, marginTrend.length - 1);
+    const yFor = (v) => H - P - ((v - minV)/range)*(H - P*2);
+    const buildPath = (key) => marginTrend.map((m, i) => {
+      const v = m[key];
+      if (v == null) return null;
+      return { x: P + i*xStep, y: yFor(v) };
+    }).filter(Boolean).map((p, i) => `${i===0?"M":"L"} ${p.x} ${p.y}`).join(" ");
+
+    const lines = [
+      { key:"grossPct",  color:T.brand, label:"Gross" },
+      { key:"opPct",     color:"#7c3aed", label:"Operating" },
+      { key:"ebitdaPct", color:T.green, label:"EBITDA" },
+      { key:"niPct",     color:T.red, label:"Net" },
+    ];
+    return (
+      <div style={{ ...card, padding:16 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:8 }}>
+          <div>
+            <div style={{ fontSize:13, fontWeight:700 }}>Margin Trend</div>
+            <div style={{ fontSize:11, color:T.textMuted }}>Monthly margin % over {marginTrend.length} months</div>
+          </div>
+          <div style={{ display:"flex", gap:12 }}>
+            {lines.map(l => (
+              <span key={l.key} style={{ fontSize:10, fontWeight:600, color:l.color, display:"flex", alignItems:"center", gap:4 }}>
+                <span style={{ width:10, height:2, background:l.color, display:"inline-block" }} /> {l.label}
+              </span>
+            ))}
+          </div>
+        </div>
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display:"block" }}>
+          <line x1={P} y1={yFor(0)} x2={W-P} y2={yFor(0)} stroke={T.border} strokeDasharray="3,3" />
+          <text x={P-4} y={yFor(0)+3} fontSize="9" fill={T.textMuted} textAnchor="end">0%</text>
+          <text x={P-4} y={yFor(maxV)+3} fontSize="9" fill={T.textMuted} textAnchor="end">{maxV.toFixed(0)}%</text>
+          <text x={P-4} y={yFor(minV)+3} fontSize="9" fill={T.textMuted} textAnchor="end">{minV.toFixed(0)}%</text>
+          {lines.map(l => (
+            <path key={l.key} d={buildPath(l.key)} fill="none" stroke={l.color} strokeWidth="1.5" />
+          ))}
+          {/* Year boundary markers */}
+          {marginTrend.map((m, i) => {
+            if (!m.period.endsWith("-01") || i === 0) return null;
+            const x = P + i*xStep;
+            return (
+              <g key={`y${i}`}>
+                <line x1={x} y1={P} x2={x} y2={H-P} stroke={T.borderLight} />
+                <text x={x+2} y={P+10} fontSize="9" fill={T.textDim}>{m.period.split("-")[0]}</text>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      {/* Executive Summary Cards */}
+      <div style={{ marginBottom:16 }}>
+        <div style={{ fontSize:13, fontWeight:700, marginBottom:8, color:T.text }}>📌 What's Going On</div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(280px, 1fr))", gap:10 }}>
+          {insights.map((ins, i) => {
+            const accent = ins.kind === "positive" ? T.green : ins.kind === "negative" ? T.red : T.brand;
+            return (
+              <div key={i} style={{ ...card, padding:12, borderLeft:`3px solid ${accent}` }}>
+                <div style={{ fontSize:12, fontWeight:700, color:T.text, marginBottom:4 }}>{ins.title}</div>
+                <div style={{ fontSize:11, color:T.textMuted, lineHeight:1.4 }}>{ins.detail}</div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Bridges: FY YoY + YTD vs same period prior year */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(450px, 1fr))", gap:12, marginBottom:16 }}>
+        {latestFY && priorFY && fyBridge.length > 0 && renderBridgeChart(
+          fyBridge,
+          `FY${latestFY} vs FY${priorFY} — What Moved Net Income`,
+          `FY${priorFY}`,
+          `FY${latestFY}`
+        )}
+        {ytdBridge.length > 0 && renderBridgeChart(
+          ytdBridge,
+          `${monthLabel(latest.period).split(" ")[0]} ${latestY} YTD vs ${monthLabel(samePriorPeriod).split(" ")[0]} ${parseInt(latestY,10)-1} YTD`,
+          `YTD ${parseInt(latestY,10)-1}`,
+          `YTD ${latestY}`
+        )}
+      </div>
+
+      {/* Margin trend */}
+      <div style={{ marginBottom:16 }}>{renderMarginTrend()}</div>
+
+      {/* Cost driver analysis */}
+      <div style={{ ...card, padding:16, marginBottom:16 }}>
+        <div style={{ fontSize:13, fontWeight:700, marginBottom:4 }}>💰 Cost Drivers — Multi-Year View</div>
+        <div style={{ fontSize:11, color:T.textMuted, marginBottom:12 }}>
+          Every cost line as % of revenue across {fyYears.length} years. Drift {">"} 1pp = cost outpacing revenue (margin compression). CV = volatility (high = unpredictable). Click for line history.
+        </div>
+        <div style={{ overflow:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+            <thead>
+              <tr>
+                <th style={tblH}>Line</th>
+                {fyYears.map(y => (
+                  <th key={y} style={{ ...tblH, textAlign:"right" }}>FY{y}</th>
+                ))}
+                <th style={{ ...tblH, textAlign:"right" }}>YoY $</th>
+                <th style={{ ...tblH, textAlign:"right" }}>YoY %</th>
+                <th style={{ ...tblH, textAlign:"right" }}>4yr Drift</th>
+                <th style={{ ...tblH, textAlign:"right" }} title="Coefficient of Variation: monthly stddev / mean. > 0.5 = highly volatile.">CV</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...costDrivers].sort((a,b) => b.latestDollars - a.latestDollars).slice(0, 25).map(r => {
+                const driftColor = r.drift > 1 ? T.red : r.drift < -1 ? T.green : T.textMuted;
+                const cvColor = r.cv > 0.5 ? T.yellow : T.textMuted;
+                const yoyColor = r.yoyDelta > 0 ? T.red : T.green;
+                return (
+                  <tr key={r.label} style={{ cursor: onSelectLineItem ? "pointer" : "default" }}
+                      onClick={() => onSelectLineItem && onSelectLineItem({ label: r.label, section: r.section, history: Object.entries(buildLineHistory(records, r.label)).map(([period, v]) => ({ period, ...v })) })}>
+                    <td style={tblD}>{r.label}</td>
+                    {fyYears.map(y => (
+                      <td key={y} style={{ ...tblDR, color: y === latestFY ? T.text : T.textMuted }}>
+                        ${(r.byYear[y].dollars/1000).toFixed(0)}K
+                        <div style={{ fontSize:9, color:T.textDim }}>{r.byYear[y].pctOfRev.toFixed(1)}%</div>
+                      </td>
+                    ))}
+                    <td style={{ ...tblDR, color:yoyColor, fontWeight:600 }}>{r.yoyDelta >= 0 ? "+" : ""}${(r.yoyDelta/1000).toFixed(0)}K</td>
+                    <td style={{ ...tblDR, color:yoyColor }}>{r.yoyPct == null ? "—" : (r.yoyPct >= 0 ? "+" : "") + r.yoyPct.toFixed(1) + "%"}</td>
+                    <td style={{ ...tblDR, color:driftColor, fontWeight:600 }}>{(r.drift >= 0 ? "+" : "") + r.drift.toFixed(2) + "pp"}</td>
+                    <td style={{ ...tblDR, color:cvColor }}>{r.cv.toFixed(2)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Volatility: latest-month outliers */}
+      {volatility.length > 0 && (
+        <div style={{ ...card, padding:16, marginBottom:16 }}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:4 }}>⚡ Latest Month Outliers</div>
+          <div style={{ fontSize:11, color:T.textMuted, marginBottom:12 }}>
+            Lines that deviated most from their trailing 6-month average in {monthLabel(latest.period)}. Investigate before they compound.
+          </div>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+            <thead>
+              <tr>
+                <th style={tblH}>Line</th>
+                <th style={{ ...tblH, textAlign:"right" }}>{monthLabel(latest.period)}</th>
+                <th style={{ ...tblH, textAlign:"right" }}>Trailing 6mo Avg</th>
+                <th style={{ ...tblH, textAlign:"right" }}>Δ$</th>
+                <th style={{ ...tblH, textAlign:"right" }}>Δ%</th>
+              </tr>
+            </thead>
+            <tbody>
+              {volatility.map(r => {
+                const direction = r.section === "revenue" ? (r.delta >= 0 ? T.green : T.red) : (r.delta >= 0 ? T.red : T.green);
+                return (
+                  <tr key={r.label} style={{ cursor: onSelectLineItem ? "pointer" : "default" }}
+                      onClick={() => onSelectLineItem && onSelectLineItem({ label: r.label, section: r.section, history: Object.entries(buildLineHistory(records, r.label)).map(([period, v]) => ({ period, ...v })) })}>
+                    <td style={tblD}>{r.label}</td>
+                    <td style={tblDR}>{fmtMoney(r.latestVal)}</td>
+                    <td style={{ ...tblDR, color:T.textMuted }}>{fmtMoney(r.avg)}</td>
+                    <td style={{ ...tblDR, color:direction, fontWeight:600 }}>{r.delta >= 0 ? "+" : ""}{fmtMoney(r.delta)}</td>
+                    <td style={{ ...tblDR, color:direction }}>{r.deltaPct >= 0 ? "+" : ""}{r.deltaPct.toFixed(0)}%</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Quality of Earnings */}
+      {qoe && (
+        <div style={{ ...card, padding:16, marginBottom:16 }}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:4 }}>🎯 Quality of Earnings</div>
+          <div style={{ fontSize:11, color:T.textMuted, marginBottom:12 }}>
+            Core operating performance with non-recurring "noise" lines stripped out (Unapplied Cash, Old Uncashed Checks, Gain/Loss on Asset Sales, Penalties, Promotional, Interest Income).
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))", gap:10 }}>
+            <div style={{ ...card, padding:12, background:T.bgSurface }}>
+              <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>FY{priorFY} Core Margin</div>
+              <div style={{ fontSize:18, fontWeight:800, color:T.text }}>{qoe.prior.coreMargin.toFixed(1)}%</div>
+              <div style={{ fontSize:10, color:T.textMuted }}>Core OpInc ${(qoe.prior.coreOpInc/1000).toFixed(0)}K</div>
+            </div>
+            <div style={{ ...card, padding:12, background:T.bgSurface }}>
+              <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>FY{latestFY} Core Margin</div>
+              <div style={{ fontSize:18, fontWeight:800, color: qoe.latest.coreMargin >= qoe.prior.coreMargin ? T.green : T.red }}>{qoe.latest.coreMargin.toFixed(1)}%</div>
+              <div style={{ fontSize:10, color:T.textMuted }}>Core OpInc ${(qoe.latest.coreOpInc/1000).toFixed(0)}K</div>
+            </div>
+            <div style={{ ...card, padding:12, background:T.bgSurface }}>
+              <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>Core Margin Δ</div>
+              <div style={{ fontSize:18, fontWeight:800, color: qoe.latest.coreMargin >= qoe.prior.coreMargin ? T.green : T.red }}>
+                {(qoe.latest.coreMargin - qoe.prior.coreMargin >= 0 ? "+" : "") + (qoe.latest.coreMargin - qoe.prior.coreMargin).toFixed(2)}pp
+              </div>
+              <div style={{ fontSize:10, color:T.textMuted }}>year-over-year</div>
+            </div>
+            <div style={{ ...card, padding:12, background:T.bgSurface }}>
+              <div style={{ fontSize:10, color:T.textMuted, fontWeight:700, textTransform:"uppercase" }}>FY{latestFY} Noise Income</div>
+              <div style={{ fontSize:18, fontWeight:800, color:T.textMuted }}>${(qoe.latest.noiseRev/1000).toFixed(0)}K</div>
+              <div style={{ fontSize:10, color:T.textMuted }}>excluded from core</div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 function AuditedFinancialsTab() {
-  const [view, setView]         = useState("dashboard"); // dashboard | pl | bs | cf | statements | chat
+  const [view, setView]         = useState("insights"); // insights | dashboard | pl | bs | cf | statements | chat
   const [records, setRecords]   = useState([]);
   const [loading, setLoading]   = useState(true);
   const [selected, setSelected] = useState(null);
@@ -2982,12 +3656,13 @@ function AuditedFinancialsTab() {
   };
 
   const views = [
-    { id:"dashboard",  icon:"📊", label:"Dashboard",  count:null },
-    { id:"pl",         icon:"💵", label:"P&L Detail", count:null },
-    { id:"bs",         icon:"📒", label:"Balance Sheet", count:null },
-    { id:"cf",         icon:"💸", label:"Cash Flow",  count:null },
-    { id:"statements", icon:"📋", label:"Statements", count:records.length },
-    { id:"chat",       icon:"💬", label:"Ask AI",     count:null },
+    { id:"insights",   icon:"🔍", label:"CFO Insights", count:null },
+    { id:"dashboard",  icon:"📊", label:"Dashboard",    count:null },
+    { id:"pl",         icon:"💵", label:"P&L Detail",   count:null },
+    { id:"bs",         icon:"📒", label:"Balance Sheet",count:null },
+    { id:"cf",         icon:"💸", label:"Cash Flow",    count:null },
+    { id:"statements", icon:"📋", label:"Statements",   count:records.length },
+    { id:"chat",       icon:"💬", label:"Ask AI",       count:null },
   ];
 
   if (loading) return (
@@ -3034,6 +3709,7 @@ function AuditedFinancialsTab() {
         ))}
       </div>
 
+      {view === "insights"   && <CFOInsights records={records} onSelectLineItem={setSelectedLine} />}
       {view === "dashboard"  && <Dashboard records={records} onSelect={setSelected} />}
       {view === "pl"         && <PLDetail records={records} onSelectLineItem={setSelectedLine} />}
       {view === "bs"         && <BSDetail records={records} />}
