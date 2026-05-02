@@ -163,13 +163,67 @@ function findCsvAttachment(payload: any): { filename: string; attachmentId: stri
   return null;
 }
 
-async function downloadAttachment(accessToken: string, messageId: string, attachmentId: string): Promise<string | null> {
+async function downloadAttachment(accessToken: string, messageId: string, attachmentId: string): Promise<{ bytes: Buffer; text: string } | null> {
   const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`;
   const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
   if (!r.ok) return null;
   const data: any = await r.json();
   const b64 = (data.data || "").replace(/-/g, "+").replace(/_/g, "/");
-  return Buffer.from(b64, "base64").toString("utf8");
+  const bytes = Buffer.from(b64, "base64");
+  return { bytes, text: bytes.toString("utf8") };
+}
+
+// v2.52.2 — Layer 1 raw file preservation. Mirrors the helper added to
+// nuvizz-auto.mts. Stores original CSV bytes (gzipped) in source_files_raw
+// + source_file_chunks so the original is preserved even if Gmail later
+// removes the email or a parser bug needs the original to be re-parsed.
+import { gzipSync as nodeGzipSync } from "node:zlib";
+const RAW_CHUNK_BUDGET = 700_000;
+
+async function stageRawFile(
+  apiKey: string,
+  source: string,
+  fileId: string,
+  filename: string,
+  bytes: Buffer,
+  emailMeta: { messageId: string; subject: string; account: string; emailDate: string },
+): Promise<{ ok: boolean; chunkCount: number; rawBytes: number; gzBytes: number; error?: string }> {
+  const gz = nodeGzipSync(bytes);
+  const b64 = gz.toString("base64");
+  const chunks: string[] = [];
+  for (let i = 0; i < b64.length; i += RAW_CHUNK_BUDGET) {
+    chunks.push(b64.substring(i, i + RAW_CHUNK_BUDGET));
+  }
+  const headerOk = await fsPatchDoc("source_files_raw", fileId, {
+    file_id: fileId,
+    source,
+    filename,
+    size_bytes: bytes.length,
+    gz_bytes: gz.length,
+    chunk_count: chunks.length,
+    state: "staged",
+    staged_at: new Date().toISOString(),
+    email_message_id: emailMeta.messageId,
+    email_subject: emailMeta.subject,
+    email_account: emailMeta.account,
+    email_date: emailMeta.emailDate,
+  }, apiKey);
+  if (!headerOk) return { ok: false, chunkCount: 0, rawBytes: bytes.length, gzBytes: gz.length, error: "Failed to write parent file doc" };
+  let chunkErrors = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkId = `${fileId}__${String(i).padStart(3, "0")}`;
+    const ok = await fsPatchDoc("source_file_chunks", chunkId, {
+      file_id: fileId, chunk_index: i, chunk_count: chunks.length,
+      data_b64: chunks[i], created_at: new Date().toISOString(),
+    }, apiKey);
+    if (!ok) chunkErrors++;
+  }
+  if (chunkErrors > 0) return { ok: false, chunkCount: chunks.length, rawBytes: bytes.length, gzBytes: gz.length, error: `${chunkErrors}/${chunks.length} chunks failed` };
+  return { ok: true, chunkCount: chunks.length, rawBytes: bytes.length, gzBytes: gz.length };
+}
+
+function sanitizeFileId(filename: string): string {
+  return filename.replace(/[^a-z0-9._-]/gi, "_").slice(0, 140);
 }
 
 // ─── CSV parser (mirrors readCSV + parseCSVStream from MarginIQ.jsx) ─────────
@@ -545,18 +599,46 @@ export default async (req: Request, _context: Context) => {
       }, 200);
     }
 
-    const csvText = await downloadAttachment(bestMsg.accessToken, bestMsg.messageId, att.attachmentId);
-    if (!csvText) {
+    const dl = await downloadAttachment(bestMsg.accessToken, bestMsg.messageId, att.attachmentId);
+    if (!dl) {
       const err = "Attachment download failed";
       await fsPatchDoc("ddis_auto_ingest_logs", runId, {
         state: "failed", error: err, completed_at: new Date().toISOString(),
       }, FIREBASE_API_KEY);
       return json({ run_id: runId, state: "failed", error: err }, 200);
     }
+    const csvText = dl.text;
+    const csvBytes = dl.bytes;
+
+    // v2.52.2: Layer 1 — stage original DDIS file bytes BEFORE parsing.
+    const fileId = `ddis__${bestMsg.messageId}__${sanitizeFileId(att.filename)}`;
+    await fsPatchDoc("ddis_auto_ingest_logs", runId, {
+      progress: `Staging raw file (${(csvBytes.length / 1024).toFixed(1)} KB)...`,
+    }, FIREBASE_API_KEY);
+    const stageRes = await stageRawFile(
+      FIREBASE_API_KEY,
+      "ddis",
+      fileId,
+      att.filename,
+      csvBytes,
+      {
+        messageId: bestMsg.messageId,
+        subject,
+        account: bestMsg.account.email,
+        emailDate: new Date(bestMsg.internalDate).toISOString(),
+      },
+    );
+    if (!stageRes.ok) {
+      console.warn(`ddis auto: raw stage failed for ${fileId}: ${stageRes.error}`);
+    }
 
     await fsPatchDoc("ddis_auto_ingest_logs", runId, {
       progress: "Parsing CSV...",
       csv_bytes: csvText.length,
+      raw_file_id: fileId,
+      raw_staged: stageRes.ok,
+      raw_chunk_count: stageRes.chunkCount,
+      raw_gz_bytes: stageRes.gzBytes,
     }, FIREBASE_API_KEY);
 
     const rows = csvToRowObjects(csvText);
