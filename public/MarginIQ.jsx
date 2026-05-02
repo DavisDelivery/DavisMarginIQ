@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.50.7";
+const APP_VERSION = "2.51.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -11234,6 +11234,7 @@ function MarginIQ() {
   const tabs = [
     { id:"command", icon:"🎯", label:"Command" },
     { id:"audited", icon:"📋", label:"Financials" },
+    { id:"uniteco", icon:"🧮", label:"Unit Econ" },
     { id:"customers", icon:"📊", label:"Customers" },
     { id:"revenue", icon:"💰", label:"Uline Revenue" },
     { id:"recon", icon:"🧾", label:"Audit" },
@@ -11276,6 +11277,7 @@ function MarginIQ() {
     </div>}
     {!loading && tab==="command" && <CommandCenter margins={margins} weeklyRollups={weeklyRollups} completeness={completeness} qboConnected={qboConnected} reconMeta={reconMeta} connections={{nuvizz:true,motive:motiveConnected,cyberpay:true}} setTab={setTab} />}
     {!loading && tab==="audited" && (typeof window !== "undefined" && window.AuditedFinancialsTab ? React.createElement(window.AuditedFinancialsTab) : <EmptyState icon="📋" title="Financials module not loaded" sub="AuditedFinancialsTab.jsx did not load. Check console." />)}
+    {!loading && tab==="uniteco" && (typeof window !== "undefined" && window.UnitEconomicsTab ? React.createElement(window.UnitEconomicsTab) : <EmptyState icon="🧮" title="Unit Economics module not loaded" sub="UnitEconomicsTab.jsx did not load. Check console." />)}
     {!loading && tab==="customers" && (typeof window !== "undefined" && window.CustomerAnalysisTab ? React.createElement(window.CustomerAnalysisTab) : <EmptyState icon="📊" title="Customer Analysis module not loaded" sub="CustomerAnalysisTab.jsx did not load. Check console." />)}
     {!loading && tab==="drivers-perf" && (typeof window !== "undefined" && window.DriverPerformanceTab ? React.createElement(window.DriverPerformanceTab) : <EmptyState icon="🏁" title="Driver Performance module not loaded" sub="DriverPerformanceTab.jsx did not load. Check console." />)}
     {!loading && tab==="revenue" && <UlineRevenue weeklyRollups={weeklyRollups} />}
