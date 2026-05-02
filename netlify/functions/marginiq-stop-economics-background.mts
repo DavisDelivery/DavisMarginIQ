@@ -605,39 +605,50 @@ export default async (req: Request, _context: Context) => {
       });
     }
 
-    if (!test) {
-      // Update status doc
-      await patchDoc("marginiq_config", "stop_economics_status", {
-        month,
-        state: "running",
-        started_at: new Date().toISOString(),
-      });
-    }
+    // Always write status doc so the UI can poll for completion (test or full)
+    await patchDoc("marginiq_config", "stop_economics_status", {
+      month,
+      state: "running",
+      test_mode: test,
+      started_at: new Date().toISOString(),
+    });
 
     const result = await rollupMonth(month, test);
 
-    if (!test) {
-      await patchDoc("marginiq_config", "stop_economics_status", {
-        month,
-        state: "complete",
-        completed_at: new Date().toISOString(),
-        result_summary: JSON.stringify({
-          stops_read: result.stops_read,
-          zips: result.zips,
-          drivers: result.drivers,
-          customers: result.customers,
-          payments_matched: result.payments_matched,
-          unpaid_matched: result.unpaid_matched,
-          elapsed_ms: result.elapsed_ms,
-        }),
-      });
-    }
+    await patchDoc("marginiq_config", "stop_economics_status", {
+      month,
+      state: "complete",
+      test_mode: test,
+      completed_at: new Date().toISOString(),
+      result_summary: JSON.stringify({
+        stops_read: result.stops_read,
+        zips: result.zips,
+        drivers: result.drivers,
+        customers: result.customers,
+        payments_matched: result.payments_matched,
+        unpaid_matched: result.unpaid_matched,
+        elapsed_ms: result.elapsed_ms,
+      }),
+    });
 
     return new Response(JSON.stringify({ ok: true, ...result }), {
       headers: { "Content-Type": "application/json" },
     });
   } catch (e: any) {
     console.error("stop-economics rollup failed:", e);
+    // Best-effort: write failed status so UI poll resolves
+    try {
+      const body2 = await req.clone().json().catch(() => ({}));
+      const m2 = body2.month;
+      if (m2) {
+        await patchDoc("marginiq_config", "stop_economics_status", {
+          month: m2,
+          state: "failed",
+          error: e?.message || String(e),
+          failed_at: new Date().toISOString(),
+        });
+      }
+    } catch { /* swallow */ }
     return new Response(
       JSON.stringify({ ok: false, error: e?.message || String(e) }),
       { status: 500, headers: { "Content-Type": "application/json" } },

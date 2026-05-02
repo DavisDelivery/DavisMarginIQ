@@ -745,7 +745,7 @@ function StopEconomicsPanel({ availableMonths }) {
 
   const runRollup = useCallback(async (testMode) => {
     if (!month) return;
-    setRunning(true); setStatusMsg(testMode ? "Running dry-run preview…" : "Running rollup…");
+    setRunning(true); setStatusMsg(testMode ? "Dispatching dry-run…" : "Dispatching rollup…");
     try {
       const r = await fetch("/.netlify/functions/marginiq-stop-economics", {
         method: "POST",
@@ -753,13 +753,37 @@ function StopEconomicsPanel({ availableMonths }) {
         body: JSON.stringify({ month, test: testMode }),
       });
       const j = await r.json();
-      if (!j.ok) {
+      if (!j.ok && r.status !== 202) {
         setStatusMsg(`Failed: ${j.error || "unknown"}`);
-      } else {
-        setStatusMsg(`Done in ${(j.elapsed_ms/1000).toFixed(1)}s · ${j.stops_read} stops · ${j.zips} ZIPs · ${j.drivers} drivers · ${j.customers} customers · ${j.payments_matched} Uline PROs paid`);
-        if (!testMode) {
-          // Re-load data
-          await loadRollup(month);
+        setRunning(false);
+        return;
+      }
+      // Background dispatched. Poll the status doc every 5s up to 3 minutes.
+      setStatusMsg(`Background ${testMode ? "dry-run" : "rollup"} started for ${month}. Polling for completion…`);
+      const maxAttempts = 36; // 3 min @ 5s
+      for (let i = 0; i < maxAttempts; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+          const stat = await db().collection("marginiq_config").doc("stop_economics_status").get();
+          if (stat.exists) {
+            const sd = stat.data() || {};
+            if (sd.month === month && sd.state === "complete") {
+              const summary = JSON.parse(sd.result_summary || "{}");
+              setStatusMsg(`✓ Done in ${(summary.elapsed_ms/1000).toFixed(1)}s · ${summary.stops_read} stops · ${summary.zips} ZIPs · ${summary.drivers} drivers · ${summary.customers} customers · ${summary.payments_matched} Uline PROs paid`);
+              if (!testMode) await loadRollup(month);
+              break;
+            }
+            if (sd.month === month && sd.state === "failed") {
+              setStatusMsg(`Failed: ${sd.error || "unknown"}`);
+              break;
+            }
+            if (sd.month === month && sd.state === "running") {
+              setStatusMsg(`Running ${month}… (poll ${i+1}/${maxAttempts})`);
+            }
+          }
+        } catch (e) { /* keep polling */ }
+        if (i === maxAttempts - 1) {
+          setStatusMsg(`Still running after 3 minutes. Click Refresh to check later.`);
         }
       }
     } catch (e) {
