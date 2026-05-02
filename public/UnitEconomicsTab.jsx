@@ -699,6 +699,224 @@ function DriverDrillModal({ driver, onClose }) {
   );
 }
 
+// ── Stop Economics Rollup Panel ───────────────────────────────────────────
+// Reads from stop_economics_zip / stop_economics_driver / stop_economics_customer
+// (computed server-side by marginiq-stop-economics function). Provides ZIP-level
+// profitability matrix and a "Run Rollup" button to trigger fresh computation.
+
+function StopEconomicsPanel({ availableMonths }) {
+  const [month, setMonth] = useState(availableMonths[0] || "");
+  const [zipData, setZipData] = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
+  const [view, setView] = useState("zip"); // zip | driver | customer
+  const [sortKey, setSortKey] = useState("stops_total");
+  const [sortDir, setSortDir] = useState(-1);
+
+  const loadRollup = useCallback(async (m) => {
+    if (!hasFirebase() || !m) return;
+    setLoading(true); setStatusMsg("");
+    try {
+      // Query zip/driver/customer rollups for this month using `month` field
+      const [zipSnap, drvSnap, custSnap, sumSnap] = await Promise.all([
+        db().collection("stop_economics_zip").where("month", "==", m).limit(2000).get().catch(() => null),
+        db().collection("stop_economics_driver").where("month", "==", m).limit(500).get().catch(() => null),
+        db().collection("stop_economics_customer").where("month", "==", m).limit(2000).get().catch(() => null),
+        db().collection("stop_economics_summary").doc(m).get().catch(() => null),
+      ]);
+      const zips = zipSnap ? zipSnap.docs.map(d => ({ id:d.id, ...d.data() })) : [];
+      const drvs = drvSnap ? drvSnap.docs.map(d => ({ id:d.id, ...d.data() })) : [];
+      const csts = custSnap ? custSnap.docs.map(d => ({ id:d.id, ...d.data() })) : [];
+      const sm   = sumSnap && sumSnap.exists ? sumSnap.data() : null;
+      setZipData({ zip: zips, driver: drvs, customer: csts });
+      setSummary(sm);
+      if (zips.length === 0 && drvs.length === 0 && !sm) {
+        setStatusMsg(`No rollup data for ${m}. Click "Run Rollup" to compute.`);
+      }
+    } catch (e) {
+      setStatusMsg(`Load failed: ${e.message || e}`);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { if (month) loadRollup(month); }, [month, loadRollup]);
+
+  const runRollup = useCallback(async (testMode) => {
+    if (!month) return;
+    setRunning(true); setStatusMsg(testMode ? "Running dry-run preview…" : "Running rollup…");
+    try {
+      const r = await fetch("/.netlify/functions/marginiq-stop-economics", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ month, test: testMode }),
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        setStatusMsg(`Failed: ${j.error || "unknown"}`);
+      } else {
+        setStatusMsg(`Done in ${(j.elapsed_ms/1000).toFixed(1)}s · ${j.stops_read} stops · ${j.zips} ZIPs · ${j.drivers} drivers · ${j.customers} customers · ${j.payments_matched} Uline PROs paid`);
+        if (!testMode) {
+          // Re-load data
+          await loadRollup(month);
+        }
+      }
+    } catch (e) {
+      setStatusMsg(`Run failed: ${e.message || e}`);
+    }
+    setRunning(false);
+  }, [month, loadRollup]);
+
+  const rows = (zipData[view] || []);
+  const sorted = useMemo(() => {
+    return [...rows].sort((a,b) => {
+      const av = a[sortKey] ?? 0, bv = b[sortKey] ?? 0;
+      if (typeof av === "string") return sortDir * (av < bv ? -1 : av > bv ? 1 : 0);
+      return sortDir * (bv - av);
+    });
+  }, [rows, sortKey, sortDir]);
+
+  const setSort = (k) => {
+    if (sortKey === k) setSortDir(-sortDir);
+    else { setSortKey(k); setSortDir(-1); }
+  };
+  const sortIcon = (k) => sortKey === k ? (sortDir === -1 ? " ↓" : " ↑") : "";
+
+  // Threshold flags for ZIPs needing price increases (margin < 50% or rev/stop < $50)
+  const threshold = (r) => {
+    const lowMargin = r.gross_margin_pct != null && r.gross_margin_pct < 50;
+    const lowRev = r.rev_per_stop != null && r.rev_per_stop < 50;
+    if (lowMargin && lowRev) return { color: T.red, label: "❗ Price increase needed" };
+    if (lowMargin || lowRev) return { color: T.yellow, label: "⚠️ Watch" };
+    return null;
+  };
+
+  return (
+    <div style={{ ...card, padding:0, marginBottom:16, overflow:"hidden" }}>
+      <div style={{ padding:"14px 16px", borderBottom:`1px solid ${T.border}` }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", flexWrap:"wrap", gap:12 }}>
+          <div>
+            <div style={{ fontSize:14, fontWeight:700 }}>📐 Stop Economics — ZIP / Driver / Customer Profitability</div>
+            <div style={{ fontSize:11, color:T.textMuted, marginTop:2 }}>
+              Server-side rollup joining stops × payments × classifications. <strong>Uline revenue from DDIS payments + unpaid_stops</strong>; <strong>non-Uline revenue implied from contractor pay ÷ 0.4</strong> (no rate card yet).
+            </div>
+          </div>
+          <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+            <select value={month} onChange={e => setMonth(e.target.value)}
+                    style={{ padding:"6px 10px", border:`1px solid ${T.border}`, borderRadius:6, fontSize:11 }}>
+              {availableMonths.map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+            <button onClick={() => runRollup(true)} disabled={running}
+                    style={{ padding:"6px 12px", borderRadius:6, border:`1px solid ${T.border}`, background:T.bgWhite, color:T.text, fontSize:11, fontWeight:600, cursor: running ? "wait" : "pointer", opacity: running ? 0.6 : 1 }}>
+              👁 Dry-Run
+            </button>
+            <button onClick={() => runRollup(false)} disabled={running}
+                    style={{ padding:"6px 12px", borderRadius:6, border:"none", background:T.brand, color:"#fff", fontSize:11, fontWeight:700, cursor: running ? "wait" : "pointer", opacity: running ? 0.6 : 1 }}>
+              {running ? "Running…" : "▶ Run Rollup"}
+            </button>
+          </div>
+        </div>
+        {statusMsg && (
+          <div style={{ marginTop:10, padding:"8px 12px", background:T.bgSurface, borderRadius:6, fontSize:11, color:T.textMuted }}>
+            {statusMsg}
+          </div>
+        )}
+      </div>
+
+      {/* Summary KPIs from monthly rollup */}
+      {summary && (
+        <div style={{ padding:"12px 16px", borderBottom:`1px solid ${T.border}`, background:T.bgSurface }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10 }}>
+            <KPI label="Total Stops" value={fmtNum(summary.stops_total)} sub={`${summary.uline_stops} Uline / ${summary.nonuline_stops} other`} />
+            <KPI label="Uline Revenue" value={fmtK(summary.uline_revenue)} sub={`${summary.uline_revenue_paid > 0 ? fmtK(summary.uline_revenue_paid)+" paid" : ""}${summary.uline_revenue_unpaid > 0 ? " + "+fmtK(summary.uline_revenue_unpaid)+" unpaid" : ""}`} accent={T.brand} />
+            <KPI label="Non-Uline Implied" value={fmtK(summary.nonuline_revenue_implied)} sub="contractor_pay ÷ 0.4" />
+            <KPI label="Total Revenue" value={fmtK(summary.total_revenue)} sub={summary.rev_per_stop != null ? fmt(summary.rev_per_stop)+"/stop" : ""} accent={T.green} />
+            <KPI label="Gross Margin" value={fmtK(summary.gross_margin)} sub={summary.gross_margin_pct != null ? summary.gross_margin_pct.toFixed(0)+"%" : ""} accent={summary.gross_margin >= 0 ? T.green : T.red} />
+          </div>
+        </div>
+      )}
+
+      {/* View tabs */}
+      {(zipData.zip?.length > 0 || zipData.driver?.length > 0 || zipData.customer?.length > 0) && (
+        <>
+          <div style={{ display:"flex", gap:4, padding:"10px 16px", borderBottom:`1px solid ${T.border}` }}>
+            {[
+              { id:"zip", label:`ZIPs (${zipData.zip?.length || 0})` },
+              { id:"driver", label:`Drivers (${zipData.driver?.length || 0})` },
+              { id:"customer", label:`Customers (${zipData.customer?.length || 0})` },
+            ].map(v => (
+              <button key={v.id} onClick={() => setView(v.id)} style={{
+                padding:"6px 12px", borderRadius:6, border:"none",
+                background: view === v.id ? T.brand : "transparent",
+                color: view === v.id ? "#fff" : T.textMuted,
+                fontSize:11, fontWeight: view === v.id ? 700 : 500, cursor:"pointer",
+              }}>
+                {v.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Matrix */}
+          <div style={{ overflow:"auto", maxHeight:600 }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+              <thead style={{ position:"sticky", top:0, zIndex:1 }}>
+                <tr>
+                  <th style={{ ...tblH, cursor:"pointer" }} onClick={() => setSort(view === "zip" ? "zip" : view === "driver" ? "driver_name" : "customer")}>
+                    {view === "zip" ? "ZIP" : view === "driver" ? "Driver" : "Customer"}
+                    {sortIcon(view === "zip" ? "zip" : view === "driver" ? "driver_name" : "customer")}
+                  </th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("stops_total")}>Stops{sortIcon("stops_total")}</th>
+                  <th style={{ ...tblH, textAlign:"right" }}>Uline / Other</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("uline_revenue")}>Uline Rev{sortIcon("uline_revenue")}</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("nonuline_revenue_implied")}>Non-U Implied{sortIcon("nonuline_revenue_implied")}</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("total_revenue")}>Total Rev{sortIcon("total_revenue")}</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("rev_per_stop")}>$/Stop{sortIcon("rev_per_stop")}</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("contractor_cost_at_40")}>Driver Cost{sortIcon("contractor_cost_at_40")}</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("gross_margin")}>Margin $ {sortIcon("gross_margin")}</th>
+                  <th style={{ ...tblH, textAlign:"right", cursor:"pointer" }} onClick={() => setSort("gross_margin_pct")}>Margin %{sortIcon("gross_margin_pct")}</th>
+                  <th style={tblH}>Flag</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.slice(0, 200).map((r, i) => {
+                  const flag = threshold(r);
+                  return (
+                    <tr key={r.id || i}>
+                      <td style={{ ...tblD, fontWeight:600 }}>
+                        {view === "zip" ? r.zip : view === "driver" ? r.driver_name : (r.customer || r.customer_key)}
+                      </td>
+                      <td style={tblDR}>{fmtNum(r.stops_total)}</td>
+                      <td style={{ ...tblDR, color:T.textMuted, fontSize:10 }}>{r.uline_stops || 0} / {r.nonuline_stops || 0}</td>
+                      <td style={{ ...tblDR, color: r.uline_revenue > 0 ? T.brand : T.textDim }}>{r.uline_revenue > 0 ? fmtK(r.uline_revenue) : "—"}</td>
+                      <td style={{ ...tblDR, color: r.nonuline_revenue_implied > 0 ? T.textMuted : T.textDim, fontStyle:"italic" }}>{r.nonuline_revenue_implied > 0 ? fmtK(r.nonuline_revenue_implied) : "—"}</td>
+                      <td style={{ ...tblDR, fontWeight:600 }}>{fmtK(r.total_revenue)}</td>
+                      <td style={{ ...tblDR, fontWeight:600 }}>{r.rev_per_stop != null ? fmt(r.rev_per_stop) : "—"}</td>
+                      <td style={{ ...tblDR, color:T.red }}>{fmtK(r.contractor_cost_at_40)}</td>
+                      <td style={{ ...tblDR, color: r.gross_margin >= 0 ? T.green : T.red, fontWeight:600 }}>{fmtK(r.gross_margin)}</td>
+                      <td style={{ ...tblDR, color: r.gross_margin_pct == null ? T.textMuted : r.gross_margin_pct >= 70 ? T.green : r.gross_margin_pct >= 50 ? T.yellow : T.red, fontWeight:700 }}>
+                        {r.gross_margin_pct != null ? r.gross_margin_pct.toFixed(0) + "%" : "—"}
+                      </td>
+                      <td style={tblD}>
+                        {flag ? <span style={{ fontSize:9, fontWeight:700, color:flag.color }}>{flag.label}</span> : ""}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {sorted.length > 200 && (
+            <div style={{ padding:"8px 16px", fontSize:10, color:T.textMuted, borderTop:`1px solid ${T.borderLight}` }}>
+              Showing top 200 of {sorted.length}. Sort columns to see different slices.
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Main tab ──────────────────────────────────────────────────────────────
 
 function UnitEconomicsTab() {
@@ -827,10 +1045,12 @@ function UnitEconomicsTab() {
         <DriverEconomicsTable drivers={drivers} totalRev={totalRev} totalStops={totalStops} onSelectDriver={setSelectedDriver} />
       </div>
 
-      {/* Note about ZIP/route-level analysis */}
+      {/* Stop Economics rollup (ZIP / driver / customer profitability matrices) */}
+      <StopEconomicsPanel availableMonths={[...monthly].map(m => m.period).sort().reverse()} />
+
+      {/* Note about route-level analysis */}
       <div style={{ ...card, padding:14, background:T.bgSurface, fontSize:11, color:T.textMuted }}>
-        <strong style={{ color:T.text }}>Click any driver row above</strong> for true revenue from DDIS payment matching, plus their top ZIPs / cities / customers (last 90 days).
-        ZIP-level and route-level all-time profitability matrices require a server-side rollup that hasn't been built yet — coming in v2.
+        <strong style={{ color:T.text }}>About the data joins above:</strong> The Stop Economics matrices read from server-side rollups (collections <code style={{fontSize:10,background:T.borderLight,padding:"1px 4px",borderRadius:3}}>stop_economics_zip / _driver / _customer</code>). Click "Run Rollup" for a month before viewing. Uline revenue comes from DDIS payments + unpaid_stops; non-Uline revenue is implied from contractor pay × 2.5 (since 1099 drivers are paid 40%) and is flagged as estimated until a customer rate card is loaded.
       </div>
 
       {selectedDriver && <DriverDrillModal driver={selectedDriver} onClose={() => setSelectedDriver(null)} />}
