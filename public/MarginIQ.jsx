@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.52.0";
+const APP_VERSION = "2.52.1";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3926,6 +3926,20 @@ function parseOriginalOrAccessorial(rows, serviceType) {
       code: codeStr,
       is_accessorial: hasCode,
       service_type: rowST, // "delivery" | "truckload" | "accessorial" — per row
+      // v2.52.0: preserve every column of the source DAS row verbatim.
+      // Uline DAS files contain notes, invoice numbers, customer codes, and
+      // other columns we don't currently use. Storage is cheap; future
+      // analyses (dispute pkgs, customer profitability) can use any field.
+      // Sanitize keys: Firestore field names can't contain . [ ] / or start with __
+      raw: (() => {
+        const safe = {};
+        for (const [k, v] of Object.entries(r || {})) {
+          if (!k) continue;
+          const sk = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+          safe[sk] = v == null ? "" : (typeof v === "string" ? v : String(v));
+        }
+        return safe;
+      })(),
     });
   }
   return stops;
@@ -4445,6 +4459,15 @@ function parsePayroll(rows) {
     const gross = parseMoney(r["gross"] || r["gross pay"] || r["total pay"] || r["pay"] || 0);
     const net = parseMoney(r["net"] || r["net pay"] || 0);
     const type = r["type"] || r["class"] || r["driver type"] || null; // W2/1099 if present
+    // v2.52.0: preserve every payroll column verbatim. Future analyses may
+    // need taxes withheld, deductions, garnishments, bonus codes, dept,
+    // workers-comp class, etc. Sanitize keys for Firestore.
+    const raw = {};
+    for (const [k, v] of Object.entries(r || {})) {
+      if (!k) continue;
+      const sk = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+      raw[sk] = v == null ? "" : (typeof v === "string" ? v : String(v));
+    }
     entries.push({
       employee: normalizeName(name),
       period_end: periodEnd,
@@ -4455,6 +4478,7 @@ function parsePayroll(rows) {
       total_hours: regHours + otHours,
       gross, net,
       classification: type ? String(type).trim() : null,
+      raw,
     });
   }
   return entries;

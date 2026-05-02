@@ -327,6 +327,10 @@ interface DailyEntry {
   reg_hours: number;
   ot_hours: number;
   doc_id: string;        // {driver_key}_{date} — Firestore doc ID
+  // v2.52.0: every source row from B600 verbatim. One per punch (multiple
+  // possible per day for split shifts). Preserves any column the parser
+  // doesn't currently use (note fields, dept codes, exception flags, etc.)
+  raw_rows: Record<string, string>[];
 }
 
 // Convert "06:33a" / "11:34p" / "12:00a" → "06:33" / "23:34" / "00:00" (24h HH:MM).
@@ -414,6 +418,7 @@ function rollupDaily(rows: Record<string, string>[]): DailyEntry[] {
         reg_hours: 0,
         ot_hours: 0,
         doc_id: `${dKey}_${dateStr}`,
+        raw_rows: [],
       };
     }
     const e = map[key];
@@ -421,6 +426,14 @@ function rollupDaily(rows: Record<string, string>[]): DailyEntry[] {
     e.total_hours += tot;
     e.reg_hours += reg;
     e.ot_hours += ot;
+    // v2.52.0: preserve the original row verbatim, with key sanitization.
+    const safeRaw: Record<string, string> = {};
+    for (const [k, v] of Object.entries(r || {})) {
+      if (!k) continue;
+      const sk = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+      safeRaw[sk] = v == null ? "" : String(v);
+    }
+    e.raw_rows.push(safeRaw);
     // Update earliest-in / latest-out across all punches for the day.
     if (inT && (!e.clock_in || inT < e.clock_in)) e.clock_in = inT;
     if (outT && (!e.clock_out || outT > e.clock_out)) e.clock_out = outT;
