@@ -507,11 +507,49 @@ export default async (req: Request, _context: Context) => {
   const CLIENT_ID = process.env["GOOGLE_CLIENT_ID"];
   const CLIENT_SECRET = process.env["GOOGLE_CLIENT_SECRET"];
   const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
-  if (!CLIENT_ID || !CLIENT_SECRET || !FIREBASE_API_KEY) {
-    return json({ error: "OAuth/Firebase not configured" }, 500);
+  if (!FIREBASE_API_KEY) {
+    return json({ error: "Firebase not configured" }, 500);
   }
 
   const url = new URL(req.url);
+
+  // v2.52.3: Reparse mode — accepts raw CSV text directly. Used by
+  // marginiq-reparse to re-run the parser on a previously staged file.
+  if (req.method === "POST" && url.searchParams.get("mode") === "reparse_csv") {
+    try {
+      const body = await req.json();
+      const csvText: string = body.csv_text || "";
+      const fileId: string = body.file_id || `reparse_${Date.now()}`;
+      const filename: string = body.filename || fileId;
+      if (!csvText || csvText.length < 100) {
+        return json({ ok: false, error: "csv_text required and must be non-empty" }, 400);
+      }
+      const rows = csvToRowObjects(csvText);
+      const payments = parseDdisRows(rows);
+      if (payments.length === 0) {
+        return json({ ok: false, error: "Parser produced 0 payments", csv_bytes: csvText.length }, 200);
+      }
+      const ingestPayload = buildIngestPayload(filename, payments, `reparse:${fileId}`);
+      const siteOrigin = `${url.protocol}//${url.host}`;
+      const dispatch = await dispatchDdisIngest(siteOrigin, ingestPayload);
+      return json({
+        ok: dispatch.ok ?? true,
+        mode: "reparse_csv",
+        file_id: fileId,
+        filename,
+        rows_parsed: rows.length,
+        payments_parsed: payments.length,
+        dispatch,
+      }, 200);
+    } catch (e: any) {
+      return json({ ok: false, error: e?.message || String(e) }, 500);
+    }
+  }
+
+  if (!CLIENT_ID || !CLIENT_SECRET) {
+    return json({ error: "OAuth not configured" }, 500);
+  }
+
   const dryRun = url.searchParams.get("dry_run") === "1";
   const runId = `ddis_auto_${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const startedAt = new Date().toISOString();
