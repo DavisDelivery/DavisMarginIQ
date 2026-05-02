@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.51.6";
+const APP_VERSION = "2.52.0";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -3940,12 +3940,23 @@ function parseDDIS(rows) {
     if (!pro) continue;
     const paidAmount = parseFloat(r["paid amount"]) || 0;
     const billDate = parseDateMDY(r["bill date"]);
+    // v2.52.0: every CSV column from the source row, preserved verbatim.
+    // Downstream analyses (customer profitability, weight-based pricing, etc.)
+    // need columns the current parser doesn't use. Storage is cheap.
+    // Sanitize keys: Firestore field names can't contain . [ ] / or start with __
+    const raw = {};
+    for (const [k, v] of Object.entries(r)) {
+      if (!k) continue;
+      const safeKey = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+      raw[safeKey] = v == null ? "" : String(v);
+    }
     payments.push({
       pro,
       voucher: r["voucher#"] ? String(r["voucher#"]) : null,
       check: r["check#"] ? String(r["check#"]) : null,
       bill_date: billDate,
       paid: paidAmount,
+      raw,
     });
   }
   return payments;
@@ -4193,9 +4204,20 @@ function parseNuVizz(rows) {
       city, zip,
       contractor_pay_base: payBase,         // raw $ from SealNbr column
       is_redelivery: isRedelivery,          // v2.46.1: see redelivery comment above
-      raw: r,                               // v2.46.0: every CSV column verbatim — for
-                                            //         addresses (mileage), weight,
-                                            //         accessorial codes, schedule windows
+      // v2.46.0/v2.52.0: every CSV column verbatim. Keys sanitized for
+      // Firestore (no . [ ] / or leading __). v2.52.0 fix: previously raw
+      // was passed through as `r` directly, but Firestore field names can't
+      // contain dots — some CSV headers have them ("ship to - city" was
+      // OK, but anything like "rate.base" would silently fail). Now safe.
+      raw: (() => {
+        const safe = {};
+        for (const [k, v] of Object.entries(r || {})) {
+          if (!k) continue;
+          const sk = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+          safe[sk] = v == null ? "" : (typeof v === "string" ? v : String(v));
+        }
+        return safe;
+      })(),
     });
   }
   return stops;

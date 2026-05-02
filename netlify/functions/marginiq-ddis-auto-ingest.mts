@@ -252,6 +252,11 @@ interface DdisPayment {
   check: string | null;
   bill_date: string | null;
   paid: number;
+  // v2.52.0: Every column from the source row verbatim. Keys are lowercased
+  // CSV header names. Preserves columns we don't currently use (customer,
+  // invoice number, weight, descriptions, addresses, etc.) so future
+  // analyses don't require re-uploads.
+  raw: Record<string, any>;
 }
 
 function parseDdisRows(rows: Record<string, any>[]): DdisPayment[] {
@@ -263,12 +268,22 @@ function parseDdisRows(rows: Record<string, any>[]): DdisPayment[] {
     if (!pro) continue;
     const paidAmount = parseFloat(String(r["paid amount"] || "")) || 0;
     const billDate = parseDateMDY(String(r["bill date"] || ""));
+    // Build raw with EVERY column, not just the ones we currently use.
+    // r is already keyed by lowercased headers from csvToRowObjects().
+    // Sanitize keys: Firestore field names can't contain . [ ] / or start with __
+    const raw: Record<string, any> = {};
+    for (const [k, v] of Object.entries(r)) {
+      if (!k) continue;
+      const safeKey = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+      raw[safeKey] = (v === undefined || v === null) ? "" : String(v);
+    }
     payments.push({
       pro,
       voucher: r["voucher#"] ? String(r["voucher#"]) : null,
       check: r["check#"] ? String(r["check#"]) : null,
       bill_date: billDate,
       paid: paidAmount,
+      raw,
     });
   }
   return payments;
@@ -397,6 +412,9 @@ function buildIngestPayload(
       voucher: p.voucher || null,
       source_file: filename,
       uploaded_at: uploadedAt,
+      // v2.52.0: every CSV column from the source row, preserved verbatim
+      // so downstream analyses can use any field without a re-import.
+      raw: p.raw,
     });
   }
 

@@ -263,6 +263,11 @@ interface ParsedStop {
   zip: string | null;
   contractor_pay_base: number;
   contractor_pay_at_40: number;
+  // v2.52.0: Every column from the source CSV verbatim. Preserves any column
+  // not yet captured in the typed fields above (addresses, weight, accessorial
+  // codes, schedule windows, customer keys, etc.) so future analyses can use
+  // them without re-uploading. Keys are lowercased CSV header names.
+  raw: Record<string, string>;
 }
 
 function parseNuvizzCsv(csvText: string): ParsedStop[] {
@@ -288,6 +293,16 @@ function parseNuvizzCsv(csvText: string): ParsedStop[] {
     const deliveryDate = iDeliv >= 0 ? parseDateMDY(cols[iDeliv] || "") : null;
     if (!deliveryDate) continue;
     const payBase = iSeal >= 0 ? parseMoney(cols[iSeal] || "") : 0;
+    // Build raw record with EVERY column from the CSV row, indexed by header.
+    // Empty strings preserved as "" so we never silently lose presence/absence info.
+    // Sanitize keys: Firestore field names can't contain . [ ] / or start with __
+    const raw: Record<string, string> = {};
+    for (let i = 0; i < headers.length; i++) {
+      const h = headers[i];
+      if (!h) continue;
+      const safeKey = h.replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+      raw[safeKey] = (cols[i] || "").trim();
+    }
     stops.push({
       stop_number: stopNum || null,
       pro: normalizePro(stopNum),
@@ -301,6 +316,7 @@ function parseNuvizzCsv(csvText: string): ParsedStop[] {
       zip: (iZip >= 0 ? (cols[iZip] || "") : "").trim() || null,
       contractor_pay_base: payBase,
       contractor_pay_at_40: payBase * CONTRACTOR_PAY_PCT,
+      raw,
     });
   }
   return stops;

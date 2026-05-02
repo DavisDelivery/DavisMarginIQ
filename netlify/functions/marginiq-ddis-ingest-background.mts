@@ -294,6 +294,38 @@ async function ingest(
     const payResult = await batchWriteDocs("ddis_payments", paymentDocs);
     console.log(`ddis-ingest: wrote ${payResult.ok}/${paymentDocs.length} ddis_payments (${payResult.failed} failed)`);
 
+    // 2b) v2.52.0 — Layer 2 raw row preservation. Independent docs in
+    // ddis_rows_raw keyed by the same docId, so future analyses have
+    // every CSV column (customer, weight, addresses, descriptions, etc.)
+    // available without re-import. Only writes when raw field present.
+    let rawWritten = 0;
+    const rawDocs: Array<{ docId: string; fields: any }> = [];
+    const ingestedAt = new Date().toISOString();
+    for (const p of cappedPayments) {
+      if (!p.raw || typeof p.raw !== "object") continue;
+      const docId = sanitizeDocId(p.id || `${p.pro}_${p.bill_date || "nodate"}_${p.check || "nocheck"}`);
+      rawDocs.push({
+        docId,
+        fields: toFsValue({
+          pro: p.pro,
+          source: "ddis",
+          ingested_at: ingestedAt,
+          bill_date: p.bill_date || null,
+          paid_amount: p.paid || 0,
+          raw: p.raw,
+        }).mapValue.fields,
+      });
+    }
+    if (rawDocs.length > 0) {
+      await writeStatus({
+        phase: "writing_payments",
+        progress_text: `Persisting ${rawDocs.length.toLocaleString()} raw rows to ddis_rows_raw...`,
+      });
+      const rawResult = await batchWriteDocs("ddis_rows_raw", rawDocs);
+      rawWritten = rawResult.ok;
+      console.log(`ddis-ingest: wrote ${rawWritten}/${rawDocs.length} ddis_rows_raw`);
+    }
+
     const totalFailed = fileResult.failed + payResult.failed;
     const totalAttempted = fileDocs.length + paymentDocs.length;
     const totalOk = fileResult.ok + payResult.ok;
