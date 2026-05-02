@@ -823,7 +823,7 @@ function StopEconomicsPanel({ availableMonths }) {
           <div>
             <div style={{ fontSize:14, fontWeight:700 }}>📐 Stop Economics — ZIP / Driver / Customer Profitability</div>
             <div style={{ fontSize:11, color:T.textMuted, marginTop:2 }}>
-              Server-side rollup joining stops × payments × classifications. <strong>Uline revenue from DDIS payments + unpaid_stops</strong>; <strong>non-Uline revenue implied from contractor pay ÷ 0.4</strong> (no rate card yet).
+              Server-side rollup joining stops × payments × classifications. <strong>Uline revenue from DDIS payments + unpaid_stops</strong>; <strong>non-Uline revenue implied from contractor pay ÷ 0.4</strong> (no rate card yet). Revenue attributed to the month the <strong>stop was delivered</strong> (not when it was billed) — won't tie exactly to audited financials month-to-month due to billing timing.
             </div>
           </div>
           <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>

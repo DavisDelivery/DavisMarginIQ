@@ -419,10 +419,33 @@ async function rollupMonth(month: string, dryRun: boolean = false): Promise<any>
     zips: 0, drivers: 0, customers: 0,
   };
 
-  // 1. Load all nuvizz_stops for this month
+  // 1. Load all nuvizz_stops for this month-bucket
+  // NOTE: nuvizz_stops.month is the week-ending Friday's month, so a Dec 29
+  // delivery in a week ending Jan 2 is bucketed as 2026-01. We load by that
+  // bucket but filter at aggregate time by actual delivery_date so revenue
+  // is attributed to the correct delivery month.
   status.phase = "loading_stops";
-  const stops = await listDocsByField("nuvizz_stops", "month", "EQUAL", month);
+  const stopsAll = await listDocsByField("nuvizz_stops", "month", "EQUAL", month);
+  // Plus the prior-month bucket because some stops with delivery_date in
+  // THIS month were bucketed in the prior month's week (e.g. Feb 1 delivery
+  // in week ending Jan 31).
+  const [py, pm] = month.split("-").map(Number);
+  const priorMonth = pm === 1 ? `${py-1}-12` : `${py}-${String(pm-1).padStart(2,"0")}`;
+  const nextMy = pm === 12 ? py+1 : py;
+  const nextMm = pm === 12 ? 1 : pm+1;
+  const nextMonth = `${nextMy}-${String(nextMm).padStart(2,"0")}`;
+  const [stopsPrior, stopsNext] = await Promise.all([
+    listDocsByField("nuvizz_stops", "month", "EQUAL", priorMonth),
+    listDocsByField("nuvizz_stops", "month", "EQUAL", nextMonth),
+  ]);
+  // Filter strictly by delivery_date YYYY-MM == requested month
+  const stops = [...stopsAll, ...stopsPrior, ...stopsNext].filter(sd => {
+    const f = fieldsToObject(sd.fields);
+    const dd = f.delivery_date;
+    return typeof dd === "string" && dd.length >= 7 && dd.slice(0, 7) === month;
+  });
   status.stops_read = stops.length;
+  status.stops_loaded_raw = stopsAll.length + stopsPrior.length + stopsNext.length;
   if (stops.length === 0) {
     return { ...status, phase: "no_stops", elapsed_ms: Date.now() - startTime };
   }
