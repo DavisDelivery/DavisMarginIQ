@@ -16,7 +16,7 @@ const PROJECT_ID = "davismarginiq";
 
 const SEARCH_QUERIES: Record<string, string> = {
   nuvizz: "from:nuvizzapps@nuvizzapps.com has:attachment",
-  ddis:   "from:noreply@ddisinc.com has:attachment",
+  ddis:   "from:APFreight@uline.com filename:csv",
 };
 
 function json(data: any, status = 200): Response {

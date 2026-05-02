@@ -45,7 +45,7 @@ const RAW_CHUNK_BUDGET = 700_000;
 
 const SEARCH_QUERIES: Record<string, string> = {
   nuvizz: "from:nuvizzapps@nuvizzapps.com has:attachment",
-  ddis:   "from:noreply@ddisinc.com has:attachment",
+  ddis:   "from:APFreight@uline.com filename:csv",
   // Uline DAS is more complex (multiple senders + multiple attachments per email)
   // Excluded from this backfill — Uline already has its own staging at pending_uline_files.
 };
