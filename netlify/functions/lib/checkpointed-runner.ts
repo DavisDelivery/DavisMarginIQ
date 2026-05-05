@@ -123,6 +123,10 @@ export interface RunCheckpointedParams {
   work: WorkFn;
   initialCursor?: any;           // used on the very first invocation
   initialPayload?: any;
+  /** Override WALL_BUDGET_MS for this run. Useful for testing. */
+  wallBudgetMs?: number;
+  /** Override MAX_CHAIN_LENGTH for this run. Useful for safety on noisy backfills. */
+  maxChainLength?: number;
 }
 
 // ─── Firestore primitives ─────────────────────────────────────────────────────
@@ -246,6 +250,8 @@ export async function runCheckpointed(params: RunCheckpointedParams): Promise<{
   error?: string;
 }> {
   const { runId, runnerUrl, statusCollection, statusDocId, apiKey, work, initialCursor, initialPayload } = params;
+  const wallBudgetMs = params.wallBudgetMs ?? WALL_BUDGET_MS;
+  const maxChainLength = params.maxChainLength ?? MAX_CHAIN_LENGTH;
   const t0 = Date.now();
 
   // Load existing state (or initialize)
@@ -306,7 +312,7 @@ export async function runCheckpointed(params: RunCheckpointedParams): Promise<{
   }, apiKey);
 
   // Build the work context
-  const yieldAt = t0 + WALL_BUDGET_MS;
+  const yieldAt = t0 + wallBudgetMs;
   const ctx: WorkContext = {
     shouldYield: () => Date.now() >= yieldAt,
     timeBudgetMs: () => Math.max(0, yieldAt - Date.now()),
@@ -378,7 +384,7 @@ export async function runCheckpointed(params: RunCheckpointedParams): Promise<{
   }
 
   // Not complete — decide whether to self-reinvoke
-  if (chainLength >= MAX_CHAIN_LENGTH) {
+  if (chainLength >= maxChainLength) {
     await patchStatus(statusCollection, statusDocId, {
       run_id: runId,
       state: "stopped_chain_limit",
@@ -389,9 +395,9 @@ export async function runCheckpointed(params: RunCheckpointedParams): Promise<{
       payload: state.payload,
       processed: state.processed,
       errors: state.errors,
-      progress_text: `⊘ Stopped at chain limit (${MAX_CHAIN_LENGTH} self-reinvocations). ${state.processed} processed. Re-trigger manually to continue.`,
+      progress_text: `⊘ Stopped at chain limit (${maxChainLength} self-reinvocations). ${state.processed} processed. Re-trigger manually to continue.`,
     }, apiKey);
-    console.warn(`checkpointed-runner: ${runId} hit MAX_CHAIN_LENGTH, stopping`);
+    console.warn(`checkpointed-runner: ${runId} hit chain limit ${maxChainLength}, stopping`);
     return {
       ok: true,
       state: "stopped_chain_limit",
@@ -411,7 +417,7 @@ export async function runCheckpointed(params: RunCheckpointedParams): Promise<{
     payload: state.payload,
     processed: state.processed,
     errors: state.errors,
-    progress_text: `Yielded after ${Math.round((Date.now() - t0) / 1000)}s — chain=${chainLength}/${MAX_CHAIN_LENGTH}, processed=${state.processed}. Self-reinvoking…`,
+    progress_text: `Yielded after ${Math.round((Date.now() - t0) / 1000)}s — chain=${chainLength}/${maxChainLength}, processed=${state.processed}. Self-reinvoking…`,
   }, apiKey);
 
   await selfReinvoke(runnerUrl);
