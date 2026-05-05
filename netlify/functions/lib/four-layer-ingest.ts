@@ -544,3 +544,92 @@ export async function getProvenanceChain(
 export function isRegisteredSource(source: string): boolean {
   return source in SOURCE_REGISTRY;
 }
+
+// ─── Lower-level helper for split L1/L2-3 architectures ───────────────────────
+
+/**
+ * Write Layer 2 + Layer 3 rows for a file whose Layer 1 was already written
+ * elsewhere (typically by an auto-ingest function that has the raw bytes,
+ * with the L2/L3 work happening in a separate background worker that only
+ * has parsed records).
+ *
+ * Use this ONLY when the architecture genuinely requires splitting L1 from
+ * L2/L3 (Gmail attachment fetch is in one function, chunked-staging hand-off
+ * to a bg worker, bg worker has no access to binary). For new ingest paths,
+ * prefer the all-in-one ingestFile() above.
+ *
+ * Caller's contract:
+ *   - source_files_raw/{fileId} must already exist (this function patches it
+ *     with completion fields but does not create it)
+ *   - Each ParsedRow must have a stable docId (used for both L2 and L3)
+ *
+ * Every L2 and L3 doc written by this function carries:
+ *   source_file_id, ingested_at, ingested_by, schema_version
+ */
+export async function writeProvenancedRows(params: {
+  source: string;
+  fileId: string;
+  rows: ParsedRow[];
+  metadata: Pick<IngestMetadata, "schemaVersion" | "ingestedBy">;
+  apiKey: string;
+}): Promise<{
+  ok: boolean;
+  layer2: { collection: string; attempted: number; written: number; failed: number };
+  layer3: { collection: string; attempted: number; written: number; failed: number };
+  ingestedAt: string;
+  error?: string;
+}> {
+  const { source, fileId, rows, metadata, apiKey } = params;
+  const ingestedAt = new Date().toISOString();
+
+  const registryEntry = SOURCE_REGISTRY[source];
+  if (!registryEntry) {
+    return {
+      ok: false,
+      layer2: { collection: "", attempted: 0, written: 0, failed: 0 },
+      layer3: { collection: "", attempted: 0, written: 0, failed: 0 },
+      ingestedAt,
+      error: `Unknown source "${source}". Add to SOURCE_REGISTRY.`,
+    };
+  }
+
+  const provenance = {
+    source_file_id: fileId,
+    ingested_at: ingestedAt,
+    ingested_by: metadata.ingestedBy,
+    schema_version: metadata.schemaVersion,
+  };
+
+  const l2Docs = rows.map(row => ({
+    docId: sanitizeId(row.docId),
+    fields: toFsFields({ ...row.rawFields, ...provenance }),
+  }));
+  const l3Docs = rows.map(row => ({
+    docId: sanitizeId(row.docId),
+    fields: toFsFields({ ...row.normalizedFields, ...provenance }),
+  }));
+
+  const l2Result = await batchWriteDocs(registryEntry.rowsRaw, l2Docs, apiKey);
+  const l3Result = await batchWriteDocs(registryEntry.primary, l3Docs, apiKey);
+
+  const allOk = l2Result.failed === 0 && l3Result.failed === 0;
+
+  // Patch the L1 doc with completion summary
+  await fsPatchDoc("source_files_raw", fileId, {
+    state: allOk ? "ingested" : "ingested_with_errors",
+    completed_at: new Date().toISOString(),
+    parsed_row_count: rows.length,
+    l2_written: l2Result.ok,
+    l2_failed: l2Result.failed,
+    l3_written: l3Result.ok,
+    l3_failed: l3Result.failed,
+  }, apiKey);
+
+  return {
+    ok: allOk,
+    layer2: { collection: registryEntry.rowsRaw, attempted: l2Docs.length, written: l2Result.ok, failed: l2Result.failed },
+    layer3: { collection: registryEntry.primary, attempted: l3Docs.length, written: l3Result.ok, failed: l3Result.failed },
+    ingestedAt,
+    error: allOk ? undefined : `Partial failure: L2 ${l2Result.failed} failed, L3 ${l3Result.failed} failed`,
+  };
+}
