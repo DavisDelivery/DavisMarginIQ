@@ -127,6 +127,15 @@ export interface RunCheckpointedParams {
   wallBudgetMs?: number;
   /** Override MAX_CHAIN_LENGTH for this run. Useful for safety on noisy backfills. */
   maxChainLength?: number;
+  /**
+   * Netlify Context object from the function handler. REQUIRED for
+   * self-reinvocation to work — the runner uses context.waitUntil()
+   * to keep the Lambda runtime alive long enough for the self-reinvoke
+   * fetch to actually hand off to the next invocation. Without this,
+   * Lambda kills the function before the fetch completes and the chain
+   * stalls. (Same fix the DDIS/NuVizz dispatchers used in v2.42.17.)
+   */
+  context?: { waitUntil: (promise: Promise<unknown>) => void };
 }
 
 // ─── Firestore primitives ─────────────────────────────────────────────────────
@@ -216,18 +225,31 @@ async function loadStatus(
 
 // ─── Self-reinvoke ────────────────────────────────────────────────────────────
 
-async function selfReinvoke(runnerUrl: string): Promise<void> {
-  // Sleep briefly so the current invocation can flush logs cleanly.
-  await new Promise(r => setTimeout(r, REINVOKE_DELAY_MS));
+async function selfReinvoke(
+  runnerUrl: string,
+  context?: { waitUntil: (promise: Promise<unknown>) => void },
+): Promise<void> {
+  // Sleep briefly so the current invocation can flush logs cleanly,
+  // THEN fire the next invocation. Wrap in waitUntil so Lambda keeps
+  // the runtime alive long enough for the fetch handoff to complete.
+  // Without waitUntil, Lambda kills the function before fetch resolves
+  // and the chain silently stalls.
+  const work = (async () => {
+    await new Promise(r => setTimeout(r, REINVOKE_DELAY_MS));
+    try {
+      const r = await fetch(runnerUrl, { method: "POST", body: "" });
+      console.log(`checkpointed-runner: self-reinvoke fired (status=${r.status})`);
+    } catch (e: any) {
+      console.error(`checkpointed-runner: self-reinvoke fetch threw: ${e?.message || e}`);
+    }
+  })();
 
-  // Fire-and-forget POST to ourselves. Same URL — the runner will load
-  // checkpoint state from Firestore on entry.
-  try {
-    fetch(runnerUrl, { method: "POST", body: "" }).catch(e => {
-      console.warn(`checkpointed-runner: self-reinvoke fetch failed: ${e?.message || e}`);
-    });
-  } catch (e: any) {
-    console.error(`checkpointed-runner: self-reinvoke threw: ${e?.message || e}`);
+  if (context?.waitUntil) {
+    context.waitUntil(work);
+  } else {
+    // Fallback: best-effort fire-and-forget. Will likely be killed by Lambda.
+    work.catch(() => {});
+    console.warn("checkpointed-runner: no Context provided — self-reinvoke may not survive Lambda shutdown. Pass context to runCheckpointed().");
   }
 }
 
@@ -420,7 +442,7 @@ export async function runCheckpointed(params: RunCheckpointedParams): Promise<{
     progress_text: `Yielded after ${Math.round((Date.now() - t0) / 1000)}s — chain=${chainLength}/${maxChainLength}, processed=${state.processed}. Self-reinvoking…`,
   }, apiKey);
 
-  await selfReinvoke(runnerUrl);
+  await selfReinvoke(runnerUrl, params.context);
 
   return {
     ok: true,
