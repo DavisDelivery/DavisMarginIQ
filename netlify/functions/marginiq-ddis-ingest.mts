@@ -177,6 +177,9 @@ export default async (req: Request, context: Context) => {
 
   const ddisFileRecords = Array.isArray(body.ddisFileRecords) ? body.ddisFileRecords : [];
   const ddisPayments = Array.isArray(body.ddisPayments) ? body.ddisPayments : [];
+  // v2.53.0 Phase 1 — provenance plumbing
+  const sourceFileId: string = typeof body.source_file_id === "string" ? body.source_file_id : "";
+  const metadata = body.metadata || {};
   if (ddisFileRecords.length === 0 && ddisPayments.length === 0) {
     return new Response(JSON.stringify({ error: "nothing to ingest — both arrays empty" }), {
       status: 400,
@@ -187,6 +190,30 @@ export default async (req: Request, context: Context) => {
   // v2.42.13: stage the payload to Firestore in chunks so the BG fetch
   // payload stays under 256 KB.
   const runId = `ddis_srv_${new Date().toISOString().replace(/[:.]/g, "-")}`;
+
+  // v2.53.0 Phase 1 — write a run header doc carrying provenance fields.
+  // The BG worker reads this on entry to know the source_file_id for the
+  // L2/L3 writes via writeProvenancedRows().
+  if (sourceFileId) {
+    const headerUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/ddis_ingest_runs/${runId}?key=${FIREBASE_API_KEY}`;
+    await fetch(headerUrl, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fields: {
+          run_id:           { stringValue: runId },
+          source_file_id:   { stringValue: sourceFileId },
+          email_message_id: { stringValue: metadata.messageId || "" },
+          email_account:    { stringValue: metadata.account || "" },
+          email_date:       { stringValue: metadata.emailDate || "" },
+          email_subject:    { stringValue: metadata.subject || "" },
+          schema_version:   { stringValue: "1.0.0" },
+          created_at:       { stringValue: new Date().toISOString() },
+        },
+      }),
+    }).catch(e => console.error("ddis-ingest dispatcher: failed to write run header", e?.message || e));
+  }
+
   const chunks = chunkPayload(ddisFileRecords, ddisPayments);
   let chunkWriteErrors = 0;
   for (let i = 0; i < chunks.length; i++) {
