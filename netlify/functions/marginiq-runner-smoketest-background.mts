@@ -49,7 +49,7 @@ async function fakeWork(i: number): Promise<void> {
   await new Promise(r => setTimeout(r, ITER_DELAY_MS));
 }
 
-export default async (req: Request, _ctx: Context) => {
+export default async (req: Request, ctx: Context) => {
   if (!FIREBASE_API_KEY) {
     return new Response(JSON.stringify({ error: "FIREBASE_API_KEY missing" }), { status: 500 });
   }
@@ -81,6 +81,7 @@ export default async (req: Request, _ctx: Context) => {
     // without waiting forever.
     wallBudgetMs: 20_000,
     maxChainLength: 30,
+    context: ctx,
     work: async (state, ctx) => {
       let cursor: number = (typeof state.cursor === "number") ? state.cursor : 0;
       const tgt: number = state.payload?.target || target;
