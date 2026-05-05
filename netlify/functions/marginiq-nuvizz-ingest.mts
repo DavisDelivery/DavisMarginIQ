@@ -1,5 +1,6 @@
 import type { Context } from "@netlify/functions";
 import { gunzipSync } from "node:zlib";
+import { writeProvenancedRows, type ParsedRow } from "./lib/four-layer-ingest.js";
 
 /**
  * Davis MarginIQ — NuVizz CSV Ingest Background Worker (v2.40.36)
@@ -381,6 +382,9 @@ export default async (req: Request, _context: Context) => {
 
   const runId: string = body.run_id || `nuvizz_srv_${Date.now()}`;
   const source: string = body.source || "server";
+  // v2.53.0 Phase 1 — provenance plumbing
+  const sourceFileId: string = typeof body.source_file_id === "string" ? body.source_file_id : "";
+  const metadataIn = body.metadata || {};
 
   // v2.40.36: stops are now loaded from Firestore chunks, not the request body.
   // The dispatcher writes nuvizz_ingest_payloads/{run_id}__NNN chunks before
@@ -466,75 +470,70 @@ export default async (req: Request, _context: Context) => {
       progress_text: `Filtered: ${toSave.length.toLocaleString()} to save, ${filterDropped} dropped. Writing to Firestore...`,
     });
 
-    // ── Step 2: Save stops in 500-doc batches ───────────────────────────────
+    // ── Step 2 (v2.53.0 Phase 1): Single sanctioned write path ────────────
+    // ALL writes route through writeProvenancedRows from lib/four-layer-ingest.
+    // Every doc gets source_file_id + ingested_at + ingested_by + schema_version.
+    //
+    // Phase 1 contract: if source_file_id is missing, FAIL LOUDLY rather than
+    // silently writing unprovenanced rows. The auto-ingest path always passes
+    // it; any caller without one needs to be updated, not papered over.
+    if (!sourceFileId) {
+      const err = `nuvizz-ingest: missing source_file_id in body (Phase 1 contract violation). All callers must pass source_file_id from auto-ingest. Run ID: ${runId}`;
+      console.error(err);
+      await writeStatusDoc(runId, {
+        state: "failed",
+        completed_at: new Date().toISOString(),
+        error: "missing source_file_id (Phase 1 four-layer contract)",
+        progress_text: "✗ Refused write: caller did not pass source_file_id. See lib/four-layer-ingest.ts.",
+      });
+      return new Response(JSON.stringify({ error: "missing source_file_id" }), { status: 400 });
+    }
+
     let savedOk = 0, savedFailed = 0, batchesTotal = 0, batchesFailed = 0;
+    let rawRowsWritten = 0;
     const BATCH = 500;
 
-    for (let i = 0; i < toSave.length; i += BATCH) {
-      batchesTotal++;
-      const chunk = toSave.slice(i, i + BATCH);
-      const r = await batchWriteDocs("nuvizz_stops", chunk);
-      savedOk += r.ok;
-      savedFailed += r.failed;
-      if (r.failed > 0) batchesFailed++;
-
-      // Update progress every 5 batches
-      if (batchesTotal % 5 === 0 || i + BATCH >= toSave.length) {
-        await writeStatusDoc(runId, {
-          state: "running",
-          saved_ok: savedOk,
-          saved_failed: savedFailed,
-          batches_total: batchesTotal,
-          progress_text: `Saving... ${savedOk.toLocaleString()}/${toSave.length.toLocaleString()} stops written (${batchesTotal} batches)`,
-        });
-      }
-    }
-
-    // ── Step 2b (v2.52.0): Independent raw-row preservation ─────────────
-    // Layer 2 of the four-layer raw data rule: every CSV row stored verbatim
-    // in nuvizz_rows_raw, keyed by the same docId as nuvizz_stops. This
-    // protects against future parser changes that might drop fields. Even
-    // if nuvizz_stops gets re-shaped, the original row data is intact here.
-    //
-    // Only writes when the inbound stop has a `raw` field (i.e. parser was
-    // updated to preserve it). Older clients without `raw` will be no-op
-    // for now — backfill is a separate task.
-    let rawRowsWritten = 0;
-    const rawDocs: Array<{ docId: string; fields: Record<string, any> }> = [];
-    const ingestedAt = new Date().toISOString();
-    for (const item of toSave) {
-      const rawField = (item.fields as any).raw;
-      if (!rawField || typeof rawField !== "object") continue;
-      rawDocs.push({
+    console.log(`nuvizz-ingest: routing through four-layer module, source_file_id=${sourceFileId}, rows=${toSave.length}`);
+    const provenancedRows: ParsedRow[] = toSave.map(item => {
+      const f = item.fields as any;
+      const rawField = f.raw && typeof f.raw === "object" ? f.raw : {};
+      return {
         docId: item.docId,
-        fields: {
+        rawFields: {
           pro: item.docId,
-          source: "nuvizz",
-          ingested_at: ingestedAt,
-          delivery_date: (item.fields as any).delivery_date || null,
-          week_ending: (item.fields as any).week_ending || null,
-          month: (item.fields as any).month || null,
+          delivery_date: f.delivery_date || null,
+          week_ending: f.week_ending || null,
+          month: f.month || null,
           raw: rawField,
         },
-      });
-    }
-    if (rawDocs.length > 0) {
-      await writeStatusDoc(runId, {
-        state: "running",
-        progress_text: `Persisting ${rawDocs.length.toLocaleString()} raw rows to nuvizz_rows_raw...`,
-      });
-      for (let i = 0; i < rawDocs.length; i += BATCH) {
-        const chunk = rawDocs.slice(i, i + BATCH);
-        const r = await batchWriteDocs("nuvizz_rows_raw", chunk);
-        rawRowsWritten += r.ok;
-      }
-    }
+        normalizedFields: f,
+      };
+    });
+
+    const result = await writeProvenancedRows({
+      source: "nuvizz",
+      fileId: sourceFileId,
+      rows: provenancedRows,
+      metadata: {
+        schemaVersion: "1.0.0",
+        ingestedBy: "marginiq-nuvizz-ingest@2.53.0",
+      },
+      apiKey: FIREBASE_API_KEY!,
+    });
+
+    savedOk = result.layer3.written;
+    savedFailed = result.layer3.failed;
+    rawRowsWritten = result.layer2.written;
+    batchesTotal = Math.ceil(toSave.length / BATCH);
+    batchesFailed = result.ok ? 0 : 1;
+
     await writeStatusDoc(runId, {
       state: "running",
+      saved_ok: savedOk,
+      saved_failed: savedFailed,
+      batches_total: batchesTotal,
       raw_rows_written: rawRowsWritten,
-      progress_text: rawRowsWritten > 0
-        ? `Raw rows preserved: ${rawRowsWritten.toLocaleString()} written to nuvizz_rows_raw`
-        : `No raw rows in payload (older client) — skipped raw layer`,
+      progress_text: `Provenanced write: L3=${savedOk.toLocaleString()}/${toSave.length.toLocaleString()}, L2=${rawRowsWritten.toLocaleString()} via four-layer module`,
     });
 
     // ── Step 3: Rebuild weekly rollups for affected weeks ──────────────────
