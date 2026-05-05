@@ -1,9 +1,11 @@
 [build]
   publish = "public"
+  command = "npm run build"
 
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
+  included_files = ["netlify/functions/lib/**"]
 
 # Extended timeout for Zoom sync functions
 [functions."marginiq-zoom-phone"]
