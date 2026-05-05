@@ -422,12 +422,17 @@ function computeBillWeekEnding(billDates: (string | null)[]): BillWeekResult {
 interface DdisIngestPayload {
   ddisFileRecords: any[];
   ddisPayments: any[];
+  // v2.53.0 Phase 1 — provenance fields propagated to bg worker
+  source_file_id?: string;
+  metadata?: { messageId: string; account: string; emailDate: string; subject: string };
 }
 
 function buildIngestPayload(
   filename: string,
   payments: DdisPayment[],
   emailFrom: string,
+  sourceFileId: string,
+  metadata: { messageId: string; account: string; emailDate: string; subject: string },
 ): DdisIngestPayload {
   const fileId = filename.replace(/[^a-z0-9._-]/gi, "_").slice(0, 140);
   const billDates = payments.map(p => p.bill_date).filter((d): d is string => !!d).sort();
@@ -451,6 +456,8 @@ function buildIngestPayload(
     uploaded_at: uploadedAt,
     source: "auto_gmail_ddis",
     email_from: emailFrom,
+    // v2.53.0 Phase 1 — provenance plumbing
+    source_file_id: sourceFileId,
   };
 
   const paymentDocs = [];
@@ -475,7 +482,10 @@ function buildIngestPayload(
   return {
     ddisFileRecords: [fileRecord],
     ddisPayments: paymentDocs,
-  };
+    // v2.53.0 Phase 1 — top-level provenance for bg worker
+    source_file_id: sourceFileId,
+    metadata,
+  } as DdisIngestPayload;
 }
 
 // ─── Dispatcher invocation ──────────────────────────────────────────────────
@@ -707,7 +717,12 @@ export default async (req: Request, _context: Context) => {
       return json({ run_id: runId, state: "complete", skipped: true, skip_reason: note }, 200);
     }
 
-    const ingestPayload = buildIngestPayload(att.filename, payments, bestMsg.account.email);
+    const ingestPayload = buildIngestPayload(att.filename, payments, bestMsg.account.email, fileId, {
+      messageId: bestMsg.messageId,
+      account: bestMsg.account.email,
+      emailDate: new Date(bestMsg.internalDate).toISOString(),
+      subject,
+    });
 
     await fsPatchDoc("ddis_auto_ingest_logs", runId, {
       progress: `Dispatching ${payments.length.toLocaleString()} payments to ingest endpoint...`,
