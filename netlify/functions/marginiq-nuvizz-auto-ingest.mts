@@ -409,7 +409,7 @@ function parseNuvizzCsv(csvText: string): ParsedStop[] {
 
 const BATCH_STOP_COUNT = 10000;
 
-async function dispatchToIngest(siteOrigin: string, stops: ParsedStop[], source: string): Promise<{
+async function dispatchToIngest(siteOrigin: string, stops: ParsedStop[], source: string, sourceFileId: string, metadata: { messageId: string; account: string; emailDate: string; subject: string }): Promise<{
   ok: boolean;
   runIds: string[];
   totalChunks: number;
@@ -436,7 +436,13 @@ async function dispatchToIngest(siteOrigin: string, stops: ParsedStop[], source:
       const r = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stops: batch, source: batchSource }),
+        body: JSON.stringify({
+          stops: batch,
+          source: batchSource,
+          // v2.53.0 Phase 1 — provenance plumbing
+          source_file_id: sourceFileId,
+          metadata,
+        }),
       });
       let data: any = null;
       try { data = await r.json(); } catch {}
@@ -492,7 +498,12 @@ export default async (req: Request, _context: Context) => {
         return json({ ok: false, error: "Parser produced 0 stops", csv_bytes: csvText.length }, 200);
       }
       const siteOrigin = `${url.protocol}//${url.host}`;
-      const dispatch = await dispatchToIngest(siteOrigin, stops, `reparse:${filename}`);
+      const dispatch = await dispatchToIngest(siteOrigin, stops, `reparse:${filename}`, fileId, {
+        messageId: `reparse:${fileId}`,
+        account: body.account || "",
+        emailDate: body.email_date || new Date().toISOString(),
+        subject: `reparse:${filename}`,
+      });
       return json({
         ok: dispatch.ok,
         mode: "reparse_csv",
@@ -696,7 +707,12 @@ export default async (req: Request, _context: Context) => {
       stops_parsed: stops.length,
     }, FIREBASE_API_KEY);
 
-    const dispatch = await dispatchToIngest(siteOrigin, stops, source);
+    const dispatch = await dispatchToIngest(siteOrigin, stops, source, fileId, {
+      messageId: bestMsg.messageId,
+      account: bestMsg.account.email,
+      emailDate: new Date(bestMsg.internalDate).toISOString(),
+      subject,
+    });
     if (!dispatch.ok && dispatch.batchesDispatched === 0) {
       // Total failure — no batches went through
       const err = `Dispatch failed: ${dispatch.error}`;
