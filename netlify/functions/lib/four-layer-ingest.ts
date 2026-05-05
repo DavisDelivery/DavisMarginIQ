@@ -1,5 +1,5 @@
 /**
- * Davis MarginIQ — Four-Layer Ingest Module (v2.53.0)
+ * Davis MarginIQ — Four-Layer Ingest Module (v2.53.1)
  *
  * Phase 1 of the Foundation Rebuild. This module is the SINGLE SANCTIONED
  * write path for any data that originates from a parseable file (Gmail
@@ -179,7 +179,15 @@ async function fsPatchDoc(
   fields: Record<string, any>,
   apiKey: string,
 ): Promise<boolean> {
-  const url = `${FS_BASE}/${collection}/${encodeURIComponent(docId)}?key=${apiKey}`;
+  // v2.53.1 — Firestore REST PATCH without updateMask.fieldPaths is a full-document
+  // REPLACE. Every field not in the body gets dropped. We append one
+  // updateMask.fieldPaths param per key to enforce true partial-merge semantics.
+  const params = new URLSearchParams();
+  params.set("key", apiKey);
+  for (const k of Object.keys(fields)) {
+    params.append("updateMask.fieldPaths", k);
+  }
+  const url = `${FS_BASE}/${collection}/${encodeURIComponent(docId)}?${params.toString()}`;
   const r = await fetch(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },

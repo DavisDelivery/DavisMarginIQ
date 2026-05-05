@@ -1,7 +1,7 @@
 import type { Context } from "@netlify/functions";
 
 /**
- * Davis MarginIQ — Phase 1 Provenance Migration (Background Worker, v2.53.0)
+ * Davis MarginIQ — Phase 1 Provenance Migration (Background Worker, v2.53.1)
  *
  * See marginiq-provenance-migration.mts for the contract and strategy.
  *
@@ -86,7 +86,15 @@ async function getDoc(collection: string, docId: string): Promise<any | null> {
 }
 
 async function patchDoc(collection: string, docId: string, fields: Record<string, any>): Promise<boolean> {
-  const url = `${FS_BASE}/${collection}/${encodeURIComponent(docId)}?key=${FIREBASE_API_KEY}`;
+  // v2.53.1 — Firestore REST PATCH without updateMask.fieldPaths is a full-document
+  // REPLACE. Every field not in the body gets dropped. We append one
+  // updateMask.fieldPaths param per key to enforce true partial-merge semantics.
+  const params = new URLSearchParams();
+  params.set("key", FIREBASE_API_KEY || "");
+  for (const k of Object.keys(fields)) {
+    params.append("updateMask.fieldPaths", k);
+  }
+  const url = `${FS_BASE}/${collection}/${encodeURIComponent(docId)}?${params.toString()}`;
   const fsFields: Record<string, any> = {};
   for (const [k, v] of Object.entries(fields)) fsFields[k] = toFsValue(v);
   const r = await fetch(url, {
