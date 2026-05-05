@@ -19,7 +19,7 @@
 //         true cost now ties out exactly to invoice total.
 
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
-const APP_VERSION = "2.52.8";
+const APP_VERSION = "2.52.9";
 
 // ─── Design Tokens ──────────────────────────────────────────
 const T = {
@@ -11340,6 +11340,10 @@ function MarginIQ() {
     {!loading && tab==="costs" && <CostStructure costs={costs} onSave={setCosts} margins={margins} />}
     {!loading && tab==="phone" && <ZoomPhoneTab />}
     {!loading && tab==="settings" && <Settings qboConnected={qboConnected} motiveConnected={motiveConnected} reconMeta={reconMeta} weeklyRollups={weeklyRollups} onRefresh={refreshData} setTab={setTab} />}
+    {/* Foundation Rebuild freeze banner (Phase 0 — removed when Phase 5 ships) */}
+    <div style={{position:"sticky",bottom:0,zIndex:200,background:T.brand,color:"#fff",padding:"8px 14px",fontSize:"11px",fontWeight:600,letterSpacing:"0.01em",textAlign:"center",borderTop:"1px solid rgba(255,255,255,0.15)",boxShadow:"0 -2px 10px rgba(0,0,0,0.18)",lineHeight:1.35}}>
+      🔒 Foundation rebuild in progress — earning back data trust. New feature work paused.
+    </div>
   </div>;
 }
 
