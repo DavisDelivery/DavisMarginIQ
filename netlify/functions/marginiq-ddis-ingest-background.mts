@@ -1,5 +1,6 @@
 import type { Context } from "@netlify/functions";
 import { gunzipSync } from "node:zlib";
+import { writeProvenancedRows, type ParsedRow } from "./lib/four-layer-ingest.js";
 
 /**
  * Davis MarginIQ — DDIS Ingest Background Worker (v2.42.13)
@@ -137,6 +138,36 @@ async function deleteStagedChunks(chunkDocIds: string[]): Promise<{ ok: number; 
   return { ok, failed };
 }
 
+// v2.53.0 Phase 1 — read run header doc carrying provenance from dispatcher.
+// Returns null if no header was written (legacy callers).
+interface RunHeader {
+  source_file_id: string;
+  email_message_id: string;
+  email_account: string;
+  email_date: string;
+  email_subject: string;
+  schema_version: string;
+}
+async function loadRunHeader(runId: string): Promise<RunHeader | null> {
+  if (!runId) return null;
+  const url = `${FS_BASE}/ddis_ingest_runs/${encodeURIComponent(runId)}?key=${FIREBASE_API_KEY}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const data: any = await r.json();
+  const f = data.fields || {};
+  const get = (k: string) => f[k]?.stringValue || "";
+  const sourceFileId = get("source_file_id");
+  if (!sourceFileId) return null;
+  return {
+    source_file_id: sourceFileId,
+    email_message_id: get("email_message_id"),
+    email_account: get("email_account"),
+    email_date: get("email_date"),
+    email_subject: get("email_subject"),
+    schema_version: get("schema_version") || "1.0.0",
+  };
+}
+
 // ─── Firestore REST helpers ────────────────────────────────────────
 
 function toFsValue(v: any): any {
@@ -253,6 +284,7 @@ function shapePaymentDoc(p: any): { docId: string; fields: any } {
 async function ingest(
   ddisFileRecords: any[],
   ddisPayments: any[],
+  runHeader: RunHeader | null,
 ): Promise<{ ok: true; fileOk: number; paymentOk: number; failed: number } | { ok: false; error: string }> {
   const startedAt = new Date().toISOString();
 
@@ -277,7 +309,8 @@ async function ingest(
   });
 
   try {
-    // 1) ddis_files (usually 1–10 rows, one batch is plenty)
+    // 1) ddis_files (DDIS-specific metadata, NOT a provenanced collection —
+    //    it's not in SOURCE_REGISTRY and isn't subject to the four-layer rule)
     const fileDocs = ddisFileRecords.map(shapeFileDoc);
     const fileResult = await batchWriteDocs("ddis_files", fileDocs);
     console.log(`ddis-ingest: wrote ${fileResult.ok}/${fileDocs.length} ddis_files (${fileResult.failed} failed)`);
@@ -289,57 +322,71 @@ async function ingest(
       failed_writes: fileResult.failed,
     });
 
-    // 2) ddis_payments — batched 500/call by batchWriteDocs automatically
-    const paymentDocs = cappedPayments.map(shapePaymentDoc);
-    const payResult = await batchWriteDocs("ddis_payments", paymentDocs);
-    console.log(`ddis-ingest: wrote ${payResult.ok}/${paymentDocs.length} ddis_payments (${payResult.failed} failed)`);
-
-    // 2b) v2.52.0 — Layer 2 raw row preservation. Independent docs in
-    // ddis_rows_raw keyed by the same docId, so future analyses have
-    // every CSV column (customer, weight, addresses, descriptions, etc.)
-    // available without re-import. Only writes when raw field present.
-    let rawWritten = 0;
-    const rawDocs: Array<{ docId: string; fields: any }> = [];
-    const ingestedAt = new Date().toISOString();
-    for (const p of cappedPayments) {
-      if (!p.raw || typeof p.raw !== "object") continue;
-      const docId = sanitizeDocId(p.id || `${p.pro}_${p.bill_date || "nodate"}_${p.check || "nocheck"}`);
-      rawDocs.push({
-        docId,
-        fields: toFsValue({
-          pro: p.pro,
-          source: "ddis",
-          ingested_at: ingestedAt,
-          bill_date: p.bill_date || null,
-          paid_amount: p.paid || 0,
-          raw: p.raw,
-        }).mapValue.fields,
-      });
-    }
-    if (rawDocs.length > 0) {
+    // 2) v2.53.0 Phase 1 — sanctioned write path via lib/four-layer-ingest.
+    //    Every L2/L3 row carries source_file_id + provenance. If the run
+    //    header is missing, fail loudly. The auto-ingest path always writes
+    //    the run header in the dispatcher; any caller without one is a
+    //    contract violation.
+    if (!runHeader || !runHeader.source_file_id) {
+      const err = "ddis-ingest: missing run header / source_file_id (Phase 1 contract violation)";
+      console.error(err);
       await writeStatus({
-        phase: "writing_payments",
-        progress_text: `Persisting ${rawDocs.length.toLocaleString()} raw rows to ddis_rows_raw...`,
+        state: "failed",
+        completed_at: new Date().toISOString(),
+        phase: "done",
+        progress_text: "✗ Refused write: caller did not provide a run header. See lib/four-layer-ingest.ts.",
+        error: err,
       });
-      const rawResult = await batchWriteDocs("ddis_rows_raw", rawDocs);
-      rawWritten = rawResult.ok;
-      console.log(`ddis-ingest: wrote ${rawWritten}/${rawDocs.length} ddis_rows_raw`);
+      return { ok: false, error: err };
     }
 
-    const totalFailed = fileResult.failed + payResult.failed;
-    const totalAttempted = fileDocs.length + paymentDocs.length;
-    const totalOk = fileResult.ok + payResult.ok;
+    console.log(`ddis-ingest: using four-layer module with source_file_id=${runHeader.source_file_id}`);
+    const rows: ParsedRow[] = cappedPayments
+      .filter(p => p.pro && p.paid_amount > 0)
+      .map(p => ({
+        docId: p.id || `${p.pro}_${p.bill_date || "nodate"}_${p.check || "nocheck"}`,
+        rawFields: {
+          pro: p.pro,
+          bill_date: p.bill_date || null,
+          paid_amount: p.paid_amount || 0,
+          raw: p.raw || {},
+        },
+        normalizedFields: {
+          pro: p.pro,
+          paid_amount: p.paid_amount,
+          bill_date: p.bill_date || null,
+          check: p.check || null,
+          voucher: p.voucher || null,
+          source_file: p.source_file || null,
+          uploaded_at: p.uploaded_at,
+        },
+      }));
+
+    const result = await writeProvenancedRows({
+      source: "ddis",
+      fileId: runHeader.source_file_id,
+      rows,
+      metadata: {
+        schemaVersion: runHeader.schema_version || "1.0.0",
+        ingestedBy: "marginiq-ddis-ingest-background@2.53.0",
+      },
+      apiKey: FIREBASE_API_KEY!,
+    });
+
+    const payOk = result.layer3.written;
+    const rawWritten = result.layer2.written;
+    console.log(`ddis-ingest: four-layer result — L2=${rawWritten}/${result.layer2.attempted}, L3=${payOk}/${result.layer3.attempted}, ok=${result.ok}`);
+
+    const totalFailed = fileResult.failed + (cappedPayments.length - payOk);
+    const totalAttempted = fileDocs.length + cappedPayments.length;
+    const totalOk = fileResult.ok + payOk;
     const droppedNote = droppedPayments > 0 ? ` · ${droppedPayments} payment rows dropped (over ${PAYMENT_CAP} cap)` : "";
 
-    // v2.42.14: distinguish between fully-successful, partial, and total
-    // failure. Pre-v2.42.14 always returned state=complete even when 100%
-    // of writes failed (e.g., missing Firestore rule for ddis_payments).
-    // Now: if zero docs landed, mark failed; if some landed, complete.
     const allFailed = totalAttempted > 0 && totalOk === 0;
     const finalState = allFailed ? "failed" : "complete";
     const progressText = allFailed
-      ? `✗ All ${totalAttempted} writes failed — check Firestore rules for ddis_files/ddis_payments`
-      : `✓ Wrote ${fileResult.ok} file record(s) + ${payResult.ok.toLocaleString()} payment row(s)${droppedNote}`;
+      ? `✗ All ${totalAttempted} writes failed — check Firestore rules`
+      : `✓ Wrote ${fileResult.ok} file record(s) + ${payOk.toLocaleString()} payment row(s)${droppedNote} · provenanced via four-layer module`;
 
     await writeStatus({
       state: finalState,
@@ -347,7 +394,7 @@ async function ingest(
       phase: "done",
       progress_text: progressText,
       file_records_ok: fileResult.ok,
-      payment_rows_ok: payResult.ok,
+      payment_rows_ok: payOk,
       failed_writes: totalFailed,
       error: allFailed ? "All writes failed (likely Firestore rules issue)" : null,
     });
@@ -361,7 +408,7 @@ async function ingest(
     return {
       ok: true,
       fileOk: fileResult.ok,
-      paymentOk: payResult.ok,
+      paymentOk: payOk,
       failed: totalFailed,
     };
   } catch (e: any) {
@@ -429,8 +476,16 @@ export default async (req: Request, _context: Context) => {
   }
 
   const t0 = Date.now();
+  // v2.53.0 Phase 1 — load the run header (provenance) doc if present
+  const runHeader = await loadRunHeader(runId);
+  if (runHeader) {
+    console.log(`ddis-ingest-background: run_header loaded — source_file_id=${runHeader.source_file_id}`);
+  } else if (runId) {
+    console.warn(`ddis-ingest-background: no run_header for run_id=${runId} (legacy caller — rows will be written via legacy path)`);
+  }
+
   console.log(`ddis-ingest-background: start — ${ddisFileRecords.length} files, ${ddisPayments.length} payments`);
-  const r = await ingest(ddisFileRecords, ddisPayments);
+  const r = await ingest(ddisFileRecords, ddisPayments, runHeader);
   const elapsed = Math.round((Date.now() - t0) / 1000);
   if (r.ok) {
     console.log(`ddis-ingest-background: done in ${elapsed}s — ${r.fileOk} files, ${r.paymentOk} payments, ${r.failed} failed`);
