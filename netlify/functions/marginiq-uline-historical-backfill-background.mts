@@ -89,7 +89,14 @@ function fsValue(v: any): any {
 }
 
 async function fsPatch(coll: string, docId: string, fields: Record<string, any>): Promise<boolean> {
-  const url = `${FS_BASE}/${coll}/${encodeURIComponent(docId)}?key=${FIREBASE_API_KEY}`;
+  // v2.53.1 — append updateMask.fieldPaths per key so PATCH is partial-merge,
+  // not full-doc replace. Without this, every field outside `fields` is dropped.
+  const params = new URLSearchParams();
+  params.set("key", FIREBASE_API_KEY || "");
+  for (const k of Object.keys(fields)) {
+    params.append("updateMask.fieldPaths", k);
+  }
+  const url = `${FS_BASE}/${coll}/${encodeURIComponent(docId)}?${params.toString()}`;
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(fields)) out[k] = fsValue(v);
   const r = await fetch(url, {

@@ -84,7 +84,14 @@ function toFsValue(v: any): any {
 }
 
 async function fsPatchDoc(coll: string, docId: string, fields: Record<string, any>, apiKey: string): Promise<boolean> {
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${coll}/${encodeURIComponent(docId)}?key=${apiKey}`;
+  // v2.53.1 — append updateMask.fieldPaths per key so PATCH is partial-merge,
+  // not full-doc replace. Without this, every field outside `fields` is dropped.
+  const params = new URLSearchParams();
+  params.set("key", apiKey);
+  for (const k of Object.keys(fields)) {
+    params.append("updateMask.fieldPaths", k);
+  }
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${coll}/${encodeURIComponent(docId)}?${params.toString()}`;
   const body: Record<string, any> = {};
   for (const [k, v] of Object.entries(fields)) body[k] = toFsValue(v);
   const r = await fetch(url, {

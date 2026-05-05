@@ -84,7 +84,18 @@ async function writePayloadChunk(
   ddisPayments: any[],
 ): Promise<boolean> {
   const docId = `${runId}__${String(chunkIndex).padStart(3, "0")}`;
-  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/ddis_ingest_payloads/${docId}?key=${FIREBASE_API_KEY}`;
+  // v2.53.1 — append updateMask.fieldPaths per key so PATCH is partial-merge,
+  // not full-doc replace. Doc is unique per chunk so first-write semantics are
+  // unchanged; fix added for consistency with sibling functions.
+  const fieldNames = [
+    "run_id", "chunk_index", "chunk_count",
+    "file_records_in", "payments_in",
+    "raw_bytes", "gz_bytes", "data_b64", "created_at",
+  ];
+  const params = new URLSearchParams();
+  params.set("key", FIREBASE_API_KEY || "");
+  for (const k of fieldNames) params.append("updateMask.fieldPaths", k);
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/ddis_ingest_payloads/${docId}?${params.toString()}`;
   const raw = JSON.stringify({ ddisFileRecords, ddisPayments });
   const gz = gzipSync(Buffer.from(raw, "utf8"));
   const b64 = gz.toString("base64");
@@ -195,7 +206,17 @@ export default async (req: Request, context: Context) => {
   // The BG worker reads this on entry to know the source_file_id for the
   // L2/L3 writes via writeProvenancedRows().
   if (sourceFileId) {
-    const headerUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/ddis_ingest_runs/${runId}?key=${FIREBASE_API_KEY}`;
+    // v2.53.1 — append updateMask.fieldPaths per key. Doc is unique per run so
+    // first-write semantics are unchanged; fix for consistency.
+    const headerFieldNames = [
+      "run_id", "source_file_id", "email_message_id",
+      "email_account", "email_date", "email_subject",
+      "schema_version", "created_at",
+    ];
+    const headerParams = new URLSearchParams();
+    headerParams.set("key", FIREBASE_API_KEY || "");
+    for (const k of headerFieldNames) headerParams.append("updateMask.fieldPaths", k);
+    const headerUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/ddis_ingest_runs/${runId}?${headerParams.toString()}`;
     await fetch(headerUrl, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },

@@ -82,7 +82,14 @@ function toFsFields(obj: Record<string, any>): Record<string, any> {
 }
 
 async function writeStatusDoc(runId: string, data: Record<string, any>): Promise<void> {
-  const url = `${BASE}/nuvizz_ingest_logs/${runId}?key=${FIREBASE_API_KEY}`;
+  // v2.53.1 — append updateMask.fieldPaths per key so progressive status
+  // updates merge into the run-log doc instead of replacing it.
+  const params = new URLSearchParams();
+  params.set("key", FIREBASE_API_KEY || "");
+  for (const k of Object.keys(data)) {
+    params.append("updateMask.fieldPaths", k);
+  }
+  const url = `${BASE}/nuvizz_ingest_logs/${runId}?${params.toString()}`;
   await fetch(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },

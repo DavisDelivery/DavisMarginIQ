@@ -357,7 +357,13 @@ async function runBackfill(): Promise<{ processed: number; updated: number; skip
   // Write a summary doc so Settings can show "last backfill ran at …" later.
   // Non-critical — ignore failure.
   try {
-    const summaryUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/ddis_backfill_summary?key=${FIREBASE_API_KEY}`;
+    // v2.53.1 — append updateMask.fieldPaths per key so the summary doc is
+    // partial-merged, preserving any future fields written by other paths.
+    const summaryFieldNames = ["last_run_at", "processed", "updated", "skipped", "errors"];
+    const summaryParams = new URLSearchParams();
+    summaryParams.set("key", FIREBASE_API_KEY || "");
+    for (const k of summaryFieldNames) summaryParams.append("updateMask.fieldPaths", k);
+    const summaryUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/marginiq_config/ddis_backfill_summary?${summaryParams.toString()}`;
     await fetch(summaryUrl, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
