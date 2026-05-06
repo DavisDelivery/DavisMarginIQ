@@ -55,6 +55,7 @@ import {
   type MigrationStatus,
 } from "./lib/migration-status.js";
 import { listHoldingQueue, deleteHoldingQueueEntry } from "./lib/holding-queue.js";
+import { gunzipSync } from "node:zlib";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -583,6 +584,122 @@ async function drainSyntheticSentinels(apiKey: string): Promise<{
     skipped += srcSkipped; cronfire += srcCronfire; failed += srcFailed;
   }
   return { drained, skipped_synthetic: skipped, cronfire_pending_count: cronfire, failed, per_source: perSource };
+}
+
+/**
+ * Replay cronfire sentinels by invoking the auto-ingest endpoint once per
+ * source that has any cronfire entries. The auto-ingest endpoint reads
+ * Gmail and processes whatever's accumulated since the last successful
+ * pre-migration fire; per-message idempotency lives in
+ * {source}_processed_emails/{messageId}, so a single replay catches up on
+ * the entire deferred window without duplicating work.
+ *
+ * Per-source forensic timestamps (Q1 refinement): the result records
+ * cronfire_first_triggered_at and cronfire_last_triggered_at so the
+ * operator can see the time range that was collapsed into the single
+ * replay invocation.
+ *
+ * Error policy (Q4): continue across sources on per-source failure.
+ * Sentinels for failed sources are left in place (Q6) — operator can
+ * manually re-invoke the auto-ingest endpoint and clean up forensically.
+ *
+ * Runtime expectation: 3 sources × (1 list query + 1 auto-ingest call +
+ * a small number of deletes per source). The auto-ingest call is the
+ * dominant cost (~10–60s per source for Gmail catch-up). Even at the
+ * 60s upper bound × 3 sources = ~3 minutes — well under the 13-min
+ * background-function budget. M6 is sequential by design and does not
+ * need its own time budgeting at expected volumes.
+ */
+async function replayCronfireSentinels(siteOrigin: string, apiKey: string): Promise<{
+  replays_attempted: number;
+  replays_ok: number;
+  replays_failed: number;
+  sentinels_deleted: number;
+  sentinels_left_in_place: number;
+  per_source: Record<string, any>;
+}> {
+  const result = {
+    replays_attempted: 0,
+    replays_ok: 0,
+    replays_failed: 0,
+    sentinels_deleted: 0,
+    sentinels_left_in_place: 0,
+    per_source: {} as Record<string, any>,
+  };
+
+  for (const src of ["uline", "ddis", "nuvizz"] as const) {
+    const entries = await listHoldingQueue(src, apiKey);
+    const cronfireEntries = entries.filter(e => e.is_preflight_sentinel !== true);
+    if (cronfireEntries.length === 0) {
+      result.per_source[src] = { cronfire_count: 0, replayed: false, skipped: true, reason: "no cronfire entries" };
+      continue;
+    }
+
+    // Forensic timestamps (Q1): min/max triggered_at across the cronfire batch
+    const triggeredTimes = cronfireEntries
+      .map(e => (typeof e.triggered_at === "string" ? e.triggered_at : ""))
+      .filter(t => t.length > 0)
+      .sort();
+    const firstTriggeredAt = triggeredTimes[0] || null;
+    const lastTriggeredAt = triggeredTimes[triggeredTimes.length - 1] || null;
+
+    result.replays_attempted++;
+    try {
+      // Single GET — auto-ingest's gate (checkMigrationAndMaybeQueue) will see
+      // in_migration=false (since M5 ran before M6) and proceed normally.
+      // If queued:true comes back, in_migration is unexpectedly still set —
+      // treat as a replay failure and leave sentinels in place.
+      const resp = await invokeLocal(siteOrigin, `/.netlify/functions/marginiq-${src}-auto-ingest`, { method: "GET" });
+      const queued = resp.data?.queued === true;
+      const replaySucceeded = resp.ok && !queued;
+
+      if (replaySucceeded) {
+        result.replays_ok++;
+        let deleted = 0;
+        let deleteFailures = 0;
+        for (const e of cronfireEntries) {
+          const ok = await deleteHoldingQueueEntry(src, e.doc_id, apiKey);
+          if (ok) deleted++; else deleteFailures++;
+        }
+        result.sentinels_deleted += deleted;
+        result.sentinels_left_in_place += deleteFailures;
+        result.per_source[src] = {
+          cronfire_count: cronfireEntries.length,
+          cronfire_first_triggered_at: firstTriggeredAt,
+          cronfire_last_triggered_at: lastTriggeredAt,
+          replayed: true,
+          auto_ingest_status: resp.status,
+          auto_ingest_summary: resp.data?.summary ?? resp.data?.message ?? null,
+          sentinels_deleted: deleted,
+          sentinel_delete_failures: deleteFailures,
+        };
+      } else {
+        result.replays_failed++;
+        result.sentinels_left_in_place += cronfireEntries.length;
+        result.per_source[src] = {
+          cronfire_count: cronfireEntries.length,
+          cronfire_first_triggered_at: firstTriggeredAt,
+          cronfire_last_triggered_at: lastTriggeredAt,
+          replayed: false,
+          error: queued
+            ? `auto-ingest returned queued:true — in_migration is unexpectedly still set`
+            : `auto-ingest replay failed (status=${resp.status})`,
+          response: resp.data,
+        };
+      }
+    } catch (e: any) {
+      result.replays_failed++;
+      result.sentinels_left_in_place += cronfireEntries.length;
+      result.per_source[src] = {
+        cronfire_count: cronfireEntries.length,
+        cronfire_first_triggered_at: firstTriggeredAt,
+        cronfire_last_triggered_at: lastTriggeredAt,
+        replayed: false,
+        error: e?.message || String(e),
+      };
+    }
+  }
+  return result;
 }
 
 // ─── Phase: M0 (ddis backfill, Gate G0) ─────────────────────────────────────
@@ -1143,13 +1260,24 @@ async function phaseDeleteCohort(spec: CohortPhaseSpec): Promise<PhaseResult> {
 }
 
 async function sampleSurvivingChunkDecompress(apiKey: string, n: number): Promise<{
-  sampled: number; all_decompressed: boolean; failures: any[];
+  sampled: number;
+  source_files_raw_resolved: number;
+  chunks_decompressed: number;
+  all_decompressed: boolean;
+  failures: any[];
 }> {
-  // Pick n surviving das_lines docs and verify their L1 backing chunk decompresses.
-  // For 4b: minimal stub — just sample, walk, and report. Full decompression
-  // verification would require pulling source_file_chunks and gunzip — leave
-  // that to lib/four-layer-ingest.ts patterns later. For now we verify that
-  // each sampled doc's source_file_id resolves to a source_files_raw doc.
+  // Sample n surviving das_lines docs. For each, verify:
+  //   1. source_file_id is set
+  //   2. source_files_raw/{source_file_id} resolves
+  //   3. source_file_chunks/{source_file_id}__000 exists
+  //   4. Its data_b64 field is present and base64-decodes
+  //   5. Decoded bytes start with gzip magic 0x1f 0x8b
+  //   6. Full gunzipSync succeeds (catches CRC and length-mismatch corruption)
+  //   7. Decompressed bytes are non-empty
+  //
+  // Strict binary contract (Q3): any failure → all_decompressed:false → G2 HALT.
+  // Failure list is bounded by the sample size (n=50) so the HALT response
+  // can include the full diagnostic for operator inspection.
   const sq: any = {
     from: [{ collectionId: "das_lines" }],
     orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
@@ -1158,18 +1286,66 @@ async function sampleSurvivingChunkDecompress(apiKey: string, n: number): Promis
   const res = await fsRunQuery({ structuredQuery: sq }, apiKey);
   const docs = res.filter((r: any) => r.document).map((r: any) => r.document);
   const failures: any[] = [];
+  let resolved = 0;
+  let decompressed = 0;
+
   for (const d of docs) {
+    const docId = (d.name || "").split("/").pop()!;
     const sfid = unwrapField(d.fields?.source_file_id);
     if (!sfid) {
-      failures.push({ doc: (d.name || "").split("/").pop(), reason: "no source_file_id" });
+      failures.push({ doc: docId, reason: "no source_file_id" });
       continue;
     }
     const src = await fsGetDoc("source_files_raw", String(sfid), apiKey);
     if (!src) {
-      failures.push({ doc: (d.name || "").split("/").pop(), reason: `source_file_id ${sfid} not found` });
+      failures.push({ doc: docId, reason: `source_files_raw/${sfid} not found` });
+      continue;
+    }
+    resolved++;
+
+    const firstChunkId = `${sfid}__000`;
+    const chunk = await fsGetDoc("source_file_chunks", firstChunkId, apiKey);
+    if (!chunk) {
+      failures.push({ doc: docId, reason: `source_file_chunks/${firstChunkId} missing` });
+      continue;
+    }
+    const dataB64 = unwrapField(chunk.fields?.data_b64);
+    if (typeof dataB64 !== "string" || dataB64.length === 0) {
+      failures.push({ doc: docId, reason: `chunk ${firstChunkId} has no data_b64` });
+      continue;
+    }
+    let buf: Buffer;
+    try {
+      buf = Buffer.from(dataB64, "base64");
+    } catch (e: any) {
+      failures.push({ doc: docId, reason: `chunk ${firstChunkId} base64 decode failed: ${e?.message || e}` });
+      continue;
+    }
+    if (buf.length < 2 || buf[0] !== 0x1f || buf[1] !== 0x8b) {
+      const m0 = buf[0]?.toString(16) || "??";
+      const m1 = buf[1]?.toString(16) || "??";
+      failures.push({ doc: docId, reason: `chunk ${firstChunkId} bad gzip magic 0x${m0} 0x${m1}` });
+      continue;
+    }
+    try {
+      const out = gunzipSync(buf);
+      if (out.length === 0) {
+        failures.push({ doc: docId, reason: `chunk ${firstChunkId} decompressed to 0 bytes` });
+        continue;
+      }
+      decompressed++;
+    } catch (e: any) {
+      failures.push({ doc: docId, reason: `chunk ${firstChunkId} gunzip error: ${e?.message || e}` });
     }
   }
-  return { sampled: docs.length, all_decompressed: failures.length === 0, failures };
+
+  return {
+    sampled: docs.length,
+    source_files_raw_resolved: resolved,
+    chunks_decompressed: decompressed,
+    all_decompressed: failures.length === 0,
+    failures,
+  };
 }
 
 // ─── Phase: M4 (mass reparse, Gate G4) ──────────────────────────────────────
@@ -1355,66 +1531,165 @@ async function evaluateG4(siteOrigin: string): Promise<GateResult> {
   };
 }
 
-// ─── Phase: M5 (sign-off; 4c adds retention metadata) ───────────────────────
+// ─── Phase: M5 (sign-off + retention metadata) ──────────────────────────────
+
+const M5_RETENTION_DAYS = 30;
+const M5_RETENTION_MS = M5_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 async function phaseM5(req: PhaseRequest, _siteOrigin: string, apiKey: string): Promise<PhaseResult> {
   const beforeState = await getMigrationStatus(apiKey);
   const dryRun = req.dry_run === true;
+
+  // Defensive: M5 should only be reachable after M1 wrote snapshot_collection
+  // and Gate G1 PASSed. If either is missing, something is genuinely off (M1
+  // bug, manual Firestore edit, or out-of-band field deletion). HALT with a
+  // diagnostic that includes the G1 gate result so the operator can see
+  // whether G1 actually passed (per Q5 refinement).
+  const snapshotCollection = beforeState?.snapshot_collection;
+  if (!snapshotCollection || typeof snapshotCollection !== "string") {
+    const g1 = beforeState?.gate_results?.G1;
+    const summary = `M5 HALT: migration_status.snapshot_collection is missing/invalid. ` +
+      `Cannot write retention metadata without a target collection name. ` +
+      `G1 gate state: ${g1?.result ?? "(no record)"}. ` +
+      (g1?.result === "PASS"
+        ? `G1 reported PASS so M1 should have written this field — investigate M1 logic or check for manual edits.`
+        : `G1 was not PASS, so M5 should not have been reachable — investigate phase ordering enforcement.`);
+    return {
+      ok: false, phase: "M5", migration_id: req.migration_id, dry_run: dryRun,
+      before_state: beforeState, after_state: beforeState,
+      phase_summary: summary,
+      phase_details: {
+        snapshot_collection: snapshotCollection ?? null,
+        G1_gate_result: g1 ?? null,
+        diagnostic: "snapshot_collection missing despite phase ordering gating M5 on G1=PASS",
+      },
+    };
+  }
+
+  // Compute retention timestamp (Q2: simple 30 calendar days, ms arithmetic)
+  const completedAt = nowIso();
+  const retentionAfter = new Date(Date.parse(completedAt) + M5_RETENTION_MS).toISOString();
+
   if (dryRun) {
     return {
       ok: true, phase: "M5", migration_id: req.migration_id, dry_run: true,
       before_state: beforeState, after_state: beforeState,
-      phase_summary: "[DRY RUN] would set current_phase=complete, in_migration=false (4c will add retention metadata)",
-      phase_details: { would_do: { current_phase: "complete", in_migration: false } },
+      phase_summary: `[DRY RUN] M5 would sign off: snapshot=${snapshotCollection}, eligible_for_deletion_after=${retentionAfter}`,
+      phase_details: {
+        would_do: {
+          in_migration: false,
+          current_phase: "complete",
+          completed_at: completedAt,
+          snapshot_collection: snapshotCollection,
+          snapshot_eligible_for_deletion_after: retentionAfter,
+          retention_days: M5_RETENTION_DAYS,
+        },
+      },
     };
   }
-  const completedAt = nowIso();
+
   await setMigrationStatus(apiKey, {
     in_migration: false,
     current_phase: "complete",
     completed_at: completedAt,
+    snapshot_collection: snapshotCollection,                 // re-confirm
+    snapshot_eligible_for_deletion_after: retentionAfter,
+    retention_days: M5_RETENTION_DAYS,
     updated_at: completedAt,
-    // Retention metadata (snapshot_eligible_for_deletion_after) is 4c's responsibility.
   });
   const afterState = await getMigrationStatus(apiKey);
   return {
     ok: true, phase: "M5", migration_id: req.migration_id, dry_run: false,
     before_state: beforeState, after_state: afterState,
-    phase_summary: `M5 sign-off complete at ${completedAt}. 4c will add retention metadata.`,
-    phase_details: { completed_at: completedAt },
+    phase_summary: `M5 sign-off complete at ${completedAt}. Snapshot ${snapshotCollection} eligible for deletion after ${retentionAfter} (${M5_RETENTION_DAYS} days).`,
+    phase_details: {
+      completed_at: completedAt,
+      snapshot_collection: snapshotCollection,
+      snapshot_eligible_for_deletion_after: retentionAfter,
+      retention_days: M5_RETENTION_DAYS,
+    },
   };
 }
 
-// ─── Phase: M6 (drain; 4b: synthetic-only) ──────────────────────────────────
+// ─── Phase: M6 (drain — synthetic + cronfire replay) ────────────────────────
 
-async function phaseM6(req: PhaseRequest, _siteOrigin: string, apiKey: string): Promise<PhaseResult> {
+async function phaseM6(req: PhaseRequest, siteOrigin: string, apiKey: string): Promise<PhaseResult> {
   const beforeState = await getMigrationStatus(apiKey);
   const dryRun = req.dry_run === true;
+
   if (dryRun) {
+    // Walk queues per source to count what would happen, with forensic
+    // timestamps so the operator can preview the cronfire window that
+    // would be replayed.
+    const perSource: Record<string, any> = {};
     let totalSynthetic = 0, totalCronfire = 0;
     for (const src of ["uline", "ddis", "nuvizz"] as const) {
       const entries = await listHoldingQueue(src, apiKey);
-      totalSynthetic += entries.filter(e => e.is_preflight_sentinel === true).length;
-      totalCronfire += entries.filter(e => e.is_preflight_sentinel !== true).length;
+      const synthetic = entries.filter(e => e.is_preflight_sentinel === true);
+      const cronfire = entries.filter(e => e.is_preflight_sentinel !== true);
+      const triggered = cronfire
+        .map(e => (typeof e.triggered_at === "string" ? e.triggered_at : ""))
+        .filter(t => t.length > 0)
+        .sort();
+      perSource[src] = {
+        synthetic_count: synthetic.length,
+        cronfire_count: cronfire.length,
+        cronfire_first_triggered_at: triggered[0] || null,
+        cronfire_last_triggered_at: triggered[triggered.length - 1] || null,
+      };
+      totalSynthetic += synthetic.length;
+      totalCronfire += cronfire.length;
     }
     return {
       ok: true, phase: "M6", migration_id: req.migration_id, dry_run: true,
       before_state: beforeState, after_state: beforeState,
-      phase_summary: `[DRY RUN] M6 would drain ${totalSynthetic} synthetic sentinels; ${totalCronfire} cronfire entries deferred to 4c`,
-      phase_details: { would_do: { synthetic: totalSynthetic, cronfire: totalCronfire } },
+      phase_summary: `[DRY RUN] M6 would drain ${totalSynthetic} synthetic sentinels and replay ${totalCronfire} cronfire entries via auto-ingest invocations`,
+      phase_details: {
+        would_do: {
+          synthetic_total: totalSynthetic,
+          cronfire_total: totalCronfire,
+          replay_invocations: Object.values(perSource).filter((s: any) => s.cronfire_count > 0).length,
+          per_source: perSource,
+        },
+      },
     };
   }
-  const result = await drainSyntheticSentinels(apiKey);
+
+  // Sequential: synthetic drain first (cheap, deterministic), then cronfire
+  // replay (involves auto-ingest HTTP calls). See replayCronfireSentinels
+  // docstring for runtime expectations under the 13-min background budget.
+  const synthetic = await drainSyntheticSentinels(apiKey);
+  const cronfire = await replayCronfireSentinels(siteOrigin, apiKey);
+
   await setMigrationStatus(apiKey, {
     updated_at: nowIso(),
-    drain_state: { ...result, completed_at: nowIso(), drained_by: "4b-synthetic-only" },
+    drain_state: {
+      synthetic,
+      cronfire,
+      completed_at: nowIso(),
+      drained_by: "4c-full",
+    },
   });
   const afterState = await getMigrationStatus(apiKey);
+
+  // ok=true if everything cleaned up successfully. Synthetic failures or
+  // cronfire replay failures both lower this; the per_source breakdown in
+  // drain_state.cronfire.per_source tells the operator which sources to
+  // manually retry.
+  const ok = synthetic.failed === 0
+    && cronfire.replays_failed === 0
+    && cronfire.sentinels_left_in_place === 0;
+
+  const summary =
+    `M6 drained ${synthetic.skipped_synthetic} synthetic sentinels; ` +
+    `replayed ${cronfire.replays_ok}/${cronfire.replays_attempted} cronfire sources ` +
+    `(${cronfire.sentinels_deleted} sentinels deleted, ${cronfire.sentinels_left_in_place} left in place)`;
+
   return {
-    ok: result.failed === 0, phase: "M6", migration_id: req.migration_id, dry_run: false,
+    ok, phase: "M6", migration_id: req.migration_id, dry_run: false,
     before_state: beforeState, after_state: afterState,
-    phase_summary: `M6 drained ${result.skipped_synthetic} synthetic sentinels; ${result.cronfire_pending_count} cronfire entries pending (4c will replay)`,
-    phase_details: result,
+    phase_summary: summary,
+    phase_details: { synthetic, cronfire },
   };
 }
 
