@@ -45,6 +45,11 @@ import { parseDasWorkbookToRows } from "./lib/uline-das-parser.js";
 const PROJECT_ID = "davismarginiq";
 const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
 
+// v2.53.5 — Centralized version tag. Used in ingestedBy fields so M2/M3's
+// concurrency check (which whitelists `@${APP_VERSION}` suffix) recognizes
+// reparse writes as runner-managed, not cron-race intruders.
+const APP_VERSION = "2.53.5";
+
 function json(data: any, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -117,6 +122,127 @@ async function loadFileBytes(fileId: string): Promise<Buffer | null> {
   return gunzipSync(gz);
 }
 
+// ─── DDIS parser helpers (inlined for this patch) ───────────────────────────
+//
+// NOTE: These helpers are duplicated from marginiq-ddis-auto-ingest.mts
+// intentionally to keep this patch contained. Follow-up: extract to
+// lib/ddis-parser.ts (mirror of lib/uline-das-parser.ts) in a separate
+// refactor session. Do not let these copies drift — if the ddis CSV
+// format changes, update both files.
+
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (c === "," && !inQuotes) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// Returns array of objects keyed by lowercased headers — matches what
+// readCSV() produces in the client and what parseDDIS expects as input.
+function csvToRowObjects(csvText: string): Record<string, any>[] {
+  // Strip UTF-8 BOM
+  if (csvText.charCodeAt(0) === 0xFEFF) csvText = csvText.slice(1);
+  const lines = csvText.replace(/\r\n/g, "\n").split("\n");
+  if (lines.length < 2) return [];
+  const headers = parseCsvLine(lines[0]).map(h => String(h || "").toLowerCase().trim());
+  const out: Record<string, any>[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.length === 0) continue;
+    const cols = parseCsvLine(line);
+    // Skip completely empty lines
+    if (cols.length === 1 && cols[0] === "") continue;
+    const obj: Record<string, any> = {};
+    for (let j = 0; j < headers.length; j++) {
+      const v = cols[j];
+      obj[headers[j]] = (v === undefined || v === "") ? null : v;
+    }
+    out.push(obj);
+  }
+  return out;
+}
+
+function parseDateMDY(s: string): string | null {
+  if (!s) return null;
+  const datePart = String(s).trim().split(" ")[0];
+  const m = datePart.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!m) return null;
+  const mo = parseInt(m[1], 10);
+  const d = parseInt(m[2], 10);
+  let y = parseInt(m[3], 10);
+  if (y < 100) y += 2000;
+  return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+function normalizePro(v: any): string | null {
+  if (v == null) return null;
+  let s = String(v).trim();
+  if (s === "") return null;
+  s = s.replace(/\.0+$/, "");
+  const stripped = s.replace(/^0+/, "");
+  return stripped || s;
+}
+
+interface DdisPayment {
+  pro: string;
+  voucher: string | null;
+  check: string | null;
+  bill_date: string | null;
+  paid: number;
+  // v2.52.0: Every column from the source row verbatim. Keys are lowercased
+  // CSV header names. Preserves columns we don't currently use (customer,
+  // invoice number, weight, descriptions, addresses, etc.) so future
+  // analyses don't require re-uploads.
+  raw: Record<string, any>;
+}
+
+function parseDdisRows(rows: Record<string, any>[]): DdisPayment[] {
+  const payments: DdisPayment[] = [];
+  for (const r of rows) {
+    const proRaw = r["pro#"];
+    if (!proRaw) continue;
+    const pro = normalizePro(proRaw);
+    if (!pro) continue;
+    const paidAmount = parseFloat(String(r["paid amount"] || "")) || 0;
+    const billDate = parseDateMDY(String(r["bill date"] || ""));
+    // Build raw with EVERY column, not just the ones we currently use.
+    // r is already keyed by lowercased headers from csvToRowObjects().
+    // Sanitize keys: Firestore field names can't contain . [ ] / or start with __
+    const raw: Record<string, any> = {};
+    for (const [k, v] of Object.entries(r)) {
+      if (!k) continue;
+      const safeKey = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
+      raw[safeKey] = (v === undefined || v === null) ? "" : String(v);
+    }
+    payments.push({
+      pro,
+      voucher: r["voucher#"] ? String(r["voucher#"]) : null,
+      check: r["check#"] ? String(r["check#"]) : null,
+      bill_date: billDate,
+      paid: paidAmount,
+      raw,
+    });
+  }
+  return payments;
+}
+
 async function dispatchToParser(
   siteOrigin: string,
   fileId: string,
@@ -141,15 +267,132 @@ async function dispatchToParser(
     const data: any = await r.json().catch(() => ({}));
     return { ok: r.ok && data.ok !== false, result: data };
   }
+  // v2.53.5 — DDIS reparse from L1.
+  //
+  // Architectural note: Prior to v2.53.5 this branch POSTed to
+  // marginiq-ddis-auto-ingest?mode=reparse_csv, which delegated to
+  // marginiq-ddis-ingest → marginiq-ddis-ingest-background. That chain
+  // wrote ddis_payments (L3) directly but never called lib/four-layer-ingest's
+  // ingestFile(), so ddis_rows_raw (L2) was never populated and
+  // parsed_row_count was never set on source_files_raw. This blocked Gate G0
+  // on the M0 phase of the das_lines redesign migration, which checks
+  // parsed_row_count > 0 on every M0 target.
+  //
+  // The new path mirrors the uline branch above: parse with the shared
+  // parseDdisRows helper, hand the resulting rows to ingestFile() with
+  // skipLayer1: true (L1 chunks already exist) and l3WriteMode: "overwrite"
+  // (ddis L3 docIds are stable {pro}_{bill_date}_{check} keys; last write
+  // wins is correct). fileIdOverride is required because live ddis L1
+  // was staged under `ddis__{messageId}__{filename}` (double underscores,
+  // verbatim messageId), which deriveFileId() does NOT produce — letting
+  // ingestFile recompute the id would write to a fresh doc instead of
+  // patching the existing L1 doc M0 is checking.
   if (source === "ddis") {
+    const messageId = String(meta.email_message_id || meta.messageId || "");
+    const stagedAt = String(meta.staged_at || "");
+    const emailDate = String(meta.email_date || meta.emailDate || "");
+    const account = String(meta.email_account || meta.account || "");
+    const subject = String(meta.email_subject || meta.subject || "");
+
+    if (!messageId) {
+      return { ok: false, error: "DDIS reparse: source_files_raw doc missing email_message_id" };
+    }
+
+    // Decode + parse. csvToRowObjects + parseDdisRows are duplicated from
+    // marginiq-ddis-auto-ingest.mts intentionally — keeps this branch
+    // self-contained and avoids an inter-function HTTP hop. If those
+    // helpers ever drift, both copies must be updated. (Future cleanup:
+    // extract to lib/ddis-parser.ts mirroring lib/uline-das-parser.ts.)
     const csvText = bytes.toString("utf8");
-    const r = await fetch(`${siteOrigin}/.netlify/functions/marginiq-ddis-auto-ingest?mode=reparse_csv`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ csv_text: csvText, file_id: fileId, filename }),
+    let payments;
+    try {
+      const csvRows = csvToRowObjects(csvText);
+      payments = parseDdisRows(csvRows);
+    } catch (e: any) {
+      return { ok: false, error: `DDIS reparse: parser threw: ${e?.message || e}` };
+    }
+
+    if (payments.length === 0) {
+      return { ok: false, error: "DDIS reparse: parser produced 0 payments — file may have no PRO# column or be malformed" };
+    }
+
+    // Transform DdisPayment[] → ParsedRow[].
+    // L3 docId: `{pro}_{bill_date||"nodate"}_{check||"nocheck"}` (matches
+    //   live buildIngestPayload at marginiq-ddis-auto-ingest.mts:474).
+    // L2 docId: `{fileId}__{6-digit-row-index}` (matches uline lossless
+    //   convention; ddis didn't have an L2 scheme before — adopting the
+    //   uline shape for consistency with the rest of the four-layer model).
+    // rawFields: every CSV column verbatim (the `raw` map produced by
+    //   parseDdisRows already has Firestore-safe keys).
+    // normalizedFields: the typed fields written to ddis_payments today.
+    //
+    // v2.53.5 — Match live cron's L3 invariant: ddis_payments only contains
+    // rows with paid_amount > 0. Zero/negative-paid rows are still preserved
+    // in L2 (ddis_rows_raw); excluding them from L3 maintains schema
+    // consistency with cron-written rows so audit/recon code doesn't see a
+    // population split between reparsed and cron-written files. Mirrors
+    // marginiq-ddis-auto-ingest.mts:473 `if (!p.pro || p.paid <= 0) continue;`.
+    // (p.pro is already truthy because parseDdisRows filters !pro upstream;
+    // the redundancy here keeps the predicate identical to the cron's.)
+    const parsedRows = payments
+      .filter(p => p.pro && p.paid > 0)
+      .map((p, idx) => ({
+        docId: `${p.pro}_${p.bill_date || "nodate"}_${p.check || "nocheck"}`,
+        l2DocId: `${fileId}__${String(idx).padStart(6, "0")}`,
+        rawFields: p.raw,
+        normalizedFields: {
+          pro: p.pro,
+          paid_amount: p.paid,
+          bill_date: p.bill_date || null,
+          check: p.check || null,
+          voucher: p.voucher || null,
+          source_file: filename,
+        },
+      }));
+
+    const result = await ingestFile({
+      source: "ddis",
+      filename,
+      binary: bytes,
+      parser: () => parsedRows,
+      metadata: {
+        messageId,
+        emailDate,
+        account,
+        subject,
+        // v2.53.5 — Match the L1 doc's schema_version so provenance on L2/L3
+        // rows reflects the same lineage as L1. Live ddis L1 docs were
+        // staged with schema_version="1.0.0-recovered" by the auto-ingest
+        // path; using "1.0.0" plain here would create an archaeology
+        // discrepancy when investigating row lineage later.
+        schemaVersion: "1.0.0-recovered",
+        ingestedBy: `marginiq-reparse@${APP_VERSION}`,
+        stagedAt,                  // preserved from L1 doc; required by Concurrency
+                                    // check whitelist semantics, optional for "overwrite"
+      },
+      apiKey: FIREBASE_API_KEY!,
+      l3WriteMode: "overwrite",
+      skipLayer1: true,
+      fileIdOverride: fileId,      // CRITICAL: preserves existing L1 doc id
+                                    // (`ddis__{messageId}__{filename}` format)
+                                    // which deriveFileId would otherwise replace
     });
-    const data: any = await r.json().catch(() => ({}));
-    return { ok: r.ok && data.ok !== false, result: data };
+
+    return {
+      ok: result.ok,
+      result: {
+        action: "ddis_reparse_from_l1",
+        file_id: fileId,
+        filename,
+        payments_parsed: payments.length,
+        l2_written: result.layer2.written,
+        l3_attempted: result.layer3.attempted,
+        l3_written: result.layer3.written,
+        staged_at_used: stagedAt || null,
+        duration_ms: result.duration_ms,
+      },
+      error: result.error,
+    };
   }
   // v2.53.3 Commit 2 — Uline DAS reparse from L1.
   //
@@ -206,7 +449,7 @@ async function dispatchToParser(
         account,
         subject,
         schemaVersion: "2.0.0",
-        ingestedBy: `marginiq-reparse@2.53.3`,
+        ingestedBy: `marginiq-reparse@${APP_VERSION}`,
         stagedAt,                  // CRITICAL: from L1 doc, NOT new Date()
         l1Extras: bundle.l1Extras, // updates column_headers/sheet_names/file_kind
                                     // on source_files_raw (won't overwrite L1

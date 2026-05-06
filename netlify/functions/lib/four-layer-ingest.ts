@@ -204,6 +204,26 @@ export interface IngestParams {
    *     v2.53.3 — no production caller invokes this mode yet.
    */
   l3WriteMode?: "overwrite" | "merge" | "reject_on_conflict";
+  /**
+   * v2.53.5 — Override the file_id that ingestFile would otherwise compute
+   * via deriveFileId(source, filename, messageId). Used by reparse-from-L1
+   * paths where the L1 doc already exists in source_files_raw under an
+   * id format that predates deriveFileId (e.g., live ddis stages docs as
+   * `ddis__{messageId}__{filename}` with double underscores, not the
+   * `{source}_{cleanFilename}_{12hex}` shape deriveFileId produces).
+   *
+   * When set, ingestFile uses this value verbatim for all L2/L3 docId
+   * prefixes, the source_files_raw completion-summary patch target,
+   * and the provenance.source_file_id field stamped on every row.
+   *
+   * Caller is responsible for passing the EXACT existing source_files_raw
+   * doc id — a mismatch will cause writes to land on the wrong doc.
+   * Validate before calling.
+   *
+   * Mutually compatible with skipLayer1 (the typical pairing for reparse).
+   * Existing callers that don't need this can omit it; behavior is unchanged.
+   */
+  fileIdOverride?: string;
 }
 
 export interface IngestResult {
@@ -657,7 +677,9 @@ export async function ingestFile(params: IngestParams): Promise<IngestResult> {
     };
   }
 
-  const fileId = deriveFileId(source, filename, metadata.messageId);
+  // v2.53.5 — Honor fileIdOverride for reparse-from-L1 callers whose existing
+  // L1 doc id was generated under a different scheme than deriveFileId.
+  const fileId = params.fileIdOverride || deriveFileId(source, filename, metadata.messageId);
 
   // Layer 1: original bytes — skipped when skipLayer1=true (reparse-from-L1)
   let l1: { ok: boolean; chunks: number; rawBytes: number; gzBytes: number; error?: string };
