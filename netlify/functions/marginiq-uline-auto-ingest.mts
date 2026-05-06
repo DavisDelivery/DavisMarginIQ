@@ -514,6 +514,9 @@ export default async (req: Request, _context: Context) => {
 // Thursday morning and click Load before end of week. The audit math
 // invoked on Load depends on DDIS payment data — Sunday's DDIS auto-ingest
 // (the prior week's payments) is already in Firestore by Wednesday.
+// 2026-05-06: Temporarily moved from Wed night ET to Sun night ET for one week
+// during Phase 2 migration runner repairs. See marginiq_config/migration_status.M0_state.
+// Restore to "0 3,4 * * 4" (Wed night ET) after Sunday 2026-05-10 run completes.
 export const config: Config = {
-  schedule: "0 3,4 * * 4",
+  schedule: "0 3,4 * * 1",
 };
