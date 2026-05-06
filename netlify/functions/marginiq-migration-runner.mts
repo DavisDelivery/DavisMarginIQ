@@ -63,10 +63,18 @@ const PROJECT_ID = "davismarginiq";
 const FS_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 const BG_PATH = "/.netlify/functions/marginiq-migration-runner-background";
 
-const APP_VERSION = "2.53.7";
-// v2.53.7 — Whitelist accepts current + last-stamping release.
+const APP_VERSION = "2.53.8";
+// v2.53.8 — Hotfix for resume-cursor format bug surfaced by 2.53.7's
+// successful first M1 invocation (181,800 docs written, time-yielded
+// cleanly, but second invocation 400ed on the resume read because
+// last_processed_doc_id was stored as a bare docId while fsRunQuery's
+// startAt requires a full reference path). Fix is at the resume seam
+// in phaseM1; no change to fsBatchWrite, retry logic, gate evaluator,
+// or sampler. See line ~1261 for the fix.
 //
-// PREVIOUS_VERSION = "2.53.5" (NOT 2.53.6). Reasoning:
+// Whitelist accepts current + last-stamping release.
+//
+// PREVIOUS_VERSION = "2.53.5" (NOT 2.53.6 or 2.53.7). Reasoning:
 // - 2.53.5 is the last version that stamped `ingested_by` markers on
 //   live das_lines docs — it's the M0-fix reparse version. Today's M0
 //   ddis reparse writes carry `marginiq-reparse@2.53.5`. The concurrency
@@ -75,18 +83,17 @@ const APP_VERSION = "2.53.7";
 // - 2.53.6 was the failed M1 :batchWrite attempt. M1 only writes to the
 //   snapshot collection (das_lines_snapshot__*), not to das_lines, AND
 //   every :batchWrite returned 403 so zero docs landed anywhere. There
-//   are no `ingested_by: ...@2.53.6` markers anywhere in das_lines. The
-//   intermediate version is a no-op for whitelist purposes.
-// - 2.53.7 is the current version (this patch). marginiq-reparse.mts is
-//   NOT bumped in this patch — its APP_VERSION stays at 2.53.6 since the
-//   reparse logic isn't changing. New reparse writes (e.g. an M2/M3
-//   reparse cycle if needed) would stamp @2.53.6, but reparse hasn't
-//   re-run since the M0 fix at 2.53.5, so no @2.53.6 reparse markers
-//   exist on das_lines either. (If reparse runs at @2.53.6 in the
-//   future, we'd extend this list.)
+//   are no `ingested_by: ...@2.53.6` markers anywhere in das_lines.
+// - 2.53.7 was the :commit M1 attempt that worked for one invocation
+//   (181,800 docs written to the snapshot collection, 0 stamps to
+//   das_lines.ingested_by) before the resume bug surfaced. Same
+//   reasoning as 2.53.6: M1 doesn't touch das_lines.ingested_by.
+// - 2.53.8 is the current version (this patch). marginiq-reparse.mts
+//   is NOT bumped in this patch — its APP_VERSION stays at 2.53.6
+//   since the reparse logic isn't changing.
 //
 // PREVIOUS_VERSION can be removed in the release AFTER this one — i.e.,
-// when the runner next bumps past 2.53.7 and any @2.53.5 markers have
+// when the runner next bumps past 2.53.8 and any @2.53.5 markers have
 // been cleared from das_lines. M2's v2.53.1-corrupted-rows cohort and
 // M3's pre-Phase-1 cohort do not target reparse markers, so this
 // rolling-window stays useful as long as live ddis L1 docs may carry
@@ -665,10 +672,11 @@ async function concurrencyCheck(
     for (const doc of docs) {
       const ingestedAt = unwrapField(doc.fields?.ingested_at) || "";
       const ingestedBy = unwrapField(doc.fields?.ingested_by) || "";
-      // v2.53.7 — Accept any of RUNNER_INGEST_MARKER_SUFFIXES (current OR
+      // v2.53.8 — Accept any of RUNNER_INGEST_MARKER_SUFFIXES (current OR
       // last-stamping release version). Keeps today's M0 reparse writes
-      // (@2.53.5) whitelisted alongside the current version (@2.53.7).
-      // See APP_VERSION block at top of file for why @2.53.6 is skipped.
+      // (@2.53.5) whitelisted alongside the current version (@2.53.8).
+      // See APP_VERSION block at top of file for why @2.53.6 and @2.53.7
+      // are skipped (neither stamped any markers on das_lines).
       const isWhitelisted =
         (typeof ingestedBy === "string" && RUNNER_INGEST_MARKER_SUFFIXES.some(suf => ingestedBy.endsWith(suf))) ||
         (typeof ingestedBy === "string" && migrationId && ingestedBy.includes(migrationId));
@@ -1258,7 +1266,20 @@ async function phaseM1(req: PhaseRequest, _siteOrigin: string, apiKey: string): 
   const failedDocIds: Array<{ docId: string; code: number; message: string }> = resuming
     ? (Array.isArray(prevState.failed_doc_ids) ? prevState.failed_doc_ids.slice() : [])
     : [];
-  let cursor: string | undefined = resuming ? prevCursor : undefined;
+  // v2.53.8 — On resume, M1_state.last_processed_doc_id is stored as a BARE
+  // docId (line ~1430 per-group checkpoint extracts via .split("/").pop()),
+  // but fsRunQuery's startAt requires a FULL Firestore reference path
+  // (projects/.../documents/das_lines/<docId>). Without this conversion,
+  // the first paged read on resume returns HTTP 400:
+  //   "Document parent name "<docId>" lacks "projects" at index 0."
+  // Mid-loop the cursor stays as a full path (set via doc_to_full_name on
+  // line ~1371). So bare ↔ full conversion happens only at the resume seam.
+  let cursor: string | undefined;
+  if (resuming && prevCursor) {
+    cursor = `projects/${PROJECT_ID}/databases/(default)/documents/das_lines/${prevCursor}`;
+  } else {
+    cursor = undefined;
+  }
   let groups = 0;
 
   // Persist snapshot collection name immediately so 4c's M5 retention
@@ -1276,7 +1297,10 @@ async function phaseM1(req: PhaseRequest, _siteOrigin: string, apiKey: string): 
       processed,
       failed_count: failedCount,
       failed_doc_ids: failedDocIds.slice(-M1_FAILED_DOC_IDS_BOUND),
-      last_processed_doc_id: cursor || null,
+      // v2.53.8 — Persist bare docId (matches per-group checkpoint format
+      // at line ~1430). prevCursor is already bare; use it directly on
+      // resume rather than the in-process `cursor` (which is the full path).
+      last_processed_doc_id: resuming ? (prevCursor || null) : null,
       resumed_from: resuming ? prevCursor : null,
       last_progress_at: nowIso(),
     },
