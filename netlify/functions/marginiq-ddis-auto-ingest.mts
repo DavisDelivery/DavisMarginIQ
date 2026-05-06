@@ -1,7 +1,8 @@
 import type { Context, Config } from "@netlify/functions";
+import { checkMigrationAndMaybeQueue } from "./lib/holding-queue.js";
 
 /**
- * Davis MarginIQ — DDIS Email Auto-Ingest (v2.42.11)
+ * Davis MarginIQ — DDIS Email Auto-Ingest (v2.53.4)
  *
  * Scheduled function that runs Sunday evening, looks for the most recent
  * unprocessed Uline DDIS820 payment-remittance CSV email in any connected
@@ -566,6 +567,15 @@ export default async (req: Request, _context: Context) => {
   if (!CLIENT_ID || !CLIENT_SECRET) {
     return json({ error: "OAuth not configured" }, 500);
   }
+
+  // v2.53.4: Migration gate. Sits AFTER the reparse_csv branch (line ~535)
+  // because the migration runner's M0 phase invokes marginiq-reparse, which
+  // calls into this endpoint via reparse_csv mode — blocking that path
+  // would deadlock M0. The gate only applies to the cron/Gmail-discovery
+  // flow below. Fail-open on read errors.
+  const preflightTest = url.searchParams.get("preflight_test") === "1";
+  const gate = await checkMigrationAndMaybeQueue("ddis", { isPreflightTest: preflightTest }, FIREBASE_API_KEY);
+  if (gate.shouldShortCircuit && gate.response) return gate.response;
 
   const dryRun = url.searchParams.get("dry_run") === "1";
   const runId = `ddis_auto_${new Date().toISOString().replace(/[:.]/g, "-")}`;

@@ -1,5 +1,5 @@
 /**
- * Davis MarginIQ — Standing health-check infrastructure (v2.53.3)
+ * Davis MarginIQ — Standing health-check infrastructure (v2.53.4)
  *
  * Centralized result-writing for the 9 standing checks introduced in
  * Phase 2 Commit 3. Each check endpoint imports `runHealthCheck` and
@@ -13,8 +13,17 @@
  * Both docs share the same payload. The `__latest` mirror is overwritten
  * on every run; the timestamped doc is append-only history.
  *
+ * v2.53.4: runHealthCheck consults marginiq_config/migration_status
+ * before invoking the closure. When in_migration=true and ?force=1 is
+ * not set, the check short-circuits to status="INFO" with a summary
+ * indicating migration is in progress. The skipped result is still
+ * persisted to marginiq_health_checks/* so the audit trail remains
+ * unbroken across the migration window.
+ *
  * See DESIGN.md §5 for the full check spec.
  */
+
+import { getMigrationStatus } from "./migration-status";
 
 const PROJECT_ID = "davismarginiq";
 const FS_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
@@ -43,31 +52,71 @@ export interface CheckClosureResult {
  * The closure should perform the check's read-only work and return
  * {status, summary, details}. This wrapper:
  *   1. Records start time
- *   2. Invokes the closure (catches throws, reports as FAIL)
- *   3. Writes both the timestamped doc and the __latest mirror
- *   4. Returns an HTTP Response containing the full result
+ *   2. Consults marginiq_config/migration_status. If in_migration=true
+ *      and options.force is not set, builds an INFO-skipped result and
+ *      skips the closure entirely. The skipped result is still persisted
+ *      to marginiq_health_checks/* so the audit trail remains intact.
+ *   3. Otherwise invokes the closure (catches throws, reports as FAIL)
+ *   4. Writes both the timestamped doc and the __latest mirror
+ *   5. Returns an HTTP Response containing the full result
  *
  * If the Firestore writes themselves fail, the response still includes
  * the result body (since the check itself completed). The caller can
  * inspect `wrote_to_firestore` to know whether persistence succeeded.
+ *
+ * @param options.force — when true, bypasses the in_migration short-circuit.
+ *   Reserved for the migration runner's own preflight phase, which needs
+ *   to verify checks still produce real results when explicitly forced.
+ *   Surfaced from the HTTP entry-point as ?force=1.
  */
 export async function runHealthCheck(
   checkId: CheckId,
   apiKey: string,
   closure: () => Promise<CheckClosureResult>,
+  options?: { force?: boolean },
 ): Promise<Response> {
   const startMs = Date.now();
   const ranAt = new Date().toISOString();
 
   let result: CheckClosureResult;
+  let skipped = false;
+
+  // Migration-flag short-circuit. Read failure is fail-open: if we can't
+  // reach Firestore to read the flag, we still want the check to run so
+  // operators have visibility into health during infrastructure incidents.
+  let migrationStatus = null as Awaited<ReturnType<typeof getMigrationStatus>>;
   try {
-    result = await closure();
+    migrationStatus = await getMigrationStatus(apiKey);
   } catch (e: any) {
+    console.error(`runHealthCheck migration-flag read failed (fail-open): ${e?.message || e}`);
+  }
+
+  if (migrationStatus?.in_migration === true && !options?.force) {
+    skipped = true;
+    const phase = migrationStatus.current_phase ?? "unknown";
+    const startedAt = migrationStatus.started_at ?? "unknown";
+    const migrationId = migrationStatus.migration_id ?? "unknown";
     result = {
-      status: "FAIL",
-      summary: `Check ${checkId} threw: ${e?.message || String(e)}`,
-      details: { error: e?.message || String(e), stack: e?.stack || null },
+      status: "INFO",
+      summary: `skipped: migration in progress (phase=${phase}, started=${startedAt})`,
+      details: {
+        skipped_reason: "in_migration",
+        migration_id: migrationId,
+        current_phase: phase,
+        started_at: startedAt,
+        force_param_hint: "pass ?force=1 to bypass this gate",
+      },
     };
+  } else {
+    try {
+      result = await closure();
+    } catch (e: any) {
+      result = {
+        status: "FAIL",
+        summary: `Check ${checkId} threw: ${e?.message || String(e)}`,
+        details: { error: e?.message || String(e), stack: e?.stack || null },
+      };
+    }
   }
 
   const durationMs = Date.now() - startMs;
@@ -94,6 +143,8 @@ export async function runHealthCheck(
     ...fullResult,
     wrote_to_firestore: tsOk && latestOk,
     timestamped_doc_id: tsId,
+    skipped_for_migration: skipped,
+    forced: skipped ? false : (options?.force === true),
   }), {
     status: result.status === "FAIL" ? 200 : 200,  // both still HTTP 200; caller reads .status
     headers: { "Content-Type": "application/json" },

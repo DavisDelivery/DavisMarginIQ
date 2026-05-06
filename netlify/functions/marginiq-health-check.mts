@@ -14,11 +14,15 @@ import { SOURCE_REGISTRY } from "./lib/four-layer-ingest.js";
 import { gunzipSync } from "node:zlib";
 
 /**
- * Davis MarginIQ — Standing Health Checks (v2.53.3, Phase 2 Commit 3)
+ * Davis MarginIQ — Standing Health Checks (v2.53.4, Phase 2 Commit 4a)
  *
  * Single endpoint dispatching to all 9 standing checks defined in
  * DESIGN.md §5. Manual-only triggering in v1 — no cron yet (per the
  * orchestrator's Q5 direction: establish baselines first, schedule later).
+ *
+ * v2.53.4: added ?force=1 query param. Surfaces to runHealthCheck so the
+ * Phase 2 migration runner's preflight phase can bypass the in_migration
+ * short-circuit and verify checks still produce real results when forced.
  *
  * Endpoint:
  *   POST /.netlify/functions/marginiq-health-check?check={id}
@@ -994,5 +998,11 @@ export default async (req: Request, _ctx: Context): Promise<Response> => {
   // the Commit 4 migration runner which invokes via its own HTTP client).
   const fullParam = url.searchParams.get("full") || "";
   const full = ["1", "true", "yes", "on"].includes(fullParam.toLowerCase());
-  return await runHealthCheck(checkId, FIREBASE_API_KEY, () => runner(FIREBASE_API_KEY!, full));
+  // v2.53.4: ?force=1 bypasses the in_migration short-circuit. Used by the
+  // migration runner's preflight phase to verify checks still produce real
+  // results when the flag is set. Operators should generally NOT pass force=1
+  // during an active migration — the gate exists for a reason.
+  const forceParam = url.searchParams.get("force") || "";
+  const force = ["1", "true", "yes", "on"].includes(forceParam.toLowerCase());
+  return await runHealthCheck(checkId, FIREBASE_API_KEY, () => runner(FIREBASE_API_KEY!, full), { force });
 };

@@ -1,8 +1,9 @@
 import type { Context, Config } from "@netlify/functions";
 import { gzipSync } from "node:zlib";
+import { checkMigrationAndMaybeQueue } from "./lib/holding-queue.js";
 
 /**
- * Davis MarginIQ — Uline DAS Auto-Ingest (Staging) (v2.42.18)
+ * Davis MarginIQ — Uline DAS Auto-Ingest (Staging) (v2.53.4)
  *
  * Runs Monday morning. Searches connected Gmail accounts for the weekly
  * Uline DAS xlsx batch (3-4 files per email — delivery, truckload,
@@ -302,6 +303,17 @@ export default async (req: Request, _context: Context) => {
 
   const url = new URL(req.url);
   const dryRun = url.searchParams.get("dry_run") === "1";
+
+  // v2.53.4: Migration gate. If a Phase 2 das_lines migration is in
+  // progress, short-circuit BEFORE any Gmail fetch. The helper queues
+  // a sentinel doc (cronfire_* for real fires, preflight-test-* for
+  // ?preflight_test=1) which Commit 4c's M6 drain replays after sign-off.
+  // Fail-open: if the migration_status read fails, we proceed normally
+  // rather than blocking auto-ingest on infrastructure problems.
+  const preflightTest = url.searchParams.get("preflight_test") === "1";
+  const gate = await checkMigrationAndMaybeQueue("uline", { isPreflightTest: preflightTest }, FIREBASE_API_KEY);
+  if (gate.shouldShortCircuit && gate.response) return gate.response;
+
   const runId = `uline_auto_${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const startedAt = new Date().toISOString();
 

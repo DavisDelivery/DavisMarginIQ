@@ -141,6 +141,19 @@ const ALLOWED_FILES = new Set([
   "netlify/functions/marginiq-nuvizz-auto-ingest.mts",
   "netlify/functions/marginiq-nuvizz-ingest-background.mts",
   "netlify/functions/marginiq-nuvizz-ingest.mts",
+
+  // ── READ-ONLY BY DESIGN — Phase 2 standing health checks (Commits 3 + 4) ──
+  // Standing health checks samples L3 collections (das_lines, ddis_payments,
+  // nuvizz_stops) by design to detect provenance drift, uniqueness violations,
+  // and merge integrity between L1 chunks and L3 rows. All operations are
+  // read-only: fsGetDoc, fsRunQuery, fsRunAggregation. There are no writes
+  // to provenanced collections from this file — every write goes to
+  // marginiq_health_checks (a non-provenanced result store).
+  //
+  // Same rationale as marginiq-data-inventory-background.mts above (read-only
+  // inventory uses literal collection names by design). Added in v2.53.4
+  // (Phase 2 Commit 4a) as a carry-along fix; the entry was missing from C3.
+  "netlify/functions/marginiq-health-check.mts",
 ]);
 
 function walk(dir) {

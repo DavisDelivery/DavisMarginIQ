@@ -1,7 +1,8 @@
 import type { Context, Config } from "@netlify/functions";
+import { checkMigrationAndMaybeQueue } from "./lib/holding-queue.js";
 
 /**
- * Davis MarginIQ — NuVizz Auto-Ingest Scheduled Function (v2.42.6)
+ * Davis MarginIQ — NuVizz Auto-Ingest Scheduled Function (v2.53.4)
  *
  * Runs Sunday morning 8am ET to pull the most recent NuVizz weekly
  * driver-stops CSV from any connected Gmail account and ingest it through
@@ -527,6 +528,15 @@ export default async (req: Request, _context: Context) => {
   if (!CLIENT_ID || !CLIENT_SECRET) {
     return json({ error: "OAuth not configured" }, 500);
   }
+
+  // v2.53.4: Migration gate. Sits AFTER the reparse_csv branch (line ~494)
+  // because the migration runner's M0 phase invokes marginiq-reparse, which
+  // calls into this endpoint via reparse_csv mode — blocking that path
+  // would deadlock M0. The gate only applies to the cron/Gmail-discovery
+  // flow below. Fail-open on read errors.
+  const preflightTest = url.searchParams.get("preflight_test") === "1";
+  const gate = await checkMigrationAndMaybeQueue("nuvizz", { isPreflightTest: preflightTest }, FIREBASE_API_KEY);
+  if (gate.shouldShortCircuit && gate.response) return gate.response;
 
   const dryRun = url.searchParams.get("dry_run") === "1";
   const runId = `nuvizz_auto_${new Date().toISOString().replace(/[:.]/g, "-")}`;
