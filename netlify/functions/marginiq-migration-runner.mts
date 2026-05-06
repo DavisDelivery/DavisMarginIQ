@@ -63,10 +63,21 @@ const PROJECT_ID = "davismarginiq";
 const FS_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 const BG_PATH = "/.netlify/functions/marginiq-migration-runner-background";
 
-const APP_VERSION = "2.53.4";
-// Concurrency-check whitelist suffix: M4 reparse writes use this marker
-// in ingested_by (NOT the migration_id). See refined Q4 semantics above.
-const RUNNER_INGEST_MARKER_SUFFIX = `@${APP_VERSION}`;
+const APP_VERSION = "2.53.6";
+// v2.53.6 — Whitelist accepts BOTH the current and previous release versions.
+// PREVIOUS_VERSION exists so today's M0-fix reparse writes (stamped
+// `marginiq-reparse@2.53.5` per c4a3a8e7's introduction of APP_VERSION in
+// marginiq-reparse.mts) remain whitelisted by the concurrency check after
+// this runner bumps to @2.53.6. The M2/M3 concurrency check would
+// otherwise treat 2.53.5 reparse writes as cron-race intruders and abort
+// the phase. PREVIOUS_VERSION can be removed in the release AFTER this one
+// (i.e., when the runner next bumps past 2.53.6 and any 2.53.5 markers
+// have been deleted by M2's v2.53.1-corrupted-rows cohort or M3's
+// pre-Phase-1 cohort — neither of which targets reparse markers, so this
+// rolling-window of accepted versions stays useful as long as live ddis
+// L1 docs may carry @2.53.5 ingestedBy stamps).
+const PREVIOUS_VERSION = "2.53.5";
+const RUNNER_INGEST_MARKER_SUFFIXES = [`@${APP_VERSION}`, `@${PREVIOUS_VERSION}`];
 
 // M4 per-invocation time budget. Netlify background functions cap at 15min;
 // we yield at 13min to leave room for cleanup writes.
@@ -235,6 +246,162 @@ async function fsBatchPatchDoc(
   return r.ok;
 }
 
+// ─── Batched-write helpers (v2.53.6) ────────────────────────────────────────
+//
+// Wraps Firestore's :batchWrite endpoint, which accepts up to 500 writes per
+// request and returns per-write success/failure status. Critically distinct
+// from lib/four-layer-ingest.ts's batchWriteDocs (which uses :commit and is
+// atomic — a partial failure means the whole batch fails with no per-doc
+// detail). M1 needs per-doc detail to maintain its cursor-advancement
+// invariant: the resumable cursor advances ONLY past success-confirmed
+// docIds, and failed docIds stash separately for diagnostic + bounded retry.
+//
+// `:batchWrite` semantics (from
+// https://firebase.google.com/docs/firestore/reference/rest/v1/projects.databases.documents/batchWrite):
+//   - Non-atomic. Order not guaranteed. Each write succeeds or fails
+//     independently.
+//   - Response shape: { writeResults[]: WriteResult[], status[]: Status[] }
+//     where status[i] corresponds to writes[i]. status[i].code === 0 means OK;
+//     non-zero is a gRPC error code with a human message in status[i].message.
+//   - HTTP non-2xx response means the request itself was malformed/auth-failed/
+//     throttled — treat all writes as failed in that case.
+//
+// Limit: 500 writes per request (Firestore-wide). Caller chunks > 500.
+const FS_BATCHWRITE_LIMIT = 500;
+
+interface BatchWriteOp {
+  // Doc id within the target collection. Must be Firestore-safe (no '/',
+  // not '.' or '..', under 1500 bytes UTF-8). Caller is responsible.
+  docId: string;
+  // Update payload (Firestore-encoded fields, i.e. each leaf value already
+  // wrapped via toFsValue). Mutually exclusive with delete:true.
+  fields?: Record<string, any>;
+  // If true, this op is a delete. fields ignored.
+  delete?: boolean;
+}
+
+interface BatchWriteResult {
+  // Doc IDs whose status[i].code === 0 (write succeeded).
+  written: string[];
+  // Per-failure detail: { docId, code, message }. status[i].code !== 0.
+  failed: Array<{ docId: string; code: number; message: string }>;
+  // Set when the entire HTTP request failed (non-2xx). In that case,
+  // `failed[]` contains all input docIds with code=-1 and the HTTP
+  // status text in `message`. `written[]` is empty.
+  http_error?: { status: number; body_snippet: string };
+}
+
+/**
+ * Apply up to FS_BATCHWRITE_LIMIT writes to a single collection via
+ * Firestore's :batchWrite endpoint.
+ *
+ * Caller MUST chunk the input list to <= 500 ops (this helper does not
+ * recursively chunk — that responsibility lives in the caller so it can
+ * checkpoint between chunks). Returns per-op outcomes; never throws on
+ * Firestore errors (HTTP-level or per-write). Throws only on truly
+ * unexpected client-side issues (JSON parse failure on a 2xx response).
+ */
+async function fsBatchWrite(
+  collection: string,
+  ops: BatchWriteOp[],
+  apiKey: string,
+): Promise<BatchWriteResult> {
+  if (ops.length === 0) return { written: [], failed: [] };
+  if (ops.length > FS_BATCHWRITE_LIMIT) {
+    // Caller bug — surface clearly rather than silently slicing.
+    throw new Error(
+      `fsBatchWrite: ops.length=${ops.length} exceeds FS_BATCHWRITE_LIMIT=${FS_BATCHWRITE_LIMIT}; caller must chunk`,
+    );
+  }
+
+  const writes = ops.map(op => {
+    const fullName = `projects/${PROJECT_ID}/databases/(default)/documents/${collection}/${op.docId}`;
+    if (op.delete) {
+      return { delete: fullName };
+    }
+    return {
+      update: {
+        name: fullName,
+        fields: op.fields || {},
+      },
+    };
+  });
+
+  const url = `${FS_BASE}:batchWrite?key=${apiKey}`;
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ writes }),
+    });
+  } catch (e: any) {
+    // Network-level failure (fetch threw). Surface as http_error with
+    // every input op marked failed so caller's cursor-advancement
+    // logic doesn't advance past these.
+    return {
+      written: [],
+      failed: ops.map(op => ({ docId: op.docId, code: -1, message: `fetch threw: ${e?.message || e}` })),
+      http_error: { status: 0, body_snippet: String(e?.message || e).slice(0, 300) },
+    };
+  }
+
+  if (!resp.ok) {
+    const bodyText = await resp.text().catch(() => "");
+    return {
+      written: [],
+      failed: ops.map(op => ({ docId: op.docId, code: -1, message: `HTTP ${resp.status}` })),
+      http_error: { status: resp.status, body_snippet: bodyText.slice(0, 300) },
+    };
+  }
+
+  let data: any;
+  try {
+    data = await resp.json();
+  } catch (e: any) {
+    // 2xx but body unparseable — vanishingly rare but possible. Treat as
+    // total failure rather than guessing about partial outcomes.
+    return {
+      written: [],
+      failed: ops.map(op => ({ docId: op.docId, code: -1, message: `body parse failed: ${e?.message || e}` })),
+      http_error: { status: resp.status, body_snippet: "(unparseable)" },
+    };
+  }
+
+  // BatchWriteResponse: { status[]: Status, writeResults[]: WriteResult }
+  // status[i] corresponds to writes[i]. code===0 is OK; non-zero is gRPC error.
+  const statusArr: any[] = Array.isArray(data?.status) ? data.status : [];
+  if (statusArr.length !== ops.length) {
+    // Canary: Firestore should always return a parallel array. Length
+    // mismatch suggests the API surface changed or returned something
+    // structurally weird. Surface as a log line; the per-op loop below
+    // already treats missing status entries as failure.
+    console.warn(`fsBatchWrite: status[] length mismatch — got ${statusArr.length}, expected ${ops.length} (collection=${collection})`);
+  }
+  const written: string[] = [];
+  const failed: Array<{ docId: string; code: number; message: string }> = [];
+
+  // Defensive: if status[] is missing or shorter than writes[], treat the
+  // missing tail as failed. Firestore should always return a parallel array,
+  // but we don't want to silently treat absence-of-status as success.
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    const st = statusArr[i];
+    if (st && typeof st === "object" && (st.code === 0 || st.code === undefined)) {
+      // code===0 OR code field missing (some API versions omit it on success)
+      written.push(op.docId);
+    } else {
+      failed.push({
+        docId: op.docId,
+        code: typeof st?.code === "number" ? st.code : -1,
+        message: typeof st?.message === "string" ? st.message : "(no status entry)",
+      });
+    }
+  }
+
+  return { written, failed };
+}
+
 /**
  * Fetch helper for invoking other Netlify Functions from this runner.
  * Uses the same origin as the inbound request so production / preview
@@ -384,8 +551,11 @@ async function concurrencyCheck(
     for (const doc of docs) {
       const ingestedAt = unwrapField(doc.fields?.ingested_at) || "";
       const ingestedBy = unwrapField(doc.fields?.ingested_by) || "";
+      // v2.53.6 — Accept any of RUNNER_INGEST_MARKER_SUFFIXES (current OR
+      // previous release version) to keep today's M0 reparse writes
+      // (@2.53.5) whitelisted alongside the current version (@2.53.6).
       const isWhitelisted =
-        (typeof ingestedBy === "string" && ingestedBy.endsWith(RUNNER_INGEST_MARKER_SUFFIX)) ||
+        (typeof ingestedBy === "string" && RUNNER_INGEST_MARKER_SUFFIXES.some(suf => ingestedBy.endsWith(suf))) ||
         (typeof ingestedBy === "string" && migrationId && ingestedBy.includes(migrationId));
       if (!isWhitelisted) {
         return {
@@ -847,93 +1017,416 @@ async function phaseM0(req: PhaseRequest, siteOrigin: string, apiKey: string): P
 
 // ─── Phase: M1 (snapshot, Gate G1) ──────────────────────────────────────────
 
+// v2.53.6 — M1 rewrite: batched writes, time-budget yield, resumable cursor.
+//
+// Three-case resume state machine (entered before any work):
+//   (1) M1_state.completed_at SET + M1_state.last_processed_doc_id SET
+//       → previous M1 fully completed; treat as fresh re-run, generate NEW
+//       snapshot name (don't append to a finished snapshot).
+//   (2) M1_state.completed_at UNSET + M1_state.last_processed_doc_id SET
+//       → previous M1 was time-yielded or crashed mid-flight; resume into
+//       the persisted M1_state.snapshot_collection from that cursor.
+//   (3) Both UNSET → fresh start.
+//   (anything else, e.g. cursor set but snapshot_collection absent) →
+//       corrupted state; HALT with a clear error rather than guessing.
+//
+// Batched-write architecture:
+//   - Each page = 200 das_lines docs read via fsRunQuery (existing pattern).
+//   - Each page becomes one fsBatchWrite call (200 ops, well under 500 cap).
+//   - 3 pages dispatched concurrently via Promise.all (the M1_CONCURRENCY
+//     constant). Mirrors M4's parallelism shape, simpler than sliding-window.
+//   - Per-doc result merged into written[] / failed[] lists per group.
+//   - Cursor advances to the highest docId seen in this group (whether
+//     written or failed-stashed); failed docs are tracked separately in
+//     M1_state.failed_doc_ids[] (bounded to last 1000) plus a scalar
+//     failed_count for the true total.
+//
+// Cursor-advancement invariant (Q4b from the brief):
+//   The persisted M1_state.last_processed_doc_id reflects the last docId
+//   we have EITHER written-confirmed OR failure-stashed — both outcomes
+//   constitute "processed" because failed docs are not retried from the
+//   cursor, they're stashed in failed_doc_ids[] for separate inspection.
+//   On crash mid-group (before checkpoint), the cursor stays at its
+//   previous value and resume re-processes the in-flight group; writes
+//   are idempotent (same docId, same fields) so re-processing is safe.
+//
+// Mid-loop HALT (Q4a from the brief):
+//   If failed_count > preCount * 0.05 at any checkpoint, abort the loop
+//   immediately and HALT G1. Continuing to write a snapshot we already
+//   know is too corrupt to be a usable recovery position is wasted work
+//   AND obscures the failure mode behind a wall of "wrote 800K with 5%
+//   missing" that operators can ignore.
+//
+// Time budget: 13min (mirror M4_TIME_BUDGET_MS) to leave 2min for cleanup.
+// On time-yield, return ok:true with a "re-invoke phase=M1 to resume"
+// summary — the migration runner's existing dispatch logic re-allows
+// the same phase when current_phase matches.
+const M1_CONCURRENCY = 3;
+const M1_PAGE_SIZE = 200;
+const M1_FAILED_DOC_IDS_BOUND = 1000;
+const M1_FAILED_RATIO_HALT = 0.05;
+
 async function phaseM1(req: PhaseRequest, _siteOrigin: string, apiKey: string): Promise<PhaseResult> {
   const beforeState = await getMigrationStatus(apiKey);
   const dryRun = req.dry_run === true;
+  const prevState = (beforeState?.M1_state || {}) as Record<string, any>;
 
-  const tsTag = nowIso().replace(/[:.]/g, "-");
-  const snapshotName = `das_lines_snapshot__${safeId(req.migration_id)}__${tsTag}`;
-
-  // Pre-count for Gate G1
+  // Pre-count for Gate G1 (always — used in dry-run summary too)
   const preCount = await fsCount("das_lines", apiKey);
+
+  // ── Resume state machine ─────────────────────────────────────────────────
+  const prevSnapshotCollection: string | undefined = prevState.snapshot_collection;
+  const prevCursor: string | undefined = prevState.last_processed_doc_id;
+  const prevCompletedAt: string | undefined = prevState.completed_at;
+
+  let snapshotName: string;
+  let resuming = false;
+  let isFreshRerun = false;
+
+  if (prevCompletedAt && prevCursor) {
+    // Case (1): previous M1 completed; this is a fresh re-run. Generate new name.
+    isFreshRerun = true;
+    const tsTag = nowIso().replace(/[:.]/g, "-");
+    snapshotName = `das_lines_snapshot__${safeId(req.migration_id)}__${tsTag}`;
+  } else if (!prevCompletedAt && prevCursor) {
+    // Case (2): previous M1 interrupted; resume into existing snapshot.
+    if (!prevSnapshotCollection) {
+      // Corrupted state guard: cursor without a snapshot collection.
+      const summary = `M1 HALT: corrupted M1_state — last_processed_doc_id=${prevCursor} but snapshot_collection is missing. Operator must clear M1_state in marginiq_config/migration_status before retry.`;
+      const gate: GateResult = {
+        id: "G1", result: "HALT", evaluated_at: nowIso(),
+        summary,
+        details: { reason: "corrupted_m1_state", prev_cursor: prevCursor, prev_snapshot_collection: null },
+      };
+      if (!dryRun) {
+        await setMigrationStatus(apiKey, {
+          updated_at: nowIso(),
+          gate_results: { ...(beforeState?.gate_results || {}), G1: gate },
+        });
+      }
+      return {
+        ok: false, phase: "M1", migration_id: req.migration_id, dry_run: dryRun,
+        before_state: beforeState, after_state: dryRun ? beforeState : await getMigrationStatus(apiKey),
+        phase_summary: summary, phase_details: gate.details, gate,
+      };
+    }
+    snapshotName = prevSnapshotCollection;
+    resuming = true;
+  } else {
+    // Case (3): fresh start.
+    const tsTag = nowIso().replace(/[:.]/g, "-");
+    snapshotName = `das_lines_snapshot__${safeId(req.migration_id)}__${tsTag}`;
+  }
 
   if (dryRun) {
     return {
       ok: true, phase: "M1", migration_id: req.migration_id, dry_run: true,
       before_state: beforeState, after_state: beforeState,
-      phase_summary: `[DRY RUN] would snapshot ${preCount} das_lines docs to ${snapshotName}`,
-      phase_details: { would_do: { snapshot_collection: snapshotName, pre_count: preCount } },
+      phase_summary: resuming
+        ? `[DRY RUN] would resume snapshot to ${snapshotName} from cursor=${prevCursor} (target ${preCount} docs)`
+        : `[DRY RUN] would snapshot ${preCount} das_lines docs to ${snapshotName}${isFreshRerun ? " (fresh re-run; previous snapshot left intact)" : ""}`,
+      phase_details: {
+        would_do: {
+          snapshot_collection: snapshotName,
+          pre_count: preCount,
+          resuming,
+          is_fresh_rerun: isFreshRerun,
+          resume_cursor: resuming ? prevCursor : null,
+        },
+      },
     };
   }
 
+  // Initialize counters: on resume, restore prior counts; otherwise zero.
+  let processed = resuming ? Number(prevState.processed || 0) : 0;
+  let failedCount = resuming ? Number(prevState.failed_count || 0) : 0;
+  const failedDocIds: Array<{ docId: string; code: number; message: string }> = resuming
+    ? (Array.isArray(prevState.failed_doc_ids) ? prevState.failed_doc_ids.slice() : [])
+    : [];
+  let cursor: string | undefined = resuming ? prevCursor : undefined;
+  let groups = 0;
+
   // Persist snapshot collection name immediately so 4c's M5 retention
-  // metadata write has a stable name to reference.
+  // metadata write has a stable name to reference. On resume this is a
+  // no-op but harmless. Reset failure stash on fresh-start / fresh-rerun;
+  // preserve on resume.
   await setMigrationStatus(apiKey, {
     current_phase: "M1",
     snapshot_collection: snapshotName,
     updated_at: nowIso(),
-    M1_state: { snapshot_collection: snapshotName, pre_count: preCount, started_at: nowIso(), pages: 0, processed: 0 },
+    M1_state: {
+      snapshot_collection: snapshotName,
+      pre_count: preCount,
+      started_at: resuming ? (prevState.started_at || nowIso()) : nowIso(),
+      processed,
+      failed_count: failedCount,
+      failed_doc_ids: failedDocIds.slice(-M1_FAILED_DOC_IDS_BOUND),
+      last_processed_doc_id: cursor || null,
+      resumed_from: resuming ? prevCursor : null,
+      last_progress_at: nowIso(),
+    },
   });
 
-  // ── Page das_lines, batch-write to snapshot collection ───────────────────
-  const PAGE = 200;
-  let cursor: string | undefined;
-  let pages = 0, processed = 0;
-  let writeFailures = 0;
+  // ── Per-batch retry helper for transient errors ─────────────────────────
+  // Wraps fsBatchWrite with retry-on-transient-error (HTTP 429 + 5xx).
+  // Co-located with M1 by intent — M2/M3 may want different retry policy
+  // (e.g., longer backoff for destructive ops). Don't generalize until then.
+  //
+  // Policy: 2 retries, fixed backoff 1000ms then 3000ms. After 2 failed
+  // retries, return the last attempt's result verbatim (which carries
+  // http_error and per-op failures). The M1 caller treats those as
+  // failure-stashed docs per the cursor-advancement invariant.
+  const M1_RETRY_DELAYS_MS = [1000, 3000];
+  const dispatchWithRetry = async (
+    collection: string,
+    ops: BatchWriteOp[],
+  ): Promise<BatchWriteResult> => {
+    let lastResult: BatchWriteResult | undefined;
+    for (let attempt = 0; attempt <= M1_RETRY_DELAYS_MS.length; attempt++) {
+      const result = await fsBatchWrite(collection, ops, apiKey);
+      const transient = !!result.http_error && (
+        result.http_error.status === 429 ||
+        (result.http_error.status >= 500 && result.http_error.status < 600)
+      );
+      if (!transient) return result;
+      lastResult = result;
+      if (attempt < M1_RETRY_DELAYS_MS.length) {
+        console.warn(`M1 batch transient error (HTTP ${result.http_error?.status}); retry ${attempt + 1}/${M1_RETRY_DELAYS_MS.length} in ${M1_RETRY_DELAYS_MS[attempt]}ms`);
+        await new Promise(r => setTimeout(r, M1_RETRY_DELAYS_MS[attempt]));
+      }
+    }
+    // Exhausted retries; return last attempt (still has http_error set,
+    // which the caller maps to per-op failures via fsBatchWrite's contract).
+    console.warn(`M1 batch transient error: exhausted ${M1_RETRY_DELAYS_MS.length} retries; stashing ${ops.length} ops to failed list`);
+    return lastResult!;
+  };
+
+  // ── Time-budget loop: read+write groups of M1_CONCURRENCY pages ──────────
+  const startMs = Date.now();
+  let halted = false;
+  let haltReason: string | null = null;
 
   while (true) {
-    const sq: any = {
-      from: [{ collectionId: "das_lines" }],
-      orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
-      limit: PAGE,
-    };
-    if (cursor) sq.startAt = { values: [{ referenceValue: cursor }], before: false };
-
-    const res = await fsRunQuery({ structuredQuery: sq }, apiKey);
-    const docs = res.filter((r: any) => r.document).map((r: any) => r.document);
-    if (docs.length === 0) break;
-
-    for (const doc of docs) {
-      const docId = (doc.name || "").split("/").pop()!;
-      const ok = await fsBatchPatchDoc(snapshotName, docId, {
-        ...unwrapDocFields(doc),
-        snapshot_source: "das_lines",
-        snapshot_at: nowIso(),
-      }, apiKey);
-      if (!ok) writeFailures++;
-      processed++;
+    if (Date.now() - startMs > M4_TIME_BUDGET_MS) {
+      haltReason = "time_budget_exceeded";
+      halted = true;
+      break;
     }
 
-    pages++;
-    if (pages % 20 === 0) {
-      // Periodic checkpoint
-      await setMigrationStatus(apiKey, {
-        updated_at: nowIso(),
-        M1_state: { snapshot_collection: snapshotName, pre_count: preCount, pages, processed, write_failures: writeFailures, last_progress_at: nowIso() },
+    // Fetch up to M1_CONCURRENCY pages SEQUENTIALLY (the read side has to
+    // advance the cursor between pages), then dispatch their writes in
+    // parallel. This is the "groups of 3" form per the brief — simpler
+    // than sliding-window, matches M4's idiom.
+    const pagesData: Array<{ docs: any[]; lastDocId: string }> = [];
+    let groupExhausted = false;
+    for (let p = 0; p < M1_CONCURRENCY; p++) {
+      const sq: any = {
+        from: [{ collectionId: "das_lines" }],
+        orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
+        limit: M1_PAGE_SIZE,
+      };
+      if (cursor) sq.startAt = { values: [{ referenceValue: cursor }], before: false };
+
+      const res = await fsRunQuery({ structuredQuery: sq }, apiKey);
+      const docs = res.filter((r: any) => r.document).map((r: any) => r.document);
+      if (docs.length === 0) {
+        groupExhausted = true;
+        break;
+      }
+      const lastDocId = (docs[docs.length - 1].name || "").split("/").pop()!;
+      pagesData.push({ docs, lastDocId });
+      // Advance read cursor for next page in this group. The full document
+      // name is the value the existing cursor pattern uses (line 890 of
+      // pre-patch original).
+      cursor = doc_to_full_name(docs[docs.length - 1]);
+      if (docs.length < M1_PAGE_SIZE) {
+        // Last page in das_lines collection — no more pages exist.
+        groupExhausted = true;
+        break;
+      }
+    }
+
+    if (pagesData.length === 0) {
+      break;
+    }
+
+    // Build batch ops per page, dispatch in parallel.
+    const groupResults = await Promise.all(pagesData.map(async (pd) => {
+      const ops: BatchWriteOp[] = pd.docs.map((doc: any) => {
+        const docId = (doc.name || "").split("/").pop()!;
+        return {
+          docId,
+          fields: toFsFieldsForSnapshot(doc),
+        };
       });
+      return await dispatchWithRetry(snapshotName, ops);
+    }));
+
+    // Merge results
+    let groupProcessed = 0;
+    for (const r of groupResults) {
+      groupProcessed += r.written.length + r.failed.length;
+      for (const f of r.failed) {
+        failedCount++;
+        // Bound the persisted list at last M1_FAILED_DOC_IDS_BOUND entries.
+        // failedCount tracks the true total separately.
+        failedDocIds.push(f);
+      }
+    }
+    processed += groupProcessed;
+    groups++;
+
+    // Mid-loop HALT: failed_count > pre_count * 0.05 ⇒ snapshot too corrupt
+    // to be a usable recovery position. Stop wasting work, surface clearly.
+    if (failedCount > preCount * M1_FAILED_RATIO_HALT) {
+      halted = true;
+      haltReason = `failure_ratio_exceeded (failed=${failedCount}, pre_count=${preCount}, threshold=${M1_FAILED_RATIO_HALT * 100}%)`;
+      break;
     }
 
-    if (docs.length < PAGE) break;
-    cursor = doc_to_full_name(docs[docs.length - 1]);
+    // Per-group checkpoint. Cursor is already advanced to the last docId
+    // in the last page of this group (set during the read phase above).
+    // Persist it so a crash before next checkpoint can resume here.
+    const lastDocIdThisGroup = pagesData[pagesData.length - 1].lastDocId;
+    await setMigrationStatus(apiKey, {
+      updated_at: nowIso(),
+      M1_state: {
+        snapshot_collection: snapshotName,
+        pre_count: preCount,
+        started_at: resuming ? (prevState.started_at || nowIso()) : (prevState.started_at || nowIso()),
+        processed,
+        failed_count: failedCount,
+        failed_doc_ids: failedDocIds.slice(-M1_FAILED_DOC_IDS_BOUND),
+        last_processed_doc_id: lastDocIdThisGroup,
+        resumed_from: resuming ? prevCursor : null,
+        groups,
+        last_progress_at: nowIso(),
+      },
+    });
+
+    if (groupExhausted) {
+      break;
+    }
   }
 
-  // Post-count for Gate G1
+  // ── Yield path: time budget exceeded, but no completion-state writes.
+  // Re-invoking phase=M1 will resume from the persisted cursor.
+  if (halted && haltReason === "time_budget_exceeded") {
+    const afterState = await getMigrationStatus(apiKey);
+    return {
+      ok: true, // ok:true so the runner records the yield as not-an-error
+      phase: "M1", migration_id: req.migration_id, dry_run: false,
+      before_state: beforeState, after_state: afterState,
+      phase_summary: `M1 yielded after ${groups} group(s), processed=${processed}/${preCount}, failed=${failedCount}. Re-invoke phase=M1 to resume.`,
+      phase_details: {
+        snapshot_collection: snapshotName, processed, failed_count: failedCount,
+        groups, last_processed_doc_id: cursor, halt_reason: haltReason,
+      },
+    };
+  }
+
+  // ── Failure-ratio HALT: write completion state with explicit halt_reason
+  // and emit a HALT gate. Caller (operator) decides whether to retry.
+  if (halted && haltReason && haltReason.startsWith("failure_ratio_exceeded")) {
+    const gate: GateResult = {
+      id: "G1", result: "HALT", evaluated_at: nowIso(),
+      summary: `G1 HALT: ${haltReason}. Snapshot at ${snapshotName} is too corrupt to be a usable recovery position; do not advance to M2.`,
+      details: {
+        snapshot_collection: snapshotName, processed, failed_count: failedCount,
+        pre_count: preCount, threshold_ratio: M1_FAILED_RATIO_HALT,
+        sample_failures: failedDocIds.slice(-20), // last 20 for diagnostic
+      },
+    };
+    await setMigrationStatus(apiKey, {
+      updated_at: nowIso(),
+      gate_results: { ...(beforeState?.gate_results || {}), G1: gate },
+      M1_state: {
+        snapshot_collection: snapshotName, pre_count: preCount,
+        started_at: prevState.started_at || nowIso(),
+        processed, failed_count: failedCount,
+        failed_doc_ids: failedDocIds.slice(-M1_FAILED_DOC_IDS_BOUND),
+        last_processed_doc_id: cursor || null,
+        halted_at: nowIso(), halt_reason: haltReason,
+      },
+    });
+    const afterState = await getMigrationStatus(apiKey);
+    return {
+      ok: false, phase: "M1", migration_id: req.migration_id, dry_run: false,
+      before_state: beforeState, after_state: afterState,
+      phase_summary: gate.summary, phase_details: gate.details, gate,
+    };
+  }
+
+  // ── Reached end: evaluate G1.
+  // G1 has two checks:
+  //   (1) Count + write-failure parity: snapshotCount === preCount && failedCount === 0
+  //   (2) Field-level sample validation: 200 docs from snapshot collection
+  //       compared field-by-field against das_lines source. Mirrors G2's
+  //       sampleSurvivingChunkDecompress pattern. See sampleSnapshotIntegrity below.
+  //
+  // Both must pass for G1=PASS. (1) failures cover whole-doc loss; (2)
+  // failures cover silent field corruption (e.g., :batchWrite reported
+  // success on a doc that ended up with a malformed field map).
   const snapshotCount = await fsCount(snapshotName, apiKey);
-  const g1Pass = snapshotCount === preCount && writeFailures === 0;
+  const countCheckPassed = snapshotCount === preCount && failedCount === 0;
+
+  // Run field-level sample validation regardless of count check — even on
+  // count-failure, the sample diagnostic helps the operator understand
+  // whether the failure mode is "missing rows" vs "corrupt rows" vs both.
+  // Sample size = 200 (4× G2's 50; G1 is the gate that authorizes destructive
+  // M2/M3 phases, so higher confidence is warranted; cost is 2 GETs × 200 = ~400
+  // round-trips, trivial against M1's ~25min total).
+  const sampleResult = await sampleSnapshotIntegrity(snapshotName, apiKey, 200);
+  const samplePassed = sampleResult.all_match;
+
+  const g1Pass = countCheckPassed && samplePassed;
+
+  let summary: string;
+  if (g1Pass) {
+    summary = `G1 PASS: snapshot count matches (${snapshotCount} == ${preCount}); sample integrity verified (${sampleResult.matched}/${sampleResult.sampled} docs field-equal)`;
+  } else if (!countCheckPassed && !samplePassed) {
+    summary = `G1 HALT: BOTH count check failed (snapshot=${snapshotCount} pre_count=${preCount} delta=${snapshotCount - preCount} failed_count=${failedCount}) AND sample integrity failed (${sampleResult.matched}/${sampleResult.sampled} matched, ${sampleResult.field_mismatches.length} mismatches)`;
+  } else if (!countCheckPassed) {
+    summary = `G1 HALT (count): snapshot=${snapshotCount} pre_count=${preCount} delta=${snapshotCount - preCount} failed_count=${failedCount}`;
+  } else {
+    summary = `G1 HALT (sample integrity): ${sampleResult.matched}/${sampleResult.sampled} matched, ${sampleResult.field_mismatches.length} field-level mismatches detected`;
+  }
+
   const gate: GateResult = {
     id: "G1",
     result: g1Pass ? "PASS" : "HALT",
     evaluated_at: nowIso(),
-    summary: g1Pass
-      ? `Snapshot count matches: ${snapshotCount} == ${preCount}`
-      : `G1 HALT: snapshot=${snapshotCount} pre_count=${preCount} delta=${snapshotCount - preCount} write_failures=${writeFailures}`,
-    details: { snapshot_count: snapshotCount, das_lines_count: preCount, delta: snapshotCount - preCount, write_failures: writeFailures, pages, processed },
+    summary,
+    details: {
+      snapshot_count: snapshotCount, das_lines_count: preCount,
+      delta: snapshotCount - preCount, failed_count: failedCount,
+      processed, groups,
+      count_check_passed: countCheckPassed,
+      sample_check_passed: samplePassed,
+      sample_size: sampleResult.sampled,
+      sample_matched: sampleResult.matched,
+      // field_mismatches is bounded by sample size (200) so safe to inline.
+      // Each entry: { doc_id, reason, expected_field?, actual_field? }
+      field_mismatches: sampleResult.field_mismatches,
+      // Last 20 batch-write failures, separate from field mismatches.
+      // Batch-write failures = doc never made it into the snapshot at all;
+      // field mismatches = doc made it but with corrupt fields.
+      sample_batch_write_failures: failedDocIds.slice(-20),
+    },
   };
 
   await setMigrationStatus(apiKey, {
     updated_at: nowIso(),
     gate_results: { ...(beforeState?.gate_results || {}), G1: gate },
-    M1_state: { snapshot_collection: snapshotName, pre_count: preCount, snapshot_count: snapshotCount, pages, processed, write_failures: writeFailures, completed_at: nowIso() },
+    M1_state: {
+      snapshot_collection: snapshotName, pre_count: preCount,
+      started_at: prevState.started_at || nowIso(),
+      snapshot_count: snapshotCount, processed,
+      failed_count: failedCount,
+      failed_doc_ids: failedDocIds.slice(-M1_FAILED_DOC_IDS_BOUND),
+      last_processed_doc_id: cursor || null,
+      groups, completed_at: nowIso(),
+    },
   });
   const afterState = await getMigrationStatus(apiKey);
 
@@ -941,9 +1434,31 @@ async function phaseM1(req: PhaseRequest, _siteOrigin: string, apiKey: string): 
     ok: g1Pass, phase: "M1", migration_id: req.migration_id, dry_run: false,
     before_state: beforeState, after_state: afterState,
     phase_summary: gate.summary,
-    phase_details: { snapshot_collection: snapshotName, pages, processed, write_failures: writeFailures },
+    phase_details: { snapshot_collection: snapshotName, processed, failed_count: failedCount, groups },
     gate,
   };
+}
+
+/**
+ * v2.53.6 — Encode a das_lines doc's fields for snapshot write, preserving
+ * the original Firestore-typed field map verbatim and adding the two
+ * snapshot markers (snapshot_source, snapshot_at). Used by the M1
+ * batched-write path; equivalent to the pre-patch fsBatchPatchDoc body's
+ * `{...unwrapDocFields(doc), snapshot_source, snapshot_at}` followed by
+ * per-leaf toFsValue, but skips the unwrap+rewrap roundtrip — original
+ * field encoding is reused directly.
+ */
+function toFsFieldsForSnapshot(doc: any): Record<string, any> {
+  const out: Record<string, any> = {};
+  // Copy original Firestore-encoded fields verbatim — no unwrap/rewrap.
+  // Preserves timestampValue, doubleValue precision, integerValue string
+  // form, mapValue/arrayValue nesting, exactly as Firestore returned them.
+  for (const [k, v] of Object.entries(doc?.fields || {})) {
+    out[k] = v;
+  }
+  out.snapshot_source = toFsValue("das_lines");
+  out.snapshot_at = toFsValue(nowIso());
+  return out;
 }
 
 function unwrapDocFields(doc: any): Record<string, any> {
@@ -1256,6 +1771,170 @@ async function phaseDeleteCohort(spec: CohortPhaseSpec): Promise<PhaseResult> {
     phase_summary: gate.summary,
     phase_details: { scanned, matched, deleted, deleteFailures, extra, sample: sampleResult },
     gate,
+  };
+}
+
+/**
+ * v2.53.6 — Deep equality with order-insensitive comparison on object keys.
+ * Used by sampleSnapshotIntegrity to compare unwrapped Firestore field
+ * values where nested mapValue field ordering may differ between separate
+ * reads (top-level field insertion order is preserved by Firestore's REST
+ * surface, but nested map sub-key ordering across separate reads is not
+ * a guarantee we want to bet G1 on).
+ *
+ * Arrays compared order-sensitively (they're semantically ordered).
+ * Objects compared by key set + per-key recursive equality.
+ * Primitives via ===.
+ *
+ * Not exported; G1 sampler is the only caller. Keep co-located.
+ */
+function deepEqualOrderInsensitive(a: any, b: any): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return a === b;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== "object") return a === b;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqualOrderInsensitive(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!deepEqualOrderInsensitive(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * v2.53.6 — G1 sample-integrity validator. Mirrors sampleSurvivingChunkDecompress
+ * (G2's sampler) in shape, but compares snapshot docs to their das_lines
+ * source counterparts field-by-field rather than verifying chunk decompression.
+ *
+ * Pattern: pull first n docs from the snapshot collection ordered by docId
+ * ASC. For each, GET the same docId from das_lines, compare unwrapped field
+ * maps. Mismatches (other than the two snapshot markers `snapshot_source`
+ * and `snapshot_at`, which are expected) push to field_mismatches[] with
+ * a short reason string and `continue`.
+ *
+ * Strict binary contract: any mismatch → all_match:false → G1 HALT.
+ * Sample size n=200 (4× G2's 50) chosen because G1 authorizes destructive
+ * M2/M3 phases — higher confidence warranted; cost is 2 GETs × n = 400
+ * round-trips, trivial relative to M1's wall-clock.
+ *
+ * NOTE on "first n by docId": matches G2's precedent. Detects systematic
+ * field drift well; doesn't catch sub-1% sparse corruption reliably even
+ * at n=200 (which is fine — sparse corruption that bypasses :batchWrite's
+ * status reporting is a Firestore-internal pathology that we can't
+ * meaningfully defend against here without doing a full collection scan).
+ */
+async function sampleSnapshotIntegrity(
+  snapshotCollection: string,
+  apiKey: string,
+  n: number,
+): Promise<{
+  sampled: number;
+  matched: number;
+  all_match: boolean;
+  field_mismatches: Array<{ doc_id: string; reason: string }>;
+}> {
+  // Pull first n docs from snapshot collection ordered ASC.
+  const sq: any = {
+    from: [{ collectionId: snapshotCollection }],
+    orderBy: [{ field: { fieldPath: "__name__" }, direction: "ASCENDING" }],
+    limit: n,
+  };
+  const res = await fsRunQuery({ structuredQuery: sq }, apiKey);
+  const snapshotDocs = res.filter((r: any) => r.document).map((r: any) => r.document);
+
+  const fieldMismatches: Array<{ doc_id: string; reason: string }> = [];
+  let matched = 0;
+
+  // Snapshot markers added by toFsFieldsForSnapshot — expected to differ
+  // from das_lines source (das_lines doesn't have them) and excluded
+  // from comparison.
+  const SNAPSHOT_MARKER_FIELDS = new Set(["snapshot_source", "snapshot_at"]);
+
+  for (const snapDoc of snapshotDocs) {
+    const docId = (snapDoc.name || "").split("/").pop()!;
+    const sourceDoc = await fsGetDoc("das_lines", docId, apiKey);
+    if (!sourceDoc) {
+      fieldMismatches.push({ doc_id: docId, reason: "source das_lines/{docId} not found (snapshot has orphan)" });
+      continue;
+    }
+
+    const snapFields = (snapDoc.fields || {}) as Record<string, any>;
+    const sourceFields = (sourceDoc.fields || {}) as Record<string, any>;
+
+    // Build the set of source field names; snapshot must contain all of them
+    // verbatim (since toFsFieldsForSnapshot copies fields-by-reference) plus
+    // the two snapshot markers and nothing else.
+    const sourceKeys = new Set(Object.keys(sourceFields));
+    const snapKeys = new Set(Object.keys(snapFields));
+
+    // Check no source field is missing from snapshot.
+    let mismatchReason: string | null = null;
+    for (const k of sourceKeys) {
+      if (!snapKeys.has(k)) {
+        mismatchReason = `field "${k}" missing from snapshot`;
+        break;
+      }
+      // Compare unwrapped values for equality. unwrapField handles
+      // every Firestore type used in das_lines (string/integer/double/
+      // boolean/null/timestamp/array/map). Use order-insensitive deep
+      // equality for objects (avoids false-positive HALTs if Firestore
+      // ever re-orders nested mapValue sub-keys across separate reads —
+      // top-level field order is preserved verbatim, sub-key order isn't
+      // a guarantee we want to bet G1 on). Arrays compared order-sensitively.
+      // Diagnostic message still uses JSON.stringify so operator sees the
+      // actual divergent values.
+      const srcVal = unwrapField(sourceFields[k]);
+      const snapVal = unwrapField(snapFields[k]);
+      if (!deepEqualOrderInsensitive(srcVal, snapVal)) {
+        mismatchReason = `field "${k}" value differs (source=${JSON.stringify(srcVal).slice(0, 80)}, snap=${JSON.stringify(snapVal).slice(0, 80)})`;
+        break;
+      }
+    }
+    if (mismatchReason) {
+      fieldMismatches.push({ doc_id: docId, reason: mismatchReason });
+      continue;
+    }
+
+    // Check snapshot has no extra fields beyond source + the two markers.
+    for (const k of snapKeys) {
+      if (sourceKeys.has(k)) continue;
+      if (SNAPSHOT_MARKER_FIELDS.has(k)) continue;
+      mismatchReason = `snapshot has unexpected extra field "${k}"`;
+      break;
+    }
+    if (mismatchReason) {
+      fieldMismatches.push({ doc_id: docId, reason: mismatchReason });
+      continue;
+    }
+
+    // Verify the two snapshot markers are present and well-formed.
+    if (!snapKeys.has("snapshot_source") || unwrapField(snapFields.snapshot_source) !== "das_lines") {
+      fieldMismatches.push({ doc_id: docId, reason: `snapshot_source missing or != "das_lines"` });
+      continue;
+    }
+    if (!snapKeys.has("snapshot_at") || typeof unwrapField(snapFields.snapshot_at) !== "string") {
+      fieldMismatches.push({ doc_id: docId, reason: `snapshot_at missing or not a string` });
+      continue;
+    }
+
+    matched++;
+  }
+
+  return {
+    sampled: snapshotDocs.length,
+    matched,
+    all_match: fieldMismatches.length === 0 && snapshotDocs.length > 0,
+    field_mismatches: fieldMismatches,
   };
 }
 

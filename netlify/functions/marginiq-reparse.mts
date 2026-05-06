@@ -48,7 +48,7 @@ const FIREBASE_API_KEY = process.env["FIREBASE_API_KEY"];
 // v2.53.5 — Centralized version tag. Used in ingestedBy fields so M2/M3's
 // concurrency check (which whitelists `@${APP_VERSION}` suffix) recognizes
 // reparse writes as runner-managed, not cron-race intruders.
-const APP_VERSION = "2.53.5";
+const APP_VERSION = "2.53.6";
 
 function json(data: any, status = 200): Response {
   return new Response(JSON.stringify(data), {
