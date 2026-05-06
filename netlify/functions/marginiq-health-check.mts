@@ -10,6 +10,7 @@ import {
   type CheckId,
   type CheckClosureResult,
 } from "./lib/health-checks.js";
+import { SOURCE_REGISTRY } from "./lib/four-layer-ingest.js";
 import { gunzipSync } from "node:zlib";
 
 /**
@@ -65,20 +66,18 @@ function jsonResponse(data: any, status = 200): Response {
 
 // ─── Check 1A: Parse fidelity ────────────────────────────────────────────────
 // For every source_files_raw doc with parsed_row_count > 0, verify the
-// das_rows_raw / nuvizz_stops_raw / ddis_payments_raw L2 row count for
-// that source_file_id MUST equal parsed_row_count.
+// L2 row count for that source_file_id (das_rows_raw / nuvizz_rows_raw /
+// ddis_rows_raw) MUST equal parsed_row_count.
+//
+// L2 collection name is read from SOURCE_REGISTRY (single source of
+// truth shared with the ingest path). If the registry ever changes,
+// this check follows automatically — no chance of drift between the
+// writer and the verifier.
 //
 // Today (pre-migration): fails for the 180 v2.53.1-staged uline files
 // because the v2.53.1 worker wrote ~50% of rows under colliding L3 docIds.
 // Goal: GREEN after migration.
 async function check1A(apiKey: string): Promise<CheckClosureResult> {
-  // L2 collections by source. Maps source -> L2 collection name.
-  const L2_BY_SOURCE: Record<string, string> = {
-    uline: "das_rows_raw",
-    nuvizz: "nuvizz_stops_raw",
-    ddis: "ddis_payments_raw",
-  };
-
   const mismatches: any[] = [];
   let totalChecked = 0;
   let totalSkipped = 0;
@@ -101,8 +100,14 @@ async function check1A(apiKey: string): Promise<CheckClosureResult> {
         const expected = Number(meta.parsed_row_count || 0);
         if (expected <= 0) continue;  // not yet parsed
         const fileId = meta.file_id || doc.name?.split("/").pop();
-        const source = meta.source;
-        const l2Coll = L2_BY_SOURCE[source];
+        const source = String(meta.source || "");
+        // Single source of truth: L2 collection comes from SOURCE_REGISTRY
+        // (same registry the ingest path writes to).
+        const l2Coll = SOURCE_REGISTRY[source]?.rowsRaw;
+        if (!l2Coll) {
+          totalSkipped++;
+          continue;
+        }
         if (!l2Coll) {
           totalSkipped++;
           continue;
@@ -818,11 +823,8 @@ async function check6(apiKey: string): Promise<CheckClosureResult> {
     const source = String(meta.source || "");
     const expectedHeaders: string[] = Array.isArray(meta.column_headers) ? meta.column_headers : [];
 
-    // L2 collection per source
-    const l2Coll = source === "uline" ? "das_rows_raw"
-      : source === "nuvizz" ? "nuvizz_stops_raw"
-      : source === "ddis" ? "ddis_payments_raw"
-      : null;
+    // L2 collection per source — single source of truth via SOURCE_REGISTRY.
+    const l2Coll = SOURCE_REGISTRY[source]?.rowsRaw ?? null;
     if (!l2Coll) {
       results.push({ file_id: fileId, source, status: "SKIPPED", reason: "no L2 collection mapped" });
       continue;
