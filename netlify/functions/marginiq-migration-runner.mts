@@ -63,19 +63,34 @@ const PROJECT_ID = "davismarginiq";
 const FS_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 const BG_PATH = "/.netlify/functions/marginiq-migration-runner-background";
 
-const APP_VERSION = "2.53.6";
-// v2.53.6 — Whitelist accepts BOTH the current and previous release versions.
-// PREVIOUS_VERSION exists so today's M0-fix reparse writes (stamped
-// `marginiq-reparse@2.53.5` per c4a3a8e7's introduction of APP_VERSION in
-// marginiq-reparse.mts) remain whitelisted by the concurrency check after
-// this runner bumps to @2.53.6. The M2/M3 concurrency check would
-// otherwise treat 2.53.5 reparse writes as cron-race intruders and abort
-// the phase. PREVIOUS_VERSION can be removed in the release AFTER this one
-// (i.e., when the runner next bumps past 2.53.6 and any 2.53.5 markers
-// have been deleted by M2's v2.53.1-corrupted-rows cohort or M3's
-// pre-Phase-1 cohort — neither of which targets reparse markers, so this
-// rolling-window of accepted versions stays useful as long as live ddis
-// L1 docs may carry @2.53.5 ingestedBy stamps).
+const APP_VERSION = "2.53.7";
+// v2.53.7 — Whitelist accepts current + last-stamping release.
+//
+// PREVIOUS_VERSION = "2.53.5" (NOT 2.53.6). Reasoning:
+// - 2.53.5 is the last version that stamped `ingested_by` markers on
+//   live das_lines docs — it's the M0-fix reparse version. Today's M0
+//   ddis reparse writes carry `marginiq-reparse@2.53.5`. The concurrency
+//   check must continue to whitelist these so M2/M3 don't treat them as
+//   cron-race intruders.
+// - 2.53.6 was the failed M1 :batchWrite attempt. M1 only writes to the
+//   snapshot collection (das_lines_snapshot__*), not to das_lines, AND
+//   every :batchWrite returned 403 so zero docs landed anywhere. There
+//   are no `ingested_by: ...@2.53.6` markers anywhere in das_lines. The
+//   intermediate version is a no-op for whitelist purposes.
+// - 2.53.7 is the current version (this patch). marginiq-reparse.mts is
+//   NOT bumped in this patch — its APP_VERSION stays at 2.53.6 since the
+//   reparse logic isn't changing. New reparse writes (e.g. an M2/M3
+//   reparse cycle if needed) would stamp @2.53.6, but reparse hasn't
+//   re-run since the M0 fix at 2.53.5, so no @2.53.6 reparse markers
+//   exist on das_lines either. (If reparse runs at @2.53.6 in the
+//   future, we'd extend this list.)
+//
+// PREVIOUS_VERSION can be removed in the release AFTER this one — i.e.,
+// when the runner next bumps past 2.53.7 and any @2.53.5 markers have
+// been cleared from das_lines. M2's v2.53.1-corrupted-rows cohort and
+// M3's pre-Phase-1 cohort do not target reparse markers, so this
+// rolling-window stays useful as long as live ddis L1 docs may carry
+// @2.53.5 ingestedBy stamps from today's M0 reparse.
 const PREVIOUS_VERSION = "2.53.5";
 const RUNNER_INGEST_MARKER_SUFFIXES = [`@${APP_VERSION}`, `@${PREVIOUS_VERSION}`];
 
@@ -246,27 +261,50 @@ async function fsBatchPatchDoc(
   return r.ok;
 }
 
-// ─── Batched-write helpers (v2.53.6) ────────────────────────────────────────
+// ─── Batched-write helpers (v2.53.7) ────────────────────────────────────────
 //
-// Wraps Firestore's :batchWrite endpoint, which accepts up to 500 writes per
-// request and returns per-write success/failure status. Critically distinct
-// from lib/four-layer-ingest.ts's batchWriteDocs (which uses :commit and is
-// atomic — a partial failure means the whole batch fails with no per-doc
-// detail). M1 needs per-doc detail to maintain its cursor-advancement
-// invariant: the resumable cursor advances ONLY past success-confirmed
-// docIds, and failed docIds stash separately for diagnostic + bounded retry.
+// Wraps Firestore's :commit endpoint for batched document writes. Used by
+// phaseM1 to write the snapshot collection in atomic batches of up to 500
+// docs per round-trip.
 //
-// `:batchWrite` semantics (from
-// https://firebase.google.com/docs/firestore/reference/rest/v1/projects.databases.documents/batchWrite):
-//   - Non-atomic. Order not guaranteed. Each write succeeds or fails
-//     independently.
-//   - Response shape: { writeResults[]: WriteResult[], status[]: Status[] }
-//     where status[i] corresponds to writes[i]. status[i].code === 0 means OK;
-//     non-zero is a gRPC error code with a human message in status[i].message.
-//   - HTTP non-2xx response means the request itself was malformed/auth-failed/
-//     throttled — treat all writes as failed in that case.
+// WHY :commit, NOT :batchWrite:
+//   v2.53.6 attempted :batchWrite — which is the natural fit, since it
+//   returns per-write status and is non-atomic — and got HTTP 403 on every
+//   call. This is a known issue in this codebase, documented twice before:
+//     - lib/four-layer-ingest.ts:308 (comment: ":commit, not :batchWrite —
+//       Firestore rules treat them differently")
+//     - marginiq-audit-rebuild-background.mts:111 (v2.40.28 commit:
+//       ":batchWrite requires full IAM auth and 403s with just an API key
+//       — it bypasses security rules; :commit runs under security rules,
+//       which allow API-key writes for this project")
+//     - marginiq-ddis-ingest-background.mts:218–221 (v2.42.16 commit:
+//       "switched from :batchWrite to :commit because the public web app's
+//       Firestore API key returns 403s on :batchWrite but works fine on
+//       :commit")
+//   Adding OAuth/service-account auth would be a substantial scope expansion
+//   (no google-auth-library / firebase-admin / service-account JSON exists
+//   anywhere in this codebase). :commit is the structural fix.
 //
-// Limit: 500 writes per request (Firestore-wide). Caller chunks > 500.
+// :commit SEMANTICS:
+//   - Endpoint: POST {FS_BASE}:commit?key={apiKey}
+//   - Same request body shape as :batchWrite: { writes: Write[] }
+//   - Auth: API-key via ?key= works (goes through Firestore Security Rules)
+//   - Atomicity: ATOMIC. The whole batch succeeds or the whole batch fails.
+//     One bad doc fails all 500 in the batch.
+//   - Response (2xx): { writeResults: WriteResult[], commitTime: Timestamp }
+//     writeResults.length should equal ops.length on full success.
+//     There is NO status[] array — failures only manifest as non-2xx HTTP.
+//   - Response (non-2xx): the whole batch failed. Body has an error message
+//     but no per-write detail.
+//
+// PER-DOC FALL-BACK:
+//   Because :commit is atomic, a single bad doc in a 500-batch fails the
+//   whole batch. To preserve per-doc isolation when this happens, callers
+//   should use fsBatchWritePerDocFallback (defined below), which falls back
+//   to per-doc :commit calls on batch failure. fsBatchWrite itself stays
+//   pure: one round-trip, one outcome.
+//
+// LIMIT: 500 writes per request (Firestore-wide). Caller chunks > 500.
 const FS_BATCHWRITE_LIMIT = 500;
 
 interface BatchWriteOp {
@@ -281,25 +319,32 @@ interface BatchWriteOp {
 }
 
 interface BatchWriteResult {
-  // Doc IDs whose status[i].code === 0 (write succeeded).
+  // Doc IDs whose write succeeded.
   written: string[];
-  // Per-failure detail: { docId, code, message }. status[i].code !== 0.
+  // Per-failure detail: { docId, code, message }.
+  // For batch-level failures (no per-doc detail from :commit), every op
+  // gets the same code/message describing the batch outcome.
+  // For per-doc fall-back failures, each op has its own code/message.
   failed: Array<{ docId: string; code: number; message: string }>;
-  // Set when the entire HTTP request failed (non-2xx). In that case,
-  // `failed[]` contains all input docIds with code=-1 and the HTTP
-  // status text in `message`. `written[]` is empty.
+  // Set when the HTTP request itself failed (non-2xx, fetch threw, or
+  // unparseable body). Includes the HTTP status and a body snippet for
+  // diagnostic. The retry wrapper inspects this field to decide whether
+  // to retry (429/5xx) or fall back (403/400/etc.).
   http_error?: { status: number; body_snippet: string };
 }
 
 /**
  * Apply up to FS_BATCHWRITE_LIMIT writes to a single collection via
- * Firestore's :batchWrite endpoint.
+ * Firestore's :commit endpoint. Single round-trip, atomic.
  *
  * Caller MUST chunk the input list to <= 500 ops (this helper does not
- * recursively chunk — that responsibility lives in the caller so it can
- * checkpoint between chunks). Returns per-op outcomes; never throws on
- * Firestore errors (HTTP-level or per-write). Throws only on truly
- * unexpected client-side issues (JSON parse failure on a 2xx response).
+ * recursively chunk). Returns aggregate outcomes; never throws on
+ * Firestore errors (HTTP-level or otherwise). Throws only on caller
+ * misuse (ops.length > FS_BATCHWRITE_LIMIT).
+ *
+ * On HTTP non-2xx, the entire batch is marked failed with the HTTP status
+ * surfaced via http_error. The caller (typically dispatchWithRetry → per-doc
+ * fall-back) is responsible for deciding what to do next.
  */
 async function fsBatchWrite(
   collection: string,
@@ -327,7 +372,7 @@ async function fsBatchWrite(
     };
   });
 
-  const url = `${FS_BASE}:batchWrite?key=${apiKey}`;
+  const url = `${FS_BASE}:commit?key=${apiKey}`;
   let resp: Response;
   try {
     resp = await fetch(url, {
@@ -337,8 +382,8 @@ async function fsBatchWrite(
     });
   } catch (e: any) {
     // Network-level failure (fetch threw). Surface as http_error with
-    // every input op marked failed so caller's cursor-advancement
-    // logic doesn't advance past these.
+    // every op marked failed so caller's cursor-advancement logic
+    // doesn't silently advance past these.
     return {
       written: [],
       failed: ops.map(op => ({ docId: op.docId, code: -1, message: `fetch threw: ${e?.message || e}` })),
@@ -347,10 +392,13 @@ async function fsBatchWrite(
   }
 
   if (!resp.ok) {
+    // Atomic batch failure — every op failed together. Body might have
+    // a structured error message; capture a snippet for diagnostic but
+    // don't try to parse out per-op detail (there is none).
     const bodyText = await resp.text().catch(() => "");
     return {
       written: [],
-      failed: ops.map(op => ({ docId: op.docId, code: -1, message: `HTTP ${resp.status}` })),
+      failed: ops.map(op => ({ docId: op.docId, code: -1, message: `HTTP ${resp.status} (batch)` })),
       http_error: { status: resp.status, body_snippet: bodyText.slice(0, 300) },
     };
   }
@@ -359,8 +407,8 @@ async function fsBatchWrite(
   try {
     data = await resp.json();
   } catch (e: any) {
-    // 2xx but body unparseable — vanishingly rare but possible. Treat as
-    // total failure rather than guessing about partial outcomes.
+    // 2xx but body unparseable — vanishingly rare. Treat as total
+    // failure rather than guessing about partial outcomes.
     return {
       written: [],
       failed: ops.map(op => ({ docId: op.docId, code: -1, message: `body parse failed: ${e?.message || e}` })),
@@ -368,35 +416,101 @@ async function fsBatchWrite(
     };
   }
 
-  // BatchWriteResponse: { status[]: Status, writeResults[]: WriteResult }
-  // status[i] corresponds to writes[i]. code===0 is OK; non-zero is gRPC error.
-  const statusArr: any[] = Array.isArray(data?.status) ? data.status : [];
-  if (statusArr.length !== ops.length) {
-    // Canary: Firestore should always return a parallel array. Length
-    // mismatch suggests the API surface changed or returned something
-    // structurally weird. Surface as a log line; the per-op loop below
-    // already treats missing status entries as failure.
-    console.warn(`fsBatchWrite: status[] length mismatch — got ${statusArr.length}, expected ${ops.length} (collection=${collection})`);
+  // CommitResponse: { writeResults: WriteResult[], commitTime: Timestamp }
+  // On full success, writeResults.length === ops.length. Each WriteResult
+  // is { updateTime: Timestamp, transformResults?: Value[] }; we don't
+  // need to inspect contents, just count.
+  const writeResults: any[] = Array.isArray(data?.writeResults) ? data.writeResults : [];
+  if (writeResults.length !== ops.length) {
+    // Defensive canary: :commit returning 2xx but with a writeResults
+    // array of unexpected length suggests an API surface change or
+    // partial-success response we don't recognize. Treat the trailing
+    // gap as failed; surface as a log line.
+    console.warn(`fsBatchWrite: writeResults length mismatch — got ${writeResults.length}, expected ${ops.length} (collection=${collection})`);
   }
+
+  const written: string[] = [];
+  const failed: Array<{ docId: string; code: number; message: string }> = [];
+  for (let i = 0; i < ops.length; i++) {
+    if (i < writeResults.length) {
+      written.push(ops[i].docId);
+    } else {
+      // Off the end of writeResults — treat as failed.
+      failed.push({
+        docId: ops[i].docId,
+        code: -1,
+        message: `writeResults gap (got ${writeResults.length}, expected ${ops.length})`,
+      });
+    }
+  }
+
+  return { written, failed };
+}
+
+/**
+ * v2.53.7 — Per-doc fall-back helper for fsBatchWrite. Called by the
+ * dispatchWithRetry wrapper after batch-level retries are exhausted (or
+ * on a non-transient error like 403/400). Issues one single-op :commit
+ * per input op, collecting per-doc outcomes.
+ *
+ * Rationale: :commit is atomic, so one bad doc in a 500-batch fails all
+ * 500. Per-doc fall-back isolates the bad doc(s) — successful docs
+ * write through individually, failed docs stash with their specific
+ * HTTP status, cursor-advancement invariant preserved.
+ *
+ * Cost: 500 round-trips per fallback batch instead of 1. Acceptable
+ * because the fallback only fires on actual failure; the fast path
+ * (batch :commit) handles the >99% success case in one round-trip.
+ *
+ * No retries inside the fallback — by the time we're here, we're already
+ * past dispatchWithRetry's retry budget. Each per-doc :commit is a single
+ * attempt; failures stash with their HTTP status verbatim.
+ */
+async function fsBatchWritePerDocFallback(
+  collection: string,
+  ops: BatchWriteOp[],
+  apiKey: string,
+): Promise<BatchWriteResult> {
+  if (ops.length === 0) return { written: [], failed: [] };
+
   const written: string[] = [];
   const failed: Array<{ docId: string; code: number; message: string }> = [];
 
-  // Defensive: if status[] is missing or shorter than writes[], treat the
-  // missing tail as failed. Firestore should always return a parallel array,
-  // but we don't want to silently treat absence-of-status as success.
-  for (let i = 0; i < ops.length; i++) {
-    const op = ops[i];
-    const st = statusArr[i];
-    if (st && typeof st === "object" && (st.code === 0 || st.code === undefined)) {
-      // code===0 OR code field missing (some API versions omit it on success)
-      written.push(op.docId);
-    } else {
+  for (const op of ops) {
+    const fullName = `projects/${PROJECT_ID}/databases/(default)/documents/${collection}/${op.docId}`;
+    const writes = op.delete
+      ? [{ delete: fullName }]
+      : [{ update: { name: fullName, fields: op.fields || {} } }];
+    const url = `${FS_BASE}:commit?key=${apiKey}`;
+
+    let resp: Response;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ writes }),
+      });
+    } catch (e: any) {
+      failed.push({ docId: op.docId, code: -1, message: `fetch threw: ${e?.message || e}` });
+      continue;
+    }
+
+    if (!resp.ok) {
+      // Per-doc HTTP failure — record specific status. This is what makes
+      // the fallback valuable: we can tell which specific doc(s) caused
+      // the batch to fail vs which would have succeeded individually.
+      const bodyText = await resp.text().catch(() => "");
       failed.push({
         docId: op.docId,
-        code: typeof st?.code === "number" ? st.code : -1,
-        message: typeof st?.message === "string" ? st.message : "(no status entry)",
+        code: resp.status,
+        message: `HTTP ${resp.status} (per-doc): ${bodyText.slice(0, 100)}`,
       });
+      continue;
     }
+
+    // 2xx — count as written without parsing the body. We don't need
+    // writeResults detail; success is success.
+    written.push(op.docId);
   }
 
   return { written, failed };
@@ -551,9 +665,10 @@ async function concurrencyCheck(
     for (const doc of docs) {
       const ingestedAt = unwrapField(doc.fields?.ingested_at) || "";
       const ingestedBy = unwrapField(doc.fields?.ingested_by) || "";
-      // v2.53.6 — Accept any of RUNNER_INGEST_MARKER_SUFFIXES (current OR
-      // previous release version) to keep today's M0 reparse writes
-      // (@2.53.5) whitelisted alongside the current version (@2.53.6).
+      // v2.53.7 — Accept any of RUNNER_INGEST_MARKER_SUFFIXES (current OR
+      // last-stamping release version). Keeps today's M0 reparse writes
+      // (@2.53.5) whitelisted alongside the current version (@2.53.7).
+      // See APP_VERSION block at top of file for why @2.53.6 is skipped.
       const isWhitelisted =
         (typeof ingestedBy === "string" && RUNNER_INGEST_MARKER_SUFFIXES.some(suf => ingestedBy.endsWith(suf))) ||
         (typeof ingestedBy === "string" && migrationId && ingestedBy.includes(migrationId));
@@ -1167,15 +1282,18 @@ async function phaseM1(req: PhaseRequest, _siteOrigin: string, apiKey: string): 
     },
   });
 
-  // ── Per-batch retry helper for transient errors ─────────────────────────
-  // Wraps fsBatchWrite with retry-on-transient-error (HTTP 429 + 5xx).
+  // ── Per-batch retry + per-doc fall-back helper ──────────────────────────
+  // Wraps fsBatchWrite with two layers:
+  //   1. Retry-on-transient-error at the batch level. HTTP 429 / 5xx.
+  //      2 retries with fixed backoff 1000ms then 3000ms.
+  //   2. Per-doc fall-back when retries are exhausted OR on first
+  //      non-transient error (e.g., 403, 400, INVALID_ARGUMENT for a
+  //      single bad doc that fails the whole atomic batch). Falls back to
+  //      individual single-op :commit calls, isolating the bad doc(s).
+  //      See fsBatchWritePerDocFallback for the per-doc mechanics.
+  //
   // Co-located with M1 by intent — M2/M3 may want different retry policy
   // (e.g., longer backoff for destructive ops). Don't generalize until then.
-  //
-  // Policy: 2 retries, fixed backoff 1000ms then 3000ms. After 2 failed
-  // retries, return the last attempt's result verbatim (which carries
-  // http_error and per-op failures). The M1 caller treats those as
-  // failure-stashed docs per the cursor-advancement invariant.
   const M1_RETRY_DELAYS_MS = [1000, 3000];
   const dispatchWithRetry = async (
     collection: string,
@@ -1184,21 +1302,33 @@ async function phaseM1(req: PhaseRequest, _siteOrigin: string, apiKey: string): 
     let lastResult: BatchWriteResult | undefined;
     for (let attempt = 0; attempt <= M1_RETRY_DELAYS_MS.length; attempt++) {
       const result = await fsBatchWrite(collection, ops, apiKey);
-      const transient = !!result.http_error && (
-        result.http_error.status === 429 ||
-        (result.http_error.status >= 500 && result.http_error.status < 600)
-      );
-      if (!transient) return result;
+      // Success: no http_error means the batch :commit returned 2xx with
+      // a writeResults array. Return immediately.
+      if (!result.http_error) return result;
+
+      const transient = result.http_error.status === 429 ||
+        (result.http_error.status >= 500 && result.http_error.status < 600);
+
+      if (!transient) {
+        // Non-transient batch failure (e.g. 403, 400, INVALID_ARGUMENT).
+        // No point retrying; fall back to per-doc :commit immediately.
+        console.warn(`M1 batch non-transient error (HTTP ${result.http_error.status}); falling back to per-doc :commit for ${ops.length} ops`);
+        return await fsBatchWritePerDocFallback(collection, ops, apiKey);
+      }
+
+      // Transient: retry the batch.
       lastResult = result;
       if (attempt < M1_RETRY_DELAYS_MS.length) {
-        console.warn(`M1 batch transient error (HTTP ${result.http_error?.status}); retry ${attempt + 1}/${M1_RETRY_DELAYS_MS.length} in ${M1_RETRY_DELAYS_MS[attempt]}ms`);
+        console.warn(`M1 batch transient error (HTTP ${result.http_error.status}); retry ${attempt + 1}/${M1_RETRY_DELAYS_MS.length} in ${M1_RETRY_DELAYS_MS[attempt]}ms`);
         await new Promise(r => setTimeout(r, M1_RETRY_DELAYS_MS[attempt]));
       }
     }
-    // Exhausted retries; return last attempt (still has http_error set,
-    // which the caller maps to per-op failures via fsBatchWrite's contract).
-    console.warn(`M1 batch transient error: exhausted ${M1_RETRY_DELAYS_MS.length} retries; stashing ${ops.length} ops to failed list`);
-    return lastResult!;
+    // Exhausted retries on transient errors. Fall back to per-doc :commit
+    // — the per-doc requests are independent, so a temporary throttle that
+    // blocked a 500-doc atomic batch may let many of the 500 individual
+    // requests through.
+    console.warn(`M1 batch transient error: exhausted ${M1_RETRY_DELAYS_MS.length} retries (last status ${lastResult?.http_error?.status}); falling back to per-doc :commit for ${ops.length} ops`);
+    return await fsBatchWritePerDocFallback(collection, ops, apiKey);
   };
 
   // ── Time-budget loop: read+write groups of M1_CONCURRENCY pages ──────────
