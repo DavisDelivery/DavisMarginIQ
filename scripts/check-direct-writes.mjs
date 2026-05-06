@@ -154,6 +154,28 @@ const ALLOWED_FILES = new Set([
   // inventory uses literal collection names by design). Added in v2.53.4
   // (Phase 2 Commit 4a) as a carry-along fix; the entry was missing from C3.
   "netlify/functions/marginiq-health-check.mts",
+
+  // ── SANCTIONED MIGRATION PATH — Phase 2 Commit 4b ──
+  // marginiq-migration-runner.mts is the migration state machine that
+  // performs the das_lines redesign. It legitimately needs direct read,
+  // delete, and snapshot-write access to das_lines because that is its
+  // entire purpose:
+  //   - M1 snapshots das_lines to a dated snapshot collection
+  //     (das_lines_snapshot__{migration_id}__{ts})
+  //   - M2 deletes the v2.53.1 corrupted cohort (~205K rows)
+  //   - M3 deletes the pre-Phase-1 long-docId cohort (~608K rows)
+  //   - M2/M3 concurrency checks page das_lines on ingested_at
+  //   - M4 reparse work goes through marginiq-reparse → ingestFile (the
+  //     sanctioned write path); the runner does not call writeProvenancedRows
+  //     itself for L3 inserts.
+  //
+  // The runner is the only function in the codebase authorized to delete
+  // from das_lines directly. Migration-time bypass of the four-layer ingest
+  // contract is intentional and audited via marginiq_config/migration_status.
+  // String-literal "das_lines" appears in: snapshot collection name template,
+  // fsCount target, structuredQuery from-clauses, fsDeleteDoc target, and a
+  // snapshot_source label field. None of those are L3 writes via ingestFile.
+  "netlify/functions/marginiq-migration-runner.mts",
 ]);
 
 function walk(dir) {
