@@ -110,11 +110,40 @@ export interface IngestMetadata {
   subject?: string;         // email subject (optional)
   schemaVersion: string;    // parser output schema version, e.g. "1.0.0"
   ingestedBy: string;       // calling function id, e.g. "marginiq-ddis-ingest-background@2.53.0"
+  /**
+   * v2.53.3 — Required when ingesting in merge mode (l3WriteMode === "merge").
+   * Must be a non-empty ISO timestamp string. The merge function asserts
+   * this and throws on violation. For new ingests, pass `new Date().toISOString()`.
+   * For reparse-from-L1, pass the original `staged_at` from the source_files_raw
+   * doc — this preserves the idempotency invariant that reparsing the same
+   * file twice produces identical L3 state (see DESIGN.md §4 idempotency proof).
+   */
+  stagedAt?: string;
+  /**
+   * v2.53.3 — Optional per-file metadata captured by the parser and persisted
+   * to source_files_raw for schema-drift detection and downstream classification.
+   * Kept optional so existing callers (nuvizz, ddis) need not change.
+   */
+  l1Extras?: {
+    column_headers?: string[];   // exact header row, byte-for-byte
+    sheet_names?: string[];      // all sheet names in the workbook
+    file_kind?: string;          // classifier output (e.g., "delivery", "accessorial")
+  };
 }
 
 export interface ParsedRow {
-  /** Stable doc ID for this row in BOTH L2 and L3. Required. */
+  /** Stable doc ID for L3. Required. Under Model B (uline) this is the
+   *  canonical merge key, e.g. `{pro}_{pu_date}_{service_type}`. */
   docId: string;
+  /** v2.53.3 — Optional L2-specific docId. When set, das_rows_raw / l2 stores
+   *  use this id instead of `docId`. Lets L2 be lossless ({file_id}__{idx})
+   *  while L3 collapses to a canonical merge key. If absent, L2 falls back
+   *  to `docId` (preserves nuvizz/ddis behavior). */
+  l2DocId?: string;
+  /** v2.53.3 — When true, skip L3 write for this row. L2 is still written.
+   *  Used by REMITTANCE-kind files that need lossless preservation but
+   *  don't add billable delivery rows to das_lines. */
+  skipL3?: boolean;
   /** Layer 2 representation: every column from the source file, verbatim. */
   rawFields: Record<string, any>;
   /** Layer 3 representation: parsed/typed/normalized fields. */
@@ -132,6 +161,29 @@ export interface IngestParams {
   apiKey: string;
   /** If true, write Layer 1 only (preserve original bytes, skip parsing). */
   layer1Only?: boolean;
+  /**
+   * v2.53.3 — Controls how Layer 3 docs are written when their docId already
+   * exists in Firestore. Layer 2 writes are unaffected (always overwrite —
+   * L2 docIds are file-scoped and never collide).
+   *
+   *   - "overwrite" (default): existing behavior. Last write wins. Used by
+   *     nuvizz and ddis where each docId is a stable logical entity (a stop,
+   *     a payment) and the latest snapshot is authoritative.
+   *
+   *   - "merge": call mergeDasLineRow per row. The merge function preserves
+   *     the existing row's `created_at`, applies a latest-staged-at-wins
+   *     ordering rule, and refuses to stomp on rows that are newer than the
+   *     incoming write. Used by the uline path where the same logical row
+   *     (pro, pu_date, service_type) may appear in multiple source files
+   *     across time and must be reconciled deterministically. Requires
+   *     metadata.stagedAt to be a non-empty ISO string; throws otherwise.
+   *
+   *   - "reject_on_conflict": if existing doc found at the L3 docId, throw
+   *     an error and refuse the write. Future safety mode for ingests that
+   *     want to fail loud on docId conflicts. Implemented as a stub in
+   *     v2.53.3 — no production caller invokes this mode yet.
+   */
+  l3WriteMode?: "overwrite" | "merge" | "reject_on_conflict";
 }
 
 export interface IngestResult {
@@ -248,8 +300,12 @@ function sanitizeId(id: string): string {
  * Deterministic file_id from source + filename + messageId. Same inputs
  * produce the same file_id forever. This means re-ingesting the same
  * file is idempotent — Layer 1 patches itself, Layers 2/3 overwrite.
+ *
+ * v2.53.3: Exported so callers can pre-compute fileId before invoking
+ * ingestFile() — required when row docIds must embed file_id (e.g., L2
+ * `{file_id}__{row_index}` lossless scheme used by the uline path).
  */
-function deriveFileId(source: string, filename: string, messageId: string): string {
+export function deriveFileId(source: string, filename: string, messageId: string): string {
   const cleanSource = source.replace(/[^a-z0-9_-]/gi, "_");
   const cleanFilename = filename.replace(/[^a-z0-9._-]/gi, "_").slice(0, 60);
   const hash = createHash("sha256")
@@ -278,7 +334,10 @@ async function writeLayer1(
   }
 
   // Parent doc
-  const headerOk = await fsPatchDoc("source_files_raw", fileId, {
+  // v2.53.3 — capture optional l1Extras (column_headers, sheet_names,
+  // file_kind) when the caller provides them. Lets downstream tools detect
+  // schema drift without re-parsing every L1 chunk.
+  const headerFields: Record<string, any> = {
     file_id: fileId,
     source,
     filename,
@@ -293,7 +352,19 @@ async function writeLayer1(
     email_date: metadata.emailDate,
     schema_version: metadata.schemaVersion,
     ingested_by: metadata.ingestedBy,
-  }, apiKey);
+  };
+  if (metadata.l1Extras) {
+    if (metadata.l1Extras.column_headers !== undefined) {
+      headerFields.column_headers = metadata.l1Extras.column_headers;
+    }
+    if (metadata.l1Extras.sheet_names !== undefined) {
+      headerFields.sheet_names = metadata.l1Extras.sheet_names;
+    }
+    if (metadata.l1Extras.file_kind !== undefined) {
+      headerFields.file_kind = metadata.l1Extras.file_kind;
+    }
+  }
+  const headerOk = await fsPatchDoc("source_files_raw", fileId, headerFields, apiKey);
   if (!headerOk) {
     return { ok: false, chunks: 0, rawBytes: bytes.length, gzBytes: gz.length, error: "Failed to write source_files_raw header doc" };
   }
@@ -316,6 +387,219 @@ async function writeLayer1(
     return { ok: false, chunks: chunks.length, rawBytes: bytes.length, gzBytes: gz.length, error: `${chunkErrors}/${chunks.length} chunks failed` };
   }
   return { ok: true, chunks: chunks.length, rawBytes: bytes.length, gzBytes: gz.length };
+}
+
+// ─── L3 merge helpers (v2.53.3) ───────────────────────────────────────────────
+// Used when ingestFile is called with l3WriteMode === "merge". The merge
+// pattern enforces "latest staged_at wins" for conflicting writes to the
+// same L3 docId, while preserving created_at as the first-writer timestamp.
+//
+// Used by the uline path because the same logical row (pro, pu_date,
+// service_type) may appear in multiple source files across time and must
+// reconcile deterministically. NOT used by nuvizz/ddis (they overwrite).
+//
+// See DESIGN.md §4 for the full ordering rule and idempotency proof.
+
+/**
+ * GET a single doc from Firestore. Returns the parsed JSON response on
+ * success, null on 404, throws on other errors.
+ */
+async function fsGetDoc(collection: string, docId: string, apiKey: string): Promise<any | null> {
+  const url = `${FS_BASE}/${collection}/${encodeURIComponent(docId)}?key=${apiKey}`;
+  const r = await fetch(url);
+  if (r.status === 404) return null;
+  if (!r.ok) {
+    throw new Error(`fsGetDoc ${collection}/${docId} failed: ${r.status} ${(await r.text()).slice(0, 300)}`);
+  }
+  return await r.json();
+}
+
+/**
+ * Unwrap a Firestore field object into its native JS value.
+ * Handles stringValue, integerValue, doubleValue, booleanValue, nullValue.
+ * For arrays/maps returns them in raw Firestore shape; this helper is only
+ * used by the merge function which compares scalar timestamp strings.
+ */
+function unwrapScalar(field: any): any {
+  if (!field || typeof field !== "object") return field;
+  if ("stringValue" in field) return field.stringValue;
+  if ("integerValue" in field) return Number(field.integerValue);
+  if ("doubleValue" in field) return field.doubleValue;
+  if ("booleanValue" in field) return field.booleanValue;
+  if ("nullValue" in field) return null;
+  return undefined;
+}
+
+/**
+ * v2.53.3 — Merge an incoming parsed row against an optional existing L3
+ * doc. Returns a Firestore patch + updateMask to apply via fsPatchDoc.
+ *
+ * Ordering rule:
+ *   - existing == null → first write. Patch sets all incoming fields plus
+ *     created_at = stagedAt and ingested_at = stagedAt.
+ *   - existing.ingested_at <= stagedAt → overwrite. All incoming fields
+ *     plus ingested_at = stagedAt. created_at NOT touched (preserved).
+ *   - existing.ingested_at > stagedAt → no-op (incoming is older). Returns
+ *     empty patch + empty updateMask. Caller skips the write.
+ *
+ * Idempotency invariant: stagedAt MUST be the L1 doc's `staged_at` for
+ * reparse to be deterministic. This function asserts stagedAt is a non-empty
+ * ISO string and throws if not.
+ */
+export interface MergeRowResult {
+  patch: Record<string, any>;
+  updateMask: string[];
+  /** True if the caller should skip the write (incoming is older). */
+  skipped: boolean;
+  /** Reason code: "first_write", "overwrite", "skipped_older". */
+  reason: "first_write" | "overwrite" | "skipped_older";
+}
+
+export function mergeDasLineRow(
+  existing: any | null,
+  incoming: ParsedRow,
+  metadata: { fileId: string; stagedAt: string; ingestedBy: string; schemaVersion: string },
+): MergeRowResult {
+  // INVARIANT: stagedAt must be non-empty ISO. The reparse path passes the
+  // L1 doc's staged_at; the live ingest path passes a fresh ISO. Anything
+  // else is a programming error (idempotency would be broken).
+  if (!metadata.stagedAt || typeof metadata.stagedAt !== "string") {
+    throw new Error(
+      `mergeDasLineRow: metadata.stagedAt must be a non-empty ISO string. Got: ${JSON.stringify(metadata.stagedAt)}`
+    );
+  }
+  // Loose ISO 8601 sanity check: starts with YYYY-MM-DD and contains T.
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(metadata.stagedAt)) {
+    throw new Error(
+      `mergeDasLineRow: metadata.stagedAt does not look like ISO 8601. Got: ${metadata.stagedAt}`
+    );
+  }
+
+  const provenance = {
+    source_file_id: metadata.fileId,
+    ingested_at: metadata.stagedAt,
+    ingested_by: metadata.ingestedBy,
+    schema_version: metadata.schemaVersion,
+  };
+
+  // First-write case
+  if (!existing) {
+    const patch = {
+      ...incoming.normalizedFields,
+      ...provenance,
+      created_at: metadata.stagedAt,  // set once; overwrite path explicitly omits this
+    };
+    return {
+      patch,
+      updateMask: Object.keys(patch),
+      skipped: false,
+      reason: "first_write",
+    };
+  }
+
+  // Existing doc present — compare ingested_at
+  const existingIngestedAt = unwrapScalar(existing.fields?.ingested_at) as string | null;
+
+  // If existing has no ingested_at (legacy/migration row), treat as older.
+  // We overwrite. This is the dominant case for the migration's first reparse.
+  if (existingIngestedAt && existingIngestedAt > metadata.stagedAt) {
+    return {
+      patch: {},
+      updateMask: [],
+      skipped: true,
+      reason: "skipped_older",
+    };
+  }
+
+  // Overwrite — created_at is intentionally NOT included so the original
+  // first-write timestamp is preserved.
+  const patch = {
+    ...incoming.normalizedFields,
+    ...provenance,
+  };
+  return {
+    patch,
+    updateMask: Object.keys(patch),
+    skipped: false,
+    reason: "overwrite",
+  };
+}
+
+/**
+ * Apply a batch of merges to L3. Sequential by design — each row needs a
+ * GET before the PATCH to make the latest-wins decision. Concurrent merges
+ * on the same docId would race; we accept the per-row latency to keep the
+ * write order deterministic.
+ *
+ * Returns counts and a per-reason breakdown for observability.
+ */
+async function applyMergeBatch(
+  collection: string,
+  rows: ParsedRow[],
+  metadata: { fileId: string; stagedAt: string; ingestedBy: string; schemaVersion: string },
+  apiKey: string,
+): Promise<{
+  ok: number;
+  failed: number;
+  first_write: number;
+  overwrite: number;
+  skipped_older: number;
+}> {
+  let ok = 0, failed = 0;
+  let first_write = 0, overwrite = 0, skipped_older = 0;
+
+  for (const row of rows) {
+    const docId = sanitizeId(row.docId);
+    let existing: any | null = null;
+    try {
+      existing = await fsGetDoc(collection, docId, apiKey);
+    } catch (e: any) {
+      console.error(`applyMergeBatch: GET ${collection}/${docId} failed: ${e?.message || e}`);
+      failed++;
+      continue;
+    }
+
+    let merge: MergeRowResult;
+    try {
+      merge = mergeDasLineRow(existing, row, metadata);
+    } catch (e: any) {
+      // Invariant violation — propagate (the caller has a bug).
+      throw e;
+    }
+
+    if (merge.skipped) {
+      skipped_older++;
+      continue;
+    }
+
+    const patchOk = await fsPatchDoc(collection, docId, merge.patch, apiKey);
+    if (!patchOk) {
+      failed++;
+      continue;
+    }
+    ok++;
+    if (merge.reason === "first_write") first_write++;
+    else if (merge.reason === "overwrite") overwrite++;
+  }
+
+  return { ok, failed, first_write, overwrite, skipped_older };
+}
+
+/**
+ * v2.53.3 — Stub for "reject_on_conflict" L3 write mode. Used by ingestFile
+ * when l3WriteMode === "reject_on_conflict". Currently throws for every
+ * call because no production caller invokes this mode. Will be wired up
+ * when a future ingest needs strict-conflict semantics.
+ */
+async function applyRejectOnConflictBatch(
+  _collection: string,
+  _rows: ParsedRow[],
+  _apiKey: string,
+): Promise<{ ok: number; failed: number; rejected: number }> {
+  throw new Error(
+    "applyRejectOnConflictBatch: l3WriteMode='reject_on_conflict' is reserved for future use and is not implemented in v2.53.3. " +
+    "If you reached this code path, your caller's l3WriteMode value is wrong."
+  );
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -421,28 +705,78 @@ export async function ingestFile(params: IngestParams): Promise<IngestResult> {
     schema_version: metadata.schemaVersion,
   };
 
-  // Layer 2: every column verbatim
+  // Layer 2: every column verbatim. L2 always uses overwrite semantics —
+  // L2 docIds are file-scoped (e.g., {file_id}__{row_index} for the uline
+  // path) and cannot collide across files. ParsedRow.l2DocId takes
+  // precedence when set; otherwise falls back to docId for backward compat
+  // with nuvizz/ddis which share docId across L2 and L3.
   const l2Docs = parsedRows.map(row => ({
-    docId: sanitizeId(row.docId),
+    docId: sanitizeId(row.l2DocId || row.docId),
     fields: toFsFields({ ...row.rawFields, ...provenance }),
   }));
 
   const l2Result = await batchWriteDocs(registryEntry.rowsRaw, l2Docs, apiKey);
 
-  // Layer 3: normalized
-  const l3Docs = parsedRows.map(row => ({
-    docId: sanitizeId(row.docId),
-    fields: toFsFields({ ...row.normalizedFields, ...provenance }),
-  }));
+  // Layer 3: normalized. v2.53.3 — branch on l3WriteMode.
+  // Filter out rows that opt out of L3 (skipL3:true) — REMITTANCE files
+  // need L2 lossless preservation but don't write to das_lines.
+  const l3CandidateRows = parsedRows.filter(r => !r.skipL3);
+  const l3Mode = params.l3WriteMode || "overwrite";
+  let l3Result: { ok: number; failed: number };
+  // Per-mode stats reported back in IngestResult for observability.
+  let l3MergeStats: { first_write?: number; overwrite?: number; skipped_older?: number } | undefined;
 
-  const l3Result = await batchWriteDocs(registryEntry.primary, l3Docs, apiKey);
+  if (l3Mode === "overwrite") {
+    const l3Docs = l3CandidateRows.map(row => ({
+      docId: sanitizeId(row.docId),
+      fields: toFsFields({ ...row.normalizedFields, ...provenance }),
+    }));
+    l3Result = await batchWriteDocs(registryEntry.primary, l3Docs, apiKey);
+  } else if (l3Mode === "merge") {
+    // Merge requires metadata.stagedAt. Validate at top of the path so we
+    // fail before doing any L3 work.
+    if (!metadata.stagedAt) {
+      return {
+        ok: false,
+        fileId,
+        source,
+        layer1: l1,
+        layer2: { collection: registryEntry.rowsRaw, attempted: l2Docs.length, written: l2Result.ok, failed: l2Result.failed },
+        layer3: { collection: registryEntry.primary, attempted: l3CandidateRows.length, written: 0, failed: l3CandidateRows.length },
+        schemaVersion: metadata.schemaVersion,
+        ingestedAt,
+        ingestedBy: metadata.ingestedBy,
+        duration_ms: Date.now() - startMs,
+        error: `l3WriteMode='merge' requires metadata.stagedAt (ISO timestamp from L1 staged_at). See lib/four-layer-ingest.ts mergeDasLineRow.`,
+      };
+    }
+    const mergeRes = await applyMergeBatch(
+      registryEntry.primary,
+      l3CandidateRows,
+      { fileId, stagedAt: metadata.stagedAt, ingestedBy: metadata.ingestedBy, schemaVersion: metadata.schemaVersion },
+      apiKey,
+    );
+    l3Result = { ok: mergeRes.ok, failed: mergeRes.failed };
+    l3MergeStats = {
+      first_write: mergeRes.first_write,
+      overwrite: mergeRes.overwrite,
+      skipped_older: mergeRes.skipped_older,
+    };
+  } else if (l3Mode === "reject_on_conflict") {
+    // Stubbed; throws.
+    const r = await applyRejectOnConflictBatch(registryEntry.primary, l3CandidateRows, apiKey);
+    l3Result = { ok: r.ok, failed: r.failed };
+  } else {
+    // Exhaustiveness — TS would flag this if the union grows.
+    throw new Error(`ingestFile: unknown l3WriteMode '${String(l3Mode)}'`);
+  }
 
   // Mark file complete with summary
   const l2Failed = l2Result.failed;
   const l3Failed = l3Result.failed;
   const allOk = l2Failed === 0 && l3Failed === 0;
 
-  await fsPatchDoc("source_files_raw", fileId, {
+  const summaryFields: Record<string, any> = {
     state: allOk ? "ingested" : "ingested_with_errors",
     completed_at: new Date().toISOString(),
     parsed_row_count: parsedRows.length,
@@ -450,7 +784,14 @@ export async function ingestFile(params: IngestParams): Promise<IngestResult> {
     l2_failed: l2Failed,
     l3_written: l3Result.ok,
     l3_failed: l3Failed,
-  }, apiKey);
+    l3_write_mode: l3Mode,
+  };
+  if (l3MergeStats) {
+    summaryFields.l3_merge_first_write = l3MergeStats.first_write ?? 0;
+    summaryFields.l3_merge_overwrite = l3MergeStats.overwrite ?? 0;
+    summaryFields.l3_merge_skipped_older = l3MergeStats.skipped_older ?? 0;
+  }
+  await fsPatchDoc("source_files_raw", fileId, summaryFields, apiKey);
 
   return {
     ok: allOk,
@@ -458,7 +799,7 @@ export async function ingestFile(params: IngestParams): Promise<IngestResult> {
     source,
     layer1: l1,
     layer2: { collection: registryEntry.rowsRaw, attempted: l2Docs.length, written: l2Result.ok, failed: l2Failed },
-    layer3: { collection: registryEntry.primary, attempted: l3Docs.length, written: l3Result.ok, failed: l3Failed },
+    layer3: { collection: registryEntry.primary, attempted: l3CandidateRows.length, written: l3Result.ok, failed: l3Failed },
     schemaVersion: metadata.schemaVersion,
     ingestedAt,
     ingestedBy: metadata.ingestedBy,

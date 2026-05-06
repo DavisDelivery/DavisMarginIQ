@@ -1,14 +1,31 @@
 import type { Context } from "@netlify/functions";
 import * as XLSX from "xlsx";
 import { runCheckpointed, type CheckpointState } from "./lib/checkpointed-runner.js";
-import { ingestFile, type ParsedRow } from "./lib/four-layer-ingest.js";
+import { ingestFile, deriveFileId, type ParsedRow } from "./lib/four-layer-ingest.js";
 
 /**
- * Davis MarginIQ — Uline DAS Historical Backfill BACKGROUND WORKER (v2.53.1, Phase 2 task 2)
+ * Davis MarginIQ — Uline DAS Historical Backfill BACKGROUND WORKER (v2.53.3, Phase 2 task 2)
  *
  * Walks Gmail for Uline DAS attachments and ingests each one through
  * lib/four-layer-ingest.ts. Wrapped in lib/checkpointed-runner.ts so the
  * walk can span many invocations without losing state.
+ *
+ * v2.53.3 — REBUILT FOR MODEL B
+ * =============================
+ *   - das_lines L3 docId is now `{pro}_{pu_date||"nodate"}_{service_type}`
+ *     (collision-safe canonical merge key, replacing v2.53.1's
+ *     `{pro}_{pu_date}_{idx}` which silently overwrote ~50% of rows).
+ *   - das_rows_raw L2 docId is now `{file_id}__{row_index}` (lossless;
+ *     same delivery in N files = N L2 rows, one per source row).
+ *   - Five file kinds classified: delivery, truckload, accessorial,
+ *     correction, remittance. REMITTANCE files write L2-only (no L3).
+ *     CORRECTION files use a different parser branch.
+ *   - L2 raw_cells captured as Array<{header,header_index,value}> —
+ *     truly lossless (no key sanitization, preserves duplicate headers).
+ *   - source_files_raw gains column_headers, sheet_names, file_kind for
+ *     schema-drift detection.
+ *   - L3 writes go through l3WriteMode='merge' which calls mergeDasLineRow
+ *     with stagedAt=L1 staged_at. Latest-wins per (pro, pu_date, service_type).
  *
  * STATE LIFECYCLE
  * ===============
@@ -19,29 +36,12 @@ import { ingestFile, type ParsedRow } from "./lib/four-layer-ingest.js";
  *      ingests them one at a time, increments cursor.
  *   3. When cursor === message_queue.length: marks complete.
  *
- * Why the message list is stored rather than re-queried per invocation:
- *   - Gmail message-list ordering changes as new emails arrive
- *   - Re-paginating across hundreds of messages is wasteful
- *   - Firestore doc limit is 1MB; 500 message ids + per-account access
- *     tokens are ~50KB total, fits comfortably
- *   - Access tokens DO expire (1hr) — if the chain runs longer than that,
- *     we refresh tokens at the start of each invocation rather than
- *     storing them in the queue. The queue stores message id + account
- *     email; we re-mint access tokens from refresh tokens each time.
- *
- * ERROR HANDLING
- * ==============
- *   - Per-message errors increment state.errors and continue. The chain
- *     does not abort on a single bad message.
- *   - Per-attachment errors are logged but the message is still marked
- *     processed (so we don't re-attempt forever).
- *   - If Gmail token refresh fails for an account mid-chain, we skip
- *     messages from that account and continue with the others.
- *
  * IDEMPOTENCY
  * ===========
  *   - file_id is deterministic (sha256 of source|filename|messageId).
  *     Re-ingesting the same file overwrites the same docs at all layers.
+ *   - L3 merge is deterministic when stagedAt is the L1 doc's staged_at
+ *     (preserved across reparse runs). See DESIGN.md §4 idempotency proof.
  *   - uline_processed_emails/{messageId} is an idempotency record. If
  *     present, the message is skipped unless reprocess=true.
  */
@@ -58,8 +58,10 @@ const STATUS_DOC = "uline_historical_backfill_status";
 const VENDOR_BASE_QUERY = '(from:@uline.com OR from:billing@davisdelivery.com) filename:das filename:xlsx -from:APFreight@uline.com';
 
 // Schema version for parsed DAS rows. Bump on parser changes.
-const DAS_SCHEMA_VERSION = "1.0.0";
-const INGESTED_BY = "marginiq-uline-historical-backfill-background@2.53.1";
+// v2.53.3 — bumped from 1.0.0 because the L3 docId scheme and field
+// shape both changed under Model B.
+const DAS_SCHEMA_VERSION = "2.0.0";
+const INGESTED_BY = "marginiq-uline-historical-backfill-background@2.53.3";
 
 // Per-invocation work budget. 10 minutes leaves headroom for the final
 // status write and the self-reinvoke fetch handoff.
@@ -232,16 +234,114 @@ async function downloadAttachment(accessToken: string, messageId: string, attach
 }
 
 // ─── DAS parser ──────────────────────────────────────────────────────────────
-// Mirrors the v2.52.8-baseline parseDasWorkbook() exactly. Only difference:
-// returns ParsedRow[] (with separate raw + normalized) instead of the
-// flat ParsedDasRow[] the original used. Same parsing logic.
+// v2.53.3 — five file kinds (delivery, truckload, accessorial, correction,
+// remittance) with filename-first classification. Helper functions
+// (normalizePro, puToDate, puToMonth, weekEndingFriday) are defined below
+// alongside the parser.
+
+// ─── File classification (v2.53.3) ───────────────────────────────────────────
+// Five distinct uline file kinds discovered in the May 5 design audit
+// (see DESIGN.md §3). Filename-first; column-headers fallback for
+// ambiguous cases; subject as tiebreaker for unknowns.
+//
+// REMITTANCE files write L2 only (no das_lines rows). They are paid-status
+// confirmations, not new billing data.
+//
+// CORRECTION files have a different schema entirely
+// (Pro#, SCAC, Invoice Date, Transmit Date, Charge) and are parsed by a
+// separate branch in the main parser.
+
+export type FileKind = "delivery" | "truckload" | "accessorial" | "correction" | "remittance" | "unknown";
+
+function classifyUlineFile(filename: string, headers: string[], subject?: string): FileKind {
+  const fn = (filename || "").toLowerCase();
+
+  // Strongest filename signals first.
+  // Truckload: "TK" or "TL" suffix surrounded by separators or at end.
+  if (/(?:^|[\s\-_])t[kl](?=\.[a-z]+$|[\s\-_])/i.test(fn)) return "truckload";
+  // Accessorial — includes the typo "acceessorials" (3 e's) seen in the wild.
+  if (/acc[e]?essorial/i.test(fn)) return "accessorial";
+  if (/remit/i.test(fn)) return "remittance";
+  if (/process|correct|late|dispute|update/i.test(fn)) return "correction";
+
+  // Filename ambiguous — fall back to header set.
+  const hdrs = (headers || []).map(h => (h || "").toString().toLowerCase().trim());
+  if (hdrs.includes("scac") && hdrs.includes("transmit date")) return "correction";
+  if (hdrs.includes("status") && hdrs.length <= 6 && hdrs.includes("pro")) return "remittance";
+
+  // Standard delivery file: starts with "das" and has the canonical
+  // pro/cost/new cost trio.
+  if (fn.startsWith("das") && hdrs.includes("pro") && hdrs.includes("cost") && hdrs.includes("new cost")) {
+    return "delivery";
+  }
+
+  // Subject tiebreaker (last resort).
+  const subj = (subject || "").toLowerCase();
+  if (subj.includes("aging") || subj.includes("remittance")) return "remittance";
+  if (subj.includes("dispute") || subj.includes("update")) return "correction";
+
+  return "unknown";
+}
+
+// ─── Parser output bundle (v2.53.3) ──────────────────────────────────────────
+// The parser now returns the parsed rows AND per-file metadata (column_headers,
+// sheet_names, file_kind) so the worker can pass them into ingestFile via
+// metadata.l1Extras for source_files_raw.
+
+interface ParseBundle {
+  rows: ParsedRow[];
+  l1Extras: {
+    column_headers: string[];
+    sheet_names: string[];
+    file_kind: FileKind;
+  };
+}
+
+// ─── Raw cell capture ────────────────────────────────────────────────────────
+// L2 raw_cells is an Array<{header, header_index, value}>. Using an array
+// (not a sanitized-key map) preserves duplicate / unsanitizable headers,
+// preserves column order, and makes schema-drift detection trivial.
+//
+// SheetJS returns rows as objects keyed by header strings. We rebuild the
+// header-indexed array by aligning to a canonical header order captured
+// once per sheet.
+
+interface RawCell {
+  header: string;
+  header_index: number;
+  value: string;
+}
+
+function captureRawCells(row: any, headers: string[]): RawCell[] {
+  const out: RawCell[] = [];
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    const v = row[h];
+    out.push({
+      header: h,
+      header_index: i,
+      value: v == null ? "" : (typeof v === "string" ? v : String(v)),
+    });
+  }
+  return out;
+}
+
+// ─── DAS parser ──────────────────────────────────────────────────────────────
+// v2.53.3 rebuild for Model B. Same field-extraction logic as v2.52.8 baseline
+// for delivery/truckload/accessorial; new branch for correction files;
+// new L2-only path for remittance files.
 
 function normalizePro(raw: any): string | null {
   if (raw == null) return null;
   const s = String(raw).trim();
   if (!s) return null;
-  const digits = s.replace(/^0+/, "");
-  return digits || s;
+  // Preserve ULI-NNNNNNN truckload PROs as-is (not all digits).
+  // For numeric PROs, strip leading zeros for join consistency.
+  if (/^\d+$/.test(s)) {
+    const digits = s.replace(/^0+/, "");
+    return digits || s;
+  }
+  return s;
 }
 
 function puToDate(pu: number | null): string | null {
@@ -272,21 +372,31 @@ function weekEndingFriday(dateStr: string | null): string | null {
   return `${yy}-${mm}-${dd}`;
 }
 
-function detectFileServiceType(filename: string): "delivery" | "truckload" | "accessorial" {
-  const fn = filename.toLowerCase();
-  if (/(?:^|[\s\-_])tk(?=\.[a-z]+$|[\s\-_])/i.test(fn)) return "truckload";
-  if (/accessorial/i.test(fn)) return "accessorial";
-  return "delivery";
-}
-
-function parseDasWorkbookToRows(buffer: Buffer, filename: string): ParsedRow[] {
+/**
+ * Parse a DAS workbook into a ParseBundle.
+ *
+ * fileId is required because L2 docIds embed it ({file_id}__{row_index})
+ * and L3 docIds need it for provenance threading. Pre-computed by the
+ * caller via deriveFileId(); this parser must use the SAME file_id that
+ * ingestFile() will use internally so L1 + L2 + L3 references stay aligned.
+ */
+function parseDasWorkbookToRows(buffer: Buffer, filename: string, fileId: string, subject?: string): ParseBundle {
   const wb = XLSX.read(buffer, { type: "buffer" });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  if (!ws) return [];
+  const sheetNames = wb.SheetNames.slice();
 
-  // Detect Uline-style meta row (common pattern: row 0 has cells like
-  // "Num,0 (No Blanks)", "CAPS (COD,$$$)"). If detected, skip one row.
-  const raw0 = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null }) as any[][];
+  // Branch by file kind. We need at least one sheet's headers to classify
+  // ambiguous filenames, so peek at the first sheet's row 0 first.
+  const firstSheet = wb.Sheets[sheetNames[0]];
+  if (!firstSheet) {
+    return {
+      rows: [],
+      l1Extras: { column_headers: [], sheet_names: sheetNames, file_kind: "unknown" },
+    };
+  }
+
+  // Capture row 0 for header inspection. Some DAS files have a Uline-style
+  // metadata row 0 (e.g. "Num,0 (No Blanks)") and the real headers are row 1.
+  const raw0 = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: null }) as any[][];
   let skipRows = 0;
   if (raw0.length >= 2) {
     const r0 = (raw0[0] || []).filter(v => v != null).map(v => String(v).toLowerCase());
@@ -296,18 +406,55 @@ function parseDasWorkbookToRows(buffer: Buffer, filename: string): ParsedRow[] {
     if (metaHints >= 3 && r0.length >= 5) skipRows = 1;
   }
 
-  const rawRows = XLSX.utils.sheet_to_json(ws, { defval: null, range: skipRows }) as any[];
-  const rows = rawRows.map(r => {
+  // Headers row (after skipping meta if present).
+  const headerRow: any[] = (raw0[skipRows] || []) as any[];
+  const headers: string[] = headerRow.map(h => (h == null ? "" : String(h)).trim());
+
+  const fileKind = classifyUlineFile(filename, headers, subject);
+
+  // Dispatch
+  if (fileKind === "remittance") {
+    return parseRemittance(wb, sheetNames, fileId, headers, fileKind);
+  }
+  if (fileKind === "correction") {
+    return parseCorrection(wb, sheetNames, fileId, headers, fileKind);
+  }
+  // delivery, truckload, accessorial, unknown — all parse with the
+  // standard DAS branch. Unknown files we attempt-parse and the resulting
+  // rows will land in das_rows_raw + das_lines if they contain a valid PRO.
+  return parseDeliveryStyleWorkbook(wb, sheetNames, fileId, filename, headers, skipRows, fileKind);
+}
+
+/**
+ * The dominant case: delivery, truckload, accessorial files share the
+ * canonical DAS schema [pro, order, customer, city, st, zip, pu, cost,
+ * wh, skid, loose, wgt, via, extra cost, code, new cost, notes].
+ */
+function parseDeliveryStyleWorkbook(
+  wb: any,
+  sheetNames: string[],
+  fileId: string,
+  filename: string,
+  headers: string[],
+  skipRows: number,
+  fileKind: FileKind,
+): ParseBundle {
+  const ws = wb.Sheets[sheetNames[0]];
+  // Re-read with normalized object keys (lowercase). We retain the
+  // ORIGINAL headers in `headers` for L2 raw_cells; the lowercase keys
+  // are only used for L3 normalized field extraction.
+  const rawObjs = XLSX.utils.sheet_to_json(ws, { defval: null, range: skipRows }) as any[];
+  const lowerKeyRows: any[] = rawObjs.map(r => {
     const o: Record<string, any> = {};
     Object.keys(r).forEach(k => { o[String(k).toLowerCase().trim()] = r[k]; });
     return o;
   });
 
-  const fileST = detectFileServiceType(filename);
   const out: ParsedRow[] = [];
 
-  for (let idx = 0; idx < rows.length; idx++) {
-    const r = rows[idx];
+  for (let idx = 0; idx < rawObjs.length; idx++) {
+    const rOrig = rawObjs[idx];
+    const r = lowerKeyRows[idx];
     const proRaw = r.pro ?? r["pro#"];
     if (!proRaw) continue;
     const proStr = String(proRaw).toLowerCase();
@@ -325,22 +472,24 @@ function parseDasWorkbookToRows(buffer: Buffer, filename: string): ParsedRow[] {
     const codeStr = r.code ? String(r.code).trim() : null;
     const hasCode = !!(codeStr && codeStr.length > 0);
 
+    // Service-type per row, with row-level override.
     let rowST: "delivery" | "truckload" | "accessorial";
-    if (fileST === "truckload") rowST = "truckload";
-    else if (hasCode) rowST = "accessorial";
-    else rowST = "delivery";
-
-    // Sanitize raw row keys for Firestore (no . [ ] / leading __)
-    const safeRaw: Record<string, string> = {};
-    for (const [k, v] of Object.entries(r || {})) {
-      if (!k) continue;
-      const sk = String(k).replace(/[.\[\]\/]/g, "_").replace(/^__/, "_");
-      safeRaw[sk] = v == null ? "" : (typeof v === "string" ? v : String(v));
+    if (fileKind === "truckload") rowST = "truckload";
+    else if (fileKind === "accessorial") rowST = "accessorial";
+    else if (fileKind === "delivery" || fileKind === "unknown") {
+      // Within a delivery file (or unknown), a populated `code` cell flips
+      // that row to accessorial. Matches v2.52.8 line 430 semantics.
+      rowST = hasCode ? "accessorial" : "delivery";
+    } else {
+      rowST = "delivery";
     }
 
     const puDate = pu ? puToDate(pu) : null;
 
-    const normalized = {
+    // Lossless raw_cells capture (Array<{header, header_index, value}>).
+    const rawCells = captureRawCells(rOrig, headers);
+
+    const normalized: Record<string, any> = {
       pro,
       order: r.order ? String(r.order) : null,
       customer: r.customer ? String(r.customer).trim() : null,
@@ -364,20 +513,193 @@ function parseDasWorkbookToRows(buffer: Buffer, filename: string): ParsedRow[] {
       service_type: rowST,
     };
 
-    // docId pattern matches v2.52.8 baseline: pro_pudate_fileid_idx
-    // file_id will be appended by the caller (we don't know it here).
-    // Using a placeholder; the caller will set the real docId.
-    // BUT — ingestFile() uses ParsedRow.docId verbatim, so we need to
-    // construct it now. The caller wraps with file_id hashing through
-    // deriveFileId, but the row docId we need to set explicitly.
-    // We use pro_pudate_idx (file_id is implicit via the L1 backref).
+    // L3 docId: canonical merge key (pro, pu_date, service_type).
+    const l3DocId = `${pro}_${puDate || "nodate"}_${rowST}`;
+    // L2 docId: lossless ({file_id}__{row_index}). Includes the original
+    // 0-based row index (not normalized index) so reparse is deterministic.
+    const l2DocId = `${fileId}__${String(idx).padStart(6, "0")}`;
+
     out.push({
-      docId: `${pro}_${puDate || "nodate"}_${idx}`,
-      rawFields: safeRaw,
+      docId: l3DocId,
+      l2DocId,
+      rawFields: {
+        // Lossless: every column from the source row, byte-for-byte, plus
+        // a few denormalized fields for query convenience.
+        raw_cells: rawCells,
+        sheet_name: sheetNames[0],
+        file_kind: fileKind,
+        row_index: idx,
+        // Denormalized PRO + pu_date for L2 indexed queries.
+        parsed_pro: pro,
+        parsed_pu_date: puDate,
+      },
       normalizedFields: normalized,
     });
   }
-  return out;
+
+  return {
+    rows: out,
+    l1Extras: { column_headers: headers, sheet_names: sheetNames, file_kind: fileKind },
+  };
+}
+
+/**
+ * Correction / processed_late files. Schema:
+ *   [Pro#, SCAC, Invoice Date, Transmit Date, Charge]
+ * These are late-billed delivery charges. Write to das_lines as
+ * service_type='delivery'.
+ */
+function parseCorrection(
+  wb: any,
+  sheetNames: string[],
+  fileId: string,
+  headers: string[],
+  fileKind: FileKind,
+): ParseBundle {
+  const ws = wb.Sheets[sheetNames[0]];
+  const rawObjs = XLSX.utils.sheet_to_json(ws, { defval: null }) as any[];
+
+  const out: ParsedRow[] = [];
+  for (let idx = 0; idx < rawObjs.length; idx++) {
+    const rOrig = rawObjs[idx];
+    const r: Record<string, any> = {};
+    Object.keys(rOrig).forEach(k => { r[String(k).toLowerCase().trim()] = rOrig[k]; });
+
+    const proRaw = r["pro#"] ?? r.pro;
+    if (!proRaw) continue;
+    const pro = normalizePro(proRaw);
+    if (!pro) continue;
+
+    const charge = parseFloat(r.charge) || 0;
+    // Invoice Date is the closest analog to pu_date for these files.
+    const invoiceDate = r["invoice date"];
+    let puDate: string | null = null;
+    if (invoiceDate) {
+      // SheetJS returns Excel date cells as Date objects when cellDates:true
+      // is set; otherwise as numeric serials. The defaults give us strings
+      // like "2025-02-03 00:00:00" — extract the date portion.
+      const s = String(invoiceDate).trim();
+      const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (m) puDate = m[1];
+    }
+
+    const rawCells = captureRawCells(rOrig, headers);
+
+    const normalized: Record<string, any> = {
+      pro,
+      scac: r.scac ? String(r.scac).trim() : null,
+      invoice_date: puDate,
+      transmit_date: r["transmit date"] ? String(r["transmit date"]).trim() : null,
+      charge,
+      // Map onto the canonical das_lines fields so the read path doesn't
+      // need to special-case correction rows.
+      pu_date: puDate,
+      month: puDate ? puDate.slice(0, 7) : null,
+      week_ending: weekEndingFriday(puDate),
+      cost: charge,
+      new_cost: charge,
+      extra_cost: 0,
+      code: null,
+      is_accessorial: false,
+      service_type: "delivery",
+    };
+
+    const l3DocId = `${pro}_${puDate || "nodate"}_delivery`;
+    const l2DocId = `${fileId}__${String(idx).padStart(6, "0")}`;
+
+    out.push({
+      docId: l3DocId,
+      l2DocId,
+      rawFields: {
+        raw_cells: rawCells,
+        sheet_name: sheetNames[0],
+        file_kind: fileKind,
+        row_index: idx,
+        parsed_pro: pro,
+        parsed_pu_date: puDate,
+      },
+      normalizedFields: normalized,
+    });
+  }
+
+  return {
+    rows: out,
+    l1Extras: { column_headers: headers, sheet_names: sheetNames, file_kind: fileKind },
+  };
+}
+
+/**
+ * Remittance files. L2 ONLY — these are paid-status confirmations and
+ * don't add das_lines billing rows. Each row gets `skipL3: true` so
+ * ingestFile writes only L2.
+ *
+ * Remittance files often have multiple sheets (one per "paid on" date);
+ * we walk every sheet so the L2 capture is complete.
+ */
+function parseRemittance(
+  wb: any,
+  sheetNames: string[],
+  fileId: string,
+  _firstSheetHeaders: string[],
+  fileKind: FileKind,
+): ParseBundle {
+  const out: ParsedRow[] = [];
+  // Capture per-sheet headers; the cross-sheet superset goes into l1Extras.
+  const allHeaders = new Set<string>();
+  let globalIdx = 0;
+
+  for (const sn of sheetNames) {
+    const ws = wb.Sheets[sn];
+    if (!ws) continue;
+    const sheetRaw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null }) as any[][];
+    if (sheetRaw.length < 2) continue;
+    const sheetHeaders: string[] = (sheetRaw[0] || []).map(h => (h == null ? "" : String(h)).trim());
+    sheetHeaders.forEach(h => allHeaders.add(h));
+    const sheetObjs = XLSX.utils.sheet_to_json(ws, { defval: null }) as any[];
+
+    for (let idx = 0; idx < sheetObjs.length; idx++) {
+      const rOrig = sheetObjs[idx];
+      const rawCells = captureRawCells(rOrig, sheetHeaders);
+      // Pull pro for indexing, but DON'T require it — we want every row
+      // captured even if PRO is null/non-numeric (lossless guarantee).
+      const lower: Record<string, any> = {};
+      Object.keys(rOrig).forEach(k => { lower[String(k).toLowerCase().trim()] = rOrig[k]; });
+      const proRaw = lower.pro ?? lower["pro#"];
+      const pro = proRaw ? normalizePro(proRaw) : null;
+
+      // Some sheets have a "Status" cell carrying free text like
+      // "Paid 63.2 for pro 6914473 on check 1346766" — preserve verbatim
+      // in raw_cells; downstream tooling can parse it.
+
+      const l2DocId = `${fileId}__${String(globalIdx).padStart(6, "0")}`;
+      out.push({
+        // No real L3; provide a stable docId so type contract is satisfied.
+        docId: `${fileId}__remit__${globalIdx}`,
+        l2DocId,
+        skipL3: true,
+        rawFields: {
+          raw_cells: rawCells,
+          sheet_name: sn,
+          file_kind: fileKind,
+          row_index: idx,
+          global_row_index: globalIdx,
+          parsed_pro: pro,
+        },
+        // Sentinel — never written.
+        normalizedFields: {},
+      });
+      globalIdx++;
+    }
+  }
+
+  return {
+    rows: out,
+    l1Extras: {
+      column_headers: Array.from(allHeaders),
+      sheet_names: sheetNames,
+      file_kind: fileKind,
+    },
+  };
 }
 
 // ─── Idempotency on processed emails ─────────────────────────────────────────
@@ -473,12 +795,32 @@ async function processOneMessage(
       continue;
     }
 
-    // ingestFile() does L1 + parsing + L2 + L3 atomically.
+    // v2.53.3 — Pre-parse to capture l1Extras (column_headers, sheet_names,
+    // file_kind) BEFORE calling ingestFile, which needs them for the
+    // source_files_raw header doc. Pre-compute fileId via the same helper
+    // ingestFile uses internally so L1, L2, and L3 references stay aligned.
+    //
+    // Live-ingest path uses stagedAt = NOW (the L1 doc is being created
+    // right now). The reparse path will pass the L1 doc's existing
+    // staged_at instead — see marginiq-reparse for that branch.
+    const fileIdForRows = deriveFileId("uline", att.filename, item.message_id);
+    let bundle;
+    try {
+      bundle = parseDasWorkbookToRows(binary, att.filename, fileIdForRows, subject);
+    } catch (e: any) {
+      payload.errors++;
+      fileSummaries.push({ filename: att.filename, error: `parse_threw: ${e?.message || e}` });
+      continue;
+    }
+    const liveStagedAt = new Date().toISOString();
+
+    // ingestFile() does L1 + L2 + L3 atomically. Parser closure returns the
+    // pre-parsed rows; ingestFile won't re-parse.
     const result = await ingestFile({
       source: "uline",
       filename: att.filename,
       binary,
-      parser: (bytes) => parseDasWorkbookToRows(bytes, att.filename),
+      parser: () => bundle.rows,
       metadata: {
         messageId: item.message_id,
         emailDate: internalDate,
@@ -486,8 +828,11 @@ async function processOneMessage(
         subject,
         schemaVersion: DAS_SCHEMA_VERSION,
         ingestedBy: INGESTED_BY,
+        stagedAt: liveStagedAt,
+        l1Extras: bundle.l1Extras,
       },
       apiKey: FIREBASE_API_KEY!,
+      l3WriteMode: "merge",
     });
 
     if (!result.ok) {
@@ -511,6 +856,7 @@ async function processOneMessage(
     fileSummaries.push({
       filename: att.filename,
       file_id: result.fileId,
+      file_kind: bundle.l1Extras.file_kind,
       l3_written: result.layer3.written,
       l2_written: result.layer2.written,
     });
