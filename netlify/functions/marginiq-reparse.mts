@@ -1,13 +1,23 @@
 import type { Context } from "@netlify/functions";
 import { gunzipSync } from "node:zlib";
+import { ingestFile, deriveFileId } from "./lib/four-layer-ingest.js";
+import { parseDasWorkbookToRows } from "./lib/uline-das-parser.js";
 
 /**
- * Davis MarginIQ — Source File Re-Parse (v2.52.3)
+ * Davis MarginIQ — Source File Re-Parse (v2.53.3)
  *
  * Reads a previously-staged raw file from source_files_raw +
  * source_file_chunks, decompresses it, and feeds it back through the
  * appropriate ingest dispatcher. This means parser bugs can be fixed
  * once and applied to all historical data without re-fetching from Gmail.
+ *
+ * v2.53.3 Commit 2 — Uline reparse path now functional
+ * ====================================================
+ * Previously the uline branch returned "decompressed_only" and required
+ * manual re-import. Now it routes through the shared lib/uline-das-parser.ts
+ * (extracted in this commit) and ingestFile() with l3WriteMode='merge'
+ * and stagedAt = L1.staged_at, preserving the merge function's
+ * idempotency guarantee.
  *
  * Endpoints:
  *   GET  /.netlify/functions/marginiq-reparse
@@ -16,9 +26,13 @@ import { gunzipSync } from "node:zlib";
  *        Returns metadata for a specific file.
  *   POST /.netlify/functions/marginiq-reparse
  *        body: { file_id, action: 'reparse' }
- *        Reads + decompresses + dispatches to the right ingest function
- *        based on file_id prefix ('nuvizz__...' → marginiq-nuvizz-ingest,
- *        'ddis__...' → marginiq-ddis-ingest-background).
+ *        Reads + decompresses + dispatches to the right parser.
+ *        For source='uline', action='reparse' uses the from_l1 path
+ *        (lib parser + ingestFile merge mode).
+ *   POST /.netlify/functions/marginiq-reparse
+ *        body: { action: 'batch_reparse', source: 'uline', limit?: 100 }
+ *        Batches reparse across all files for a given source. Used by
+ *        the migration runner (Commit 4) for the M4 mass reparse step.
  *
  * Why this matters: We told user "we keep all data forever now" — they
  * pushed back that all earlier ingests dropped fields. Even with v2.52.0
@@ -103,7 +117,14 @@ async function loadFileBytes(fileId: string): Promise<Buffer | null> {
   return gunzipSync(gz);
 }
 
-async function dispatchToParser(siteOrigin: string, fileId: string, filename: string, source: string, bytes: Buffer): Promise<{ ok: boolean; result?: any; error?: string }> {
+async function dispatchToParser(
+  siteOrigin: string,
+  fileId: string,
+  filename: string,
+  source: string,
+  bytes: Buffer,
+  meta: Record<string, any>,
+): Promise<{ ok: boolean; result?: any; error?: string }> {
   // Decompress already happened — bytes is the original CSV/XLSX bytes.
   // For text-format sources (NuVizz, DDIS), decode to text and POST to the
   // appropriate auto-ingest function in reparse_csv mode (added in v2.52.3).
@@ -130,20 +151,87 @@ async function dispatchToParser(siteOrigin: string, fileId: string, filename: st
     const data: any = await r.json().catch(() => ({}));
     return { ok: r.ok && data.ok !== false, result: data };
   }
-  // Uline DAS files are XLSX (binary). Reparse path TBD — would require an
-  // XLSX-aware parser endpoint. For now, return the file ready for manual
-  // re-import via the UI.
-  if (source === "uline" || source === "das") {
+  // v2.53.3 Commit 2 — Uline DAS reparse from L1.
+  //
+  // Critical invariant: stagedAt MUST be the L1 doc's original staged_at,
+  // NOT the current time. This preserves the merge function's idempotency
+  // guarantee (DESIGN.md §4): reparsing the same file twice produces
+  // identical L3 state.
+  //
+  // Skip Layer 1 because the L1 doc + chunks already exist in Firestore.
+  // Re-writing them would (a) duplicate work, (b) overwrite staged_at
+  // with a fresh timestamp, breaking idempotency.
+  if (source === "uline") {
+    const messageId = String(meta.email_message_id || meta.messageId || "");
+    const stagedAt = String(meta.staged_at || "");
+    const emailDate = String(meta.email_date || meta.emailDate || "");
+    const account = String(meta.email_account || meta.account || "");
+    const subject = String(meta.email_subject || meta.subject || "");
+
+    if (!messageId) {
+      return { ok: false, error: "Uline reparse: source_files_raw doc missing email_message_id" };
+    }
+    if (!stagedAt) {
+      return { ok: false, error: "Uline reparse: source_files_raw doc missing staged_at — required for merge idempotency" };
+    }
+
+    // Pre-compute file_id the same way the live worker does. This MUST
+    // match the existing source_files_raw doc id (which is fileId arg).
+    // We assert the match — if it doesn't, the reparse would corrupt L2
+    // by writing under a different file_id prefix.
+    const computedFileId = deriveFileId("uline", filename, messageId);
+    if (computedFileId !== fileId) {
+      return {
+        ok: false,
+        error: `Uline reparse: deriveFileId("uline", "${filename}", "${messageId}") = "${computedFileId}" but expected "${fileId}". The L1 doc id was generated under different inputs; cannot reparse without breaking L2 alignment.`,
+      };
+    }
+
+    // Parse via the shared library (same code path as live ingest).
+    let bundle;
+    try {
+      bundle = parseDasWorkbookToRows(bytes, filename, fileId, subject);
+    } catch (e: any) {
+      return { ok: false, error: `Uline reparse: parser threw: ${e?.message || e}` };
+    }
+
+    const result = await ingestFile({
+      source: "uline",
+      filename,
+      binary: bytes,
+      parser: () => bundle.rows,
+      metadata: {
+        messageId,
+        emailDate,
+        account,
+        subject,
+        schemaVersion: "2.0.0",
+        ingestedBy: `marginiq-reparse@2.53.3`,
+        stagedAt,                  // CRITICAL: from L1 doc, NOT new Date()
+        l1Extras: bundle.l1Extras, // updates column_headers/sheet_names/file_kind
+                                    // on source_files_raw (won't overwrite L1
+                                    // chunks because skipLayer1 is set below)
+      },
+      apiKey: FIREBASE_API_KEY!,
+      l3WriteMode: "merge",
+      skipLayer1: true,
+    });
+
     return {
-      ok: true,
+      ok: result.ok,
       result: {
-        action: "decompressed_only",
-        source,
+        action: "uline_reparse_from_l1",
         file_id: fileId,
         filename,
-        bytes_length: bytes.length,
-        note: "Uline DAS files are XLSX (binary). Re-import via the UI Data Ingest tab to re-run the parser. The decompressed bytes are available via the GET endpoint on this file_id.",
+        file_kind: bundle.l1Extras.file_kind,
+        rows_parsed: bundle.rows.length,
+        l2_written: result.layer2.written,
+        l3_attempted: result.layer3.attempted,
+        l3_written: result.layer3.written,
+        staged_at_used: stagedAt,
+        duration_ms: result.duration_ms,
       },
+      error: result.error,
     };
   }
   return { ok: false, error: `Unknown source '${source}' — no reparse pipeline defined yet` };
@@ -218,12 +306,17 @@ export default async (req: Request, _context: Context) => {
             continue;
           }
           const filename = String(f.filename || f.id);
-          const r = await dispatchToParser(baseUrl, f.id, filename, source, bytes);
+          // f already contains the unwrapped fields (filename, source,
+          // staged_at, email_message_id, email_subject, email_account,
+          // email_date) from unwrapDoc(). Pass it as meta to dispatchToParser
+          // so the uline branch can read staged_at + email_message_id.
+          const r = await dispatchToParser(baseUrl, f.id, filename, source, bytes, f);
           results.push({
             file_id: f.id,
             filename,
             ok: r.ok,
-            stops_or_payments: r.result?.stops_parsed ?? r.result?.payments_parsed ?? null,
+            stops_or_payments: r.result?.stops_parsed ?? r.result?.payments_parsed ?? r.result?.l3_written ?? null,
+            file_kind: r.result?.file_kind,
             error: r.error,
           });
           if (r.ok) okCount++; else failCount++;
@@ -274,7 +367,9 @@ export default async (req: Request, _context: Context) => {
     if (action === "reparse") {
       const baseUrl = `${url.protocol}//${url.host}`;
       const filename = String(meta.filename || fileId);
-      const result = await dispatchToParser(baseUrl, fileId, filename, source, bytes);
+      // Pass the full unwrapped meta so dispatchToParser's uline branch
+      // can read staged_at, email_message_id, etc.
+      const result = await dispatchToParser(baseUrl, fileId, filename, source, bytes, meta);
       return json({ ok: result.ok, result: result.result, error: result.error });
     }
 

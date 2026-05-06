@@ -162,6 +162,26 @@ export interface IngestParams {
   /** If true, write Layer 1 only (preserve original bytes, skip parsing). */
   layer1Only?: boolean;
   /**
+   * v2.53.3 Commit 2 — If true, skip the Layer 1 write. Used by the
+   * reparse-from-L1 path (marginiq-reparse, migration runner) where the
+   * L1 doc + chunks already exist in Firestore and re-writing them would:
+   *   (a) needlessly duplicate work
+   *   (b) overwrite the original `staged_at` with a fresh timestamp,
+   *       breaking the merge function's idempotency guarantee
+   *
+   * When skipLayer1 is true:
+   *   - writeLayer1 is not called
+   *   - fileId is computed via deriveFileId() the same way as a normal
+   *     ingest (caller must ensure the same source/filename/messageId)
+   *   - L2+L3 writes proceed as usual
+   *   - the source_files_raw completion-summary patch still happens
+   *     (state, completed_at, parsed_row_count, l2/l3 counts) so the
+   *     reparse leaves a record of what changed
+   *
+   * Mutually exclusive with layer1Only. Setting both throws.
+   */
+  skipLayer1?: boolean;
+  /**
    * v2.53.3 — Controls how Layer 3 docs are written when their docId already
    * exists in Firestore. Layer 2 writes are unaffected (always overwrite —
    * L2 docIds are file-scoped and never collide).
@@ -610,9 +630,14 @@ async function applyRejectOnConflictBatch(
  * should call to write data into MarginIQ.
  */
 export async function ingestFile(params: IngestParams): Promise<IngestResult> {
-  const { source, filename, binary, parser, metadata, apiKey, layer1Only } = params;
+  const { source, filename, binary, parser, metadata, apiKey, layer1Only, skipLayer1 } = params;
   const startMs = Date.now();
   const ingestedAt = new Date().toISOString();
+
+  // skipLayer1 + layer1Only are mutually exclusive — caller has a bug.
+  if (layer1Only && skipLayer1) {
+    throw new Error("ingestFile: layer1Only and skipLayer1 cannot both be true");
+  }
 
   // Validate source
   const registryEntry = SOURCE_REGISTRY[source];
@@ -634,22 +659,31 @@ export async function ingestFile(params: IngestParams): Promise<IngestResult> {
 
   const fileId = deriveFileId(source, filename, metadata.messageId);
 
-  // Layer 1: original bytes
-  const l1 = await writeLayer1(source, fileId, filename, binary, metadata, apiKey);
-  if (!l1.ok) {
-    return {
-      ok: false,
-      fileId,
-      source,
-      layer1: l1,
-      layer2: { collection: registryEntry.rowsRaw, attempted: 0, written: 0, failed: 0 },
-      layer3: { collection: registryEntry.primary, attempted: 0, written: 0, failed: 0 },
-      schemaVersion: metadata.schemaVersion,
-      ingestedAt,
-      ingestedBy: metadata.ingestedBy,
-      duration_ms: Date.now() - startMs,
-      error: `Layer 1 write failed: ${l1.error}`,
-    };
+  // Layer 1: original bytes — skipped when skipLayer1=true (reparse-from-L1)
+  let l1: { ok: boolean; chunks: number; rawBytes: number; gzBytes: number; error?: string };
+  if (skipLayer1) {
+    // Synthesize a layer1 result. Caller asserts the L1 doc + chunks
+    // already exist in Firestore. We don't re-verify here because the
+    // reparse caller has already loaded the bytes (binary param) which
+    // came from those chunks — that IS the verification.
+    l1 = { ok: true, chunks: 0, rawBytes: binary.length, gzBytes: 0 };
+  } else {
+    l1 = await writeLayer1(source, fileId, filename, binary, metadata, apiKey);
+    if (!l1.ok) {
+      return {
+        ok: false,
+        fileId,
+        source,
+        layer1: l1,
+        layer2: { collection: registryEntry.rowsRaw, attempted: 0, written: 0, failed: 0 },
+        layer3: { collection: registryEntry.primary, attempted: 0, written: 0, failed: 0 },
+        schemaVersion: metadata.schemaVersion,
+        ingestedBy: metadata.ingestedBy,
+        ingestedAt,
+        duration_ms: Date.now() - startMs,
+        error: `Layer 1 write failed: ${l1.error}`,
+      };
+    }
   }
 
   if (layer1Only) {
